@@ -756,6 +756,7 @@ WARP 的集成验证也是手工的：启动 `warp` profile，在 WebUI 上把�
 | 签到的查询参数 | `device_platform=web&is_desktop=1&desktop_version=0.6.12` | 签到调用 |
 | 积分账本的查询参数 | 签到的三个 + `page_number`、`page_size=20`、`include_expired=true` | 账本调用 |
 | 签到面板的状态码 | `1` 未开始、`2` 可领、`3` 已领、`4` 不可领；`claim_result` `1` 领到、`2` 已是今天 | §9 |
+| 登录轮询的等待 | `authorization_pending` 和 `slow_down` 都是**继续等**，不是错误；`slow_down` 多等 5 秒 | §9 |
 | 账号 API 的端点 | `/v1/api/user/info`、`/matrix/api/v1/user/get_user_extra_info`、`/matrix/api/v1/commerce/get_membership_info`、`/minimax-cloud/api/v1/credit/details`、`/minimax-cloud/api/v1/signin/status`、`/minimax-cloud/api/v1/signin/claim` | `site` 里对应的常量 |
 | 套餐窗口的端点 | `/backend/account/token_plan/remains_percent`、`/v1/api/openplatform/coding_plan/remains`、`/v1/api/openplatform/charge/combo/cycle_audio_resource_package` | `site.PlanRemainsPath` 等 |
 
