@@ -17,6 +17,7 @@ import (
 	"mmxcode/internal/account"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
@@ -38,6 +39,7 @@ type env struct {
 	up    *upstream.Client
 	egr   *egress.Resolver
 	acc   *account.Client
+	mgr   *manager.Manager
 }
 
 func newRoot() *cobra.Command {
@@ -85,6 +87,7 @@ func newRoot() *cobra.Command {
 		}
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
+		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -98,6 +101,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
+	root.AddCommand(newServeCmd(e))
 	return root
 }
 

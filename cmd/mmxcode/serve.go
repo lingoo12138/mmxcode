@@ -1,0 +1,96 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"mmxcode/internal/gateway"
+	"mmxcode/internal/scheduler"
+	"mmxcode/internal/webui"
+)
+
+func newServeCmd(e *env) *cobra.Command {
+	return &cobra.Command{
+		Use:   "serve",
+		Short: "起 HTTP 服务、WebUI 与定时任务",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// 只有国际站。中国站是另一套主机，token 不通用。
+			if s := e.cfg.Upstream.Site; s != "" && s != "global" {
+				return fmt.Errorf("upstream.site = %q; only \"global\" is supported", s)
+			}
+
+			// 签到时间写错的话，调度器会默默按 09:00 跑。用户以为自己
+			// 配了别的点，就永远等不到那个点的签到。起不来比悄悄跑错好。
+			if _, err := time.Parse("15:04", e.cfg.Schedule.CheckinAt); err != nil {
+				return fmt.Errorf("schedule.checkin_at = %q; want HH:MM", e.cfg.Schedule.CheckinAt)
+			}
+
+			// 没配 key 时只听本机，不然就是把模型白送出去
+			listen := e.cfg.Server.Listen
+			if len(e.cfg.Server.APIKeys) == 0 && !isLoopback(listen) {
+				return fmt.Errorf("no api key is configured, so the gateway would listen on %s for everyone; put api_keys in the config or listen on 127.0.0.1", listen)
+			}
+
+			ui := webui.New(e.mgr, e.cfg, e.store)
+			gw := gateway.New(e.mgr, e.cfg, e.store, ui)
+			sc := scheduler.New(e.mgr, e.cfg)
+
+			srv := &http.Server{
+				Addr:              listen,
+				Handler:           gw,
+				ReadHeaderTimeout: 10 * time.Second,
+				// 聊天会流很久，不给写超时
+			}
+
+			go sc.Run(ctx)
+
+			errc := make(chan error, 1)
+			go func() {
+				fmt.Printf("网关在 %s 上\n", listen)
+				errc <- srv.ListenAndServe()
+			}()
+
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+			select {
+			case err := <-errc:
+				if err != nil && err != http.ErrServerClosed {
+					return err
+				}
+			case <-sig:
+				fmt.Println("正在关掉……")
+			}
+			cancel()
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutCancel()
+			return srv.Shutdown(shutCtx)
+		},
+	}
+}
+
+// isLoopback says a listen address is only on this machine.
+//
+// ":8080" and "0.0.0.0:8080" are not: they mean every interface of the
+// machine, so anyone who can reach it can use the accounts.
+func isLoopback(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
