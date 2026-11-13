@@ -1,0 +1,29 @@
+server:
+  listen: ":8080"
+  api_keys: ["sk-local-xxxx"]
+
+proxy:
+  # 全局默认出口。"direct" 表示不走代理。
+  default: "http://127.0.0.1:7890"
+  # 出口组：账号可以指向其中一组，一组共用一个出口。
+  groups:
+    clash:  "http://127.0.0.1:7890"
+    warp:   "socks5h://warp:4000"
+    direct: "direct"
+
+upstream:
+  timeout: 120s
+  site: global
+
+rotation:
+  strategy: sticky
+  max_attempts: 3
+  exhausted_cooldown: 5m
+
+schedule:
+  checkin_at: "09:00"
+  usage_refresh: 15m
+  token_refresh: 5m
+  egress_health: 2m
+
+db: "/data/mmxcode.db"
