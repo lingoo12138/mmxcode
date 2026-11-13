@@ -1,0 +1,577 @@
+# mmxcode-gateway 设计文档
+
+日期：2026-11-13
+状态：待评审
+
+## 1. 目标与范围
+
+### 1.1 一句话
+
+用 Go 实现一个**不依赖 magpie** 的 MiniMax Code (Global) 多账号网关：登录、多账号管理、每日签到、账号轮转，对外提供 Anthropic / OpenAI / Codex 三种协议，并带 Web 管理界面和 Docker 部署。
+
+上游行为对齐社区插件 [`@magpie-community/opencode-minimax-auth`](https://github.com/magpie-community/plugins/blob/main/packages/minimax/README.md)（下称"参考插件"）的协议实现。
+
+### 1.2 范围内
+
+- MiniMax Code 国际站（`minimax.io`）的账号登录（OAuth 2 device flow + PKCE）
+- 多账号存储、管理、状态跟踪
+- 每日签到（定时自动 + 手动触发）
+- 账号轮转：粘性会话绑定 + 配额耗尽故障转移
+- HTTP 网关：`/v1/messages`（Anthropic）、`/v1/chat/completions`（OpenAI）、`/v1/responses`（Codex）
+- 用量聚合接口 `GET /api/usage`
+- Web 管理界面（服务端渲染）
+- CLI + Docker 部署
+
+### 1.3 范围外（明确不做）
+
+- 中国站（`minimax.cn` / `minimaxi.com`）
+- Matrix 工具：图片/视频/语音生成、`web_search`、图像理解等
+- magpie 插件（不写 JS 适配层，不接入 magpie 的 Usage 卡片）
+- 图形验证码处理（上游若返回验证码状态，原样透传为 `captcha`）
+- 账号签出（删除本地记录即可，不吊销 MiniMax 侧 token，与参考插件一致）
+- 真实账号的自动化集成测试（refresh token 一次性，跑两次会废掉账号）
+
+### 1.4 与参考插件的对应关系
+
+参考插件是 JS 实现的 OpenCode/magpie provider 插件。本项目用 Go 网关替代它，承担全部协议、凭据与轮转逻辑；magpie 侧不接入。
+
+协议细节（端点、签名、请求头、错误语义）以参考插件的 `packages/minimax/index.mjs` 为准，本文档逐条记录。
+
+## 2. 站点与端点
+
+只支持国际站（Global）。参考插件的 `SITES["minimax-code-global"]`：
+
+| 用途 | Host |
+|---|---|
+| OAuth 登录 | `account.minimax.io` |
+| 聊天 + 模型列表 | `agent.minimax.io` |
+| 账户 API + 签到 + 积分账本 | `agent.minimax.io` |
+| 套餐控制台 | `platform.minimax.io` |
+
+端点：
+
+| 功能 | 路径 | 方法 |
+|---|---|---|
+| 申请设备码 | `{account}/oauth2/device/code` | POST form |
+| 换取 token（设备码 / 刷新） | `{account}/oauth2/token` | POST form |
+| 聊天（Anthropic） | `{llm}/mavis/api/v1/llm/v1/messages` | POST |
+| 聊天（OpenAI） | `{llm}/mavis/api/v1/llm/v1/chat/completions` | POST |
+| 聊天（Codex Responses） | `{llm}/mavis/api/v1/llm/v1/responses` | POST |
+| 模型列表 | `{llm}/mavis/api/v1/models?region=en&buildEnv=prod` | GET |
+| 账户身份 | `{agent}/v1/api/user/info` | GET |
+| 工作区信息 | `{agent}/matrix/api/v1/user/get_user_extra_info` | POST |
+| 会员信息 | `{agent}/matrix/api/v1/commerce/get_membership_info` | POST |
+| 积分账本 | `{agent}/minimax-cloud/api/v1/credit/details` | GET |
+| 签到面板 | `{agent}/minimax-cloud/api/v1/signin/status` | GET |
+| 签到领取 | `{agent}/minimax-cloud/api/v1/signin/claim` | POST |
+| 套餐窗口（首选） | `{platform}/backend/account/token_plan/remains_percent` | GET |
+| 套餐窗口（回退） | `{platform}/v1/api/openplatform/coding_plan/remains` | GET |
+| 套餐名称 | `{platform}/v1/api/openplatform/charge/combo/cycle_audio_resource_package?...` | GET |
+
+**国际站注意事项**：参考插件实测国际站对 `get_user_extra_info` 与 `get_membership_info` 两个会员接口都返回 404（#666），因此套餐信息在国际站属于"未知"，不是"Free"。`/api/usage` 与 WebUI 必须能表达"套餐未知"这一状态。
+
+## 3. 架构
+
+### 3.1 模块划分
+
+```
+mmxcode-api/
+├── cmd/mmxcode/main.go         单一入口，cobra 子命令
+├── internal/
+│   ├── site/       站点常量、端点表、内置模型表（纯常量，无 IO）
+│   ├── sign/       MiniMax 请求签名：yy / x-signature（纯函数）
+│   ├── oauth/      device flow 登录、token 解析、刷新与单飞保护
+│   ├── account/    账户 API 客户端：identity / membership / 积分账本 / 套餐窗口
+│   ├── checkin/    签到：读面板 → 判定 → claim → 结果归一
+│   ├── store/      SQLite 存储层
+│   ├── rotator/    粘性会话 + 配额故障转移（只做决策，不发 HTTP）
+│   ├── gateway/    三协议 HTTP 路由、上游请求改写、重放
+│   ├── proxy/      上游 HTTP 客户端：代理、重定向策略、超时、业务错误码检查
+│   ├── webui/      服务端渲染页面 + SSE
+│   └── scheduler/  定时任务（自动签到、token 续期、用量刷新）
+├── web/            templates + static
+├── Dockerfile / docker-compose.yml / config.example.yaml
+└── docs/superpowers/specs/
+```
+
+**依赖方向**：`gateway → rotator → oauth/account → site/sign → store`。`store` 不依赖上层；`rotator` 只决定"用哪个账号、是否允许重放"，重放由 `gateway` 执行，因此轮转逻辑可以脱离网络测试。
+
+### 3.2 边界约定
+
+- `site`：只有常量和纯函数。换站、改端点、调模型表只动这里。
+- `sign`：纯函数（path/query/body/timestamp → headers），无 IO，可对照参考插件的 JS 实现造固定向量单测。
+- `rotator`：接口为 `Acquire(sessionKey, model) → (account, permit)`，`permit` 表示是否允许重放。不认识 HTTP。
+- `gateway`：唯一的重放执行者，也是唯一给上游加认证头的层。
+
+## 4. 登录（OAuth device flow）
+
+### 4.1 流程
+
+1. 生成 32 字节随机 `verifier`（base64url），`challenge = base64url(sha256(verifier))`
+2. POST `{account}/oauth2/device/code`，form：`client_id=mcode-public`、`scope=agent.default`、`audience=agent-backend`、`code_challenge=<challenge>`、`code_challenge_method=S256`
+3. 响应取 `user_code`、`device_code`、`verification_uri` / `verification_url`、`verification_uri_complete`、`expires_in` / `expired_in`、`interval`
+4. 向用户展示 user_code 与链接，轮询 `{account}/oauth2/token`，form：`grant_type=urn:ietf:params:oauth:grant-type:device_code`、`device_code`（或 `user_code`）、`client_id`、`code_verifier`
+
+**MiniMax 变体**：响应里可能没有 `device_code`，而是用 `user_code` 轮询、且 `expired_in` 可能是绝对毫秒时间戳。两 种形式都要支持，由 `expired_in` 是否存在且 `device_code` 是否缺失来判断。
+
+**轮询语义**：
+- `authorization_pending` / `status=pending` → 继续等
+- `slow_down` / `status=slow_down` → 间隔 +5s
+- `denied` / `access_denied` → `access_denied`
+- `expired` / `expired_token` → `expired_token`
+- 成功 → 解析 token
+
+**重试**：仅传输层错误和 5xx/408/429 重试，最多 3 次，指数退避（1s → 2s → 4s，上限 30s）。`invalid_grant` / `access_denied` / `expired_token` / `invalid_client` / `unauthorized_client` 不重试。刷新 token 的请求**永不重试**（可能已经花掉）。
+
+### 4.2 token 解析
+
+响应体取 `access_token`、`expires_in`、`refresh_token`。access token 是 JWT，从中解出 `sub`（MiniMax user id）和 `account_id` 作为账号身份线索。
+
+### 4.3 token 刷新
+
+**核心约束：refresh token 一次性。** 第二次使用返回 `invalid_grant` + HTTP 400，账号被判登出。
+
+因此：
+
+- **单飞**：每个账号一把锁，同一时刻只允许一个刷新在跑，后来者等待并复用结果。
+- **刷新链**：刷新结果按"旧 refresh token → 新 token"缓存，沿链可以取到最新的一代，而不是只记最后一次。
+- **落盘优先**：拿到新 token 后先写 SQLite，再发布到内存。写盘失败时**不能**退回旧 token（旧 token 已作废）；正确做法是保留新 token 在内存继续服务，后台按退避重试落盘，并把该账号标为"待持久化"在 WebUI 告警。（参考插件只存在内存里，进程一挂该账号就要重登；我们做得更严。）
+- **登出判定**：仅 `invalid_grant` + HTTP 400 视为真登出，标记 `signed_out`。
+  - 但若 DB 中当前的 refresh token 与本次使用的不是同一个，说明已被别处（CLI 又登录了一次 / 另一个进程）先行消费，**不算登出**，改用 DB 中的新 token 继续。
+  - 5xx / 超时 / 网络错误**不算登出**，token 未过期则继续使用。
+- **提前续期**：调度任务每 5 分钟扫描，距过期 10 分钟以上即刷新，保证不会在请求中途过期；请求侧另有一道 2 分钟的检查。
+
+## 5. 签名
+
+参考插件的 `signed()`：
+
+- 查询串固定字段：`device_platform=mcode`、`biz_id=3`、`app_id=3001`、`version_code=22201`、`unix=<毫秒>`、`timezone_offset=<秒>`、`sys_language=en`、`lang=en`、`device_id=0`、`os_name=<platform>`、`browser_name=mcode`、`user_id=<realUserID 或 0>`、`client=mcode`
+- 待签名串 `at = path + "?" + query`
+- `yy`：
+  - GET（无 body）：`md5(urlEncode(at) + "_" + "{}" + md5(unix) + "ooui")`
+  - POST：`md5(urlEncode(at) + "_" + body + md5(unix) + "ooui")`
+- `x-timestamp` = `unix / 1000`
+- `x-signature`：
+  - GET：`md5(timestamp + "I*7Cf%WZ#S&%1RlZJ&C2")`
+  - POST：`md5(timestamp + "I*7Cf%WZ#S&%1RlZJ&C2" + body)`
+- 请求头另有：`Accept: application/json`、`Content-Type: application/json`、`User-Agent: MiniMaxCode`、`Authorization: Bearer <access>`
+
+签到与积分账本使用 `device_platform=web`、`is_desktop=1`、`desktop_version=0.6.12`（覆盖默认的 `device_platform=mcode`），其余签名逻辑不变。
+
+**幂等性**：签名含时间戳与 unix，重放同一请求会产生不同签名，因此所有带签名的请求不可重试到不同的账号——只有聊天请求（无签名）允许换号重放。
+
+## 6. 聊天请求
+
+### 6.1 上游地址
+
+- Anthropic：`{llm}/mavis/api/v1/llm/v1/messages`
+- OpenAI：`{llm}/mavis/api/v1/llm/v1/chat/completions`
+- Codex：`{llm}/mavis/api/v1/llm/v1/responses`
+
+### 6.2 上游请求头
+
+```
+Authorization: Bearer <access_token>
+x-api-key: sk-xxx                       # MiniMax Code 给 SDK 的占位 key
+User-Agent: MiniMaxAgent
+X-Mavis-Agent-Id: main
+X-Mavis-Timezone-Offset: <秒>
+X-Mavis-Session-Id: <会话 id>
+anthropic-version: 2023-06-01          # 仅 Anthropic 协议，客户端没带时补
+accept-encoding: identity              # 必须
+```
+
+`accept-encoding: identity` 必须显式设置：MiniMax 会把被要求压缩的响应压成单个 gzip member 并在结束时 flush，导致流式响应的所有事件一次性到达、首个 token 等到最后一个。Go 的 `http.Transport` 默认自动加 `Accept-Encoding: gzip`，必须覆盖。回给客户端的响应不携带 `content-encoding`。
+
+### 6.3 协议转换
+
+| 客户端 | 上游 | 转换 |
+|---|---|---|
+| Anthropic | `/messages` | 原生直通，body 不改 |
+| OpenAI | `/chat/completions` | 原生直通，body 不改 |
+| Codex | `/responses` | 先试上游原生 `/responses`；上游返回 404 / 不支持时，**本地**转成 Anthropic `/messages`，再把上游 SSE 转回 Responses 事件 |
+
+Codex 回退转换需要产出 `response.output_text.delta`、`response.function_call_arguments.delta`、`response.reasoning_summary_text.delta`、`response.completed` 等事件。
+
+**待实测**：上游是否原生支持 `/responses`。实现时先探原生，探不到再启用回退路径；两条路径的输出行为必须一致。
+
+### 6.4 错误语义
+
+1. **业务错误码**：HTTP 200 不代表成功。检查 body 的 `statusInfo.code`（`1000048` = 登录被拒）与 `base_resp.status_code`，非 0 视为失败。
+2. **配额拒绝改写**：状态码 402 / 403 / 429 且 body 命中配额正则时，改写为 `429` + `{"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached: <原消息>"}}`，让客户端知道是配额问题、可以换号重试。其他状态码原样透传。
+   配额正则：`insufficient|balance|credit|quota|exhaust|limit|余额|积分|额度|不足|用完|上限`（忽略大小写）
+3. **401**：先刷新 token，同账号重试一次；若刷新判定登出则换号。
+4. **跨站重定向**：见 8.3，返回 502 + 代理提示，**不当作登录被拒，不消耗 refresh token**。
+
+## 7. 轮转
+
+### 7.1 会话亲和
+
+一个会话键绑定一个账号，稳态下不换。
+
+**会话键来源（优先级）**：
+1. 客户端显式请求头 `X-Session-Id` / `X-Conversation-Id`
+2. 客户端自带的其他会话标识
+3. `hash(system + 首条 user 消息)` —— 同一会话里首条消息不变，能稳定命中；哈希只在本地计算，不外发
+4. 都没有 → 退化为轮询（每个请求取下一个账号）
+
+**注意区分两个概念**：
+
+| 概念 | 作用 | 归属 |
+|---|---|---|
+| `X-Mavis-Session-Id` | 发给 MiniMax 上游的会话标识，影响上游侧上下文与缓存 | 客户端带就用客户端的，否则我们生成固定值；**换号时保持不变**，它标识"这段对话"而非"用哪个账号" |
+| 账号亲和键 | 决定本请求使用我们哪个账号 | 由会话键哈希得到 |
+
+### 7.2 选号
+
+会话已有绑定且该账号可用 → 用它。否则从候选池选：跳过已耗尽的账号与窗口，优先剩余额度多的，其次最久未使用的。
+
+### 7.3 故障转移判定
+
+| 上游结果 | 动作 |
+|---|---|
+| 401 | 刷新 token → 同账号重试一次；刷新判定登出 → 换号 |
+| 402 / 403 / 429 且 body 命中配额正则 | 标记耗尽 → 换号重放 |
+| 429 但 body 非配额问题 | 限流 → 同账号退避重试（1-2 次） |
+| 5xx / 网络错误 | 同账号退避重试 |
+| 跨站重定向 | 502 + 代理提示，**不轮转、不消耗 refresh token** |
+
+### 7.4 耗尽粒度：账号 × 窗口
+
+套餐窗口按模型组划分（M3 聊天属 `general`，视频属另一组）。一个账号的 5 小时窗口打满，不影响同账号其他组继续使用。
+
+耗尽标记为二维：`账号 × 窗口键`。窗口键取自套餐窗口的 `model_name`（缺省 `general`）。请求的模型 → 窗口组的映射来自最近一次套餐窗口快照；映射不可得时，退化为账号级耗尽，并按 `exhausted_cooldown`（默认 5 分钟）冷却后自动恢复。
+
+积分余额为 0、或无法归因到具体窗口时，整体标记账号耗尽。
+
+### 7.5 恢复
+
+- 窗口耗尽：按该窗口的 `resetsAt` 自动解锁
+- 积分耗尽：靠下一轮账本快照判断余额是否回补
+- 轮转器选号时跳过耗尽中的项，恢复是自动的，无需人工干预
+
+### 7.6 重放边界
+
+**只有在上游响应头尚未写给客户端之前，才允许换号重放。**
+
+SSE 一旦开始吐字节就不能再切换账号——客户端已收到部分内容。此时上游中途断流，只能发出一个错误事件收尾，不重放。
+
+配额类拒绝发生在流开始之前（上游先返回 429 JSON），因此这条边界成立。
+
+重放次数上限 `max_attempts`（默认 3），且不超过账号总数。
+
+### 7.7 签名的副作用
+
+带签名的账户 API 请求（账本、签到、会员）**不能换号重放**——签名含时间戳，换账号重放会带着旧签名。只有聊天请求允许重放。
+
+## 8. 上游客户端
+
+### 8.1 超时分级
+
+| 场景 | 超时 |
+|---|---|
+| OAuth 登录 | 30s |
+| 账户 API | 15s |
+| 模型列表 | 10s |
+| 套餐 console 端点 | 5s（回退端点 10s） |
+
+### 8.2 代理
+
+出站代理可配置（`proxy:`），用于访问国际站。参考插件记录的问题：国内网络直连 `agent.minimax.io` 会被 Akamai 307 到中国站。
+
+### 8.3 重定向策略
+
+- **同 host**：跟随，最多 5 跳。307/308 保留 method 与 body 重发；301/302/303 的非 GET/HEAD 请求转为 GET 且丢弃 body。
+- **跨 host**：抛 `OtherSite` 错误，对外返回 `502` + 明确提示（需要境外网络的代理），**不当作登录被拒、不消耗 refresh token、不切换账号**。
+
+这是参考插件踩过的坑：两个站的 token 不通用，跟着跳会被误判成"登录被拒"，白白消耗一次性的 refresh token。
+
+### 8.4 业务错误码
+
+见 6.4 第 1 条。
+
+## 9. 签到
+
+### 9.1 流程
+
+1. 读取 `realUserID`：从 token 的 `sub` 取；取不到则调 `/v1/api/user/info` 查
+2. GET `{agent}/minimax-cloud/api/v1/signin/status`，查询串带 `device_platform=web`、`is_desktop=1`、`desktop_version=0.6.12`
+3. 解析面板：`data.days` 恰好 7 项，`day_no` 为 1..7
+4. 判定：
+   - 今天的 `status == 3` → `done`（今天已签），返回本次积分与连续天数
+   - 今天的 `status == 2` → POST `/minimax-cloud/api/v1/signin/claim`，body `{}`；`claim_result == 1` → `claimed`，`== 2` → `done`
+   - 今天的 `status == 4` → `ineligible`
+   - 今天的 `status == 1` → `inactive`（今日未开始）
+   - 找不到今天 → `inactive`
+5. **401 重试**：签到被 401 → 刷新 token → 重新读一次 `realUserID` → 再问一次（只重试一次）
+
+### 9.2 连续天数
+
+从今天往前数连续 `status == 3` 的天数；今天刚领取时为前一天的连续数 +1。
+
+### 9.3 触发方式
+
+- **定时**：调度任务每天在配置时间（默认北京时间 09:00）执行，每个账号加 0-30 分钟随机抖动，避免同时打上游
+- **手动**：WebUI 按钮、CLI `mmxcode checkin`
+- **幂等**：当天已签到时返回 `done`，不重复领取
+
+## 10. 用量与积分
+
+### 10.1 数据来源
+
+- **积分账本**：GET `{agent}/minimax-cloud/api/v1/credit/details`，查询串 `page_number`（从 1）、`page_size=20`、`include_expired=true`；最多翻 10 页。响应含 `details` 与 `total_count`。每批含 `credit_type`（1 购买 / 2 签到）、`granted_amount`、`consumed_amount`、`remaining_amount`（十进制字符串，可能带千分位逗号；负数按 0 处理）、`granted_at_ms`、`expire_at_ms`。批次超过 `expire_at_ms` 即过期。
+
+**金额口径**（与参考插件 `creditsWindow` 一致）：
+- 只统计 `credit_type` 为 1 或 2 的批次
+- 批次金额先去掉千分位逗号再解析；不符合 `^\d+(\.\d+)?$` 的视为无法解析，该批次直接跳过（不能用部分数据算出错误的比例）
+- `granted` = `granted_amount`；`remaining` = `min(remaining_amount, granted)`（`remaining_amount` 为负按 0）
+- `consumed` = `granted - remaining`（不直接用 `consumed_amount`，以免与 `remaining` 口径不一致）
+- **套餐窗口**：`{platform}/backend/account/token_plan/remains_percent`（带 `X-Group-Id`），失败回退 `{platform}/v1/api/openplatform/coding_plan/remains`
+- **会员信息**：`get_user_extra_info` + `get_membership_info`（国际站预期 404 → 套餐未知）
+- **套餐名称**：`cycle_audio_resource_package` 的 `current_subscribe.current_subscribe_title`
+
+### 10.2 刷新策略
+
+- 调度任务默认每 15 分钟刷新每个账号的账本与套餐窗口，写入 `usage_snapshots`
+- 被上游按配额拒绝时立即更新对应窗口的耗尽状态与重置时间，不等下一个轮询周期
+
+### 10.3 `GET /api/usage`
+
+网关内所有账号的积分汇总，口径与 MiniMax 账本一致：
+
+```json
+{
+  "total_granted": 1200,
+  "total_consumed": 340.5,
+  "total_remaining": 859.5,
+  "expires_at": "2026-12-01T16:00:00Z",
+  "updated_at": "2026-11-13T22:10:00Z",
+  "accounts": [
+    { "id": "acc_01", "email": "a@example.com",
+      "granted": 600, "consumed": 120.5, "remaining": 479.5,
+      "expires_at": "2026-12-01T16:00:00Z" }
+  ]
+}
+```
+
+- `total_*` 只累加未过期的批次（`expire_at_ms > now`）
+- `expires_at` 取所有计入批次中最早的 `expire_at_ms`
+- `updated_at` 是最近一次刷新时间；快照过期不影响接口返回
+- **账本不可用时**（见 19.2）：该账号的 `granted/consumed/remaining` 置为 `null`，不计入 `total_*`；汇总里带一个 `accounts_unavailable` 计数说明有多少账号没数据。宁可少报，不要用套餐窗口的百分比反推积分绝对值——那是两个量纲
+- 单账号明细在 `GET /api/accounts` 里一并给出（WebUI 用），`/api/usage` 不额外触发上游请求。
+
+## 11. 模型
+
+### 11.1 列表
+
+GET `{llm}/mavis/api/v1/models?region=en&buildEnv=prod`：带 token 优先；401/403 时不带 token 再试一次；仍失败则用内置列表兜底。
+
+### 11.2 内置列表与真实上限
+
+参考插件实测：上游模型配置对 M3 系列宣称的 512K/128K 是保守声明，端点实际接受 1,048,576 输入 token 与 524,288 输出 token。用实测值覆盖宣传值，否则 agent 会提前约一半压缩历史。
+
+| 模型 | Context | Output | 输入模态 | 思考 |
+|---|---|---|---|---|
+| MiniMax-M3.1-Flash-Preview | 1048576 | 524288 | text/image/video | forced_on，档位 low/medium/high/xhigh/max |
+| MiniMax-M3 | 1048576 | 524288 | text/image/video | switchable：none / high |
+| MiniMax-M2.7 | 200000 | 128000 | text | 总是思考 |
+| MiniMax-M2.7-highspeed | 200000 | 128000 | text | 总是思考 |
+
+思考变体映射到 Anthropic 的 `thinking: {type:"disabled"}`（none）与 `thinking: {type:"adaptive"}` + `output_config.effort`（各档位）。
+
+## 12. 存储
+
+SQLite（`modernc.org/sqlite`，纯 Go，无 cgo）。文件路径由 `db:` 配置，默认 `/data/mmxcode.db`。
+
+### 12.1 表
+
+```sql
+CREATE TABLE accounts (
+  id            TEXT PRIMARY KEY,        -- acc_01
+  name          TEXT NOT NULL,           -- 用户可改的标签
+  user_id       TEXT,                    -- MiniMax realUserID
+  email         TEXT,
+  status        TEXT NOT NULL,           -- active | signed_out | error
+  pending_persist INTEGER NOT NULL DEFAULT 0,
+  exhausted_until TEXT,                  -- 账号级耗尽的恢复时刻
+  last_error    TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE tokens (
+  account_id    TEXT PRIMARY KEY REFERENCES accounts(id),
+  access        TEXT NOT NULL,
+  refresh       TEXT NOT NULL,
+  expires_at    INTEGER NOT NULL,        -- 毫秒
+  subject       TEXT,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE exhausted_windows (
+  account_id    TEXT NOT NULL,
+  window_key    TEXT NOT NULL,           -- 模型组，如 general / video
+  until         INTEGER NOT NULL,        -- 恢复时刻（毫秒）
+  reason        TEXT,
+  PRIMARY KEY (account_id, window_key)
+);
+
+CREATE TABLE sessions (
+  session_key   TEXT PRIMARY KEY,
+  account_id    TEXT NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE checkins (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id    TEXT NOT NULL,
+  day           TEXT NOT NULL,           -- YYYY-MM-DD（北京时间）
+  outcome       TEXT NOT NULL,           -- claimed|done|ineligible|inactive|failed
+  credit        REAL,
+  streak        INTEGER,
+  message       TEXT,
+  created_at    INTEGER NOT NULL,
+  UNIQUE (account_id, day)
+);
+
+CREATE TABLE usage_snapshots (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id    TEXT NOT NULL,
+  granted       REAL, consumed REAL, remaining REAL,
+  expires_at    INTEGER,
+  plan          TEXT,
+  plan_until    INTEGER,
+  windows_json  TEXT,                    -- 套餐窗口快照
+  balance       TEXT,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE settings (
+  key           TEXT PRIMARY KEY,
+  value         TEXT NOT NULL
+);
+```
+
+### 12.2 并发
+
+SQLite 开启 WAL，busy_timeout 5s。写操作集中在一个 goroutine 的串行队列里，读操作并发。会话亲和表 `sessions` 与耗尽表 `exhausted_windows` 是热路径，写入频率低。
+
+## 13. HTTP 接口
+
+### 13.1 对外（代理）
+
+| 路由 | 用途 |
+|---|---|
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | Codex Responses |
+| `GET /v1/models` | 可用模型列表 |
+
+鉴权：配置了 `api_keys` 时，请求必须带 `x-api-key` 或 `Authorization: Bearer <key>`；未配置时不鉴权，此时服务只监听 `127.0.0.1`。
+
+### 13.2 管理
+
+| 路由 | 用途 |
+|---|---|
+| `GET /api/accounts` | 账号列表（含单账号积分、套餐、签到状态） |
+| `POST /api/accounts` | 新增账号（触发 device flow，返回 user_code 与链接） |
+| `POST /api/accounts/poll` | 轮询设备登录结果 |
+| `DELETE /api/accounts/{id}` | 删除账号 |
+| `GET /api/accounts/{id}/usage` | 单账号额度（magpie 卡片形状） |
+| `POST /api/accounts/{id}/checkin` | 触发单账号签到，返回 `{outcome, credit?, streak?, message?}` |
+| `GET /api/usage` | 全网关积分汇总（见 10.3） |
+| `GET /api/sessions` | 当前会话绑定 |
+| `GET /api/events` | SSE 状态推送（签到结果、额度刷新、账号状态变化） |
+
+管理接口的鉴权与对外接口共用 `api_keys`；未配置时同样只监听 `127.0.0.1`。
+
+### 13.3 WebUI
+
+服务端渲染（Go `html/template`）+ 少量原生 JS + SSE 推送。页面：
+
+- **账号总览**：账号列表、状态、套餐、积分、窗口用量、签到连续天数、今日签到状态；每行一个「立即签到」按钮
+- **用量汇总**：总积分 / 总消耗 / 总剩余 / 最近过期时间
+- **登录**：显示 user_code 与链接，JS 轮询结果
+- **日志**：最近的错误与轮转记录
+
+## 14. 配置
+
+```yaml
+server:
+  listen: ":8080"
+  api_keys: ["sk-local-xxxx"]        # 空 = 不鉴权，此时只听 127.0.0.1
+proxy: "http://127.0.0.1:7890"        # 可选，出站代理
+upstream:
+  timeout: 120s                      # 聊天请求超时
+  site: global
+rotation:
+  strategy: sticky                   # sticky | round-robin
+  max_attempts: 3
+  exhausted_cooldown: 5m             # 无法归因到窗口时的兜底冷却
+schedule:
+  checkin_at: "09:00"                # 北京时间，每账号加 0-30min 随机抖动
+  usage_refresh: 15m
+  token_refresh: 5m
+db: "/data/mmxcode.db"
+```
+
+## 15. CLI
+
+```
+mmxcode serve                    # 起 HTTP 服务 + WebUI + 定时任务
+mmxcode login                    # device flow，打印验证码和链接，轮询到成功
+mmxcode accounts                 # 列出账号
+mmxcode accounts remove <id>     # 删除账号
+mmxcode checkin [--account id]   # 手动签到
+mmxcode usage                    # 打印 /api/usage 汇总
+mmxcode models                   # 上游模型列表
+```
+
+## 16. 部署
+
+### 16.1 Dockerfile
+
+多阶段构建：builder 用 `golang:1.22` 编译静态二进制，runtime 用 `alpine` 或 `distroless`。最终镜像只含二进制与模板，约 20MB。
+
+### 16.2 docker-compose.yml
+
+- 服务 `mmxcode`，映射 8080
+- 卷：`/data` 挂载宿主机目录（存 SQLite）
+- 环境变量 `MMXCODE_PROXY` 覆盖代理（容器内访问宿主机的 7890 需要 `host.docker.internal` 或网关模式）
+- `restart: unless-stopped`
+
+### 16.3 备份
+
+SQLite 单文件，备份即复制 `.db` 文件（WAL 模式下需一并处理 `-wal` / `-shm`，或用 `VACUUM INTO` 导出）。
+
+## 17. 测试
+
+| 层 | 覆盖 | 方式 |
+|---|---|---|
+| `sign` | `yy` / `x-signature` | 对照参考插件 JS 实现造固定向量 |
+| `oauth` | device flow 解析（含 MiniMax 的 user_code 变体）、刷新链、invalid_grant 判定 | httptest 假服务器 |
+| `account` | 业务错误码检查、账本分页与金额解析 | httptest 假服务器 + 表驱动 |
+| `checkin` | 7 天面板各种状态组合、连续天数 | 表驱动单测 |
+| `rotator` | 选号、耗尽判定、401→刷新重试、429→换号、会话亲和与改绑 | 假账号池 + 假上游，纯逻辑不碰网络 |
+| `store` | 迁移、并发写 | 临时 SQLite |
+| `gateway` | 三协议路由、头部改写、错误改写、重放边界 | httptest 假上游 |
+| 协议转换 | Responses→Anthropic→Responses SSE | 固定 SSE 样本回放 |
+
+不写真实 MiniMax 账号的自动化集成测试（refresh token 一次性，测试跑两次就废账号）。集成验证手工执行一次 `login` + `checkin` + `usage`。
+
+## 18. 实现顺序
+
+1. `site` + `sign`（纯常量与纯函数，先做并单测）
+2. `store`（schema 与迁移）
+3. `oauth`（登录 + 刷新 + 单飞）
+4. `account` + `checkin`（账户 API 与签到）
+5. `rotator`（选号与故障转移）
+6. `proxy` + `gateway`（三协议路由与重放）
+7. `webui` + `scheduler`
+8. CLI 收口、Docker 部署
+
+## 19. 待实测项
+
+1. 上游 `/mavis/api/v1/llm/v1/responses` 是否原生支持 —— 决定 Codex 路径是直通还是走本地转换。**回退已定义**：探到 404 / 不支持就启用本地转换，两条路径输出行为一致
+2. 国际站的 `/minimax-cloud/api/v1/credit/details` 是否可用 —— 参考插件只记录了会员接口 404。**回退已定义**：账本不可用时该账号积分置 `null`，`/api/usage` 的 `total_*` 只累加有数据的账号，并带 `accounts_unavailable` 计数
+3. `token_plan/remains_percent` 在国际站是否返回数据 —— 决定耗尽标记能否精确到窗口组。**回退已定义**：拿不到窗口映射时退化为账号级耗尽 + `exhausted_cooldown` 冷却
