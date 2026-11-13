@@ -761,11 +761,26 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 		if hop >= 5 {
 			return resp, nil
 		}
+		// The body has to be read again: http.Request.Body is a reader
+		// the previous request already consumed, so replaying it as it
+		// is would send an empty body — and a chat with an empty body is
+		// not the chat that was asked for. GetBody is what reads it a
+		// second time; without it the body cannot be replayed, so the
+		// answer is handed back as it came.
 		method, body := current.Method, current.Body
 		if resp.StatusCode != 307 && resp.StatusCode != 308 {
 			if method != http.MethodGet && method != http.MethodHead {
 				method, body = http.MethodGet, nil
 			}
+		} else if body != nil {
+			if current.GetBody == nil {
+				return resp, nil
+			}
+			fresh, err := current.GetBody()
+			if err != nil {
+				return resp, nil
+			}
+			body = fresh
 		}
 		resp.Body.Close()
 		nextReq, err := http.NewRequestWithContext(current.Context(), method, next.String(), body)
@@ -773,6 +788,9 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 			return nil, err
 		}
 		nextReq.Header = current.Header.Clone()
+		// The body is a reader now, so the next hop would not know how
+		// to read it again. Keep the way to do it.
+		nextReq.GetBody = current.GetBody
 		current = nextReq
 	}
 }

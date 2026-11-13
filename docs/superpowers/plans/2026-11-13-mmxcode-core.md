@@ -456,7 +456,9 @@ func TestDurationRejectsZero(t *testing.T) {
 func TestLoadStripsBOM(t *testing.T) {
 	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里。
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	body := "\ufeff" + "server:\n  listen: \":9090\"\n"
+	// The BOM is written as bytes, not as a rune escape: a literal BOM
+	// pasted into a .go file is a syntax error.
+	body := "\xef\xbb\xbf" + "server:\n  listen: \":9090\"\n"
 	if err := writeFile(path, body); err != nil {
 		t.Fatal(err)
 	}
@@ -2543,9 +2545,12 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestFollowsSameHostRedirect(t *testing.T) {
@@ -2568,6 +2573,43 @@ func TestFollowsSameHostRedirect(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "arrived" {
 		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestSameHostRedirectKeepsTheBody(t *testing.T) {
+	// 307 之后重放，body 必须还在。签名是按 body 算的，body 没了，
+	// 上游看到的就是一个签错的请求。
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if len(bodies) == 1 {
+			w.Header().Set("Location", "/again")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/start", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests, want 2: %v", len(bodies), bodies)
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("the replayed body differs: %q vs %q", bodies[0], bodies[1])
+	}
+	if bodies[1] != `{"a":1}` {
+		t.Fatalf("the replayed body = %q", bodies[1])
 	}
 }
 
@@ -2888,11 +2930,28 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		}
 		// 307 and 308 keep the method and the body; the others turn a
 		// non-GET into a GET without a body.
+		//
+		// The body has to be read again: http.Request.Body is a reader
+		// the previous request already consumed, so replaying it as it
+		// is would send an empty body — and a signed request with the
+		// wrong body is refused. GetBody is what reads it a second time;
+		// http.NewRequest prepares it for bytes.Reader and
+		// strings.Reader. Without it the body cannot be replayed, so the
+		// answer is handed back as it came.
 		method, body := current.Method, current.Body
 		if resp.StatusCode != 307 && resp.StatusCode != 308 {
 			if method != http.MethodGet && method != http.MethodHead {
 				method, body = http.MethodGet, nil
 			}
+		} else if body != nil {
+			if current.GetBody == nil {
+				return resp, nil
+			}
+			fresh, err := current.GetBody()
+			if err != nil {
+				return resp, nil
+			}
+			body = fresh
 		}
 		resp.Body.Close()
 		nextReq, err := http.NewRequestWithContext(current.Context(), method, next.String(), body)
@@ -2900,6 +2959,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 		nextReq.Header = current.Header.Clone()
+		// The body is a reader now, so the next hop would not know how
+		// to read it again. Keep the way to do it.
+		nextReq.GetBody = current.GetBody
 		current = nextReq
 	}
 }
