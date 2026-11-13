@@ -8,7 +8,9 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
+      # 默认挂仓库里自带的 config.docker.yaml；要用自己的副本就设
+      # MMXCODE_CONFIG_FILE=./config.yaml（相对路径按 compose 文件所在目录解析）。
+      - ${MMXCODE_CONFIG_FILE:-./config.docker.yaml}:/app/config.yaml:ro
     environment:
       MMXCODE_CONFIG: /app/config.yaml
       # 容器内访问宿主机的代理要写 host.docker.internal
