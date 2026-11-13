@@ -1039,7 +1039,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 //
 // The token is used when there is one; the site also answers without.
 func (c *Client) Models(ctx context.Context, baseURL, access string) ([]byte, error) {
-	u := strings.TrimRight(baseURL, "/") + site.ModelsPath + "?region=" + site.Region + "&buildEnv=prod"
+	u := strings.TrimRight(baseURL, "/") + site.ModelsPath + "?" + site.ModelsQuery
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

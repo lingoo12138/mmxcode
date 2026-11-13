@@ -160,8 +160,10 @@ go 1.23.0
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -282,8 +284,9 @@ func TestDurationYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Go 的 Duration.String() 总是带秒：90 分钟是 1h30m0s，不是 1h30m
-	if string(b) != "1h30m0s\n" {
+	// 写出来的形状由标准库决定（Duration.String() 总是带秒），
+	// 要守的是"写出来能读回去"。
+	if !strings.Contains(string(b), "1h30m0s") {
 		t.Fatalf("marshalled = %q", b)
 	}
 	// 写出来要能读回去
@@ -344,13 +347,118 @@ func TestLoadMissingFile(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownKey(t *testing.T) {
-	// 键名写错时必须报错。拼错一个出口组名，静默走全局默认是很坏的失败方式。
+	// 结构体的字段名写错时必须报错。出口组的名字不在这里查，见
+	// config.go 里关于 KnownFields 的说明。
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := writeFile(path, "server:\n  listenn: \":9090\"\n"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected an error for the unknown key")
+	} else if !strings.Contains(err.Error(), "listenn") {
+		t.Fatalf("error %q does not name the bad key", err)
+	}
+}
+
+func TestLoadRejectsTwoDocuments(t *testing.T) {
+	// 一个文件里只该有一份配置。Decode 一次只读一个文档，第二个会被
+	// 悄悄丢掉 —— 配置的一半就没了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  listen: \":1\"\n---\nserver:\n  listen: \":2\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the second document")
+	}
+}
+
+func TestLoadAllowsTrailingSeparator(t *testing.T) {
+	// 结尾一个裸的 "---" 是空文档，不是第二份配置。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  listen: \":1\"\n---\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.Listen != ":1" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadNullGroupsBecomesEmptyMap(t *testing.T) {
+	// WebUI 要遍历出口组，nil map 会让它炸。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "proxy:\n  groups:\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Proxy.Groups == nil {
+		t.Fatal("groups is nil")
+	}
+	if len(c.Proxy.Groups) != 0 {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
+	}
+}
+
+func TestConfigYAMLRoundTrip(t *testing.T) {
+	// CLI 与 WebUI 都要把配置写回文件，写出来要能读回来。
+	c := Default()
+	c.Proxy.Groups["warp"] = "socks5h://warp:4000"
+	c.Server.APIKeys = []string{"sk-a"}
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, string(b)); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Upstream.Timeout.Duration() != c.Upstream.Timeout.Duration() {
+		t.Fatalf("timeout = %v, want %v", back.Upstream.Timeout.Duration(), c.Upstream.Timeout.Duration())
+	}
+	if back.Proxy.Groups["warp"] != c.Proxy.Groups["warp"] {
+		t.Fatalf("groups = %v", back.Proxy.Groups)
+	}
+	if back.Schedule.CheckinAt != c.Schedule.CheckinAt || back.DB != c.DB {
+		t.Fatalf("round trip lost data: %+v", back)
+	}
+	if len(back.Server.APIKeys) != 1 || back.Server.APIKeys[0] != "sk-a" {
+		t.Fatalf("api keys = %v", back.Server.APIKeys)
+	}
+}
+
+func TestDurationRejectsNegative(t *testing.T) {
+	// 负的时长到用的时候就是"没有超时"，请求会一直挂着。
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"-5s"`), &d); err == nil {
+		t.Fatal("expected an error for the negative duration")
+	}
+}
+
+func TestDurationJSON(t *testing.T) {
+	// WebUI 读配置用 JSON，时长要写成字符串，不是纳秒数。
+	b, err := json.Marshal(Duration(90 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `"1h30m0s"` {
+		t.Fatalf("marshalled = %s", b)
+	}
+	var d Duration
+	if err := json.Unmarshal(b, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Duration() != 90*time.Minute {
+		t.Fatalf("d = %v", d.Duration())
 	}
 }
 ```
@@ -384,6 +492,8 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -401,9 +511,9 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&s); err != nil {
 		return err
 	}
-	v, err := time.ParseDuration(s)
+	v, err := parseDuration(s)
 	if err != nil {
-		return fmt.Errorf("duration %q: %w", s, err)
+		return err
 	}
 	*d = Duration(v)
 	return nil
@@ -411,6 +521,45 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 
 // MarshalYAML writes the duration back as a string.
 func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+
+// MarshalJSON writes the duration as a string.
+//
+// Not as a number of nanoseconds: the WebUI reads the configuration as
+// JSON, and 120000000000 means nothing to it.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// UnmarshalJSON reads a duration from a string.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := parseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(v)
+	return nil
+}
+
+// parseDuration reads a duration, refusing the impossible ones.
+//
+// A negative duration is refused here, at the last gate before the
+// configuration is used: everywhere a timeout is read, "not positive"
+// means "no timeout at all", so a stray minus sign would quietly turn
+// into a request that never comes back.
+func parseDuration(s string) (time.Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	}
+	return v, nil
+}
 
 // String is the duration's own text.
 func (d Duration) String() string { return time.Duration(d).String() }
@@ -485,6 +634,12 @@ func Default() Config {
 //
 // An empty path gives the defaults alone, which is what the CLI wants
 // when it runs without a config file.
+//
+// On an error the configuration returned is the zero value: a half-read
+// configuration is worse than none.
+//
+// The groups map is shared with the returned configuration. It is
+// read-only: whoever wants to change a group copies it first.
 func Load(path string) (Config, error) {
 	c := Default()
 	if path == "" {
@@ -492,7 +647,7 @@ func Load(path string) (Config, error) {
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return c, fmt.Errorf("read config: %w", err)
+		return Config{}, fmt.Errorf("read config: %w", err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
@@ -501,17 +656,50 @@ func Load(path string) (Config, error) {
 	// 自己定的，加载器没有一份已知的名单可比。组名写错由设置出口组的
 	// 地方挡（CLI 与 WebUI 都查配置里有没有这个组）。
 	dec.KnownFields(true)
+	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
 	if err := dec.Decode(&c); err != nil {
 		if err == io.EOF {
-			// 空的或只有注释的配置文件：没有要覆盖的，用默认值
 			return c, nil
 		}
-		return c, fmt.Errorf("parse config %s: %w", path, err)
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// 一个文件里只该有一份配置。Decode 一次只读一个文档，第二个会被
+	// 悄悄丢掉 —— 配置的一半就没了，连语法错都不报。宁可报错。
+	if err := oneDocument(dec); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {
 		c.Proxy.Groups = map[string]string{}
 	}
 	return c, nil
+}
+
+// oneDocument makes sure the file holds exactly one document.
+func oneDocument(dec *yaml.Decoder) error {
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); err {
+	case nil:
+		if !nullDocument(&extra) {
+			return errors.New("more than one YAML document")
+		}
+		return nil
+	case io.EOF:
+		return nil
+	default:
+		return err
+	}
+}
+
+// nullDocument is true for an empty document, which is what a file
+// ending in a bare "---" holds.
+func nullDocument(n *yaml.Node) bool {
+	if n.Kind == yaml.DocumentNode {
+		if len(n.Content) == 0 {
+			return true
+		}
+		return n.Content[0].Tag == "!!null"
+	}
+	return n.Tag == "!!null"
 }
 ```
 
@@ -567,8 +755,11 @@ const (
 	// PlaceholderKey is the key MiniMax Code gives its SDK; the account
 	// itself goes in Authorization.
 	PlaceholderKey = "sk-xxx"
-	// UserAgent is what MiniMax Code calls itself.
+	// UserAgent is what MiniMax Code calls itself when it chats.
 	UserAgent = "MiniMaxAgent"
+	// AccountUserAgent is what MiniMax Code calls itself when it signs
+	// an account API request.
+	AccountUserAgent = "MiniMaxCode"
 	// AgentID is MiniMax Code's agent id.
 	AgentID = "main"
 )
@@ -593,12 +784,12 @@ const (
 	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
 
 	// The account API's endpoints, on AgentHost.
-	IdentityPath   = "/v1/api/user/info"
-	WorkspacePath  = "/matrix/api/v1/user/get_user_extra_info"
-	MembershipPath = "/matrix/api/v1/commerce/get_membership_info"
-	CreditPath     = "/minimax-cloud/api/v1/credit/details"
-	SigninStatus   = "/minimax-cloud/api/v1/signin/status"
-	SigninClaim    = "/minimax-cloud/api/v1/signin/claim"
+	IdentityPath      = "/v1/api/user/info"
+	WorkspacePath     = "/matrix/api/v1/user/get_user_extra_info"
+	MembershipPath    = "/matrix/api/v1/commerce/get_membership_info"
+	CreditPath        = "/minimax-cloud/api/v1/credit/details"
+	SigninStatusPath  = "/minimax-cloud/api/v1/signin/status"
+	SigninClaimPath   = "/minimax-cloud/api/v1/signin/claim"
 
 	// The plan console's endpoints, on PlatformHost.
 	PlanRemainsPath = "/backend/account/token_plan/remains_percent"
@@ -606,8 +797,21 @@ const (
 	PlanTitlePath   = "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
 )
 
+// ModelsQuery is the query the model list endpoint needs.
+//
+// It is the only endpoint with a query of its own, so it lives here
+// rather than being spelled out at the call site.
+const ModelsQuery = "region=en&buildEnv=prod"
+
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
+
+// AgentURL gives an account API endpoint's full URL.
+//
+// AgentHost and LLMHost are the same host today. That is exactly why
+// this helper is worth having: a call site that picks the wrong one
+// would not notice.
+func AgentURL(path string) string { return AgentHost + path }
 
 // LLMURL gives a chat endpoint's full URL.
 func LLMURL(path string) string { return LLMHost + path }
@@ -622,11 +826,15 @@ func PlatformURL(path string) string { return PlatformHost + path }
 package site
 
 // Thinking says how a model handles thinking.
+//
+// A type of its own, so a typo like "switchble" does not compile.
+type Thinking string
+
 const (
-	ThinkingOff        = "off"
-	ThinkingOn         = "on"
-	ThinkingForcedOn   = "forced_on"
-	ThinkingSwitchable = "switchable"
+	ThinkingOff        Thinking = "off"
+	ThinkingOn         Thinking = "on"
+	ThinkingForcedOn   Thinking = "forced_on"
+	ThinkingSwitchable Thinking = "switchable"
 )
 
 // Model is one model of the site's.
@@ -642,14 +850,15 @@ type Model struct {
 	// Inputs are the input kinds it takes.
 	Inputs []string
 	// Thinking says how it handles thinking.
-	Thinking string
+	Thinking Thinking
 	// Efforts are the reasoning levels it takes, when it takes any.
 	Efforts []string
 }
 
 // FallbackModels is the list used when the live one can't be had.
 //
-// It is read-only: a caller that wants to change it copies it first.
+// It is read-only: a caller that wants to change it copies it with
+// CloneModels, which copies the slices inside each model too.
 //
 // The context and output limits are the ones the endpoint really allows,
 // not the ones MiniMax Code declares. Its model config says 512K/128K for
@@ -685,8 +894,27 @@ var FallbackModels = []Model{
 	},
 }
 
-// Limits returns a model's context and output limits.
-func (m Model) Limits() (ctxLimit, outputLimit int) { return m.Context, m.Output }
+// Clone copies the model, including the slices inside it, so a caller
+// can change it without touching the original.
+func (m Model) Clone() Model {
+	c := m
+	c.Inputs = append([]string(nil), m.Inputs...)
+	c.Efforts = append([]string(nil), m.Efforts...)
+	return c
+}
+
+// CloneModels copies the list, the models and their slices.
+//
+// A plain copy of the slice would share the slices inside each model:
+// changing one model's inputs would change the original's, in a process
+// that runs for days, with nothing in the log to point at it.
+func CloneModels(in []Model) []Model {
+	out := make([]Model, len(in))
+	for i, m := range in {
+		out[i] = m.Clone()
+	}
+	return out
+}
 ```
 
 - [ ] **Step 7: 写 site 包的测试**
@@ -712,7 +940,7 @@ func TestPathsAreBare(t *testing.T) {
 		DeviceCodePath, TokenPath,
 		ModelsPath, MessagesPath, ChatCompletionsPath, ResponsesPath,
 		IdentityPath, WorkspacePath, MembershipPath, CreditPath,
-		SigninStatus, SigninClaim,
+		SigninStatusPath, SigninClaimPath,
 		PlanRemainsPath, CodingPlanPath, PlanTitlePath,
 	}
 	for _, p := range paths {
@@ -721,6 +949,9 @@ func TestPathsAreBare(t *testing.T) {
 		}
 		if strings.Contains(p, "://") {
 			t.Errorf("path %q carries a host", p)
+		}
+		if strings.ContainsAny(p, "?#") {
+			t.Errorf("path %q carries a query or a fragment", p)
 		}
 	}
 }
@@ -735,6 +966,9 @@ func TestURLHelpers(t *testing.T) {
 	}
 	if got := PlatformURL(PlanRemainsPath); got != PlatformHost+"/backend/account/token_plan/remains_percent" {
 		t.Errorf("PlatformURL = %q", got)
+	}
+	if got := AgentURL(SigninStatusPath); got != AgentHost+"/minimax-cloud/api/v1/signin/status" {
+		t.Errorf("AgentURL = %q", got)
 	}
 }
 
@@ -763,14 +997,23 @@ func TestHosts(t *testing.T) {
 ```go
 package site
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestFallbackModelsLimits(t *testing.T) {
-	want := map[string][2]int{
-		"MiniMax-M3.1-Flash-Preview": {1048576, 524288},
-		"MiniMax-M3":                 {1048576, 524288},
-		"MiniMax-M2.7":               {200000, 128000},
-		"MiniMax-M2.7-highspeed":     {200000, 128000},
+	type want struct {
+		ctx, out int
+		name     string
+		inputs   []string
+		thinking Thinking
+	}
+	want := map[string]want{
+		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn},
+		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable},
+		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn},
+		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn},
 	}
 	if len(FallbackModels) != len(want) {
 		t.Fatalf("got %d models, want %d", len(FallbackModels), len(want))
@@ -780,9 +1023,37 @@ func TestFallbackModelsLimits(t *testing.T) {
 		if !ok {
 			t.Fatalf("unexpected model %q", m.ID)
 		}
-		c, o := m.Limits()
-		if c != w[0] || o != w[1] {
-			t.Fatalf("%s limits = %d/%d, want %d/%d", m.ID, c, o, w[0], w[1])
+		if m.Context != w.ctx || m.Output != w.out {
+			t.Fatalf("%s limits = %d/%d, want %d/%d", m.ID, m.Context, m.Output, w.ctx, w.out)
+		}
+		if m.Name != w.name {
+			t.Fatalf("%s name = %q, want %q", m.ID, m.Name, w.name)
+		}
+		if strings.Join(m.Inputs, ",") != strings.Join(w.inputs, ",") {
+			t.Fatalf("%s inputs = %v, want %v", m.ID, m.Inputs, w.inputs)
+		}
+		if m.Thinking != w.thinking {
+			t.Fatalf("%s thinking = %q, want %q", m.ID, m.Thinking, w.thinking)
+		}
+	}
+}
+
+// TestCloneModelsIsIndependent makes sure a copy really is a copy.
+//
+// The list is a package-level variable that outlives every request. A
+// shallow copy would share the slices inside each model, and a change
+// to one model's inputs would change the original's, with nothing in
+// the log to point at it.
+func TestCloneModelsIsIndependent(t *testing.T) {
+	c := CloneModels(FallbackModels)
+	c[0].Inputs[0] = "audio"
+	c[0].Efforts = append(c[0].Efforts, "extra")
+	if FallbackModels[0].Inputs[0] != "text" {
+		t.Fatalf("the original's inputs changed to %q", FallbackModels[0].Inputs[0])
+	}
+	for _, e := range FallbackModels[0].Efforts {
+		if e == "extra" {
+			t.Fatal("the original's efforts changed")
 		}
 	}
 }
@@ -1062,6 +1333,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"mmxcode/internal/site"
 )
 
 // Secret is MiniMax Code's request-signing secret.
@@ -1115,7 +1388,7 @@ func (s Signed) Headers() map[string]string {
 	return map[string]string{
 		"Accept":        "application/json",
 		"Content-Type":  "application/json",
-		"User-Agent":    "MiniMaxCode",
+		"User-Agent":    site.AccountUserAgent,
 		"Authorization": "Bearer " + s.access,
 		"yy":            s.YY,
 		"x-timestamp":   s.Timestamp,
@@ -1127,7 +1400,7 @@ func (s Signed) Headers() map[string]string {
 func Sign(origin, path string, o Options) Signed {
 	lang := o.Lang
 	if lang == "" {
-		lang = "en"
+		lang = site.Lang
 	}
 	osName := o.OSName
 	if osName == "" {
