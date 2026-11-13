@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,9 +25,13 @@ import (
 
 // harness is a gateway with one account and a fake upstream.
 type harness struct {
-	srv    *httptest.Server
-	gw     *Server
-	store  *store.Store
+	srv   *httptest.Server
+	gw    *Server
+	store *store.Store
+	// mu guards the counters below: a test may send many requests at
+	// once, and the fake upstream counts them from the server's own
+	// goroutines.
+	mu     sync.Mutex
 	hits   int
 	tokens []string
 	// renewals counts the token renewals the gateway asked for.
@@ -38,13 +44,17 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == site.TokenPath {
 			// 续签也走假服务器：测试永远不碰 MiniMax 自己。
+			h.mu.Lock()
 			h.renewals++
+			h.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"access_token":"tok2","refresh_token":"ref2","expires_in":3600}`))
 			return
 		}
+		h.mu.Lock()
 		h.hits++
 		h.tokens = append(h.tokens, r.Header.Get("Authorization"))
+		h.mu.Unlock()
 		handler(w, r)
 	}))
 	t.Cleanup(h.srv.Close)
@@ -851,5 +861,73 @@ func TestSignOutTakesTheCookieAway(t *testing.T) {
 	}
 	if !cleared {
 		t.Fatalf("the cookie was not taken away: %v", w.Result().Cookies())
+	}
+}
+
+// TestTheNativeFlagIsSafeWhileTheFallbackHappens says the flag that
+// says the upstream speaks Responses is read and written by many
+// requests at once without a race.
+//
+// 上游第一次说它没有 /responses 的时候，网关要把这条路关掉：那是一根
+// 所有人都读的杆，一根被写一根被读，就是数据竞争。
+//
+// 这台机器上没有 race detector（-race 要 cgo，这里没有 gcc），所以在
+// 这里看不出差别：在有 gcc 的机器上跑
+// go test -race ./internal/gateway/
+// 才会报出竞争来。
+func TestTheNativeFlagIsSafeWhileTheFallbackHappens(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == site.ResponsesPath {
+			// 上游没有 Responses：网关要改走本地转换。
+			// 慢一点再答，让所有请求都已经在读那根杆了。
+			time.Sleep(50 * time.Millisecond)
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"message":"no such endpoint"}}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`))
+	})
+
+	const workers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			body := `{"model":"m","input":"hi ` + strconv.Itoa(i) + `"}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			h.gw.ServeHTTP(w, req)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// 第一个 404 把这条路关掉之后，它就一直是关着的。
+	if h.gw.NativeResponses.Load() {
+		t.Fatal("the native path is still on")
+	}
+
+	// 关掉之后，Codex 的请求就走本地转换那条路了：上游再也收不到
+	// /responses。
+	mu.Lock()
+	before := len(paths)
+	mu.Unlock()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"again"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range paths[before:] {
+		if p == site.ResponsesPath {
+			t.Fatalf("the native path was used again: %v", paths[before:])
+		}
 	}
 }

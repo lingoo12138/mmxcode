@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mmxcode/internal/config"
@@ -52,7 +53,10 @@ type Server struct {
 	UpstreamBase string
 	// NativeResponses says the upstream speaks the Responses protocol
 	// itself. It is tried and turned off when the upstream says no.
-	NativeResponses bool
+	//
+	// 每个请求都读它，而第一个 404 会把它写掉：一个字段被一个请求写、
+	// 被别的请求读，就是数据竞争。所以它是 atomic 的。
+	NativeResponses atomic.Bool
 	// WebUI serves the management pages, when there is one.
 	WebUI http.Handler
 }
@@ -60,13 +64,14 @@ type Server struct {
 // New makes a gateway.
 func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Handler) *Server {
 	g := &Server{
-		Mgr:             mgr,
-		Cfg:             cfg,
-		Store:           s,
-		UpstreamBase:    site.LLMHost,
-		NativeResponses: true,
-		WebUI:           webui,
+		Mgr:          mgr,
+		Cfg:          cfg,
+		Store:        s,
+		UpstreamBase: site.LLMHost,
+		WebUI:        webui,
 	}
+	// 原生路径先开着：上游说它没有 /responses 的时候再关。
+	g.NativeResponses.Store(true)
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -305,8 +310,8 @@ accountLoop:
 			}
 
 			// 上游没有 /responses：改用本地转换，同一个账号再来一次
-			if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses {
-				s.NativeResponses = false
+			if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses.Load() {
+				s.NativeResponses.Store(false)
 				upBody, upPath, convertBack = s.upstreamShape(body, proto)
 				chatReq.Body = upBody
 				chatReq.Path = upPath
@@ -575,7 +580,7 @@ func (s *Server) upstreamShape(body []byte, proto protocol) (out []byte, path st
 	case protocolOpenAI:
 		return body, site.ChatCompletionsPath, false
 	default:
-		if s.NativeResponses {
+		if s.NativeResponses.Load() {
 			return body, site.ResponsesPath, false
 		}
 		b, err := convert.ToAnthropic(body)
