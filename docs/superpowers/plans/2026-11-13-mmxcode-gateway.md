@@ -4758,6 +4758,13 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			a.Name = *body.Name
 		}
 		if body.ProxyGroup != nil {
+			// 组名写错会让账号悄悄改走全局默认。挡在这里。
+			if *body.ProxyGroup != "" {
+				if _, ok := w.Cfg.Proxy.Groups[*body.ProxyGroup]; !ok {
+					http.Error(rw, "no such outlet group: "+*body.ProxyGroup, http.StatusBadRequest)
+					return
+				}
+			}
 			a.ProxyGroup = *body.ProxyGroup
 		}
 		if body.ProxyURL != nil {

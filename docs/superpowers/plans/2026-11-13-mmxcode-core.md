@@ -282,9 +282,18 @@ func TestDurationYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(b) != "\"1h30m\"
+	// Go 的 Duration.String() 总是带秒：90 分钟是 1h30m0s，不是 1h30m
+	if string(b) != "1h30m0s
 " {
 		t.Fatalf("marshalled = %q", b)
+	}
+	// 写出来要能读回去
+	var back Duration
+	if err := yaml.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Duration() != 90*time.Minute {
+		t.Fatalf("round trip = %v", back.Duration())
 	}
 }
 
@@ -302,6 +311,31 @@ func TestLoadEmptyPath(t *testing.T) {
 	}
 	if c.Server.Listen != ":8080" {
 		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, ""); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.Listen != ":8080" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadCommentOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "# 只有注释
+"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -355,6 +389,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -465,8 +500,16 @@ func Load(path string) (Config, error) {
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
+	//
+	// 注意这只管结构体的字段。map 的键名管不了：出口组的名字是配置
+	// 自己定的，加载器没有一份已知的名单可比。组名写错由设置出口组的
+	// 地方挡（CLI 与 WebUI 都查配置里有没有这个组）。
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
+		if err == io.EOF {
+			// 空的或只有注释的配置文件：没有要覆盖的，用默认值
+			return c, nil
+		}
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {
@@ -5808,6 +5851,10 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 				return err
 			}
 			if group != "" {
+				// 组名写错会让账号悄悄改走全局默认。挡在这里。
+				if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+					return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+				}
 				a.ProxyGroup = group
 			}
 			if url != "" {
@@ -5827,6 +5874,16 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 
 ```go
 func nowUTC() time.Time { return time.Now().UTC() }
+
+// groupNames lists the outlet groups, for an error message.
+func groupNames(groups map[string]string) string {
+	names := make([]string, 0, len(groups))
+	for n := range groups {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
 ```
 
 - [ ] **Step 4: 写 checkin、usage、models 子命令**
