@@ -159,6 +159,7 @@ go 1.23.0
 package config
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -168,7 +169,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Server.Listen != ":8080" {
 		t.Fatalf("listen = %q, want :8080", c.Server.Listen)
 	}
-	if c.Upstream.Timeout != 120*time.Second {
+	if c.Upstream.Timeout.Duration() != 120*time.Second {
 		t.Fatalf("timeout = %v, want 120s", c.Upstream.Timeout)
 	}
 	if c.Rotation.Strategy != "sticky" {
@@ -177,19 +178,19 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Rotation.MaxAttempts != 3 {
 		t.Fatalf("max_attempts = %d, want 3", c.Rotation.MaxAttempts)
 	}
-	if c.Rotation.ExhaustedCooldown != 5*time.Minute {
+	if c.Rotation.ExhaustedCooldown.Duration() != 5*time.Minute {
 		t.Fatalf("cooldown = %v, want 5m", c.Rotation.ExhaustedCooldown)
 	}
 	if c.Schedule.CheckinAt != "09:00" {
 		t.Fatalf("checkin_at = %q, want 09:00", c.Schedule.CheckinAt)
 	}
-	if c.Schedule.UsageRefresh != 15*time.Minute {
+	if c.Schedule.UsageRefresh.Duration() != 15*time.Minute {
 		t.Fatalf("usage_refresh = %v, want 15m", c.Schedule.UsageRefresh)
 	}
-	if c.Schedule.TokenRefresh != 5*time.Minute {
+	if c.Schedule.TokenRefresh.Duration() != 5*time.Minute {
 		t.Fatalf("token_refresh = %v, want 5m", c.Schedule.TokenRefresh)
 	}
-	if c.Schedule.EgressHealth != 2*time.Minute {
+	if c.Schedule.EgressHealth.Duration() != 2*time.Minute {
 		t.Fatalf("egress_health = %v, want 2m", c.Schedule.EgressHealth)
 	}
 	if c.DB != "/data/mmxcode.db" {
@@ -240,7 +241,7 @@ db: "./local.db"
 	if c.Proxy.Groups["direct"] != "direct" {
 		t.Fatalf("groups = %v", c.Proxy.Groups)
 	}
-	if c.Upstream.Timeout != 45*time.Second {
+	if c.Upstream.Timeout.Duration() != 45*time.Second {
 		t.Fatalf("timeout = %v", c.Upstream.Timeout)
 	}
 	if c.Rotation.Strategy != "round-robin" || c.Rotation.MaxAttempts != 5 {
@@ -253,7 +254,7 @@ db: "./local.db"
 		t.Fatalf("db = %q", c.DB)
 	}
 	// 未写的字段保留默认值
-	if c.Schedule.UsageRefresh != 15*time.Minute {
+	if c.Schedule.UsageRefresh.Duration() != 15*time.Minute {
 		t.Fatalf("usage_refresh = %v, want default 15m", c.Schedule.UsageRefresh)
 	}
 }
