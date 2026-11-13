@@ -43,33 +43,44 @@ const (
 	AgentID = "main"
 )
 
-// The OAuth paths.
+// The paths of the endpoints.
+//
+// They are paths, not URLs. The host is decided by whoever sends the
+// request, so a test can point them at a stand-in server and a
+// deployment can move a host without touching the paths.
+//
+// The full URL of an endpoint is its host followed by its path:
+// site.AccountHost + site.DeviceCodePath.
 const (
-	DeviceCodePath = AccountHost + "/oauth2/device/code"
-	TokenPath      = AccountHost + "/oauth2/token"
+	// The OAuth endpoints, on AccountHost.
+	DeviceCodePath = "/oauth2/device/code"
+	TokenPath      = "/oauth2/token"
+
+	// The chat and model endpoints, on LLMHost.
+	ModelsPath          = "/mavis/api/v1/models"
+	MessagesPath        = "/mavis/api/v1/llm/v1/messages"
+	ChatCompletionsPath = "/mavis/api/v1/llm/v1/chat/completions"
+	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
+
+	// The account API's endpoints, on AgentHost.
+	IdentityPath   = "/v1/api/user/info"
+	WorkspacePath  = "/matrix/api/v1/user/get_user_extra_info"
+	MembershipPath = "/matrix/api/v1/commerce/get_membership_info"
+	CreditPath     = "/minimax-cloud/api/v1/credit/details"
+	SigninStatus   = "/minimax-cloud/api/v1/signin/status"
+	SigninClaim    = "/minimax-cloud/api/v1/signin/claim"
+
+	// The plan console's endpoints, on PlatformHost.
+	PlanRemainsPath = "/backend/account/token_plan/remains_percent"
+	CodingPlanPath  = "/v1/api/openplatform/coding_plan/remains"
+	PlanTitlePath   = "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
 )
 
-// The chat and model paths.
-const (
-	ModelsPath          = LLMHost + "/mavis/api/v1/models?region=en&buildEnv=prod"
-	MessagesPath        = LLMHost + "/mavis/api/v1/llm/v1/messages"
-	ChatCompletionsPath = LLMHost + "/mavis/api/v1/llm/v1/chat/completions"
-	ResponsesPath       = LLMHost + "/mavis/api/v1/llm/v1/responses"
-)
+// AccountURL gives an account endpoint's full URL.
+func AccountURL(path string) string { return AccountHost + path }
 
-// The account API's paths.
-const (
-	IdentityPath   = AgentHost + "/v1/api/user/info"
-	WorkspacePath  = AgentHost + "/matrix/api/v1/user/get_user_extra_info"
-	MembershipPath = AgentHost + "/matrix/api/v1/commerce/get_membership_info"
-	CreditPath     = AgentHost + "/minimax-cloud/api/v1/credit/details"
-	SigninStatus   = AgentHost + "/minimax-cloud/api/v1/signin/status"
-	SigninClaim    = AgentHost + "/minimax-cloud/api/v1/signin/claim"
-)
+// LLMURL gives a chat endpoint's full URL.
+func LLMURL(path string) string { return LLMHost + path }
 
-// The plan console's paths.
-const (
-	PlanRemainsPath = PlatformHost + "/backend/account/token_plan/remains_percent"
-	CodingPlanPath  = PlatformHost + "/v1/api/openplatform/coding_plan/remains"
-	PlanTitlePath   = PlatformHost + "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
-)
+// PlatformURL gives a plan console endpoint's full URL.
+func PlatformURL(path string) string { return PlatformHost + path }

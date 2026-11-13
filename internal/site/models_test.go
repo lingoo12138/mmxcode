@@ -34,7 +34,8 @@ func TestM3ThinkingVariants(t *testing.T) {
 	if m.Thinking != ThinkingSwitchable {
 		t.Fatalf("M3 thinking = %q", m.Thinking)
 	}
-	if len(m.Efforts) != 0 {
+	// 规格里 M3 是 switchable：none / high
+	if len(m.Efforts) != 2 || m.Efforts[0] != "none" || m.Efforts[1] != "high" {
 		t.Fatalf("M3 efforts = %v", m.Efforts)
 	}
 }

@@ -28,6 +28,8 @@ type Model struct {
 
 // FallbackModels is the list used when the live one can't be had.
 //
+// It is read-only: a caller that wants to change it copies it first.
+//
 // The context and output limits are the ones the endpoint really allows,
 // not the ones MiniMax Code declares. Its model config says 512K/128K for
 // the M3 family, but the endpoint accepts 1,048,576 input tokens and
@@ -46,6 +48,7 @@ var FallbackModels = []Model{
 		Context: 1048576, Output: 524288,
 		Inputs:   []string{"text", "image", "video"},
 		Thinking: ThinkingSwitchable,
+		Efforts:  []string{"none", "high"},
 	},
 	{
 		ID: "MiniMax-M2.7", Name: "M2.7",
@@ -62,4 +65,4 @@ var FallbackModels = []Model{
 }
 
 // Limits returns a model's context and output limits.
-func (m Model) Limits() (context, output int) { return m.Context, m.Output }
+func (m Model) Limits() (ctxLimit, outputLimit int) { return m.Context, m.Output }

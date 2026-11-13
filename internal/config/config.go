@@ -5,7 +5,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -114,7 +116,11 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("read config: %w", err)
 	}
-	if err := yaml.Unmarshal(raw, &c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
+	dec.KnownFields(true)
+	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
+	if err := dec.Decode(&c); err != nil && err != io.EOF {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {
