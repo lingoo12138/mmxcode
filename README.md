@@ -206,5 +206,7 @@ WARP 是额外的出口选项，跟按账号单独指定的代理并列。
 
 ## 计划
 
-- 计划 A（本仓库已实现）：核心库与 CLI
-- 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署
+两个计划都已实现：
+
+- 计划 A：核心库与 CLI（`docs/superpowers/plans/2026-11-13-mmxcode-core.md`）
+- 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署（`docs/superpowers/plans/2026-11-13-mmxcode-gateway.md`）
