@@ -2,11 +2,13 @@ package manager
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,11 +20,26 @@ import (
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
+
+	_ "modernc.org/sqlite"
 )
 
 func newTestManager(t *testing.T, srv *httptest.Server) *Manager {
 	t.Helper()
-	s, err := store.Open(t.TempDir() + "/t.db")
+	m, _ := newTestManagerWithPath(t, srv)
+	return m
+}
+
+// newTestManagerWithPath makes a manager and says where its database
+// is.
+//
+// A test that wants the database to misbehave — a write that is
+// refused, a write that touches more than it should — opens the file
+// itself and puts a trigger in it.
+func newTestManagerWithPath(t *testing.T, srv *httptest.Server) (*Manager, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "t.db")
+	s, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +57,36 @@ func newTestManager(t *testing.T, srv *httptest.Server) *Manager {
 		m.TokenURL = srv.URL + site.TokenPath
 		acc.SetBase(srv.URL, srv.URL)
 	}
-	return m
+	return m, path
+}
+
+// rawDB opens the test's database file with plain SQL.
+//
+// The store keeps its own handle to itself, so this is the way a test
+// gets at the file the store is using.
+func rawDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// refuseWrites makes the writes to a table fail.
+//
+// The trigger stands in for a full disk or a read-only file: the
+// writes are refused and the reads go on, which is what such a fault
+// looks like to the store.
+func refuseWrites(t *testing.T, path, table, event string) {
+	t.Helper()
+	db := rawDB(t, path)
+	q := `CREATE TRIGGER refuse_writes BEFORE ` + event + ` ON ` + table +
+		` BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;`
+	if _, err := db.Exec(q); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestTokenReturnsStoredToken(t *testing.T) {
@@ -970,6 +1016,9 @@ func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
 // 站点对已经花掉的 refresh token 也回 invalid_grant，跟登录失效长得
 // 一模一样。renewer 手里还有更新的令牌时，被拒的那份只是旧了：账号还
 // 活着，不能把它登出，要用更新的那份。
+//
+// 这里走的是强制的续期（网关收到 401 时做的事）：平常那条路根本不会
+// 把旧的那份发出去——renewer 手里有更新的，就用那一份。
 func TestAStaleRefusalDoesNotSignTheAccountOut(t *testing.T) {
 	var sent []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -993,7 +1042,7 @@ func TestAStaleRefusalDoesNotSignTheAccountOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tok, err := m.Token(ctx, "acc_01")
+	tok, err := m.ForceRenew(ctx, "acc_01")
 	if err != nil {
 		t.Fatalf("the account was signed out over a stale token: %v", err)
 	}
@@ -1101,10 +1150,11 @@ func TestTheTokenCarriesTheSitesAccountID(t *testing.T) {
 	if tok.AccountID != "site-42" {
 		t.Fatalf("account id = %q, want the site's one", tok.AccountID)
 	}
-	// 库里那份没有站点的账号 id：它就空着，不能拿库里的 id 顶上去
+	// 库里那份换成了更新的：renewer 手里那份比它还新，manager 会用
+	// renewer 那份，所以这里要给库里那份一个更晚的到期时间。
 	if err := m.Store.SaveToken(ctx, store.Token{
 		AccountID: "acc_01", Access: "acc9", Refresh: "ref9",
-		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		ExpiresAt: now.Add(2 * time.Hour), UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1138,7 +1188,8 @@ func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
 	seedAccount(t, m, "acc_01", "acc3", "ref3", now.Add(time.Minute))
 	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc2", Refresh: "ref2"},
 		func(ctx context.Context, refresh string) (*oauth.Token, error) {
-			return &oauth.Token{Access: "acc3", Refresh: "ref3", Expires: now.Add(time.Hour)}, nil
+			// renewer 手里那份就是库里那份，到期时间也一样
+			return &oauth.Token{Access: "acc3", Refresh: "ref3", Expires: now.Add(time.Minute)}, nil
 		}); err != nil {
 		t.Fatal(err)
 	}
@@ -1164,6 +1215,9 @@ func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
 //
 // 登出的时候 renewer 要忘掉这个账号：忘掉之后这个账号再登进来，renewer
 // 手里不能还留着老令牌，那会把新登进来的令牌当成旧链上的一段。
+//
+// 这里走的是强制的续期（网关收到 401 时做的事）：平常那条路会用
+// renewer 手里那份更新的令牌，根本不会走到登出。
 func TestTheRenewerForgetsAnAccountThatIsSignedOut(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1183,7 +1237,7 @@ func TestTheRenewerForgetsAnAccountThatIsSignedOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := m.Token(ctx, "acc_01"); err == nil {
+	if _, err := m.ForceRenew(ctx, "acc_01"); err == nil {
 		t.Fatal("expected an error")
 	}
 	a, err := m.Store.GetAccount(ctx, "acc_01")
@@ -1195,5 +1249,367 @@ func TestTheRenewerForgetsAnAccountThatIsSignedOut(t *testing.T) {
 	}
 	if _, ok := m.Renewer.Newest("acc_01"); ok {
 		t.Fatal("the renewer still holds a token of a signed-out account")
+	}
+}
+
+// TestTheSignOutWritesOnlyTheStatus says the sign-out does not write
+// back the account's other columns.
+//
+// 管理员把账号登出时只写状态、最后一条错误和时间。别的写者（WebUI）改
+// 过的名字、代理不能被管理员手里那份旧拷贝抹掉——那份拷贝是登出之前读
+// 的，别人的改动就在这中间进来的。
+func TestTheSignOutWritesOnlyTheStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	// 一个看火的触发器：只有写了账号别的列的语句才会让它动。
+	db := rawDB(t, path)
+	if _, err := db.Exec(`CREATE TABLE watched (id TEXT, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER watch_account
+		AFTER UPDATE OF name, user_id, email, proxy_group, proxy_url ON accounts
+		BEGIN INSERT INTO watched (id, name) VALUES (OLD.id, NEW.name); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 另一个写者改了名字
+	if err := m.Store.UpdateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "renamed", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 从这里开始看
+	if _, err := db.Exec(`DELETE FROM watched`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	var watched int
+	if err := db.QueryRow(`SELECT count(*) FROM watched`).Scan(&watched); err != nil {
+		t.Fatal(err)
+	}
+	if watched != 0 {
+		t.Fatalf("the sign-out wrote %d rows of the other columns", watched)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.Name != "renamed" {
+		t.Fatalf("name = %q, want the name the other writer set", a.Name)
+	}
+}
+
+// TestTheSignOutSurvivesAnotherWriter says a sign-out is not undone by
+// a writer that does not touch the status.
+//
+// 登出之后另一个写者改了账号的代理：代理的改动不该把登出抹掉，账号是
+// 站点已经不认的账号，不能又变回能用的。
+func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	// 另一个写者改了出口
+	if err := m.Store.SetAccountProxy(ctx, "acc_01", "grp", "http://127.0.0.1:7890", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.ProxyGroup != "grp" || a.ProxyURL != "http://127.0.0.1:7890" {
+		t.Fatalf("the account = %+v, want the outlet the other writer set", a)
+	}
+}
+
+// TestARenewalThatWorkedIsKeptWhenTheWriteFails says a renewal that
+// worked is not thrown away because the database would not take it.
+//
+// 站点刚给了新令牌，写库却失败了：令牌不能丢。丢了这次请求要白换一个
+// 账号，而库里那份 refresh 已经花掉了，下一次请求又要再花一次 refresh
+// token。
+func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+	// 写库失败：磁盘满了
+	refuseWrites(t, path, "tokens", "UPDATE")
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatalf("the renewal was thrown away: %v", err)
+	}
+	if tok == nil || tok.Access != "new" {
+		t.Fatalf("token = %+v, want the token the site handed out", tok)
+	}
+	if calls != 1 {
+		t.Fatalf("the site was asked %d times, want 1", calls)
+	}
+	// 写库失败这件事要写在账号上，WebUI 才看得出库里那份是旧的
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(a.LastError, "written down") {
+		t.Fatalf("last error = %q, want the failed write", a.LastError)
+	}
+}
+
+// TestAFailedRenewalKeepsTheTokenInHand says a renewal that failed for
+// a reason that is not a refusal leaves the caller with the token it
+// has.
+//
+// 令牌端点回 500：令牌还在有效期内，还有几分钟能用。为了几分钟后的
+// 一次续期失败就把现在能用的令牌扔掉，是白扔。
+func TestAFailedRenewalKeepsTheTokenInHand(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"the token endpoint is down"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 令牌还有一分钟就过期，落在续期窗口里，但它还是好的
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatalf("the token in hand was thrown away: %v", err)
+	}
+	if tok == nil || tok.Access != "old" {
+		t.Fatalf("token = %+v, want the token in hand", tok)
+	}
+	if calls != 1 {
+		t.Fatalf("the site was asked %d times, want 1", calls)
+	}
+}
+
+// TestATokenThatCannotBeReadIsNotASignOut says a database that is in
+// trouble is not an account that is signed out.
+//
+// 数据库坏了和账号没登录是两回事。写成“账号没登录”，真正的原因就没
+// 了，WebUI 也会说错。
+func TestATokenThatCannotBeReadIsNotASignOut(t *testing.T) {
+	ctx := context.Background()
+	m := newTestManager(t, nil)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc", "ref", now.Add(time.Hour))
+
+	// 数据库读不了了
+	if err := m.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.Token(ctx, "acc_01")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "is not signed in") {
+		t.Fatalf("error = %q, want the fault of the database", err)
+	}
+	if !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("error = %q, want the cause of the failure", err)
+	}
+}
+
+// TestAnAccountWithoutATokenIsNotSignedIn says a missing token is a
+// sign-in that is not there.
+//
+// 没有令牌行就是没登录，这个说法要留着。
+func TestAnAccountWithoutATokenIsNotSignedIn(t *testing.T) {
+	ctx := context.Background()
+	m := newTestManager(t, nil)
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.Token(ctx, "acc_01")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "is not signed in") {
+		t.Fatalf("error = %q, want the missing sign-in", err)
+	}
+}
+
+// TestTheRenewersTokenIsUsedWhenItIsNewer says the token the renewer
+// holds is used when it is newer than the one in the store.
+//
+// 续期成功了但写库失败：renewer 手里那份是新的，库里那份是旧的。再续
+// 一次就是再花一个 refresh token，而那一枚可能已经没了。
+func TestTheRenewersTokenIsUsedWhenItIsNewer(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Write([]byte(`{"access_token":"other","refresh_token":"otherref","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+	// renewer 手里有一份更新的：上一次续期成功了，但没写进库
+	if _, err := m.Renewer.Renew(ctx, "acc_01",
+		&oauth.Token{Access: "old", Refresh: "ref"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "new", Refresh: "newref",
+				Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new" {
+		t.Fatalf("access = %q, want the newer one", tok.Access)
+	}
+	if calls != 0 {
+		t.Fatalf("the site was asked %d times, want 0", calls)
+	}
+	// 新的一份也写进库里
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "new" {
+		t.Fatalf("stored = %+v, want the newer token", stored)
+	}
+}
+
+// TestACheckinWhoseRecordFailsIsWrittenDown says a check-in that
+// worked is not dropped because its record could not be written.
+//
+// 签到成功了，记录写不进去：这一天不能再签，积分和连续天数就都没有
+// 记下来。写不进去这件事要写在账号上。
+func TestACheckinWhoseRecordFailsIsWrittenDown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":2,"is_today":true,"points":25},
+				{"day_no":4,"status":1,"is_today":false,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, srv)
+	now := time.Now()
+	// 签到要账号的 user id
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 签到记录写不进去
+	refuseWrites(t, path, "checkins", "INSERT")
+
+	out, err := m.Checkin(ctx, "acc_01")
+	if err != nil {
+		t.Fatalf("the check-in worked: %v", err)
+	}
+	if out.Outcome != checkin.OutcomeClaimed {
+		t.Fatalf("outcome = %q, want the claimed one", out.Outcome)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(a.LastError, "written down") {
+		t.Fatalf("last error = %q, want the failed record", a.LastError)
+	}
+}
+
+// TestTheUnknownOutcomeKeepsTheCause says the account's last error
+// says what happened, and not only which case it was.
+//
+// 刷新请求发出去了、回答没回来：账号上要写的不只是“结果不明”，还有那
+// 个传输上的原因，WebUI 才看得出出了什么事。
+func TestTheUnknownOutcomeKeepsTheCause(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 回答还没写出来连接就断了：请求到了站点，回答没回来
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	_, tokErr := m.Token(ctx, "acc_01")
+	if tokErr == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(a.LastError, "not known") {
+		t.Fatalf("last error = %q, want the unknown outcome", a.LastError)
+	}
+	if !strings.Contains(a.LastError, tokErr.Error()) {
+		t.Fatalf("last error = %q, want the cause %q", a.LastError, tokErr)
 	}
 }

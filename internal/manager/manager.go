@@ -2,10 +2,11 @@
 // one has, which way out its requests go, what its credits are and
 // whether it has checked in.
 //
-// Everything above it — the gateway, the WebUI, the scheduler — goes
-// through this package rather than touching the store and the upstream
-// client on its own, so that a token is renewed in one place and a
-// refresh token is never spent twice.
+// The layers above it — the gateway, the WebUI, the scheduler — come
+// here for an account's token and for its readings, but they do reach
+// the store on their own, so this package is not the only way into the
+// database. What it does hold is that a token is renewed in one place
+// and a refresh token is never spent twice.
 //
 // There are two account ids, and they are not the same thing. The
 // store's id is the manager's own key for an account, and the renewer
@@ -58,6 +59,15 @@ const (
 	chainBrokenReason = "the refresh chain is broken: the refresh token was spent already and there is no newer one, so the account has to be signed in again"
 	// unknownOutcomeReason says a refresh was sent and its answer was lost.
 	unknownOutcomeReason = "the outcome of the last refresh is not known: the site may have spent the refresh token, so it was not sent again"
+	// tokenNotWrittenReason says a renewal worked and its token could
+	// not be written down.
+	tokenNotWrittenReason = "the token was renewed but it could not be written down, so the token in the database is older than the token in use"
+	// checkinNotWrittenReason says a check-in worked and its record
+	// could not be written down.
+	checkinNotWrittenReason = "the check-in was claimed but its record could not be written down, so the credit and the streak are recorded nowhere"
+	// renewalFailedReason says a renewal failed but the token in hand
+	// is still good.
+	renewalFailedReason = "the renewal failed but the token in hand is still good"
 )
 
 // Manager holds the gateway's accounts.
@@ -100,10 +110,15 @@ func (m *Manager) Account(ctx context.Context, id string) (store.Account, error)
 // The renewal goes through the renewer, so a burst of requests finds
 // one renewal in flight rather than several, and the one-time refresh
 // token is sent once.
+//
+// The token the renewer holds is asked for before the renewal: a
+// renewal that worked but whose writing failed leaves the renewer with
+// a newer token than the store has, and renewing again would spend
+// another refresh token — one the site may have taken already.
 func (m *Manager) Token(ctx context.Context, accountID string) (*oauth.Token, error) {
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err != nil {
-		return nil, fmt.Errorf("account %s is not signed in", accountID)
+		return nil, tokenReadError(accountID, err)
 	}
 	if stored.Access == "" && stored.Refresh == "" {
 		// The sign-in was taken away: the site has refused it. There
@@ -112,6 +127,17 @@ func (m *Manager) Token(ctx context.Context, accountID string) (*oauth.Token, er
 		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
 	cur := tokenFromStore(stored)
+	if held, ok := m.Renewer.Newest(accountID); ok && newerThanStored(held, stored) {
+		// The renewer holds a token that is newer than the one in the
+		// store, so it is the one to use: renewing again would spend
+		// a refresh token that the site may have taken already.
+		cur = held
+		// It is written down as well, so that the next reader of the
+		// store finds the same token.
+		if err := m.saveToken(ctx, accountID, cur); err != nil {
+			m.note(ctx, accountID, tokenNotWrittenReason+": "+err.Error())
+		}
+	}
 	if cur.Expires.After(time.Now().Add(renewWindow)) {
 		return cur, nil
 	}
@@ -134,6 +160,33 @@ func tokenFromStore(stored store.Token) *oauth.Token {
 	}
 }
 
+// newerThanStored says the token is newer than the one the store has.
+//
+// The expiry says which one is newer, the same way saveToken says it:
+// the site hands out access tokens that live an hour, so the token of
+// the later renewal ends later. Two tokens that end at the same time
+// are the same step of the chain, and the one in the store is kept.
+func newerThanStored(tok *oauth.Token, stored store.Token) bool {
+	if tok == nil || tok.Expires.IsZero() {
+		return false
+	}
+	return stored.ExpiresAt.Before(tok.Expires)
+}
+
+// tokenReadError says what it is that the token could not be read.
+//
+// A token that is not there is an account that is not signed in, and
+// that is one thing. Anything else is the database in trouble, and
+// saying "not signed in" about it hides the cause: the account looks
+// signed out in the WebUI while the truth is that the file could not
+// be read at all.
+func tokenReadError(accountID string, err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("account %s is not signed in", accountID)
+	}
+	return fmt.Errorf("account %s: the token could not be read: %w", accountID, err)
+}
+
 // Renew trades an account's refresh token for a new one.
 //
 // The failures are told apart, because they are mended in different
@@ -149,7 +202,19 @@ func tokenFromStore(stored store.Token) *oauth.Token {
 //   - The answer was lost (oauth.ErrRefreshOutcomeUnknown). The site
 //     may have spent the token, so it is not sent again, but the site
 //     never said the sign-in is no good: the account is not signed out.
+//   - Anything else — the site is having a bad moment, or the network
+//     is. The token in hand may still do, so it is kept when it has
+//     not ended.
 func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token) (*oauth.Token, error) {
+	return m.renew(ctx, accountID, cur, false)
+}
+
+// renew trades a refresh token for a new one.
+//
+// force says whether the renewal was forced. A forced renewal is what
+// the gateway does when the site has refused the access token, and then
+// the token in hand is no good whatever its expiry says.
+func (m *Manager) renew(ctx context.Context, accountID string, cur *oauth.Token, force bool) (*oauth.Token, error) {
 	if cur == nil {
 		return nil, fmt.Errorf("no token to renew")
 	}
@@ -166,10 +231,26 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 		return oauth.Refresh(ctx, m.Up, m.TokenURL, refresh)
 	})
 	if err != nil {
-		return m.renewFailed(ctx, accountID, cur, sent.get(), held, err)
+		return m.renewFailed(ctx, accountID, cur, sent.get(), held, err, force)
 	}
 	if err := m.saveToken(ctx, accountID, tok); err != nil {
-		return nil, err
+		// The site has just handed out a token that is good for an
+		// hour. Throwing it away because the database would not take
+		// it burns the quota of another account for nothing: the
+		// caller fails the request over, and the refresh token in the
+		// store is spent already, so every request after this one
+		// renews again and spends another one.
+		//
+		// So the token is kept and the caller gets it, and no error
+		// comes with it. An error would send the request over to
+		// another account, and the gateway cannot make use of a token
+		// that arrives with one: it fails the request over and drops
+		// the token.
+		//
+		// The failed write is written down on the account instead, so
+		// that the WebUI shows why the token in the database is older
+		// than the token in use.
+		m.note(ctx, accountID, tokenNotWrittenReason+": "+err.Error())
 	}
 	return tok, nil
 }
@@ -180,7 +261,7 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 // was only stale is not the end of the account — and the error to give
 // back when there is not.
 func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.Token,
-	refused string, held *oauth.Token, err error) (*oauth.Token, error) {
+	refused string, held *oauth.Token, err error, force bool) (*oauth.Token, error) {
 	switch {
 	case errors.Is(err, oauth.ErrRefreshChainBroken):
 		// The chain cannot go on: the token in hand is spent and there
@@ -197,13 +278,28 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// so the account is not signed out. The error is written down
 		// all the same, so that the WebUI shows that this account is
 		// in trouble.
-		if mErr := m.markError(ctx, accountID, unknownOutcomeReason); mErr != nil {
+		//
+		// The cause goes with it: "the outcome is not known" says
+		// which case it is, but the transport's own words say what
+		// happened, and the sign-out branch keeps those too.
+		if mErr := m.markError(ctx, accountID, unknownOutcomeReason+": "+err.Error()); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the error could not be saved: %w", mErr))
 		}
 		return nil, err
 	}
 	var oe *oauth.Error
 	if !asOAuthError(err, &oe) || !oe.IsSignedOut() {
+		// Not a refusal: the site is having a bad moment, or the
+		// network is. The token in hand may still do — the reference
+		// keeps it — so it is kept when it has not ended yet.
+		//
+		// A forced renewal does not keep it: that is what the gateway
+		// does when the site has refused the access token, and then
+		// the token in hand is no good whatever its expiry says.
+		if !force && cur != nil && cur.Expires.After(time.Now()) {
+			m.note(ctx, accountID, renewalFailedReason+": "+err.Error())
+			return cur, nil
+		}
 		return nil, err
 	}
 	// The site refused a refresh token. The account is signed out —
@@ -309,15 +405,19 @@ func (m *Manager) saveToken(ctx context.Context, accountID string, tok *oauth.To
 // sent again. A reset would drop the token that is the only way out, and
 // a forget would drop the record of the tokens already spent, so that
 // one of them would be sent again.
+//
+// A forced renewal does not keep the token in hand when it fails: the
+// site has refused the token that is in hand, so it is no good
+// whatever its expiry says.
 func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Token, error) {
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err != nil {
-		return nil, fmt.Errorf("account %s is not signed in", accountID)
+		return nil, tokenReadError(accountID, err)
 	}
 	if stored.Access == "" && stored.Refresh == "" {
 		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
-	return m.Renew(ctx, accountID, tokenFromStore(stored))
+	return m.renew(ctx, accountID, tokenFromStore(stored), true)
 }
 
 // markSignedOut records that an account's sign-in is gone.
@@ -326,17 +426,16 @@ func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Toke
 // has refused must not keep a token that every request would try to
 // renew.
 //
+// The state is written with the narrow setter, and not with the one
+// that writes every field: the name, the proxy and the rest of the
+// account are not this method's business, and writing them back from a
+// copy that was read a moment ago would undo a change another writer
+// made in between.
+//
 // The error is not swallowed: a sign-out that could not be written
 // down is an account that stays active with a token the site refuses.
 func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) error {
-	a, err := m.Store.GetAccount(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	a.Status = store.StatusSignedOut
-	a.LastError = reason
-	a.UpdatedAt = time.Now()
-	if err := m.Store.UpdateAccount(ctx, a); err != nil {
+	if err := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, reason, time.Now()); err != nil {
 		return err
 	}
 	// The token row is blanked: the sign-in is gone, so the token is
@@ -367,18 +466,44 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) e
 // that this account is in trouble instead of showing it as a normal
 // one.
 //
+// The state is written with the narrow setter, for the same reason as
+// in markSignedOut.
+//
 // The renewer is not told anything: it has to keep the record of the
 // token whose outcome is not known, because that token must not be sent
 // again.
 func (m *Manager) markError(ctx context.Context, accountID, reason string) error {
+	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusError, reason, time.Now())
+}
+
+// note writes a note on the account without changing its state.
+//
+// The note is about something that went wrong that the account is not
+// broken by: a renewal that could not be written down, a check-in
+// whose record was lost. The account itself is still good, so the
+// state it has is kept and only the note is written.
+//
+// The state is read first and written back, because the store has no
+// setter that writes the note alone. That leaves a small race: the
+// state can change between the read and the write, and a sign-out in
+// that moment would be undone. The store should grow a setter that
+// writes the note alone, and the race goes with it.
+//
+// The note is best effort. A note that could not be written down must
+// not make a working token unusable, and the fault that stopped the
+// note is the very fault that stopped the thing the note is about.
+func (m *Manager) note(ctx context.Context, accountID, reason string) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
-		return err
+		return
 	}
-	a.Status = store.StatusError
-	a.LastError = reason
-	a.UpdatedAt = time.Now()
-	return m.Store.UpdateAccount(ctx, a)
+	if a.Status == store.StatusSignedOut {
+		// The sign-out has its own reason, and that is the one that
+		// matters: it says why the site does not take this account
+		// any more.
+		return
+	}
+	_ = m.Store.UpdateAccountStatus(ctx, accountID, a.Status, reason, time.Now())
 }
 
 // spentRefresh remembers the refresh token that really went to the
@@ -588,12 +713,26 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 			}
 		}
 	}
-	if title, err := acc.PlanTitle(ctx, tok.Access, group); err == nil {
+
+	title, err := acc.PlanTitle(ctx, tok.Access, group)
+	switch {
+	case err == nil:
 		snap.Plan = title
-	} else if isRefusal(err) {
+	case isRefusal(err):
 		if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
 			return store.UsageSnapshot{}, err
 		}
+	default:
+		// The plan's name could not be read, and the failure is lost
+		// here: the snapshot has no field for it, and Plan: "" reads
+		// as "this account has no plan" rather than "the plan could
+		// not be read". The membership's failure and the windows'
+		// failure have a field each; the plan's has none, and it
+		// cannot go into theirs without saying something false.
+		//
+		// What is needed is a plan_error column on usage_snapshots
+		// and a setter for it. Until it is there, the failure of this
+		// reading is nowhere.
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
@@ -621,7 +760,7 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 		return checkin.Outcome{}, err
 	}
 	day := store.DayKey(time.Now())
-	_ = m.Store.SaveCheckin(ctx, store.Checkin{
+	if err := m.Store.SaveCheckin(ctx, store.Checkin{
 		AccountID: accountID,
 		Day:       day,
 		Outcome:   out.Outcome,
@@ -629,7 +768,16 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 		Streak:    out.Streak,
 		Message:   out.Message,
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		// The check-in worked: the credits are claimed and the day
+		// cannot be claimed again. The record of it is lost, so the
+		// credit and the streak are recorded nowhere.
+		//
+		// The failure is written down on the account rather than
+		// returned: the caller would tell the user that the check-in
+		// failed, and it did not.
+		m.note(ctx, accountID, checkinNotWrittenReason+": "+err.Error())
+	}
 	return out, nil
 }
 
