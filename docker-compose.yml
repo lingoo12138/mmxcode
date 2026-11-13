@@ -1,0 +1,48 @@
+services:
+  mmxcode:
+    build: .
+    image: mmxcode-gateway:latest
+    restart: unless-stopped
+    ports:
+      # 只绑本机，管理界面不暴露到公网
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      MMXCODE_CONFIG: /app/config.yaml
+      # 容器内访问宿主机的代理要写 host.docker.internal
+      MMXCODE_PROXY_DEFAULT: "${MMXCODE_PROXY_DEFAULT:-http://host.docker.internal:7890}"
+      TZ: Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # WARP 作为额外的出口，默认不启动。
+  # 开启：.env 里写 COMPOSE_PROFILES=warp
+  warp:
+    image: cloudflare/warp:latest
+    profiles: ["warp"]
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - warp-state:/var/lib/cloudflare-warp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        warp-cli --accept-tos registration new || true
+        warp-cli mode proxy
+        warp-cli proxy port 4000
+        warp-cli proxy bind 0.0.0.0
+        warp-cli connect
+        tail -f /dev/null
+    expose:
+      - "4000"
+
+volumes:
+  warp-state:

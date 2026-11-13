@@ -1,0 +1,7 @@
+.git
+docs
+data
+tmp.db
+tmp.db-wal
+tmp.db-shm
+*.md
