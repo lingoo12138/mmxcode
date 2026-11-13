@@ -226,6 +226,15 @@ func TestAPIKeyAuth(t *testing.T) {
 		t.Fatalf("code = %d, want 401", w.Code)
 	}
 
+	// 错的 key 也是进不去的。
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", "sk-wrong")
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 for the wrong key", w.Code)
+	}
+
 	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("x-api-key", "sk-1")
 	w = httptest.NewRecorder()
@@ -928,6 +937,75 @@ func TestTheNativeFlagIsSafeWhileTheFallbackHappens(t *testing.T) {
 	for _, p := range paths[before:] {
 		if p == site.ResponsesPath {
 			t.Fatalf("the native path was used again: %v", paths[before:])
+		}
+	}
+}
+
+// TestAnEmptyConfiguredKeyOpensNothing says a configured key that is
+// not a key never matches.
+//
+// 配置里写了空串的时候，一个不带 key 的请求带来的也是空串，两边一比
+// 就"相等"了：等于是没有认证。配置这一头要挡住，配置说什么都不能
+// 让空 key 进门。
+func TestAnEmptyConfiguredKeyOpensNothing(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	headers := []string{"", " ", "  \t "}
+	for _, key := range headers {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+		if key != "" {
+			req.Header.Set("x-api-key", key)
+		}
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("the key %q was accepted: code = %d", key, w.Code)
+		}
+	}
+}
+
+// TestAnEmptyKeyInBearerOpensNothing says the same of the other place
+// a key can come from.
+//
+// Bearer 后面空着，带来的也是空串。
+func TestAnEmptyKeyInBearerOpensNothing(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Authorization", "Bearer ")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("the empty bearer key was accepted: code = %d", w.Code)
+	}
+}
+
+// TestAnEmptyKeySignsNobodyIn says the sign-in page does not give a
+// cookie to an empty key either.
+//
+// 登录是另一扇门：空 key 配在那里的时候，空 key 也要进不去。
+func TestAnEmptyKeySignsNobodyIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", w.Code)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for an empty key: %+v", c)
 		}
 	}
 }

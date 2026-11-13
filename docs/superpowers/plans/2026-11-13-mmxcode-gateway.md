@@ -5253,6 +5253,15 @@ func TestAPIKeyAuth(t *testing.T) {
 		t.Fatalf("code = %d, want 401", w.Code)
 	}
 
+	// 错的 key 也是进不去的。
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", "sk-wrong")
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 for the wrong key", w.Code)
+	}
+
 	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("x-api-key", "sk-1")
 	w = httptest.NewRecorder()
@@ -5958,6 +5967,75 @@ func TestTheNativeFlagIsSafeWhileTheFallbackHappens(t *testing.T) {
 		}
 	}
 }
+
+// TestAnEmptyConfiguredKeyOpensNothing says a configured key that is
+// not a key never matches.
+//
+// 配置里写了空串的时候，一个不带 key 的请求带来的也是空串，两边一比
+// 就"相等"了：等于是没有认证。配置这一头要挡住，配置说什么都不能
+// 让空 key 进门。
+func TestAnEmptyConfiguredKeyOpensNothing(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	headers := []string{"", " ", "  \t "}
+	for _, key := range headers {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+		if key != "" {
+			req.Header.Set("x-api-key", key)
+		}
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("the key %q was accepted: code = %d", key, w.Code)
+		}
+	}
+}
+
+// TestAnEmptyKeyInBearerOpensNothing says the same of the other place
+// a key can come from.
+//
+// Bearer 后面空着，带来的也是空串。
+func TestAnEmptyKeyInBearerOpensNothing(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Authorization", "Bearer ")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("the empty bearer key was accepted: code = %d", w.Code)
+	}
+}
+
+// TestAnEmptyKeySignsNobodyIn says the sign-in page does not give a
+// cookie to an empty key either.
+//
+// 登录是另一扇门：空 key 配在那里的时候，空 key 也要进不去。
+func TestAnEmptyKeySignsNobodyIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{""}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", w.Code)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for an empty key: %+v", c)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -6032,10 +6110,8 @@ func (s *Server) auth(r *http.Request) bool {
 			given = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 		}
 	}
-	for _, k := range keys {
-		if subtle.ConstantTimeCompare([]byte(given), []byte(k)) == 1 {
-			return true
-		}
+	if _, ok := matchingKey(given, keys); ok {
+		return true
 	}
 	// 浏览器带来的 cookie：值是某一把配好的 key 算出来的
 	c, err := r.Cookie(sessionCookie)
@@ -6043,11 +6119,36 @@ func (s *Server) auth(r *http.Request) bool {
 		return false
 	}
 	for _, k := range keys {
+		if strings.TrimSpace(k) == "" {
+			// 空的 key 算不出票来：它不该是谁的票。
+			continue
+		}
 		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(sessionValue(k))) == 1 {
 			return true
 		}
 	}
 	return false
+}
+
+// matchingKey gives the configured key the given one matches.
+//
+// 空白的 key 不算一把 key。配置里有一把空的时候，一个不带 key 的请求
+// 带来的也是空串，两边一比就是"相等"——那等于没有认证，一份配错的配置
+// 就把门打开了。所以空的配置项和空的请求都挡在这里：配置说什么都不
+// 算数。
+func matchingKey(given string, keys []string) (string, bool) {
+	if strings.TrimSpace(given) == "" {
+		return "", false
+	}
+	for _, k := range keys {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(given), []byte(k)) == 1 {
+			return k, true
+		}
+	}
+	return "", false
 }
 
 // session handles the sign-in cookie.
@@ -6078,13 +6179,12 @@ func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := submittedKey(r)
-	for _, k := range keys {
-		if subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
-			s.setSessionCookie(w, r, k)
-			w.Header().Set("Cache-Control", "no-store")
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
+	// 空 key 进不来：登录是另一扇门，空的那把不该把门打开。
+	if k, ok := matchingKey(key, keys); ok {
+		s.setSessionCookie(w, r, k)
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
 	}
 	// 错的 key：不发 cookie
 	s.signInPage(w, r, http.StatusUnauthorized, "the key was refused")
