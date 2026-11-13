@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -199,7 +200,27 @@ func Load(path string) (Config, error) {
 	if c.Proxy.Groups == nil {
 		c.Proxy.Groups = map[string]string{}
 	}
+	if err := c.checkAPIKeys(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	return c, nil
+}
+
+// checkAPIKeys refuses the api keys that are not keys.
+//
+// 空的一把 key 等于没有 key：网关拿请求带来的 key 跟配置里的每一把比，
+// 配置里有一把空串的时候，一个不带 key 的请求带来的也是空串，两边一
+// 比就"相等"了——于是所有请求都过了这道门。
+//
+// 这跟"一把 key 都不配"不是一回事：那是不用认证（只该听在本机），配
+// 的人自己知道。配了一把空的，是配错了，所以在这里就报错。
+func (c *Config) checkAPIKeys() error {
+	for i, k := range c.Server.APIKeys {
+		if strings.TrimSpace(k) == "" {
+			return fmt.Errorf("server.api_keys[%d] is empty: remove it to run without authentication, or give it a real key", i)
+		}
+	}
+	return nil
 }
 
 // oneDocument makes sure the file holds exactly one document.

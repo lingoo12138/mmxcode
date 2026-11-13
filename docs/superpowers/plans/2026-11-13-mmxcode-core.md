@@ -457,9 +457,7 @@ func TestDurationRejectsZero(t *testing.T) {
 func TestLoadStripsBOM(t *testing.T) {
 	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里。
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	// The BOM is written as bytes, not as a rune escape: a literal BOM
-	// pasted into a .go file is a syntax error.
-	body := "\xef\xbb\xbf" + "server:\n  listen: \":9090\"\n"
+	body := "\ufeff" + "server:\n  listen: \":9090\"\n"
 	if err := writeFile(path, body); err != nil {
 		t.Fatal(err)
 	}
@@ -540,6 +538,57 @@ func TestDurationJSON(t *testing.T) {
 		t.Fatalf("d = %v", d.Duration())
 	}
 }
+
+func TestLoadRejectsAnEmptyAPIKey(t *testing.T) {
+	// 空的一把 key 等于没有 key：配置里写了空串的时候，一个不带 key
+	// 的请求带来的也是空串，两边一比就"相等"了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\"sk-a\", \"\"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for the empty key")
+	}
+	if !strings.Contains(err.Error(), "api_keys[1]") {
+		t.Fatalf("error %q does not name the position of the key", err)
+	}
+}
+
+func TestLoadRejectsAWhitespaceAPIKey(t *testing.T) {
+	// 只有空白的 key 和空的一样：一把 key 总得有字。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\"   \"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for the whitespace key")
+	}
+	if !strings.Contains(err.Error(), "api_keys[0]") {
+		t.Fatalf("error %q does not name the position of the key", err)
+	}
+}
+
+func TestLoadAcceptsAKeyWithSpacesInIt(t *testing.T) {
+	// key 前后有空格是有可能的：它是一段口令，不是一个词。
+	// 只有全空白的 key 才是配错了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\" sk-a \"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Server.APIKeys) != 1 || c.Server.APIKeys[0] != " sk-a " {
+		t.Fatalf("api_keys = %v", c.Server.APIKeys)
+	}
+}
+
+func writeFile(path, body string) error {
+	return os.WriteFile(path, []byte(body), 0o600)
+}
 ```
 
 `writeFile` 助手放在测试文件里：
@@ -576,6 +625,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -764,7 +814,27 @@ func Load(path string) (Config, error) {
 	if c.Proxy.Groups == nil {
 		c.Proxy.Groups = map[string]string{}
 	}
+	if err := c.checkAPIKeys(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	return c, nil
+}
+
+// checkAPIKeys refuses the api keys that are not keys.
+//
+// 空的一把 key 等于没有 key：网关拿请求带来的 key 跟配置里的每一把比，
+// 配置里有一把空串的时候，一个不带 key 的请求带来的也是空串，两边一
+// 比就"相等"了——于是所有请求都过了这道门。
+//
+// 这跟"一把 key 都不配"不是一回事：那是不用认证（只该听在本机），配
+// 的人自己知道。配了一把空的，是配错了，所以在这里就报错。
+func (c *Config) checkAPIKeys() error {
+	for i, k := range c.Server.APIKeys {
+		if strings.TrimSpace(k) == "" {
+			return fmt.Errorf("server.api_keys[%d] is empty: remove it to run without authentication, or give it a real key", i)
+		}
+	}
+	return nil
 }
 
 // oneDocument makes sure the file holds exactly one document.

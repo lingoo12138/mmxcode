@@ -379,6 +379,53 @@ func TestDurationJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsAnEmptyAPIKey(t *testing.T) {
+	// 空的一把 key 等于没有 key：配置里写了空串的时候，一个不带 key
+	// 的请求带来的也是空串，两边一比就"相等"了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\"sk-a\", \"\"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for the empty key")
+	}
+	if !strings.Contains(err.Error(), "api_keys[1]") {
+		t.Fatalf("error %q does not name the position of the key", err)
+	}
+}
+
+func TestLoadRejectsAWhitespaceAPIKey(t *testing.T) {
+	// 只有空白的 key 和空的一样：一把 key 总得有字。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\"   \"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for the whitespace key")
+	}
+	if !strings.Contains(err.Error(), "api_keys[0]") {
+		t.Fatalf("error %q does not name the position of the key", err)
+	}
+}
+
+func TestLoadAcceptsAKeyWithSpacesInIt(t *testing.T) {
+	// key 前后有空格是有可能的：它是一段口令，不是一个词。
+	// 只有全空白的 key 才是配错了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  api_keys: [\" sk-a \"]\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Server.APIKeys) != 1 || c.Server.APIKeys[0] != " sk-a " {
+		t.Fatalf("api_keys = %v", c.Server.APIKeys)
+	}
+}
+
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }
