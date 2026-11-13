@@ -5077,8 +5077,7 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 // is asked for by whoever needs it — the gateway's /v1/models — so
 // that a fallback and a live read are not confused with each other.
 func (c *Client) Models(access string) []site.Model {
-	out := site.CloneModels(site.FallbackModels())
-	return out
+	return site.FallbackModels()
 }
 
 // ParseAmount reads a ledger amount.
