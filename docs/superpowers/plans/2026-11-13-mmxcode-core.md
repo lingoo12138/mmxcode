@@ -1009,17 +1009,17 @@ func TestFallbackModelsLimits(t *testing.T) {
 		inputs   []string
 		thinking Thinking
 	}
-	want := map[string]want{
+	wants := map[string]want{
 		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn},
 		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable},
 		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn},
 		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn},
 	}
-	if len(FallbackModels) != len(want) {
-		t.Fatalf("got %d models, want %d", len(FallbackModels), len(want))
+	if len(FallbackModels) != len(wants) {
+		t.Fatalf("got %d models, want %d", len(FallbackModels), len(wants))
 	}
 	for _, m := range FallbackModels {
-		w, ok := want[m.ID]
+		w, ok := wants[m.ID]
 		if !ok {
 			t.Fatalf("unexpected model %q", m.ID)
 		}
