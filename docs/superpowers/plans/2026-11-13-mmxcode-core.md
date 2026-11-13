@@ -1239,13 +1239,13 @@ import "testing"
 // to the one MiniMax Code sends.
 func TestSignGoldenVectors(t *testing.T) {
 	cases := []struct {
-		name      string
-		path      string
-		opts      Options
-		wantURL   string
-		wantYY    string
-		wantTS    string
-		wantSig   string
+		name    string
+		path    string
+		opts    Options
+		wantURL string
+		wantYY  string
+		wantTS  string
+		wantSig string
 	}{
 		{
 			name: "identity GET",
@@ -1376,10 +1376,12 @@ func TestQueryOverrideKeepsPosition(t *testing.T) {
 func TestEncodeURIComponentMatchesJS(t *testing.T) {
 	cases := map[string]string{
 		"/v1/api/user/info?a=b&c=d": "%2Fv1%2Fapi%2Fuser%2Finfo%3Fa%3Db%26c%3Dd",
-		"a b":                        "a%20b",
-		"~":                          "~",
-		"*":                          "*",
-		"!'()":                       "!%27%28%29",
+		"a b":                       "a%20b",
+		"~":                         "~",
+		"*":                         "*",
+		// encodeURIComponent keeps !'()* — unlike URLSearchParams, which
+		// escapes them. The two encoders differ exactly here.
+		"!'()": "!'()",
 	}
 	for in, want := range cases {
 		if got := encodeURIComponent(in); got != want {
@@ -1395,6 +1397,8 @@ func TestFormEncodeMatchesJS(t *testing.T) {
 		"*":   "*",
 		"-._": "-._",
 		"/":   "%2F",
+		// URLSearchParams escapes these; encodeURIComponent does not.
+		"!'()": "%21%27%28%29",
 	}
 	for in, want := range cases {
 		if got := formEncode(in); got != want {
@@ -2673,11 +2677,11 @@ func TestCheckEnvelopeNotJSON(t *testing.T) {
 
 func TestQuotaRefusalDetection(t *testing.T) {
 	cases := map[string]bool{
-		`{"error":{"message":"insufficient balance"}}`:  true,
-		`{"message":"额度不足"}`:                        true,
-		`{"message":"积分已用完"}`:                       true,
-		`{"message":"model not available"}`:             false,
-		`{"message":"quota exceeded"}`:                  true,
+		`{"error":{"message":"insufficient balance"}}`: true,
+		`{"message":"额度不足"}`:                           true,
+		`{"message":"积分已用完"}`:                          true,
+		`{"message":"model not available"}`:            false,
+		`{"message":"quota exceeded"}`:                 true,
 	}
 	for body, want := range cases {
 		if got := IsQuotaRefusal(body); got != want {
@@ -3469,12 +3473,12 @@ func TestStartDevice(t *testing.T) {
 			t.Error("no code_challenge")
 		}
 		json.NewEncoder(w).Encode(map[string]any{
-			"device_code":              "dev-1",
-			"user_code":                "ABCD-EFGH",
-			"verification_uri":         "https://example.invalid/activate",
+			"device_code":               "dev-1",
+			"user_code":                 "ABCD-EFGH",
+			"verification_uri":          "https://example.invalid/activate",
 			"verification_uri_complete": "https://example.invalid/activate?code=ABCD-EFGH",
-			"expires_in":               600,
-			"interval":                 5,
+			"expires_in":                600,
+			"interval":                  5,
 		})
 	}))
 	defer srv.Close()
@@ -3500,10 +3504,10 @@ func TestStartDeviceUserCodeVariant(t *testing.T) {
 	// for, and the end is an absolute time in milliseconds.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
-			"user_code":         "WXYZ-1234",
-			"verification_uri":  "https://example.invalid/activate",
-			"expired_in":        time.Now().Add(10 * time.Minute).UnixMilli(),
-			"interval":          3000,
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       time.Now().Add(10 * time.Minute).UnixMilli(),
+			"interval":         3000,
 		})
 	}))
 	defer srv.Close()
@@ -3525,11 +3529,11 @@ func TestStartDeviceExpiredInSeconds(t *testing.T) {
 	// expired_in 小于 1e12 时是"还剩多少秒"，不是绝对时间。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
-			"device_code":        "dev-2",
-			"user_code":          "ABCD-EFGH",
-			"verification_uri":   "https://example.invalid/activate",
-			"expired_in":         600,
-			"interval":           5,
+			"device_code":      "dev-2",
+			"user_code":        "ABCD-EFGH",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       600,
+			"interval":         5,
 		})
 	}))
 	defer srv.Close()
@@ -3583,12 +3587,12 @@ func TestPollDeviceSuccess(t *testing.T) {
 
 	c := testClient(t, srv)
 	d := &Device{
-		userCode:   "ABCD",
-		verifier:   "v",
-		pollField:  "device_code",
-		pollValue:  "dev-1",
-		deadline:   time.Now().Add(time.Minute),
-		interval:   time.Millisecond,
+		userCode:  "ABCD",
+		verifier:  "v",
+		pollField: "device_code",
+		pollValue: "dev-1",
+		deadline:  time.Now().Add(time.Minute),
+		interval:  time.Millisecond,
 	}
 	tok, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
 	if err != nil {
@@ -5269,7 +5273,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			StatusMsg  string `json:"status_msg"`
 		} `json:"base_resp"`
 		ModelRemains []struct {
-			ModelName               string   `json:"model_name"`
+			ModelName                string   `json:"model_name"`
 			CurrentIntervalStatus    *float64 `json:"current_interval_status"`
 			CurrentIntervalRemaining *float64 `json:"current_interval_remaining_percent"`
 			CurrentIntervalUsed      *float64 `json:"current_interval_used_percent"`
@@ -5457,10 +5461,10 @@ func panel(todayStatus int, todayIsToday bool) string {
 			status = 3
 		}
 		days[i] = map[string]any{
-			"day_no":  i + 1,
-			"status":  status,
+			"day_no":   i + 1,
+			"status":   status,
 			"is_today": i == 3 && todayIsToday,
-			"points":  25,
+			"points":   25,
 		}
 	}
 	return `{"data":{"days":[` + join(days) + `]}}`
@@ -6389,8 +6393,8 @@ package mmxcode
 import (
 	"context"
 	"fmt"
-	"text/tabwriter"
 	"os"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 

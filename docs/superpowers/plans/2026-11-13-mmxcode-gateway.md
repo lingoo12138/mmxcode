@@ -841,14 +841,14 @@ func TestChatSendsTheRightHeaders(t *testing.T) {
 
 	c := New(Options{Timeout: 5 * time.Second})
 	req := ChatRequest{
-		BaseURL:    srv.URL,
-		Path:       "/mavis/api/v1/llm/v1/messages",
-		Access:     "acc-token",
-		SessionID:  "sess-1",
-		TZOffset:   -480,
-		Body:       []byte(`{"model":"MiniMax-M3"}`),
-		Stream:     false,
-		Anthropic:  true,
+		BaseURL:   srv.URL,
+		Path:      "/mavis/api/v1/llm/v1/messages",
+		Access:    "acc-token",
+		SessionID: "sess-1",
+		TZOffset:  -480,
+		Body:      []byte(`{"model":"MiniMax-M3"}`),
+		Stream:    false,
+		Anthropic: true,
 	}
 	resp, err := c.Chat(context.Background(), req, nil)
 	if err != nil {
@@ -2486,12 +2486,12 @@ type anthropicEvent struct {
 		} `json:"usage"`
 	} `json:"message"`
 	ContentBlock *struct {
-		Type    string          `json:"type"`
-		Text    string          `json:"text"`
-		Thinking string         `json:"thinking"`
-		ID      string          `json:"id"`
-		Name    string          `json:"name"`
-		Input   json.RawMessage `json:"input"`
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		Thinking string          `json:"thinking"`
+		ID       string          `json:"id"`
+		Name     string          `json:"name"`
+		Input    json.RawMessage `json:"input"`
 	} `json:"content_block"`
 	Delta *struct {
 		Type        string `json:"type"`
@@ -2763,7 +2763,7 @@ func StreamResponses(r io.Reader, w io.Writer, model string) error {
 		"response": map[string]any{
 			"id": responseID, "object": "response", "model": model,
 			"status": "completed", "stop_reason": stopReason,
-			"output_text": text.String(),
+			"output_text":            text.String(),
 			"reasoning_summary_text": reasoning.String(),
 			"usage": map[string]any{
 				"input_tokens": inputTokens, "output_tokens": outputTokens,

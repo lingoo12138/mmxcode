@@ -511,7 +511,7 @@ CREATE TABLE exhausted_windows (
 );
 
 CREATE TABLE sessions (
-  session_key   TEXT PRIMARY KEY,
+  session_key   TEXT PRIMARY KEY,        -- 亲和键，永远是哈希（见 7.1）
   account_id    TEXT NOT NULL,
   updated_at    INTEGER NOT NULL
 );
