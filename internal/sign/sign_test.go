@@ -1,6 +1,11 @@
 package sign
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"mmxcode/internal/site"
+)
 
 // The vectors were produced by running the reference implementation
 // (magpie-community/plugins, packages/minimax/index.mjs) under Node 24.
@@ -125,6 +130,159 @@ func TestSignGoldenVectors(t *testing.T) {
 			if got.Signature != c.wantSig {
 				t.Errorf("signature = %s, want %s", got.Signature, c.wantSig)
 			}
+
+			headers := got.Headers()
+			want := map[string]string{
+				"Authorization": "Bearer " + c.opts.Access,
+				"Accept":        "application/json",
+				"Content-Type":  "application/json",
+				"User-Agent":    site.AccountUserAgent,
+				"yy":            c.wantYY,
+				"x-timestamp":   c.wantTS,
+				"x-signature":   c.wantSig,
+			}
+			for name, value := range want {
+				if headers[name] != value {
+					t.Errorf("header %s = %q, want %q", name, headers[name], value)
+				}
+			}
+		})
+	}
+}
+
+// The query the reference builds for a plain request, so that the cases
+// below can spell out only what they change.
+const plainQuery = "device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+	"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+	"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode"
+
+// The reference resolves the path against the origin and signs the
+// resolved, percent-encoded path, so these all sign something other
+// than what the path looks like.
+func TestSignResolvesThePath(t *testing.T) {
+	cases := []struct {
+		name    string
+		origin  string
+		path    string
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:   "a path without a leading slash",
+			origin: "https://agent.minimax.io",
+			path:   "v1/api/user/info",
+			// The reference resolves it against the origin, so it is
+			// the same request as the golden identity GET.
+			wantURL: "https://agent.minimax.io/v1/api/user/info?" + plainQuery,
+			wantYY:  "40865acf7e929978824a2892b1cc0e7b",
+		},
+		{
+			name:    "a path with a space in it",
+			origin:  "https://agent.minimax.io",
+			path:    "/v1/a b",
+			wantURL: "https://agent.minimax.io/v1/a%20b?" + plainQuery,
+			wantYY:  "5bf73d0b32d9919785be6e1cf3b76a84",
+		},
+		{
+			name:   "a path with a query of its own",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/x?a=1",
+			// The reference assigns the defaults to url.search, which
+			// replaces the path's own query.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "an origin with a path of its own",
+			origin: "https://agent.minimax.io/base/",
+			path:   "/v1/x",
+			// An absolute path replaces the origin's path.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "a path with a percent that is not an escape",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/100%",
+			// JavaScript keeps a "%" that is not an escape as it is,
+			// so the reference signs it as it is too.
+			wantURL: "https://agent.minimax.io/v1/100%?" + plainQuery,
+			wantYY:  "203556ac721d12836c9fa21a52201df3",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign(c.origin, c.path, Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// The reference builds its query as an object literal with the
+// caller's query spread into the middle of it, so a repeated key takes
+// the caller's place but only the leading defaults take the caller's
+// value.
+func TestQueryDefaults(t *testing.T) {
+	cases := []struct {
+		name    string
+		query   []KV
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:  "a leading default is the caller's to override",
+			query: []KV{{"device_platform", "web"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "98e6fa51a036f804c2c65e80295a731b",
+		},
+		{
+			name:  "lang keeps the reference's value",
+			query: []KV{{"lang", "zh"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&lang=en&unix=1763150000000&timezone_offset=-480&sys_language=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d2e7a1e8b377f6fa116a09b1d9825613",
+		},
+		{
+			name:  "client keeps the reference's value",
+			query: []KV{{"client", "x"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&client=mcode&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890",
+			wantYY: "f73c2ba5320fdc2145e65d82d40b14b8",
+		},
+		{
+			name:  "user_id keeps the option's value",
+			query: []KV{{"user_id", "q"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&user_id=1234567890&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&client=mcode",
+			wantYY: "84f842303887f8956faa37fad5226a13",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: c.query,
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
 		})
 	}
 }
@@ -137,8 +295,138 @@ func TestQueryOverrideKeepsPosition(t *testing.T) {
 		Query: []KV{{"device_platform", "web"}, {"is_desktop", "1"}},
 	})
 	want := "device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1"
-	if !contains(got.URL, want) {
+	if !strings.Contains(got.URL, want) {
 		t.Fatalf("URL %s does not contain %s", got.URL, want)
+	}
+}
+
+// The options that fall back to a default, and the ones that are
+// trimmed, are all part of the signed query.
+func TestSignOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    Options
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name: "a language of its own",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Lang: "zh",
+			},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=zh&lang=zh" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d6bbe2721fce479b89ca1b7c05de3591",
+		},
+		{
+			name: "no platform name falls back to linux",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480,
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a user id with whitespace around it",
+			opts: Options{
+				Access: "tok_1", UserID: "  1234567890  ",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a query value with a space and a non-ASCII character",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: []KV{{"q", "a b 中文"}},
+			},
+			// URLSearchParams encodes a space as "+" and everything
+			// else as UTF-8 percent escapes.
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&q=a+b+%E4%B8%AD%E6%96%87&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "79bfb3e01c70c286bc75523a8c43a2b2",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", c.opts)
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// An empty body is a GET: the reference has no way to send one, and a
+// POST with an empty body would sign a body the reference never signs.
+func TestSignEmptyBodyIsGet(t *testing.T) {
+	opts := Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: 1763150000000, TZOffset: -480, OSName: "linux",
+	}
+	get := Sign("https://agent.minimax.io", "/p", opts)
+	empty := Sign("https://agent.minimax.io", "/p", Options{
+		Access: opts.Access, UserID: opts.UserID, Body: []byte{},
+		Now: opts.Now, TZOffset: opts.TZOffset, OSName: opts.OSName,
+	})
+	if empty.YY != get.YY {
+		t.Errorf("yy = %s, want the GET one %s", empty.YY, get.YY)
+	}
+	if empty.Signature != get.Signature {
+		t.Errorf("signature = %s, want the GET one %s", empty.Signature, get.Signature)
+	}
+	if want := "cf6860c1fac0feba1367dc97c06cd876"; empty.YY != want {
+		t.Errorf("yy = %s, want %s", empty.YY, want)
+	}
+	if want := "12f7ac9ac565a90bb1d7652ab46ac58c"; empty.Signature != want {
+		t.Errorf("signature = %s, want %s", empty.Signature, want)
+	}
+}
+
+// The reference floors the seconds and Go's division truncates towards
+// zero.
+func TestSignFloorsNegativeSeconds(t *testing.T) {
+	got := Sign("https://agent.minimax.io", "/p", Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: -1500, TZOffset: -480, OSName: "linux",
+	})
+	if got.Timestamp != "-2" {
+		t.Errorf("timestamp = %s, want -2", got.Timestamp)
+	}
+	if want := "f13f639021bd969f8a1dad1c171b5785"; got.YY != want {
+		t.Errorf("yy = %s, want %s", got.YY, want)
+	}
+	if want := "c70bef52e842c40feaa0a33d76040802"; got.Signature != want {
+		t.Errorf("signature = %s, want %s", got.Signature, want)
+	}
+}
+
+// The user id is trimmed the way JavaScript trims a string, which is
+// not quite strings.TrimSpace: JavaScript strips U+FEFF and keeps
+// U+0085, and Go does the opposite.
+func TestJSTrimMatchesJavaScript(t *testing.T) {
+	bom := string(rune(0xFEFF))
+	nel := string(rune(0x0085))
+	cases := map[string]string{
+		"  42  ":     "42",
+		"\t\n42\r\n": "42",
+		bom + "42":   "42",
+		"42" + nel:   "42" + nel,
+	}
+	for in, want := range cases {
+		if got := jsTrim(in); got != want {
+			t.Errorf("jsTrim(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -174,15 +462,4 @@ func TestFormEncodeMatchesJS(t *testing.T) {
 			t.Errorf("formEncode(%q) = %q, want %q", in, got, want)
 		}
 	}
-}
-
-func contains(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && (func() bool {
-		for i := 0; i+len(needle) <= len(haystack); i++ {
-			if haystack[i:i+len(needle)] == needle {
-				return true
-			}
-		}
-		return false
-	})()
 }
