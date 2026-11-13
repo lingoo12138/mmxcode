@@ -826,8 +826,18 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Create: `internal/sign/sign.go`
 - Create: `internal/sign/sign_test.go`
+- Already there: `internal/sign/testdata/regen-vectors.mjs` —— 把参考实现的 `signed()` 原样抄过来的向量生成脚本。提交它，但别改它。
 
 - [ ] **Step 1: 写失败的测试 —— 金标准向量**
+
+这六个向量的来源：它们由参考实现（magpie-community/plugins 的
+`packages/minimax/index.mjs` 里的 `signed()`）在 Node 上跑出来。
+`internal/sign/testdata/regen-vectors.mjs` 里抄了那个 `signed()` 的原文，
+跑一下它就能重新得到这六个向量，两边必须一致：
+
+```bash
+node internal/sign/testdata/regen-vectors.mjs
+```
 
 创建 `internal/sign/sign_test.go`：
 
