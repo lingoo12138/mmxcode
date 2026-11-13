@@ -6,7 +6,7 @@
 
 **Architecture:** 分层包结构，`site`（常量）→ `sign`（签名，纯函数）→ `store`（SQLite）→ `upstream`（HTTP 客户端）→ `egress`（出口）→ `oauth`/`account`/`checkin`（MiniMax 协议）→ `usage`（聚合）→ `cmd/mmxcode`（CLI）。所有 MiniMax 协议细节对齐参考插件 `@magpie-community/opencode-minimax-auth` 的 `packages/minimax/index.mjs`。
 
-**Tech Stack:** Go 1.23（由 Go 1.21 的 toolchain 自动机制拉取）、`modernc.org/sqlite` v1.62.0（纯 Go，无 cgo）、`golang.org/x/net` v0.62.0（SOCKS5 拨号）、`github.com/spf13/cobra` v1.10.2、`gopkg.in/yaml.v3` v3.0.1。
+**Tech Stack:** Go 1.26（由 Go 1.21 的 toolchain 自动机制拉取）、`modernc.org/sqlite` v1.62.0（纯 Go，无 cgo）、`golang.org/x/net` v0.62.0（SOCKS5 拨号）、`github.com/spf13/cobra` v1.10.2、`gopkg.in/yaml.v3` v3.0.1。
 
 **设计文档：** `docs/superpowers/specs/2026-11-13-mmxcode-gateway-design.md`
 
@@ -22,7 +22,8 @@ HTTP 网关（三种协议、账号轮转）、WebUI、Docker 部署在 **计划
 
 ## 环境前提
 
-- 本机 Go 为 1.21.0，但 `go.mod` 写 `go 1.23.0`，Go 1.21 会自动下载并使用 1.23 工具链（已验证可用）
+- 本机 Go 为 1.21.0，但 `go.mod` 写 `go 1.26.0`，Go 1.21 会自动下载并使用 1.26 工具链（已验证可用）
+- `modernc.org/sqlite` v1.62.0 要求 `go >= 1.26.0`，所以 go 指令不能低于 1.26 —— 它比 sqlite 老两个大版本（v1.59.0 起就要 1.25，v1.48.2 起就要 1.25），没有既能配 1.23 的版本
 - 模块代理 `https://goproxy.cn,direct` 可用
 - 访问 MiniMax 国际站需要代理 `http://127.0.0.1:7890`（通过 `proxy.default` 配置）
 
@@ -144,12 +145,12 @@ cd "E:/lishihua_workspace/golang_coding/mmxcode-api"
 go mod init mmxcode
 ```
 
-然后写 `go.mod`（保留 `go mod init` 生成的 module 行，把 go 指令改成 1.23.0）：
+然后写 `go.mod`（保留 `go mod init` 生成的 module 行，把 go 指令改成 1.26.0）：
 
 ```
 module mmxcode
 
-go 1.23.0
+go 1.26.0
 ```
 
 - [ ] **Step 2: 写失败的测试 —— 配置默认值与时长解析**
@@ -2517,6 +2518,9 @@ go get modernc.org/sqlite@v1.62.0
 go mod tidy
 go test ./internal/store/...
 ```
+
+`go get` 会把 `go.mod` 的 go 指令顶到 `1.26.0` 并写上一行 `toolchain` —— sqlite v1.62.0 要求
+`go >= 1.26.0`。这是预期的，别改回去。
 
 Expected: PASS
 
