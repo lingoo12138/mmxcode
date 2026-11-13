@@ -1,0 +1,11 @@
+# 隔离工作区
+.worktrees/
+
+# 本地数据库与 WAL 文件
+*.db
+*.db-wal
+*.db-shm
+
+# 本地配置
+config.yaml
+.env
