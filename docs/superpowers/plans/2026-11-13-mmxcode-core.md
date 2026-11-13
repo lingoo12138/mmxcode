@@ -444,6 +444,82 @@ func TestDurationRejectsNegative(t *testing.T) {
 	}
 }
 
+func TestDurationRejectsZero(t *testing.T) {
+	// 零在下游是"不设超时"或者"默默用默认值"，两个都不好。
+	// 默认值全都不是零，所以文件里出现零一定是人写的。
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"0s"`), &d); err == nil {
+		t.Fatal("expected an error for the zero duration")
+	}
+}
+
+func TestLoadStripsBOM(t *testing.T) {
+	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "\ufeff" + "server:\n  listen: \":9090\"\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.Listen != ":9090" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadRejectsDocumentAfterAnEmptyOne(t *testing.T) {
+	// 文档1、空文档、文档3：只看一次的话，文档3 会被悄悄丢掉，
+	// 连它的语法错都不报。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server:\n  listen: \":1\"\n---\nnull\n---\nserver:\n  listen: \":3\"\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the third document")
+	}
+}
+
+func TestLoadRejectsDocumentAfterAnEmptyOneWithBadSyntax(t *testing.T) {
+	// 第三份文档的语法错也不能被吞掉。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server:\n  listen: \":1\"\n---\nnull\n---\nbogus: [\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the third document")
+	}
+}
+
+func TestConfigJSONUsesTheSameNames(t *testing.T) {
+	// WebUI 读配置用 JSON，字段名要和 YAML 里的一样。
+	c := Default()
+	c.Server.Listen = ":9090"
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"server", "proxy", "upstream", "rotation", "schedule", "db"} {
+		if _, ok := m[key]; !ok {
+			t.Fatalf("json has no %q: %s", key, b)
+		}
+	}
+	srv, ok := m["server"].(map[string]any)
+	if !ok {
+		t.Fatalf("server is not an object: %s", b)
+	}
+	if srv["listen"] != ":9090" {
+		t.Fatalf("server.listen = %v", srv["listen"])
+	}
+}
+
 func TestDurationJSON(t *testing.T) {
 	// WebUI 读配置用 JSON，时长要写成字符串，不是纳秒数。
 	b, err := json.Marshal(Duration(90 * time.Minute))
@@ -503,6 +579,11 @@ import (
 )
 
 // Duration is a time.Duration written in YAML as "5m", "120s", "1h30m".
+//
+// It is never zero. Every place that reads one treats "not positive" as
+// "no limit at all" or "fall back to the default", so a zero would be
+// read as something the writer did not mean. Zero is refused where the
+// configuration is read.
 type Duration time.Duration
 
 // UnmarshalYAML reads a duration from a string.
@@ -546,17 +627,21 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // parseDuration reads a duration, refusing the impossible ones.
 //
-// A negative duration is refused here, at the last gate before the
-// configuration is used: everywhere a timeout is read, "not positive"
-// means "no timeout at all", so a stray minus sign would quietly turn
-// into a request that never comes back.
+// Zero and negative are refused here, at the last gate before the
+// configuration is used. Everywhere a timeout is read, "not positive"
+// means either "no timeout at all" — a request that never comes back —
+// or "fall back to the default" — a schedule that quietly runs at a
+// time nobody asked for. Both are worse than refusing to start.
+//
+// There is no legitimate zero to protect: the defaults are all
+// positive, so a zero in a file can only be a mistake.
 func parseDuration(s string) (time.Duration, error) {
 	v, err := time.ParseDuration(s)
 	if err != nil {
 		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 	}
-	if v < 0 {
-		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	if v <= 0 {
+		return 0, fmt.Errorf("invalid duration %q: must be positive", s)
 	}
 	return v, nil
 }
@@ -569,8 +654,8 @@ func (d Duration) Duration() time.Duration { return time.Duration(d) }
 
 // Server holds the listener and the keys the gateway accepts.
 type Server struct {
-	Listen  string   `yaml:"listen"`
-	APIKeys []string `yaml:"api_keys"`
+	Listen  string   `yaml:"listen" json:"listen"`
+	APIKeys []string `yaml:"api_keys" json:"api_keys"`
 }
 
 // Proxy holds the global proxy and the named egress groups.
@@ -578,39 +663,39 @@ type Server struct {
 // The groups are the names an account can be pointed at; the addresses
 // live here, so moving a group moves every account that uses it.
 type Proxy struct {
-	Default string            `yaml:"default"`
-	Groups  map[string]string `yaml:"groups"`
+	Default string            `yaml:"default" json:"default"`
+	Groups  map[string]string `yaml:"groups" json:"groups"`
 }
 
 // Upstream holds the upstream site's settings.
 type Upstream struct {
-	Timeout Duration `yaml:"timeout"`
-	Site    string   `yaml:"site"`
+	Timeout Duration `yaml:"timeout" json:"timeout"`
+	Site    string   `yaml:"site" json:"site"`
 }
 
 // Rotation holds how accounts are picked and when one is given up on.
 type Rotation struct {
-	Strategy          string   `yaml:"strategy"`
-	MaxAttempts       int      `yaml:"max_attempts"`
-	ExhaustedCooldown Duration `yaml:"exhausted_cooldown"`
+	Strategy          string   `yaml:"strategy" json:"strategy"`
+	MaxAttempts       int      `yaml:"max_attempts" json:"max_attempts"`
+	ExhaustedCooldown Duration `yaml:"exhausted_cooldown" json:"exhausted_cooldown"`
 }
 
 // Schedule holds the timers.
 type Schedule struct {
-	CheckinAt    string   `yaml:"checkin_at"`
-	UsageRefresh Duration `yaml:"usage_refresh"`
-	TokenRefresh Duration `yaml:"token_refresh"`
-	EgressHealth Duration `yaml:"egress_health"`
+	CheckinAt    string   `yaml:"checkin_at" json:"checkin_at"`
+	UsageRefresh Duration `yaml:"usage_refresh" json:"usage_refresh"`
+	TokenRefresh Duration `yaml:"token_refresh" json:"token_refresh"`
+	EgressHealth Duration `yaml:"egress_health" json:"egress_health"`
 }
 
 // Config is the whole configuration.
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Proxy    Proxy    `yaml:"proxy"`
-	Upstream Upstream `yaml:"upstream"`
-	Rotation Rotation `yaml:"rotation"`
-	Schedule Schedule `yaml:"schedule"`
-	DB       string   `yaml:"db"`
+	Server   Server   `yaml:"server" json:"server"`
+	Proxy    Proxy    `yaml:"proxy" json:"proxy"`
+	Upstream Upstream `yaml:"upstream" json:"upstream"`
+	Rotation Rotation `yaml:"rotation" json:"rotation"`
+	Schedule Schedule `yaml:"schedule" json:"schedule"`
+	DB       string   `yaml:"db" json:"db"`
 }
 
 // Default is the configuration a file starts from.
@@ -636,10 +721,12 @@ func Default() Config {
 // when it runs without a config file.
 //
 // On an error the configuration returned is the zero value: a half-read
-// configuration is worse than none.
+// configuration is worse than none, and the zero value must not be
+// used. Whoever wants the defaults on an error has Default().
 //
-// The groups map is shared with the returned configuration. It is
-// read-only: whoever wants to change a group copies it first.
+// The groups map belongs to the configuration it was read into, but a
+// copy of the configuration shares it: whoever wants to change a group
+// copies the map first (maps.Clone).
 func Load(path string) (Config, error) {
 	c := Default()
 	if path == "" {
@@ -649,6 +736,9 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
+	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里，报错会指向
+	// 一个根本不存在的字段。
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
 	//
@@ -658,7 +748,7 @@ func Load(path string) (Config, error) {
 	dec.KnownFields(true)
 	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
 	if err := dec.Decode(&c); err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return c, nil
 		}
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
@@ -675,19 +765,33 @@ func Load(path string) (Config, error) {
 }
 
 // oneDocument makes sure the file holds exactly one document.
+//
+// It reads every document there is, not just the second one: a file
+// with "doc1 --- (empty) --- doc3" would slip past a check that only
+// looked once, and doc3 — with its syntax errors and all — would go
+// missing without a word.
 func oneDocument(dec *yaml.Decoder) error {
-	var extra yaml.Node
-	switch err := dec.Decode(&extra); err {
-	case nil:
-		if !nullDocument(&extra) {
-			return errors.New("more than one YAML document")
+	for {
+		var extra yaml.Node
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		return nil
-	case io.EOF:
-		return nil
-	default:
-		return err
+		if err != nil {
+			return err
+		}
+		if !nullDocument(&extra) {
+			return fmt.Errorf("more than one YAML document, at line %d", documentLine(&extra))
+		}
 	}
+}
+
+// documentLine is the line a document starts on, for the error message.
+func documentLine(n *yaml.Node) int {
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0].Line
+	}
+	return n.Line
 }
 
 // nullDocument is true for an empty document, which is what a file
@@ -695,6 +799,9 @@ func oneDocument(dec *yaml.Decoder) error {
 func nullDocument(n *yaml.Node) bool {
 	if n.Kind == yaml.DocumentNode {
 		if len(n.Content) == 0 {
+			return true
+		}
+		if n.Content[0] == nil {
 			return true
 		}
 		return n.Content[0].Tag == "!!null"
@@ -801,7 +908,7 @@ const (
 //
 // It is the only endpoint with a query of its own, so it lives here
 // rather than being spelled out at the call site.
-const ModelsQuery = "region=en&buildEnv=prod"
+const ModelsQuery = "region=" + Region + "&buildEnv=prod"
 
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
@@ -855,17 +962,18 @@ type Model struct {
 	Efforts []string
 }
 
-// FallbackModels is the list used when the live one can't be had.
+// fallbackModels is the list used when the live one can't be had.
 //
-// It is read-only: a caller that wants to change it copies it with
-// CloneModels, which copies the slices inside each model too.
+// It is package-private on purpose: a caller that gets a copy can
+// change its copy, and there is no way to reach this one and change
+// it for everybody.
 //
 // The context and output limits are the ones the endpoint really allows,
 // not the ones MiniMax Code declares. Its model config says 512K/128K for
 // the M3 family, but the endpoint accepts 1,048,576 input tokens and
 // 524,288 output tokens for every one of them. An agent that believed the
 // advertised ones would compact its history about half way too early.
-var FallbackModels = []Model{
+var fallbackModels = []Model{
 	{
 		ID: "MiniMax-M3.1-Flash-Preview", Name: "M3.1-Flash-Preview",
 		Context: 1048576, Output: 524288,
@@ -893,6 +1001,12 @@ var FallbackModels = []Model{
 		Thinking: ThinkingOn,
 	},
 }
+
+// FallbackModels gives the built-in model list.
+//
+// The caller gets its own copy: the models and the slices inside them.
+// Changing what it got back changes nothing for anybody else.
+func FallbackModels() []Model { return CloneModels(fallbackModels) }
 
 // Clone copies the model, including the slices inside it, so a caller
 // can change it without touching the original.
@@ -1008,17 +1122,19 @@ func TestFallbackModelsLimits(t *testing.T) {
 		name     string
 		inputs   []string
 		thinking Thinking
+		efforts  []string
 	}
 	wants := map[string]want{
-		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn},
-		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable},
-		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn},
-		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn},
+		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
+		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, []string{"none", "high"}},
+		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn, nil},
+		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn, nil},
 	}
-	if len(FallbackModels) != len(wants) {
-		t.Fatalf("got %d models, want %d", len(FallbackModels), len(wants))
+	models := FallbackModels()
+	if len(models) != len(wants) {
+		t.Fatalf("got %d models, want %d", len(models), len(wants))
 	}
-	for _, m := range FallbackModels {
+	for _, m := range models {
 		w, ok := wants[m.ID]
 		if !ok {
 			t.Fatalf("unexpected model %q", m.ID)
@@ -1035,6 +1151,9 @@ func TestFallbackModelsLimits(t *testing.T) {
 		if m.Thinking != w.thinking {
 			t.Fatalf("%s thinking = %q, want %q", m.ID, m.Thinking, w.thinking)
 		}
+		if strings.Join(m.Efforts, ",") != strings.Join(w.efforts, ",") {
+			t.Fatalf("%s efforts = %v, want %v", m.ID, m.Efforts, w.efforts)
+		}
 	}
 }
 
@@ -1045,22 +1164,21 @@ func TestFallbackModelsLimits(t *testing.T) {
 // to one model's inputs would change the original's, with nothing in
 // the log to point at it.
 func TestCloneModelsIsIndependent(t *testing.T) {
-	c := CloneModels(FallbackModels)
+	c := FallbackModels()
 	c[0].Inputs[0] = "audio"
-	c[0].Efforts = append(c[0].Efforts, "extra")
-	if FallbackModels[0].Inputs[0] != "text" {
-		t.Fatalf("the original's inputs changed to %q", FallbackModels[0].Inputs[0])
+	c[0].Efforts[0] = "changed"
+	original := FallbackModels()
+	if original[0].Inputs[0] != "text" {
+		t.Fatalf("the original's inputs changed to %q", original[0].Inputs[0])
 	}
-	for _, e := range FallbackModels[0].Efforts {
-		if e == "extra" {
-			t.Fatal("the original's efforts changed")
-		}
+	if original[0].Efforts[0] == "changed" {
+		t.Fatal("the original's efforts changed")
 	}
 }
 
 func TestM3ThinkingVariants(t *testing.T) {
 	var m Model
-	for _, x := range FallbackModels {
+	for _, x := range FallbackModels() {
 		if x.ID == "MiniMax-M3" {
 			m = x
 		}
@@ -4897,8 +5015,7 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 // is asked for by whoever needs it — the gateway's /v1/models — so
 // that a fallback and a live read are not confused with each other.
 func (c *Client) Models(access string) []site.Model {
-	out := make([]site.Model, len(site.FallbackModels))
-	copy(out, site.FallbackModels)
+	out := site.CloneModels(site.FallbackModels())
 	return out
 }
 
@@ -6459,7 +6576,7 @@ func newModelsCmd(e *env) *cobra.Command {
 		Use:   "models",
 		Short: "列出可用模型",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			for _, m := range site.FallbackModels {
+			for _, m := range site.FallbackModels() {
 				fmt.Printf("%-28s %8d %8d  %s\n", m.ID, m.Context, m.Output, m.Thinking)
 			}
 			return nil

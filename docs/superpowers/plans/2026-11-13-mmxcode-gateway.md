@@ -3698,7 +3698,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(raw, &out)
 	}
 	if len(out.Data) == 0 {
-		for _, m := range site.FallbackModels {
+		for _, m := range site.FallbackModels() {
 			out.Data = append(out.Data, map[string]any{
 				"id": m.ID, "object": "model", "owned_by": "minimax",
 			})
