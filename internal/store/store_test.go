@@ -201,3 +201,107 @@ func TestUsageSnapshotWithoutAmounts(t *testing.T) {
 		t.Fatalf("a reading with no amounts says it has amounts: %+v", got[0])
 	}
 }
+
+// TestLatestUsageSnapshotIsOneRowPerAccount says two readings of one
+// account in the same millisecond come back as one row.
+//
+// 两行都回来的时候求和会把同一个账号的积分算两遍。
+func TestLatestUsageSnapshotIsOneRowPerAccount(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	// 同一毫秒里的两次刷新
+	at := time.UnixMilli(1763000000000)
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Consumed: 0, Remaining: 100,
+		ExpiresAt: at.Add(time.Hour), CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Consumed: 0, Remaining: 300,
+		ExpiresAt: at.Add(time.Hour), CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 300 {
+		t.Fatalf("got %+v, want the newest reading", got[0])
+	}
+}
+
+// TestLatestUsageSnapshotGivesOneAccount says one account's newest
+// reading is asked for on its own.
+func TestLatestUsageSnapshotGivesOneAccount(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+			AccountID: id, HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("got %+v, want acc_02", got)
+	}
+	// 没有读过的账号没有读数，也没有错
+	none, err := s.LatestUsageSnapshot(ctx, "acc_99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.AccountID != "" {
+		t.Fatalf("got %+v, want nothing", none)
+	}
+}
+
+// TestUsageSnapshotKeepsTheReadErrors says the errors of the parts
+// that could not be read are written down with the reading.
+//
+// 读不到窗口和没有窗口不是一回事，读数要能说出来。
+func TestUsageSnapshotKeepsTheReadErrors(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10,
+		MembershipError: "the membership is not there",
+		WindowsError:    "the windows are not there",
+		CreatedAt:       time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MembershipError != "the membership is not there" {
+		t.Fatalf("got %+v", got)
+	}
+	if got.WindowsError != "the windows are not there" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestDayKeyIsTheSitesDay says the day key is the site's day.
+//
+// The site counts its days in China: a check-in at half past midnight
+// in that zone is the next day, whatever the machine's own zone is.
+func TestDayKeyIsTheSitesDay(t *testing.T) {
+	// 2026-11-13 20:00 UTC is 2026-11-14 04:00 in China
+	at := time.Date(2026, 11, 13, 20, 0, 0, 0, time.UTC)
+	if got := DayKey(at); got != "2026-11-14" {
+		t.Fatalf("day = %q, want 2026-11-14", got)
+	}
+}

@@ -106,8 +106,10 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -371,6 +373,581 @@ func TestCheckinDelegates(t *testing.T) {
 		t.Fatalf("outcome = %q", out.Outcome)
 	}
 }
+
+// TestRefreshUsageSendsTheGroup says the plan is asked for the group's
+// windows.
+//
+// 会员回答里有 op_group_id，控制台要带上 X-Group-Id 才会给那一组的窗口。
+func TestRefreshUsageSendsTheGroup(t *testing.T) {
+	var groups []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matrix/api/v1/commerce/get_membership_info":
+			w.Write([]byte(`{"data":{"has_token_plan":true,"op_group_id":"grp-1"}}`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			groups = append(groups, r.Header.Get("X-Group-Id"))
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":0,
+				 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24}
+			]}`))
+		case "/v1/api/openplatform/charge/combo/cycle_audio_resource_package":
+			groups = append(groups, r.Header.Get("X-Group-Id"))
+			w.Write([]byte(`{"current_subscribe":{"current_subscribe_title":"TokenPlanMax"}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("the plan was asked %d times, want 2", len(groups))
+	}
+	for _, g := range groups {
+		if g != "grp-1" {
+			t.Fatalf("X-Group-Id = %q, want grp-1", g)
+		}
+	}
+	if snap.Plan != "TokenPlanMax" {
+		t.Fatalf("plan = %q", snap.Plan)
+	}
+	if snap.WindowsJSON == "" {
+		t.Fatal("no windows")
+	}
+}
+
+// TestRefreshUsageWithoutAGroup says no group, no header.
+//
+// 会员不知道的时候就没有组，控制台也不该收到一个空的组。
+func TestRefreshUsageWithoutAGroup(t *testing.T) {
+	var groups []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matrix/api/v1/commerce/get_membership_info":
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`404 page not found`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			groups = append(groups, r.Header.Get("X-Group-Id"))
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	if _, err := m.RefreshUsage(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range groups {
+		if g != "" {
+			t.Fatalf("X-Group-Id = %q, want nothing", g)
+		}
+	}
+}
+
+// TestRefreshUsageMissingExpiry says the credits cannot be read.
+//
+// 账本里有一批没有到期时间，这批积分读不出来，整个余额就不给。
+func TestRefreshUsageMissingExpiry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matrix/api/v1/commerce/get_membership_info":
+			w.Write([]byte(`{"data":{"has_token_plan":true}}`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want no amounts", snap)
+	}
+	if snap.Granted != 0 || snap.Remaining != 0 {
+		t.Fatalf("snapshot = %+v, want no amounts", snap)
+	}
+}
+
+// TestRefreshUsageRefusedSignIn says a refused sign-in is not a plan
+// without windows.
+//
+// 签到被拒的时候账号要标成登出，不能把读不到窗口说成没有窗口。
+func TestRefreshUsageRefusedSignIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/matrix/api/v1/commerce/get_membership_info":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"invalid access token"}`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":0,"details":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	if _, err := m.RefreshUsage(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+}
+
+// TestRefreshUsageExpiredBatch says a ledger that was read and has
+// nothing live in it is not a ledger that could not be read.
+//
+// 账本读到了，但里面的批次都已经过期：这是“用完了”，不是“读不到”。
+func TestRefreshUsageExpiredBatch(t *testing.T) {
+	expired := time.Now().Add(-time.Hour).UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":` +
+				fmt.Sprint(expired) + `}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want the reading that was made", snap)
+	}
+	if snap.Remaining != 0 || snap.Granted != 0 {
+		t.Fatalf("snapshot = %+v, want nothing left", snap)
+	}
+	if snap.ExpiresAt.IsZero() {
+		t.Fatal("the reading has to say when the credits ran out")
+	}
+	if snap.ExpiresAt.After(time.Now()) {
+		t.Fatalf("expires_at = %v, want a time in the past", snap.ExpiresAt)
+	}
+}
+
+// TestRefreshUsageEmptyLedger says a ledger that was read and is empty
+// is an account with nothing left, not an account that was never read.
+//
+// 读到空账本是 0，读不到账本是不知道：两回事。
+func TestRefreshUsageEmptyLedger(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":0,"details":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want a reading of zero", snap)
+	}
+	if snap.Remaining != 0 {
+		t.Fatalf("snapshot = %+v, want nothing left", snap)
+	}
+}
+
+// TestRefreshUsageUnreadableLedger says a ledger that cannot be read
+// leaves the credits unknown.
+//
+// 账本读不出来的时候没有数：没有数不是 0。
+func TestRefreshUsageUnreadableLedger(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			// 这一批的数额读不出来，整个账本就读不出来
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"abc","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want no amounts", snap)
+	}
+	// 存下来的也是没有数的那一份
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HasAmounts {
+		t.Fatalf("stored = %+v, want no amounts", stored)
+	}
+}
+
+// TestRefreshUsageRecordsAFailedReading says a failed reading is
+// written down.
+//
+// 读失败时什么都不写，上一份读数就还是这个账号当前的读数，陈旧的数字
+// 看起来是新的。
+func TestRefreshUsageRecordsAFailedReading(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"the ledger is down"}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	if _, err := m.RefreshUsage(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HasAmounts {
+		t.Fatalf("stored = %+v, want the failed reading", stored)
+	}
+	if stored.CreatedAt.IsZero() {
+		t.Fatal("the failed reading has to say when it was made")
+	}
+}
+
+// TestRefreshUsageKeepsThePlanWindowError says a plan whose windows
+// could not be read is not a plan without windows.
+//
+// 读不到窗口和没有窗口不是一回事：调用方要能分清，不然就会把账号放上
+// 错误的冷却。
+func TestRefreshUsageKeepsThePlanWindowError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend/account/token_plan/remains_percent",
+			"/v1/api/openplatform/coding_plan/remains":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"the console is down"}`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.WindowsError == "" {
+		t.Fatalf("snapshot = %+v, want the error of the windows", snap)
+	}
+	if snap.WindowsJSON != "" {
+		t.Fatalf("snapshot = %+v, want no windows", snap)
+	}
+	// 读数存下来了，调用方也能问出来
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WindowsError == "" {
+		t.Fatalf("stored = %+v, want the error of the windows", stored)
+	}
+	if _, err := m.LatestWindows(ctx, "acc_01"); err == nil {
+		t.Fatal("the caller has to be told that the windows are unknown")
+	}
+}
+
+// TestForceRenew says a forced renewal gives a new token.
+//
+// 这是网关收到 401 时做的事。
+func TestForceRenew(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.Write([]byte(`{"access_token":"acc2","refresh_token":"ref2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc1", Refresh: "ref1",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	tok, err := m.ForceRenew(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "acc2" {
+		t.Fatalf("token = %+v, want the renewed one", tok)
+	}
+	if len(sent) != 1 || sent[0] != "ref1" {
+		t.Fatalf("the refresh tokens sent = %v, want [ref1]", sent)
+	}
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc2" || stored.Refresh != "ref2" {
+		t.Fatalf("stored = %+v, want the new token", stored)
+	}
+}
+
+// TestForceRenewWalksTheChainWhenTheStoreIsBehind says an account
+// whose store did not get the last renewal can still be renewed.
+//
+// 续期成功了但写库失败时，库里那份 refresh 已经用掉了，renewer 手里
+// 的新 token 是唯一的出路。
+func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.Write([]byte(`{"access_token":"acc3","refresh_token":"ref3","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	// 库里还是老的那份：写库失败了
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc1", Refresh: "ref1",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+	// renewer 手里有更新的一份
+	if _, err := m.Renewer.Renew(ctx, "acc_01",
+		&oauth.Token{AccountID: "acc_01", Access: "acc1", Refresh: "ref1"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{AccountID: "acc_01", Access: "acc2", Refresh: "ref2",
+				Expires: time.Now().Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := m.ForceRenew(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "acc3" {
+		t.Fatalf("token = %+v, want the renewed one", tok)
+	}
+	if len(sent) != 1 || sent[0] != "ref2" {
+		t.Fatalf("the refresh tokens sent = %v, want the newer one [ref2]", sent)
+	}
+}
+
+// TestSignedOutAccountFailsFast says a signed-out account is not
+// handed out with a token the site has refused.
+//
+// 登出的账号要把令牌抹掉，不然每次请求都要白白付一次续期。
+func TestSignedOutAccountFailsFast(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(time.Minute), UpdatedAt: now,
+	})
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "" || stored.Refresh != "" {
+		t.Fatalf("stored = %+v, want the token taken away", stored)
+	}
+	// 再要一次令牌也是错，不会再去续期
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh was sent %d times, want 1", calls)
+	}
+}
+
+// TestClientHidesTheProxyCredentials says the proxy address the manager
+// hands out has no credentials in it.
+func TestClientHidesTheProxyCredentials(t *testing.T) {
+	ctx := context.Background()
+	m := newTestManager(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive,
+		ProxyURL: "http://user:secret@127.0.0.1:7890", CreatedAt: now, UpdatedAt: now,
+	})
+	_, url, err := m.Client(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(url, "secret") {
+		t.Fatalf("url = %q, want no credentials", url)
+	}
+	if !strings.Contains(url, "127.0.0.1:7890") {
+		t.Fatalf("url = %q, want the host and the port", url)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -420,6 +997,14 @@ import (
 // access tokens that live an hour.
 const renewWindow = 10 * time.Minute
 
+// accountTimeout is how long the account API is waited for.
+//
+// The account API answers in a moment: the membership, the ledger and
+// the plan's windows are three small answers. A stalled one gets
+// little of that, so that one account's reading does not hold up the
+// others'.
+const accountTimeout = 5 * time.Second
+
 // Manager holds the gateway's accounts.
 type Manager struct {
 	// Store is the database.
@@ -465,11 +1050,18 @@ func (m *Manager) Token(ctx context.Context, accountID string) (*oauth.Token, er
 	if err != nil {
 		return nil, fmt.Errorf("account %s is not signed in", accountID)
 	}
+	if stored.Access == "" && stored.Refresh == "" {
+		// The sign-in was taken away: the site has refused it. There
+		// is nothing to send, so the account fails here instead of
+		// paying for a renewal that cannot work.
+		return nil, fmt.Errorf("account %s is signed out", accountID)
+	}
 	cur := &oauth.Token{
-		Access:  stored.Access,
-		Refresh: stored.Refresh,
-		Expires: stored.ExpiresAt,
-		Subject: stored.Subject,
+		AccountID: accountID,
+		Access:    stored.Access,
+		Refresh:   stored.Refresh,
+		Expires:   stored.ExpiresAt,
+		Subject:   stored.Subject,
 	}
 	if cur.Expires.After(time.Now().Add(renewWindow)) {
 		return cur, nil
@@ -491,7 +1083,13 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 	if err != nil {
 		var oe *oauth.Error
 		if asOAuthError(err, &oe) && oe.IsSignedOut() {
-			m.markSignedOut(ctx, accountID, err.Error())
+			// The sign-out has to be written down. An account that
+			// stays active with a token the site has refused is
+			// handed out again and again, and every request pays for
+			// a renewal that cannot work.
+			if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
+			}
 		}
 		return nil, err
 	}
@@ -512,32 +1110,63 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 // near its end.
 //
 // It is what the gateway does when the site answers 401.
+//
+// The renewer is not told to forget the account. The token it holds
+// may be newer than the one in the store -- a renewal that worked but
+// whose writing failed leaves the store behind -- and it is the only
+// way out of that: the refresh token in the store is spent, and a spent
+// refresh token must not be sent again.
 func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Token, error) {
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("account %s is not signed in", accountID)
 	}
-	cur := &oauth.Token{
-		Access:  stored.Access,
-		Refresh: stored.Refresh,
-		Expires: stored.ExpiresAt,
-		Subject: stored.Subject,
+	if stored.Access == "" && stored.Refresh == "" {
+		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
-	// 让 renewer 忘记旧链，用库里那份 refresh 重新走一次
-	m.Renewer.Forget(accountID)
+	cur := &oauth.Token{
+		AccountID: accountID,
+		Access:    stored.Access,
+		Refresh:   stored.Refresh,
+		Expires:   stored.ExpiresAt,
+		Subject:   stored.Subject,
+	}
 	return m.Renew(ctx, accountID, cur)
 }
 
 // markSignedOut records that an account's sign-in is gone.
-func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) {
+//
+// The sign-in is taken away as well: an account whose sign-in the site
+// has refused must not keep a token that every request would try to
+// renew.
+//
+// The error is not swallowed: a sign-out that could not be written
+// down is an account that stays active with a token the site refuses.
+func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) error {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
-		return
+		return err
 	}
 	a.Status = store.StatusSignedOut
 	a.LastError = reason
 	a.UpdatedAt = time.Now()
-	_ = m.Store.UpdateAccount(ctx, a)
+	if err := m.Store.UpdateAccount(ctx, a); err != nil {
+		return err
+	}
+	// The token row is blanked: the sign-in is gone, so the token is
+	// of no use, and keeping it would send the account back to the
+	// site for a renewal that was already refused.
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: accountID,
+		UpdatedAt: time.Now(),
+	}); err != nil {
+		return err
+	}
+	// The renewer forgets the account too: a signed-out account must
+	// not be able to renew, and a token of the old sign-in must not be
+	// waiting when the account signs in again.
+	m.Renewer.Forget(accountID)
+	return nil
 }
 
 // accFor gives the account API client an account's calls go out with.
@@ -553,11 +1182,15 @@ func (m *Manager) accFor(a store.Account) (*account.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.Acc.With(upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: tr})), nil
+	return m.Acc.With(upstream.New(upstream.Options{Timeout: accountTimeout, Transport: tr})), nil
 }
 
 // Client gives the HTTP client an account's requests go out with, and
 // the address of that way out.
+//
+// The address is redacted: it is shown to the user, and the proxy's
+// credentials are a secret. The client itself carries the real
+// address, so nothing is lost by hiding it here.
 func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, string, error) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
@@ -566,9 +1199,9 @@ func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, s
 	url := m.Egress.Resolve(a)
 	c, err := m.Egress.Client(url)
 	if err != nil {
-		return nil, url, err
+		return nil, egress.Redacted(url), err
 	}
-	return c, url, nil
+	return c, egress.Redacted(url), nil
 }
 
 // RefreshUsage reads an account's credits and windows and saves them.
@@ -579,6 +1212,10 @@ func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, s
 // A refused sign-in is not a missing reading: the account is marked
 // signed out, so that a plan that could not be read is not mistaken
 // for a plan without windows.
+//
+// A reading that failed is written down as well: the snapshot of the
+// failed reading says so, so the numbers of the reading before it are
+// not passed off as current.
 func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
@@ -602,21 +1239,50 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		snap.Balance = mem.Balance
 		snap.PlanUntil = mem.ExpiresAt
 		group = mem.GroupID
-	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+	} else {
+		// The error is kept: a membership that could not be read is
+		// not a membership without a group, and the windows are
+		// asked for under that group.
+		snap.MembershipError = err.Error()
+		if isRefusal(err) {
+			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+				return store.UsageSnapshot{}, err
+			}
+		}
 	}
 
 	batches, err := acc.Ledger(ctx, tok.Access, a.UserID)
 	if err != nil {
-		return store.UsageSnapshot{}, err
+		// The reading failed. It is written down, so that a consumer
+		// can say "the last reading of this account failed" instead
+		// of showing the numbers of the reading before it as if they
+		// were current.
+		snap.HasAmounts = false
+		if sErr := m.Store.SaveUsageSnapshot(ctx, snap); sErr != nil {
+			return store.UsageSnapshot{}, errors.Join(err, sErr)
+		}
+		return snap, err
+	}
+	if batches == nil {
+		// The ledger could not be read. The credits are unknown, and
+		// an unknown share is not a share of zero. The reading is
+		// written down all the same, so that it is known to have
+		// failed.
+		snap.HasAmounts = false
+		if sErr := m.Store.SaveUsageSnapshot(ctx, snap); sErr != nil {
+			return store.UsageSnapshot{}, sErr
+		}
+		return snap, nil
 	}
 	now := time.Now()
 	var granted, consumed, remaining float64
-	have := false
+	live := false
 	unknown := false
+	expired := false
 	var soonest time.Time
+	var lastExpiry time.Time
 	for _, b := range batches {
-		if b.CreditType != 1 && b.CreditType != 2 {
+		if b.CreditType != account.CreditTypePurchase && b.CreditType != account.CreditTypeCheckin {
 			// A bucket the plan does not count.
 			continue
 		}
@@ -628,28 +1294,43 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 			break
 		}
 		if !b.ExpiresAt.After(now) {
-			// Expired.
+			// The batch has run out. That is not a loss: the
+			// account's credits ran out, which is not the same as
+			// the credits being unknown.
+			expired = true
+			if b.ExpiresAt.After(lastExpiry) {
+				lastExpiry = b.ExpiresAt
+			}
 			continue
 		}
 		granted += b.Granted
 		consumed += b.Consumed
 		remaining += b.Remaining
-		have = true
+		live = true
 		if soonest.IsZero() || b.ExpiresAt.Before(soonest) {
 			soonest = b.ExpiresAt
 		}
 	}
-	if unknown {
+	switch {
+	case unknown:
 		// A part of the ledger would tell a wrong share, so no
 		// share is told at all.
-		have = false
-	}
-	if have {
+		snap.HasAmounts = false
+	default:
+		// The ledger was read: the account has what it has. A ledger
+		// with nothing live in it means the account has no credits
+		// left, which is not the same as a ledger that could not be
+		// read.
 		snap.HasAmounts = true
-		snap.Granted = granted
-		snap.Consumed = consumed
-		snap.Remaining = remaining
-		snap.ExpiresAt = soonest
+		snap.Granted, snap.Consumed, snap.Remaining = granted, consumed, remaining
+		switch {
+		case live:
+			snap.ExpiresAt = soonest
+		case expired:
+			// Every batch had run out: the account ran out at this
+			// time, and the summary can say so.
+			snap.ExpiresAt = lastExpiry
+		}
 	}
 
 	if ws, err := acc.PlanWindows(ctx, tok.Access, group); err == nil {
@@ -658,13 +1339,23 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 				snap.WindowsJSON = string(b)
 			}
 		}
-	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+	} else {
+		// The error is kept: a plan whose windows could not be read
+		// is not a plan without windows, and the caller decides what
+		// to do with the account.
+		snap.WindowsError = err.Error()
+		if isRefusal(err) {
+			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+				return store.UsageSnapshot{}, err
+			}
+		}
 	}
 	if title, err := acc.PlanTitle(ctx, tok.Access, group); err == nil {
 		snap.Plan = title
 	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+		if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			return store.UsageSnapshot{}, err
+		}
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
@@ -691,7 +1382,7 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
-	day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	day := store.DayKey(time.Now())
 	_ = m.Store.SaveCheckin(ctx, store.Checkin{
 		AccountID: accountID,
 		Day:       day,
@@ -705,22 +1396,28 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 }
 
 // LatestWindows gives an account's saved windows.
+//
+// It is the windows of the account's newest reading: an earlier
+// reading's windows are not looked at. When that reading could not
+// read the windows, the error is given: a plan whose windows could
+// not be read is not a plan without windows, and the caller decides
+// what to do with the account.
 func (m *Manager) LatestWindows(ctx context.Context, accountID string) ([]account.Window, error) {
-	snaps, err := m.Store.LatestUsageSnapshots(ctx)
+	snap, err := m.Store.LatestUsageSnapshot(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-	for _, s := range snaps {
-		if s.AccountID != accountID || s.WindowsJSON == "" {
-			continue
-		}
-		var ws []account.Window
-		if err := json.Unmarshal([]byte(s.WindowsJSON), &ws); err != nil {
-			return nil, err
-		}
-		return ws, nil
+	if snap.WindowsError != "" {
+		return nil, fmt.Errorf("the plan's windows could not be read: %s", snap.WindowsError)
 	}
-	return nil, nil
+	if snap.WindowsJSON == "" {
+		return nil, nil
+	}
+	var ws []account.Window
+	if err := json.Unmarshal([]byte(snap.WindowsJSON), &ws); err != nil {
+		return nil, err
+	}
+	return ws, nil
 }
 
 // asOAuthError unwraps an error into an OAuth error.
@@ -4963,7 +5660,16 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	groups := map[string]string{"warp": "socks5h://warp:4000"}
-	mgr := manager.New(s, up, account.New(up), egress.New(groups, ""), oauth.NewRenewer())
+	// The account API is pointed at a stand-in server: the check-in
+	// route reaches the account API, and a test must never talk to
+	// MiniMax itself.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no upstream in the test", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(groups, ""), oauth.NewRenewer())
 	cfg := config.Default()
 	// The outlet groups are the configuration's; the resolver is built
 	// from the same map, so the page and the resolver agree on which
@@ -5079,6 +5785,94 @@ func TestAPIDeleteAccount(t *testing.T) {
 	}
 	if _, err := s.GetAccount(context.Background(), "acc_01"); err == nil {
 		t.Fatal("the account is still there")
+	}
+}
+
+// TestAPIAccountsHideTheProxyCredentials says the account list does not
+// carry the proxy's credentials.
+//
+// 账号列表是要给人看的，代理的账号密码不能跟着出去。
+func TestAPIAccountsHideTheProxyCredentials(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "secret") {
+		t.Fatalf("the credentials are in the answer: %s", body)
+	}
+	if !strings.Contains(body, "127.0.0.1:7890") {
+		t.Fatalf("the address is not there either: %s", body)
+	}
+}
+
+// TestAccountsPageHideTheProxyCredentials says the page does not carry
+// the proxy's credentials either.
+func TestAccountsPageHideTheProxyCredentials(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "secret") {
+		t.Fatalf("the credentials are in the page: %s", rec.Body.String())
+	}
+}
+
+// TestPatchKeepsTheProxyBehindTheShownAddress says the address the page
+// shows is not written over the one that is stored.
+//
+// 页面上看到的是没有凭据的地址，它原样回去的时候不能把存着的凭据抹掉。
+func TestPatchKeepsTheProxyBehindTheShownAddress(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.NewReader(`{"proxy_url":"http://***@127.0.0.1:7890"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01", body)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyURL != "http://user:secret@127.0.0.1:7890" {
+		t.Fatalf("proxy_url = %q, want the one that is stored", got.ProxyURL)
 	}
 }
 ```
@@ -5201,15 +5995,17 @@ input, select { padding: .25rem; }
   <div class="card"><div class="muted">总剩余</div><div class="n">{{printf "%.2f" .Summary.TotalRemaining}}</div></div>
 </div>
 {{if .Summary.ExpiresAt}}<p class="muted">最近过期：{{.Summary.ExpiresAt.Format "2006-01-02 15:04"}}</p>{{end}}
+<p class="muted">读数时间：{{.Summary.UpdatedAt.Format "2006-01-02 15:04"}}</p>
 {{if .Summary.AccountsUnavailable}}<p class="bad">有 {{.Summary.AccountsUnavailable}} 个账号的积分读不到。</p>{{end}}
+{{if .Summary.AccountsExpired}}<p class="muted">有 {{.Summary.AccountsExpired}} 个账号的积分已经过期，没有算进总数。</p>{{end}}
 <table>
 <tr><th>账号</th><th>积分</th><th>消耗</th><th>剩余</th><th>过期</th></tr>
 {{range .Summary.Accounts}}
 <tr>
-  <td>{{if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}</td>
-  <td>{{if .Granted}}{{printf "%.2f" .Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
-  <td>{{if .Consumed}}{{printf "%.2f" .Consumed}}{{else}}0{{end}}</td>
-  <td>{{if .Remaining}}{{printf "%.2f" .Remaining}}{{else}}0{{end}}</td>
+  <td>{{if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}{{if eq .State "expired"}} <span class="muted">已过期</span>{{end}}</td>
+  <td>{{if .Granted}}{{printf "%.2f" (num .Granted)}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td>{{if .Consumed}}{{printf "%.2f" (num .Consumed)}}{{else}}0{{end}}</td>
+  <td>{{if .Remaining}}{{printf "%.2f" (num .Remaining)}}{{else}}0{{end}}</td>
   <td class="muted">{{if .ExpiresAt}}{{.ExpiresAt.Format "2006-01-02"}}{{end}}</td>
 </tr>
 {{end}}
@@ -5365,6 +6161,7 @@ import (
 	"time"
 
 	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/site"
@@ -5539,12 +6336,13 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"Email":         a.Email,
 			"Status":        a.Status,
 			"ProxyGroup":    a.ProxyGroup,
-			"ProxyURL":      a.ProxyURL,
+			"ProxyURL":      egress.Redacted(a.ProxyURL),
 			"Current":       a.ProxyGroup,
 			"HasAmounts":    snap.HasAmounts,
 			"Granted":       snap.Granted,
 			"Remaining":     snap.Remaining,
 			"Plan":          snap.Plan,
+			"WindowsError":  snap.WindowsError,
 			"WindowSummary": w.windowSummary(ctx, a.ID),
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
@@ -5582,7 +6380,7 @@ func (w *WebUI) windowSummary(ctx context.Context, accountID string) string {
 
 // todayCheckin says whether the account has checked in today.
 func (w *WebUI) todayCheckin(ctx context.Context, accountID string) (bool, int) {
-	day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	day := store.DayKey(time.Now())
 	list, err := w.Store.ListCheckins(ctx, accountID, 5)
 	if err != nil {
 		return false, 0
@@ -5609,7 +6407,7 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	for name, url := range w.Cfg.Proxy.Groups {
 		h, ok := byURL[url]
 		out = append(out, map[string]any{
-			"Name": name, "URL": url,
+			"Name": name, "URL": egress.Redacted(url),
 			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
 		})
 	}
@@ -5850,7 +6648,14 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			a.ProxyGroup = *body.ProxyGroup
 		}
 		if body.ProxyURL != nil {
-			a.ProxyURL = *body.ProxyURL
+			// The page shows the address without its credentials, so
+			// the address that comes back unchanged is the one that
+			// is stored, and not the redacted one. An address the
+			// user really changed is written as it is.
+			shown := egress.Redacted(a.ProxyURL)
+			if *body.ProxyURL != shown || shown == a.ProxyURL {
+				a.ProxyURL = *body.ProxyURL
+			}
 		}
 		a.UpdatedAt = time.Now()
 		if err := w.Store.UpdateAccount(r.Context(), a); err != nil {

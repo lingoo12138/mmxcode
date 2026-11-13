@@ -181,6 +181,30 @@ func TestLedgerExpireAtZero(t *testing.T) {
 	}
 }
 
+// TestLedgerEmptyIsNotUnreadable says a ledger that was read and is
+// empty is not a ledger that could not be read.
+//
+// 读到空账本是“没有积分”，读不到账本是“不知道”：两回事。
+func TestLedgerEmptyIsNotUnreadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":0,"details":[]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches == nil {
+		t.Fatal("an empty ledger must not look like one that could not be read")
+	}
+	if len(batches) != 0 {
+		t.Fatalf("got %d batches, want none", len(batches))
+	}
+}
+
 func TestLedgerBusinessError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`))

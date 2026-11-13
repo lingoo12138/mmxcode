@@ -2040,6 +2040,110 @@ func TestUsageSnapshotWithoutAmounts(t *testing.T) {
 		t.Fatalf("a reading with no amounts says it has amounts: %+v", got[0])
 	}
 }
+
+// TestLatestUsageSnapshotIsOneRowPerAccount says two readings of one
+// account in the same millisecond come back as one row.
+//
+// 两行都回来的时候求和会把同一个账号的积分算两遍。
+func TestLatestUsageSnapshotIsOneRowPerAccount(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	// 同一毫秒里的两次刷新
+	at := time.UnixMilli(1763000000000)
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Consumed: 0, Remaining: 100,
+		ExpiresAt: at.Add(time.Hour), CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Consumed: 0, Remaining: 300,
+		ExpiresAt: at.Add(time.Hour), CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 300 {
+		t.Fatalf("got %+v, want the newest reading", got[0])
+	}
+}
+
+// TestLatestUsageSnapshotGivesOneAccount says one account's newest
+// reading is asked for on its own.
+func TestLatestUsageSnapshotGivesOneAccount(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+			AccountID: id, HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("got %+v, want acc_02", got)
+	}
+	// 没有读过的账号没有读数，也没有错
+	none, err := s.LatestUsageSnapshot(ctx, "acc_99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.AccountID != "" {
+		t.Fatalf("got %+v, want nothing", none)
+	}
+}
+
+// TestUsageSnapshotKeepsTheReadErrors says the errors of the parts
+// that could not be read are written down with the reading.
+//
+// 读不到窗口和没有窗口不是一回事，读数要能说出来。
+func TestUsageSnapshotKeepsTheReadErrors(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10,
+		MembershipError: "the membership is not there",
+		WindowsError:    "the windows are not there",
+		CreatedAt:       time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MembershipError != "the membership is not there" {
+		t.Fatalf("got %+v", got)
+	}
+	if got.WindowsError != "the windows are not there" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestDayKeyIsTheSitesDay says the day key is the site's day.
+//
+// The site counts its days in China: a check-in at half past midnight
+// in that zone is the next day, whatever the machine's own zone is.
+func TestDayKeyIsTheSitesDay(t *testing.T) {
+	// 2026-11-13 20:00 UTC is 2026-11-14 04:00 in China
+	at := time.Date(2026, 11, 13, 20, 0, 0, 0, time.UTC)
+	if got := DayKey(at); got != "2026-11-14" {
+		t.Fatalf("day = %q, want 2026-11-14", got)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2121,6 +2225,8 @@ CREATE TABLE IF NOT EXISTS usage_snapshots (
   plan_until  INTEGER,
   windows_json TEXT,
   balance     TEXT,
+  membership_error TEXT,
+  windows_error TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -2158,6 +2264,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -2226,7 +2333,17 @@ type UsageSnapshot struct {
 	PlanUntil   time.Time
 	WindowsJSON string
 	Balance     string
-	CreatedAt   time.Time
+	// MembershipError says the membership could not be read.
+	//
+	// It is kept, because a plan that could not be read is not a plan
+	// without a group: the windows are asked for under that group.
+	MembershipError string
+	// WindowsError says the plan's windows could not be read.
+	//
+	// It is kept, because a plan whose windows could not be read is
+	// not a plan without windows.
+	WindowsError string
+	CreatedAt    time.Time
 }
 
 // Exhausted is one account's spent window.
@@ -2279,7 +2396,60 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// A file that was made before these columns were added does not
+	// get them from CREATE TABLE IF NOT EXISTS, so they are added
+	// here.
+	for _, col := range []struct{ table, name, decl string }{
+		{"usage_snapshots", "membership_error", "TEXT"},
+		{"usage_snapshots", "windows_error", "TEXT"},
+	} {
+		if err := s.addColumn(ctx, col.table, col.name, col.decl); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// addColumn adds a column to a table, unless the table already has it.
+func (s *Store) addColumn(ctx context.Context, table, name, decl string) error {
+	have, err := s.columnExists(ctx, table, name)
+	if err != nil {
+		return err
+	}
+	if have {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl)); err != nil {
+		return fmt.Errorf("migrate: add column %s.%s: %w", table, name, err)
+	}
+	return nil
+}
+
+// columnExists says whether a table has a column.
+func (s *Store) columnExists(ctx context.Context, table, name string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, fmt.Errorf("migrate: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			colName string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("migrate: %w", err)
+		}
+		if strings.EqualFold(colName, name) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func ms(t time.Time) int64 {
@@ -2507,6 +2677,10 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 // the amounts the three numbers are NULL, so the reader can tell "no
 // idea" from "nothing left" -- and an account with no idea is not an
 // account with nothing left.
+//
+// The errors of the parts that could not be read are written down with
+// it: a plan whose windows could not be read is not a plan without
+// windows, and the reader has to be able to tell them apart.
 func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 	var granted, consumed, remaining any
 	if u.HasAmounts {
@@ -2514,24 +2688,50 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO usage_snapshots (account_id, granted, consumed, remaining,
-			expires_at, plan, plan_until, windows_json, balance, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			expires_at, plan, plan_until, windows_json, balance,
+			membership_error, windows_error, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		u.AccountID, granted, consumed, remaining, ms(u.ExpiresAt),
-		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance, ms(u.CreatedAt))
+		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance,
+		u.MembershipError, u.WindowsError, ms(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("save usage snapshot: %w", err)
 	}
 	return nil
 }
 
+// usageSnapshotColumns gives the columns of a usage snapshot, in the
+// order scanUsageSnapshot reads them.
+//
+// The prefix names the table the columns come from: a join needs it,
+// or the column names are ambiguous.
+func usageSnapshotColumns(prefix string) string {
+	cols := []string{
+		"id", "account_id", "granted", "consumed", "remaining", "expires_at",
+		"plan", "plan_until", "windows_json", "balance",
+		"membership_error", "windows_error", "created_at",
+	}
+	if prefix != "" {
+		for i := range cols {
+			cols[i] = prefix + "." + cols[i]
+		}
+	}
+	return strings.Join(cols, ", ")
+}
+
 // LatestUsageSnapshots gives each account's newest usage reading.
+//
+// The newest is the row with the greatest id. Two readings of one
+// account can share a millisecond, and the timestamp alone would then
+// name two rows -- and both would be summed, so the account's credits
+// would be counted twice. The id grows with every row written, so it
+// tells the readings apart, and there is one row per account, always.
 func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.id, s.account_id, s.granted, s.consumed, s.remaining, s.expires_at,
-			s.plan, s.plan_until, s.windows_json, s.balance, s.created_at
+		SELECT `+usageSnapshotColumns("s")+`
 		FROM usage_snapshots s
-		JOIN (SELECT account_id, MAX(created_at) AS mx FROM usage_snapshots GROUP BY account_id)
-			m ON m.account_id = s.account_id AND m.mx = s.created_at
+		JOIN (SELECT account_id, MAX(id) AS mid FROM usage_snapshots GROUP BY account_id)
+			m ON m.account_id = s.account_id AND m.mid = s.id
 		ORDER BY s.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("latest usage snapshots: %w", err)
@@ -2539,31 +2739,65 @@ func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, erro
 	defer rows.Close()
 	var out []UsageSnapshot
 	for rows.Next() {
-		var (
-			u                            UsageSnapshot
-			granted, consumed, remaining sql.NullFloat64
-			expiresAt                    sql.NullInt64
-			plan, windowsJSON, balance   sql.NullString
-			planUntil                    sql.NullInt64
-			createdAt                    int64
-		)
-		if err := rows.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
-			&plan, &planUntil, &windowsJSON, &balance, &createdAt); err != nil {
+		u, err := scanUsageSnapshot(rows)
+		if err != nil {
 			return nil, err
 		}
-		u.Granted = granted.Float64
-		u.Consumed = consumed.Float64
-		u.Remaining = remaining.Float64
-		u.HasAmounts = granted.Valid && consumed.Valid && remaining.Valid
-		u.ExpiresAt = fromMS(expiresAt.Int64)
-		u.Plan = plan.String
-		u.PlanUntil = fromMS(planUntil.Int64)
-		u.WindowsJSON = windowsJSON.String
-		u.Balance = balance.String
-		u.CreatedAt = fromMS(createdAt)
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// LatestUsageSnapshot gives one account's newest usage reading.
+//
+// It is the row with the greatest id, for the same reason as in
+// LatestUsageSnapshots: two readings of one account can share a
+// millisecond.
+//
+// An account that was never read has no reading and no error.
+func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (UsageSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+usageSnapshotColumns("")+`
+		FROM usage_snapshots WHERE account_id=? ORDER BY id DESC LIMIT 1`, accountID)
+	u, err := scanUsageSnapshot(row)
+	if err == sql.ErrNoRows {
+		return UsageSnapshot{}, nil
+	}
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("latest usage snapshot %s: %w", accountID, err)
+	}
+	return u, nil
+}
+
+// scanUsageSnapshot reads one usage snapshot.
+func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
+	var (
+		u                            UsageSnapshot
+		granted, consumed, remaining sql.NullFloat64
+		expiresAt                    sql.NullInt64
+		plan, windowsJSON, balance   sql.NullString
+		membershipErr, windowsErr    sql.NullString
+		planUntil                    sql.NullInt64
+		createdAt                    int64
+	)
+	if err := sc.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
+		&plan, &planUntil, &windowsJSON, &balance, &membershipErr, &windowsErr,
+		&createdAt); err != nil {
+		return UsageSnapshot{}, err
+	}
+	u.Granted = granted.Float64
+	u.Consumed = consumed.Float64
+	u.Remaining = remaining.Float64
+	u.HasAmounts = granted.Valid && consumed.Valid && remaining.Valid
+	u.ExpiresAt = fromMS(expiresAt.Int64)
+	u.Plan = plan.String
+	u.PlanUntil = fromMS(planUntil.Int64)
+	u.WindowsJSON = windowsJSON.String
+	u.Balance = balance.String
+	u.MembershipError = membershipErr.String
+	u.WindowsError = windowsErr.String
+	u.CreatedAt = fromMS(createdAt)
+	return u, nil
 }
 
 // SetExhausted marks an account's window as spent until a time.
@@ -2713,6 +2947,31 @@ func MarshalWindows(v any) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// checkinZone is the timezone a check-in day is counted in.
+//
+// The site counts its days in China, so a day here is that zone's day.
+// The zone is loaded by name, so the name is never ambiguous: "CST" is
+// China Standard Time here and US Central somewhere else. A machine
+// without the timezone database gets the same offset under a name that
+// says what it is.
+var checkinZone = loadCheckinZone()
+
+// loadCheckinZone gives the timezone a check-in day is counted in.
+func loadCheckinZone() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		return loc
+	}
+	return time.FixedZone("UTC+8", 8*3600)
+}
+
+// DayKey is the day a check-in is counted for.
+//
+// The day is the site's day, so that the day rolls over at the same
+// hour for every account, whatever the machine's own timezone is.
+func DayKey(t time.Time) string {
+	return t.In(checkinZone).Format("2006-01-02")
 }
 
 func boolInt(b bool) int {
@@ -3524,8 +3783,12 @@ package egress
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3565,6 +3828,62 @@ func TestResolveEmptyMeansDirect(t *testing.T) {
 	}
 }
 
+func TestResolveAnEmptyGroupFallsBackToTheDefault(t *testing.T) {
+	// 一个空的组值不是一条出路。空地址会被当成直连，请求就悄悄
+	// 走掉了代理——这正是代理支持最不能犯的错。
+	r := New(map[string]string{"g": "", "blank": "   "}, "http://127.0.0.1:7890")
+	cases := []struct {
+		name string
+		acc  store.Account
+		want string
+	}{
+		{"空组落到全局", store.Account{ProxyGroup: "g"}, "http://127.0.0.1:7890"},
+		{"空白组落到全局", store.Account{ProxyGroup: "blank"}, "http://127.0.0.1:7890"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := r.Resolve(c.acc)
+			if got != c.want {
+				t.Fatalf("Resolve = %q, want %q", got, c.want)
+			}
+			if got == Direct {
+				t.Fatalf("Resolve = %q: the traffic would go out direct", got)
+			}
+		})
+	}
+}
+
+func TestResolveNeverReturnsAnEmptyAddress(t *testing.T) {
+	resolvers := []*Resolver{
+		New(nil, ""),
+		New(map[string]string{"g": ""}, ""),
+		New(map[string]string{"g": " "}, "  "),
+		New(nil, "direct"),
+	}
+	for _, r := range resolvers {
+		got := r.Resolve(store.Account{ProxyGroup: "g"})
+		if strings.TrimSpace(got) == "" {
+			t.Fatalf("Resolve = %q: an empty address would go out direct", got)
+		}
+	}
+}
+
+func TestAnEmptyGroupDoesNotResolveToAProxyLessTransport(t *testing.T) {
+	r := New(map[string]string{"g": ""}, "http://127.0.0.1:7890")
+	addr := r.Resolve(store.Account{ProxyGroup: "g"})
+	c, err := r.Client(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T", c.Transport)
+	}
+	if tr.Proxy == nil {
+		t.Fatal("the transport has no proxy: the traffic would go out direct")
+	}
+}
+
 func TestClientIsCachedPerURL(t *testing.T) {
 	r := New(nil, "")
 	c1, err := r.Client("http://127.0.0.1:7890")
@@ -3587,6 +3906,90 @@ func TestClientIsCachedPerURL(t *testing.T) {
 	}
 }
 
+func TestTheSameAddressWrittenTwoWaysIsOneClient(t *testing.T) {
+	r := New(nil, "")
+	c1, err := r.Client("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := r.Client("HTTP://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1 != c2 {
+		t.Fatal("expected the same client for the same address")
+	}
+	c3, err := r.Client("http://127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c4, err := r.Client("http://127.0.0.1:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3 != c4 {
+		t.Fatal("expected the same client for the same address with the default port")
+	}
+}
+
+func TestInvalidateDropsTheClient(t *testing.T) {
+	r := New(nil, "")
+	c1, err := r.Client("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写成另一个样子也要能丢掉同一个。
+	r.Invalidate("HTTP://127.0.0.1:7890")
+	c2, err := r.Client("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1 == c2 {
+		t.Fatal("expected a new client after Invalidate")
+	}
+}
+
+func TestInvalidateClosesTheIdleConnections(t *testing.T) {
+	closed := make(chan struct{}, 4)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	srv.Config.ConnState = func(c net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	r := New(nil, "")
+	proxyURL := "http://" + srv.Listener.Addr().String()
+	c, err := r.Client(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:1/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	r.Invalidate(proxyURL)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the idle connection of the dropped transport was not closed")
+	}
+}
+
 func TestDirectClientDoesNotUseEnvProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://should-not-be-used:9999")
 	r := New(nil, "")
@@ -3603,6 +4006,23 @@ func TestDirectClientDoesNotUseEnvProxy(t *testing.T) {
 	}
 }
 
+func TestDirectIsComparedWithoutTheCase(t *testing.T) {
+	r := New(nil, "")
+	for _, v := range []string{"direct", "Direct", "DIRECT", " direct "} {
+		c, err := r.Client(v)
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%q: transport = %T", v, c.Transport)
+		}
+		if tr.Proxy != nil {
+			t.Fatalf("%q: the direct transport must not use a proxy", v)
+		}
+	}
+}
+
 func TestHTTPProxyIsUsed(t *testing.T) {
 	r := New(nil, "")
 	c, err := r.Client("http://127.0.0.1:7890")
@@ -3612,6 +4032,21 @@ func TestHTTPProxyIsUsed(t *testing.T) {
 	tr := c.Transport.(*http.Transport)
 	if tr.Proxy == nil {
 		t.Fatal("expected a proxy on the transport")
+	}
+}
+
+func TestTheTransportIsTunedForManyAccounts(t *testing.T) {
+	r := New(nil, "")
+	c, err := r.Client("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := c.Transport.(*http.Transport)
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("http/2 is not attempted")
+	}
+	if tr.MaxIdleConnsPerHost != 32 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 32", tr.MaxIdleConnsPerHost)
 	}
 }
 
@@ -3641,6 +4076,159 @@ func TestLoopbackNeverProxied(t *testing.T) {
 	}
 	if got := r.ResolveForHost(store.Account{}, "example.com:443"); got != "http://127.0.0.1:7890" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAnAddressWithoutAHostIsRefused(t *testing.T) {
+	r := New(nil, "")
+	if _, err := r.Client("http://"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if _, err := r.Client("socks5://"); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestASocks5AddressWithoutAPortIsRefused(t *testing.T) {
+	r := New(nil, "")
+	if _, err := r.Client("socks5://host"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if _, err := r.Client("socks5h://host"); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestTheCredentialsAreNotInTheErrorText(t *testing.T) {
+	r := New(nil, "")
+	_, err := r.Client("http://user:secret@")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "user") {
+		t.Fatalf("the credentials are in the error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Fatalf("the error does not show the redacted address: %v", err)
+	}
+	_, err = r.Client("socks5://user:secret@host")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("the credentials are in the error: %v", err)
+	}
+}
+
+// TestRedacted says the credentials are taken out of an address that is
+// shown, and the rest of it stays.
+//
+// 地址要给用户看，凭据是秘密：换掉凭据，scheme、主机和端口都还在。
+func TestRedacted(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://user:secret@host:1080", "http://***@host:1080"},
+		{"socks5h://user:secret@host:1080", "socks5h://***@host:1080"},
+		{"http://user@host:1080", "http://***@host:1080"},
+		{"http://host:1080", "http://host:1080"},
+		{"direct", "direct"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got := Redacted(c.in)
+		if got != c.want {
+			t.Fatalf("Redacted(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if strings.Contains(got, "secret") || strings.Contains(got, "user") {
+			t.Fatalf("Redacted(%q) = %q, want no credentials", c.in, got)
+		}
+	}
+}
+
+func TestCheckTreatsA407AsAFailure(t *testing.T) {
+	// 代理拒绝我们的凭据，就是不能用，不是健康。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer srv.Close()
+
+	r := New(nil, "")
+	proxyURL := "http://user:secret@" + srv.Listener.Addr().String()
+	err := r.Check(context.Background(), proxyURL, "http://127.0.0.1:1/")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "407") {
+		t.Fatalf("err = %v, want the status in it", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("the credentials are in the error: %v", err)
+	}
+}
+
+func TestCheckDoesNotFollowRedirects(t *testing.T) {
+	var hits atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write([]byte("other"))
+	}))
+	defer other.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/x", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	r := New(nil, "")
+	err := r.Check(context.Background(), Direct, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("the other server got %d requests, want 0", got)
+	}
+}
+
+func TestCheckHasADeadline(t *testing.T) {
+	// 一个接了连接却不回答的代理不能把健康检查挂死。
+	old := checkTimeout
+	checkTimeout = 300 * time.Millisecond
+	defer func() { checkTimeout = old }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+
+	r := New(nil, "")
+	start := time.Now()
+	err = r.Check(context.Background(), Direct, "http://"+ln.Addr().String()+"/")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the check took %s: it has no deadline of its own", took)
+	}
+}
+
+func TestCheckPassesWhenTheTargetAnswers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	r := New(nil, "")
+	if err := r.Check(context.Background(), Direct, srv.URL); err != nil {
+		t.Fatal(err)
 	}
 }
 ```
@@ -3904,11 +4492,15 @@ func isDirect(proxyURL string) bool {
 	return strings.EqualFold(strings.TrimSpace(proxyURL), Direct)
 }
 
-// redacted is a proxy URL as it may be shown.
+// Redacted is a proxy URL as it may be shown.
 //
 // The credentials are taken out: they are a secret, and the health
-// check's error is stored in the database.
-func redacted(proxyURL string) string {
+// check's error is stored in the database. The scheme, the host and
+// the port stay, so that one address can still be told from another.
+//
+// An address without a scheme has no credentials to take out of it, so
+// it is left as it is.
+func Redacted(proxyURL string) string {
 	s := strings.TrimSpace(proxyURL)
 	i := strings.Index(s, "://")
 	if i < 0 {
@@ -3951,10 +4543,10 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 	}
 	u, err := url.Parse(strings.TrimSpace(proxyURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy %q: %w", redacted(proxyURL), err)
+		return nil, fmt.Errorf("parse proxy %q: %w", Redacted(proxyURL), err)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("proxy %q: no host, write an address like http://host:port", redacted(proxyURL))
+		return nil, fmt.Errorf("proxy %q: no host, write an address like http://host:port", Redacted(proxyURL))
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
@@ -3962,7 +4554,7 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		return base, nil
 	case "socks5", "socks5h":
 		if u.Port() == "" {
-			return nil, fmt.Errorf("proxy %q: no port, write an address like socks5h://host:port", redacted(proxyURL))
+			return nil, fmt.Errorf("proxy %q: no port, write an address like socks5h://host:port", Redacted(proxyURL))
 		}
 		var auth *proxy.Auth
 		if u.User != nil {
@@ -3971,11 +4563,11 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		}
 		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
 		if err != nil {
-			return nil, fmt.Errorf("socks5 proxy %q: %w", redacted(proxyURL), err)
+			return nil, fmt.Errorf("socks5 proxy %q: %w", Redacted(proxyURL), err)
 		}
 		ctxDialer, ok := dialer.(proxy.ContextDialer)
 		if !ok {
-			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", redacted(proxyURL))
+			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", Redacted(proxyURL))
 		}
 		base.DialContext = ctxDialer.DialContext
 		base.Proxy = nil
@@ -3983,9 +4575,9 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 	case "":
 		// 没有 scheme 就不是一个地址。默默直连是最坏的一种错：它
 		// 看起来跑通了，其实请求根本没走代理。
-		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", redacted(proxyURL))
+		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", Redacted(proxyURL))
 	default:
-		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", redacted(proxyURL), u.Scheme)
+		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", Redacted(proxyURL), u.Scheme)
 	}
 }
 
@@ -4027,7 +4619,7 @@ func (r *Resolver) Check(ctx context.Context, proxyURL, target string) error {
 	// itself, and a redirect says the target is somewhere else. It is
 	// not a failure either — the proxy did carry the request through.
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return fmt.Errorf("proxy %q: HTTP %d", redacted(proxyURL), resp.StatusCode)
+		return fmt.Errorf("proxy %q: HTTP %d", Redacted(proxyURL), resp.StatusCode)
 	}
 	return nil
 }
@@ -6511,6 +7103,30 @@ func TestLedgerExpireAtZero(t *testing.T) {
 	}
 }
 
+// TestLedgerEmptyIsNotUnreadable says a ledger that was read and is
+// empty is not a ledger that could not be read.
+//
+// 读到空账本是“没有积分”，读不到账本是“不知道”：两回事。
+func TestLedgerEmptyIsNotUnreadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":0,"details":[]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches == nil {
+		t.Fatal("an empty ledger must not look like one that could not be read")
+	}
+	if len(batches) != 0 {
+		t.Fatalf("got %d batches, want none", len(batches))
+	}
+}
+
 func TestLedgerBusinessError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`))
@@ -6901,6 +7517,18 @@ import (
 // not documented, so a stalled one gets little of that.
 const modelsTimeout = 10 * time.Second
 
+// The credit types the plan counts.
+//
+// The ledger writes them as plain numbers, and the plan counts only
+// these two: what was bought and what a check-in gave. Another type is
+// a bucket the plan does not count.
+const (
+	// CreditTypePurchase is a batch that was bought.
+	CreditTypePurchase = 1
+	// CreditTypeCheckin is a batch that a check-in gave.
+	CreditTypeCheckin = 2
+)
+
 // Identity is who the account is.
 type Identity struct {
 	// RealUserID is the MiniMax user id.
@@ -6916,7 +7544,9 @@ type Identity struct {
 // The site writes the amounts as strings, sometimes with a thousands
 // separator, so they are kept as they come and read by ParseAmount.
 type Batch struct {
-	// CreditType is 1 for a purchase, 2 for a check-in.
+	// CreditType is CreditTypePurchase or CreditTypeCheckin for the
+	// batches the plan counts. Another type is a bucket the plan does
+	// not count.
 	CreditType int `json:"credit_type"`
 	// GrantedAmount is what the batch gave.
 	GrantedAmount string `json:"granted_amount"`
@@ -7305,14 +7935,19 @@ func (l ledgerBatch) batch() Batch {
 
 // Ledger reads every batch of credits.
 //
-// A page that can't be read whole gives nil: a part of the ledger
+// A ledger that was read and is empty gives an empty list: the account
+// has no credits, which is not the same as a ledger that could not be
+// read. A ledger that cannot be read gives nil: a part of the ledger
 // would tell a wrong share. So does a batch whose amounts cannot be
 // read: the credits cannot be told apart then, and none is better
 // than a wrong share.
 func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, error) {
 	const pageSize = 20
 	const maxPages = 10
-	var out []Batch
+	// The list starts empty and not nil: a ledger that was read and is
+	// empty is an empty list, and a nil one would say the ledger could
+	// not be read.
+	out := []Batch{}
 	for page := 1; page <= maxPages; page++ {
 		query := append(append([]QueryKV{}, CheckinQuery()...),
 			QueryKV{K: "page_number", V: strconv.Itoa(page)},
@@ -7339,11 +7974,12 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 			details, total = env.Data.Details, env.Data.TotalCount
 		}
 		if total == nil {
+			// The answer is not a ledger: it cannot be read.
 			return nil, nil
 		}
 		for _, lb := range details {
 			b := lb.batch()
-			if b.CreditType == 1 || b.CreditType == 2 {
+			if b.CreditType == CreditTypePurchase || b.CreditType == CreditTypeCheckin {
 				granted, ok1 := ParseAmount(b.GrantedAmount, false)
 				remaining, ok2 := ParseAmount(b.RemainingAmount, true)
 				if !ok1 || !ok2 {
@@ -7361,11 +7997,13 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 		}
 		if len(out) >= *total || len(details) == 0 {
 			if len(out) < *total {
+				// The answer says there is more than it gave.
 				return nil, nil
 			}
 			return out, nil
 		}
 	}
+	// Too many pages: the ledger was not read whole.
 	return nil, nil
 }
 
@@ -8711,6 +9349,21 @@ import (
 	"mmxcode/internal/store"
 )
 
+// accountOf gives the entry of one account.
+//
+// The accounts are sorted by id, but a test that counts on the order
+// breaks when an account is added: the account is asked for by name.
+func accountOf(t *testing.T, s Summary, id string) AccountUsage {
+	t.Helper()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			return a
+		}
+	}
+	t.Fatalf("no entry for %s in %+v", id, s.Accounts)
+	return AccountUsage{}
+}
+
 func TestAggregate(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	snaps := []store.UsageSnapshot{
@@ -8718,11 +9371,13 @@ func TestAggregate(t *testing.T) {
 			AccountID: "acc_01", HasAmounts: true,
 			Granted: 600, Consumed: 120.5, Remaining: 479.5,
 			ExpiresAt: now.Add(48 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
 		},
 		{
 			AccountID: "acc_02", HasAmounts: true,
 			Granted: 300, Consumed: 0, Remaining: 300,
 			ExpiresAt: now.Add(24 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
 		},
 	}
 	s := Aggregate(snaps, now)
@@ -8741,6 +9396,17 @@ func TestAggregate(t *testing.T) {
 	if len(s.Accounts) != 2 {
 		t.Fatalf("accounts = %d", len(s.Accounts))
 	}
+	a1 := accountOf(t, s, "acc_01")
+	if a1.Granted == nil || *a1.Granted != 600 {
+		t.Fatalf("acc_01 = %+v", a1)
+	}
+	if a1.State != StateRead {
+		t.Fatalf("acc_01 state = %q, want %q", a1.State, StateRead)
+	}
+	a2 := accountOf(t, s, "acc_02")
+	if a2.Remaining == nil || *a2.Remaining != 300 {
+		t.Fatalf("acc_02 = %+v", a2)
+	}
 }
 
 func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
@@ -8756,8 +9422,12 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 	if s.AccountsUnavailable != 1 {
 		t.Fatalf("unavailable = %d, want 1", s.AccountsUnavailable)
 	}
-	if s.Accounts[1].Granted != nil {
+	a := accountOf(t, s, "acc_02")
+	if a.Granted != nil {
 		t.Fatal("an account without amounts must not carry a number")
+	}
+	if a.State != StateUnavailable {
+		t.Fatalf("state = %q, want %q", a.State, StateUnavailable)
 	}
 }
 
@@ -8768,6 +9438,153 @@ func TestAggregateEmpty(t *testing.T) {
 	}
 	if s.ExpiresAt != nil {
 		t.Fatal("no expiry without accounts")
+	}
+}
+
+// TestAggregateCountsAnAccountOnce says two readings of one account are
+// one account.
+//
+// 同一个账号的两行读数都被加起来，积分就翻倍：一个 100 积分的账号
+// 会被报成 300。
+func TestAggregateCountsAnAccountOnce(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			ID: 1, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+		{
+			// 同一毫秒里的第二次刷新
+			ID: 2, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 100 {
+		t.Fatalf("granted = %v, want 100: one account is one account", s.TotalGranted)
+	}
+	if s.TotalRemaining != 100 {
+		t.Fatalf("remaining = %v, want 100", s.TotalRemaining)
+	}
+	if len(s.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(s.Accounts))
+	}
+}
+
+// TestAggregateKeepsTheNewestReading says the newer reading of an
+// account is the one that counts.
+func TestAggregateKeepsTheNewestReading(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			ID: 1, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now.Add(-time.Minute),
+		},
+		{
+			ID: 2, AccountID: "acc_01", HasAmounts: true,
+			Granted: 300, Consumed: 0, Remaining: 300,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 300 {
+		t.Fatalf("granted = %v, want 300: the newest reading counts", s.TotalGranted)
+	}
+	if len(s.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(s.Accounts))
+	}
+}
+
+// TestAggregateTellsExpiredFromUnread says an account whose credits ran
+// out and an account whose credits were never read are not the same.
+//
+// 两个都说成“读不到”，总数就短了一截，却没有人知道为什么。
+func TestAggregateTellsExpiredFromUnread(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 100, Remaining: 0,
+			ExpiresAt: now.Add(-time.Hour), CreatedAt: now,
+		},
+		{
+			AccountID: "acc_02", HasAmounts: false, CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 0 {
+		t.Fatalf("granted = %v, want 0: expired credits are not counted", s.TotalGranted)
+	}
+	if s.AccountsExpired != 1 {
+		t.Fatalf("expired = %d, want 1", s.AccountsExpired)
+	}
+	if s.AccountsUnavailable != 1 {
+		t.Fatalf("unavailable = %d, want 1", s.AccountsUnavailable)
+	}
+	expired := accountOf(t, s, "acc_01")
+	if expired.State != StateExpired {
+		t.Fatalf("acc_01 state = %q, want %q", expired.State, StateExpired)
+	}
+	if expired.ExpiresAt == nil {
+		t.Fatal("an expired reading has to say when it ran out")
+	}
+	unread := accountOf(t, s, "acc_02")
+	if unread.State != StateUnavailable {
+		t.Fatalf("acc_02 state = %q, want %q", unread.State, StateUnavailable)
+	}
+	if unread.Granted != nil {
+		t.Fatal("a reading that never happened has no numbers")
+	}
+}
+
+// TestAggregateTellsZeroFromUnread says an account with nothing left is
+// not an account that was never read.
+//
+// 真的 0 和读不到不是一回事：读不到的账号不计入总数，真的 0 计入。
+func TestAggregateTellsZeroFromUnread(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 0, Consumed: 0, Remaining: 0, CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.AccountsUnavailable != 0 {
+		t.Fatalf("unavailable = %d, want 0: a zero is not an unknown", s.AccountsUnavailable)
+	}
+	if s.AccountsExpired != 0 {
+		t.Fatalf("expired = %d, want 0", s.AccountsExpired)
+	}
+	a := accountOf(t, s, "acc_01")
+	if a.State != StateRead {
+		t.Fatalf("state = %q, want %q", a.State, StateRead)
+	}
+	if a.Remaining == nil || *a.Remaining != 0 {
+		t.Fatalf("acc_01 = %+v, want a zero that is there", a)
+	}
+}
+
+// TestAggregateUpdatedAtIsTheReadingTime says the summary says when
+// the numbers were read, not when the summary was made.
+//
+// 汇总时间当成读数时间，陈旧的数字看起来就是新的。
+func TestAggregateUpdatedAtIsTheReadingTime(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	read := now.Add(-2 * time.Minute)
+	s := Aggregate([]store.UsageSnapshot{
+		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: read},
+	}, now)
+	if !s.UpdatedAt.Equal(read) {
+		t.Fatalf("updated_at = %v, want the reading time %v", s.UpdatedAt, read)
+	}
+	// 没有读数时退回汇总时间
+	empty := Aggregate(nil, now)
+	if !empty.UpdatedAt.Equal(now) {
+		t.Fatalf("updated_at = %v, want %v", empty.UpdatedAt, now)
 	}
 }
 ```
@@ -8792,6 +9609,10 @@ Expected: FAIL —— `undefined: Aggregate`
 // batches that have not expired count, and an account whose ledger
 // could not be read is left out of the totals rather than counted as
 // zero.
+//
+// The three states are kept apart: an account whose credits were read,
+// an account whose credits have run out, and an account whose credits
+// could not be read. A total that is short must be explainable.
 package usage
 
 import (
@@ -8799,6 +9620,21 @@ import (
 	"time"
 
 	"mmxcode/internal/store"
+)
+
+// The states an account's credits can be in.
+//
+// They are told apart, because they mean different things: credits that
+// were read are counted, credits that have run out are counted as
+// nothing, and credits that could not be read are not counted at all.
+const (
+	// StateRead means the credits were read and some of them are live.
+	StateRead = "read"
+	// StateExpired means the credits were read and all of them have
+	// run out.
+	StateExpired = "expired"
+	// StateUnavailable means the credits could not be read.
+	StateUnavailable = "unavailable"
 )
 
 // AccountUsage is one account's credits.
@@ -8815,6 +9651,12 @@ type AccountUsage struct {
 	Remaining *float64 `json:"remaining"`
 	// ExpiresAt is when the soonest of its live batches runs out.
 	ExpiresAt *time.Time `json:"expires_at"`
+	// State says what the numbers are: StateRead, StateExpired or
+	// StateUnavailable.
+	//
+	// The three are told apart, so that an account whose credits ran
+	// out is not the same as an account whose credits were never read.
+	State string `json:"state"`
 }
 
 // Summary is the gateway's credits as a whole.
@@ -8827,28 +9669,52 @@ type Summary struct {
 	TotalRemaining float64 `json:"total_remaining"`
 	// ExpiresAt is when the soonest live batch runs out.
 	ExpiresAt *time.Time `json:"expires_at"`
-	// UpdatedAt is when the numbers were read.
+	// UpdatedAt is when the numbers were read: the newest of the
+	// readings that went into this summary. It is not the time the
+	// summary was made, so a stale number is not made to look fresh.
 	UpdatedAt time.Time `json:"updated_at"`
 	// AccountsUnavailable counts the accounts whose ledger could not be
 	// read, so a short total is not mistaken for a full one.
 	AccountsUnavailable int `json:"accounts_unavailable"`
+	// AccountsExpired counts the accounts whose credits were read and
+	// have all run out, so a short total can say why it is short.
+	AccountsExpired int `json:"accounts_expired"`
 	// Accounts is each account's own numbers.
 	Accounts []AccountUsage `json:"accounts"`
 }
 
 // Aggregate sums the accounts' snapshots.
 //
-// now decides which batches count: one that has run out is out.
+// One account is one row. When two readings of one account are given,
+// the newer one is the account's reading and the older one is left
+// out: summing both would count the same credits twice.
+//
+// now decides which batches count: one that has run out is out. It is
+// also what an expired reading is compared with, so that the same
+// reading does not change its state from one call to the next.
 func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
 	s := Summary{UpdatedAt: now}
-	for _, sn := range snaps {
+	var newest time.Time
+	for _, sn := range newestPerAccount(snaps) {
 		au := AccountUsage{ID: sn.AccountID}
-		if !sn.HasAmounts {
+		switch {
+		case !sn.HasAmounts:
+			// The credits could not be read: the account is left out
+			// of the totals rather than counted as zero.
+			au.State = StateUnavailable
 			s.AccountsUnavailable++
-			s.Accounts = append(s.Accounts, au)
-			continue
-		}
-		if sn.ExpiresAt.IsZero() || sn.ExpiresAt.After(now) {
+		case !sn.ExpiresAt.IsZero() && !sn.ExpiresAt.After(now):
+			// The credits were read and every one of them has run
+			// out. The account has nothing left, which is not the
+			// same as an account whose credits are unknown.
+			au.State = StateExpired
+			s.AccountsExpired++
+			g, c, r := sn.Granted, sn.Consumed, sn.Remaining
+			au.Granted, au.Consumed, au.Remaining = &g, &c, &r
+			t := sn.ExpiresAt
+			au.ExpiresAt = &t
+		default:
+			au.State = StateRead
 			g, c, r := sn.Granted, sn.Consumed, sn.Remaining
 			au.Granted, au.Consumed, au.Remaining = &g, &c, &r
 			s.TotalGranted += g
@@ -8862,10 +9728,55 @@ func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
 				}
 			}
 		}
+		if sn.CreatedAt.After(newest) {
+			newest = sn.CreatedAt
+		}
 		s.Accounts = append(s.Accounts, au)
+	}
+	if !newest.IsZero() {
+		s.UpdatedAt = newest
 	}
 	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].ID < s.Accounts[j].ID })
 	return s
+}
+
+// newestPerAccount gives each account's newest snapshot.
+//
+// The newest is the one that was read last: the later reading wins,
+// and a reading that shares its millisecond with another is told from
+// it by the id, which grows with every row written.
+func newestPerAccount(snaps []store.UsageSnapshot) []store.UsageSnapshot {
+	byAccount := make(map[string]store.UsageSnapshot, len(snaps))
+	at := make(map[string]int, len(snaps))
+	order := make([]string, 0, len(snaps))
+	for i, sn := range snaps {
+		cur, ok := byAccount[sn.AccountID]
+		if !ok {
+			byAccount[sn.AccountID] = sn
+			at[sn.AccountID] = i
+			order = append(order, sn.AccountID)
+			continue
+		}
+		// Two readings that cannot be told apart are the later one's:
+		// they are the same reading, so either will do.
+		if newer(sn, cur) || (sn.ID == cur.ID && i > at[sn.AccountID]) {
+			byAccount[sn.AccountID] = sn
+			at[sn.AccountID] = i
+		}
+	}
+	out := make([]store.UsageSnapshot, 0, len(order))
+	for _, id := range order {
+		out = append(out, byAccount[id])
+	}
+	return out
+}
+
+// newer says a reading is newer than another.
+func newer(a, b store.UsageSnapshot) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+	return a.ID > b.ID
 }
 ```
 

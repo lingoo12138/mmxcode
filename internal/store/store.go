@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -80,7 +81,17 @@ type UsageSnapshot struct {
 	PlanUntil   time.Time
 	WindowsJSON string
 	Balance     string
-	CreatedAt   time.Time
+	// MembershipError says the membership could not be read.
+	//
+	// It is kept, because a plan that could not be read is not a plan
+	// without a group: the windows are asked for under that group.
+	MembershipError string
+	// WindowsError says the plan's windows could not be read.
+	//
+	// It is kept, because a plan whose windows could not be read is
+	// not a plan without windows.
+	WindowsError string
+	CreatedAt    time.Time
 }
 
 // Exhausted is one account's spent window.
@@ -133,7 +144,60 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// A file that was made before these columns were added does not
+	// get them from CREATE TABLE IF NOT EXISTS, so they are added
+	// here.
+	for _, col := range []struct{ table, name, decl string }{
+		{"usage_snapshots", "membership_error", "TEXT"},
+		{"usage_snapshots", "windows_error", "TEXT"},
+	} {
+		if err := s.addColumn(ctx, col.table, col.name, col.decl); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// addColumn adds a column to a table, unless the table already has it.
+func (s *Store) addColumn(ctx context.Context, table, name, decl string) error {
+	have, err := s.columnExists(ctx, table, name)
+	if err != nil {
+		return err
+	}
+	if have {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl)); err != nil {
+		return fmt.Errorf("migrate: add column %s.%s: %w", table, name, err)
+	}
+	return nil
+}
+
+// columnExists says whether a table has a column.
+func (s *Store) columnExists(ctx context.Context, table, name string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, fmt.Errorf("migrate: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			colName string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("migrate: %w", err)
+		}
+		if strings.EqualFold(colName, name) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func ms(t time.Time) int64 {
@@ -361,6 +425,10 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 // the amounts the three numbers are NULL, so the reader can tell "no
 // idea" from "nothing left" -- and an account with no idea is not an
 // account with nothing left.
+//
+// The errors of the parts that could not be read are written down with
+// it: a plan whose windows could not be read is not a plan without
+// windows, and the reader has to be able to tell them apart.
 func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 	var granted, consumed, remaining any
 	if u.HasAmounts {
@@ -368,24 +436,50 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO usage_snapshots (account_id, granted, consumed, remaining,
-			expires_at, plan, plan_until, windows_json, balance, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			expires_at, plan, plan_until, windows_json, balance,
+			membership_error, windows_error, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		u.AccountID, granted, consumed, remaining, ms(u.ExpiresAt),
-		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance, ms(u.CreatedAt))
+		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance,
+		u.MembershipError, u.WindowsError, ms(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("save usage snapshot: %w", err)
 	}
 	return nil
 }
 
+// usageSnapshotColumns gives the columns of a usage snapshot, in the
+// order scanUsageSnapshot reads them.
+//
+// The prefix names the table the columns come from: a join needs it,
+// or the column names are ambiguous.
+func usageSnapshotColumns(prefix string) string {
+	cols := []string{
+		"id", "account_id", "granted", "consumed", "remaining", "expires_at",
+		"plan", "plan_until", "windows_json", "balance",
+		"membership_error", "windows_error", "created_at",
+	}
+	if prefix != "" {
+		for i := range cols {
+			cols[i] = prefix + "." + cols[i]
+		}
+	}
+	return strings.Join(cols, ", ")
+}
+
 // LatestUsageSnapshots gives each account's newest usage reading.
+//
+// The newest is the row with the greatest id. Two readings of one
+// account can share a millisecond, and the timestamp alone would then
+// name two rows -- and both would be summed, so the account's credits
+// would be counted twice. The id grows with every row written, so it
+// tells the readings apart, and there is one row per account, always.
 func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.id, s.account_id, s.granted, s.consumed, s.remaining, s.expires_at,
-			s.plan, s.plan_until, s.windows_json, s.balance, s.created_at
+		SELECT `+usageSnapshotColumns("s")+`
 		FROM usage_snapshots s
-		JOIN (SELECT account_id, MAX(created_at) AS mx FROM usage_snapshots GROUP BY account_id)
-			m ON m.account_id = s.account_id AND m.mx = s.created_at
+		JOIN (SELECT account_id, MAX(id) AS mid FROM usage_snapshots GROUP BY account_id)
+			m ON m.account_id = s.account_id AND m.mid = s.id
 		ORDER BY s.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("latest usage snapshots: %w", err)
@@ -393,31 +487,65 @@ func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, erro
 	defer rows.Close()
 	var out []UsageSnapshot
 	for rows.Next() {
-		var (
-			u                            UsageSnapshot
-			granted, consumed, remaining sql.NullFloat64
-			expiresAt                    sql.NullInt64
-			plan, windowsJSON, balance   sql.NullString
-			planUntil                    sql.NullInt64
-			createdAt                    int64
-		)
-		if err := rows.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
-			&plan, &planUntil, &windowsJSON, &balance, &createdAt); err != nil {
+		u, err := scanUsageSnapshot(rows)
+		if err != nil {
 			return nil, err
 		}
-		u.Granted = granted.Float64
-		u.Consumed = consumed.Float64
-		u.Remaining = remaining.Float64
-		u.HasAmounts = granted.Valid && consumed.Valid && remaining.Valid
-		u.ExpiresAt = fromMS(expiresAt.Int64)
-		u.Plan = plan.String
-		u.PlanUntil = fromMS(planUntil.Int64)
-		u.WindowsJSON = windowsJSON.String
-		u.Balance = balance.String
-		u.CreatedAt = fromMS(createdAt)
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// LatestUsageSnapshot gives one account's newest usage reading.
+//
+// It is the row with the greatest id, for the same reason as in
+// LatestUsageSnapshots: two readings of one account can share a
+// millisecond.
+//
+// An account that was never read has no reading and no error.
+func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (UsageSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+usageSnapshotColumns("")+`
+		FROM usage_snapshots WHERE account_id=? ORDER BY id DESC LIMIT 1`, accountID)
+	u, err := scanUsageSnapshot(row)
+	if err == sql.ErrNoRows {
+		return UsageSnapshot{}, nil
+	}
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("latest usage snapshot %s: %w", accountID, err)
+	}
+	return u, nil
+}
+
+// scanUsageSnapshot reads one usage snapshot.
+func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
+	var (
+		u                            UsageSnapshot
+		granted, consumed, remaining sql.NullFloat64
+		expiresAt                    sql.NullInt64
+		plan, windowsJSON, balance   sql.NullString
+		membershipErr, windowsErr    sql.NullString
+		planUntil                    sql.NullInt64
+		createdAt                    int64
+	)
+	if err := sc.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
+		&plan, &planUntil, &windowsJSON, &balance, &membershipErr, &windowsErr,
+		&createdAt); err != nil {
+		return UsageSnapshot{}, err
+	}
+	u.Granted = granted.Float64
+	u.Consumed = consumed.Float64
+	u.Remaining = remaining.Float64
+	u.HasAmounts = granted.Valid && consumed.Valid && remaining.Valid
+	u.ExpiresAt = fromMS(expiresAt.Int64)
+	u.Plan = plan.String
+	u.PlanUntil = fromMS(planUntil.Int64)
+	u.WindowsJSON = windowsJSON.String
+	u.Balance = balance.String
+	u.MembershipError = membershipErr.String
+	u.WindowsError = windowsErr.String
+	u.CreatedAt = fromMS(createdAt)
+	return u, nil
 }
 
 // SetExhausted marks an account's window as spent until a time.
@@ -567,6 +695,31 @@ func MarshalWindows(v any) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// checkinZone is the timezone a check-in day is counted in.
+//
+// The site counts its days in China, so a day here is that zone's day.
+// The zone is loaded by name, so the name is never ambiguous: "CST" is
+// China Standard Time here and US Central somewhere else. A machine
+// without the timezone database gets the same offset under a name that
+// says what it is.
+var checkinZone = loadCheckinZone()
+
+// loadCheckinZone gives the timezone a check-in day is counted in.
+func loadCheckinZone() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		return loc
+	}
+	return time.FixedZone("UTC+8", 8*3600)
+}
+
+// DayKey is the day a check-in is counted for.
+//
+// The day is the site's day, so that the day rolls over at the same
+// hour for every account, whatever the machine's own timezone is.
+func DayKey(t time.Time) string {
+	return t.In(checkinZone).Format("2006-01-02")
 }
 
 func boolInt(b bool) int {

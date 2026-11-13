@@ -244,11 +244,15 @@ func isDirect(proxyURL string) bool {
 	return strings.EqualFold(strings.TrimSpace(proxyURL), Direct)
 }
 
-// redacted is a proxy URL as it may be shown.
+// Redacted is a proxy URL as it may be shown.
 //
 // The credentials are taken out: they are a secret, and the health
-// check's error is stored in the database.
-func redacted(proxyURL string) string {
+// check's error is stored in the database. The scheme, the host and
+// the port stay, so that one address can still be told from another.
+//
+// An address without a scheme has no credentials to take out of it, so
+// it is left as it is.
+func Redacted(proxyURL string) string {
 	s := strings.TrimSpace(proxyURL)
 	i := strings.Index(s, "://")
 	if i < 0 {
@@ -291,10 +295,10 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 	}
 	u, err := url.Parse(strings.TrimSpace(proxyURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy %q: %w", redacted(proxyURL), err)
+		return nil, fmt.Errorf("parse proxy %q: %w", Redacted(proxyURL), err)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("proxy %q: no host, write an address like http://host:port", redacted(proxyURL))
+		return nil, fmt.Errorf("proxy %q: no host, write an address like http://host:port", Redacted(proxyURL))
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
@@ -302,7 +306,7 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		return base, nil
 	case "socks5", "socks5h":
 		if u.Port() == "" {
-			return nil, fmt.Errorf("proxy %q: no port, write an address like socks5h://host:port", redacted(proxyURL))
+			return nil, fmt.Errorf("proxy %q: no port, write an address like socks5h://host:port", Redacted(proxyURL))
 		}
 		var auth *proxy.Auth
 		if u.User != nil {
@@ -311,11 +315,11 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		}
 		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
 		if err != nil {
-			return nil, fmt.Errorf("socks5 proxy %q: %w", redacted(proxyURL), err)
+			return nil, fmt.Errorf("socks5 proxy %q: %w", Redacted(proxyURL), err)
 		}
 		ctxDialer, ok := dialer.(proxy.ContextDialer)
 		if !ok {
-			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", redacted(proxyURL))
+			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", Redacted(proxyURL))
 		}
 		base.DialContext = ctxDialer.DialContext
 		base.Proxy = nil
@@ -323,9 +327,9 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 	case "":
 		// 没有 scheme 就不是一个地址。默默直连是最坏的一种错：它
 		// 看起来跑通了，其实请求根本没走代理。
-		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", redacted(proxyURL))
+		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", Redacted(proxyURL))
 	default:
-		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", redacted(proxyURL), u.Scheme)
+		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", Redacted(proxyURL), u.Scheme)
 	}
 }
 
@@ -367,7 +371,7 @@ func (r *Resolver) Check(ctx context.Context, proxyURL, target string) error {
 	// itself, and a redirect says the target is somewhere else. It is
 	// not a failure either — the proxy did carry the request through.
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return fmt.Errorf("proxy %q: HTTP %d", redacted(proxyURL), resp.StatusCode)
+		return fmt.Errorf("proxy %q: HTTP %d", Redacted(proxyURL), resp.StatusCode)
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/site"
@@ -190,12 +191,13 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"Email":         a.Email,
 			"Status":        a.Status,
 			"ProxyGroup":    a.ProxyGroup,
-			"ProxyURL":      a.ProxyURL,
+			"ProxyURL":      egress.Redacted(a.ProxyURL),
 			"Current":       a.ProxyGroup,
 			"HasAmounts":    snap.HasAmounts,
 			"Granted":       snap.Granted,
 			"Remaining":     snap.Remaining,
 			"Plan":          snap.Plan,
+			"WindowsError":  snap.WindowsError,
 			"WindowSummary": w.windowSummary(ctx, a.ID),
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
@@ -233,7 +235,7 @@ func (w *WebUI) windowSummary(ctx context.Context, accountID string) string {
 
 // todayCheckin says whether the account has checked in today.
 func (w *WebUI) todayCheckin(ctx context.Context, accountID string) (bool, int) {
-	day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	day := store.DayKey(time.Now())
 	list, err := w.Store.ListCheckins(ctx, accountID, 5)
 	if err != nil {
 		return false, 0
@@ -260,7 +262,7 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	for name, url := range w.Cfg.Proxy.Groups {
 		h, ok := byURL[url]
 		out = append(out, map[string]any{
-			"Name": name, "URL": url,
+			"Name": name, "URL": egress.Redacted(url),
 			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
 		})
 	}
@@ -501,7 +503,14 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			a.ProxyGroup = *body.ProxyGroup
 		}
 		if body.ProxyURL != nil {
-			a.ProxyURL = *body.ProxyURL
+			// The page shows the address without its credentials, so
+			// the address that comes back unchanged is the one that
+			// is stored, and not the redacted one. An address the
+			// user really changed is written as it is.
+			shown := egress.Redacted(a.ProxyURL)
+			if *body.ProxyURL != shown || shown == a.ProxyURL {
+				a.ProxyURL = *body.ProxyURL
+			}
 		}
 		a.UpdatedAt = time.Now()
 		if err := w.Store.UpdateAccount(r.Context(), a); err != nil {

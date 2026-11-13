@@ -28,6 +28,18 @@ import (
 // not documented, so a stalled one gets little of that.
 const modelsTimeout = 10 * time.Second
 
+// The credit types the plan counts.
+//
+// The ledger writes them as plain numbers, and the plan counts only
+// these two: what was bought and what a check-in gave. Another type is
+// a bucket the plan does not count.
+const (
+	// CreditTypePurchase is a batch that was bought.
+	CreditTypePurchase = 1
+	// CreditTypeCheckin is a batch that a check-in gave.
+	CreditTypeCheckin = 2
+)
+
 // Identity is who the account is.
 type Identity struct {
 	// RealUserID is the MiniMax user id.
@@ -43,7 +55,9 @@ type Identity struct {
 // The site writes the amounts as strings, sometimes with a thousands
 // separator, so they are kept as they come and read by ParseAmount.
 type Batch struct {
-	// CreditType is 1 for a purchase, 2 for a check-in.
+	// CreditType is CreditTypePurchase or CreditTypeCheckin for the
+	// batches the plan counts. Another type is a bucket the plan does
+	// not count.
 	CreditType int `json:"credit_type"`
 	// GrantedAmount is what the batch gave.
 	GrantedAmount string `json:"granted_amount"`
@@ -432,14 +446,19 @@ func (l ledgerBatch) batch() Batch {
 
 // Ledger reads every batch of credits.
 //
-// A page that can't be read whole gives nil: a part of the ledger
+// A ledger that was read and is empty gives an empty list: the account
+// has no credits, which is not the same as a ledger that could not be
+// read. A ledger that cannot be read gives nil: a part of the ledger
 // would tell a wrong share. So does a batch whose amounts cannot be
 // read: the credits cannot be told apart then, and none is better
 // than a wrong share.
 func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, error) {
 	const pageSize = 20
 	const maxPages = 10
-	var out []Batch
+	// The list starts empty and not nil: a ledger that was read and is
+	// empty is an empty list, and a nil one would say the ledger could
+	// not be read.
+	out := []Batch{}
 	for page := 1; page <= maxPages; page++ {
 		query := append(append([]QueryKV{}, CheckinQuery()...),
 			QueryKV{K: "page_number", V: strconv.Itoa(page)},
@@ -466,11 +485,12 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 			details, total = env.Data.Details, env.Data.TotalCount
 		}
 		if total == nil {
+			// The answer is not a ledger: it cannot be read.
 			return nil, nil
 		}
 		for _, lb := range details {
 			b := lb.batch()
-			if b.CreditType == 1 || b.CreditType == 2 {
+			if b.CreditType == CreditTypePurchase || b.CreditType == CreditTypeCheckin {
 				granted, ok1 := ParseAmount(b.GrantedAmount, false)
 				remaining, ok2 := ParseAmount(b.RemainingAmount, true)
 				if !ok1 || !ok2 {
@@ -488,11 +508,13 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 		}
 		if len(out) >= *total || len(details) == 0 {
 			if len(out) < *total {
+				// The answer says there is more than it gave.
 				return nil, nil
 			}
 			return out, nil
 		}
 	}
+	// Too many pages: the ledger was not read whole.
 	return nil, nil
 }
 

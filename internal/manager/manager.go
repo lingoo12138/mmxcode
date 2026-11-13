@@ -32,6 +32,14 @@ import (
 // access tokens that live an hour.
 const renewWindow = 10 * time.Minute
 
+// accountTimeout is how long the account API is waited for.
+//
+// The account API answers in a moment: the membership, the ledger and
+// the plan's windows are three small answers. A stalled one gets
+// little of that, so that one account's reading does not hold up the
+// others'.
+const accountTimeout = 5 * time.Second
+
 // Manager holds the gateway's accounts.
 type Manager struct {
 	// Store is the database.
@@ -77,11 +85,18 @@ func (m *Manager) Token(ctx context.Context, accountID string) (*oauth.Token, er
 	if err != nil {
 		return nil, fmt.Errorf("account %s is not signed in", accountID)
 	}
+	if stored.Access == "" && stored.Refresh == "" {
+		// The sign-in was taken away: the site has refused it. There
+		// is nothing to send, so the account fails here instead of
+		// paying for a renewal that cannot work.
+		return nil, fmt.Errorf("account %s is signed out", accountID)
+	}
 	cur := &oauth.Token{
-		Access:  stored.Access,
-		Refresh: stored.Refresh,
-		Expires: stored.ExpiresAt,
-		Subject: stored.Subject,
+		AccountID: accountID,
+		Access:    stored.Access,
+		Refresh:   stored.Refresh,
+		Expires:   stored.ExpiresAt,
+		Subject:   stored.Subject,
 	}
 	if cur.Expires.After(time.Now().Add(renewWindow)) {
 		return cur, nil
@@ -103,7 +118,13 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 	if err != nil {
 		var oe *oauth.Error
 		if asOAuthError(err, &oe) && oe.IsSignedOut() {
-			m.markSignedOut(ctx, accountID, err.Error())
+			// The sign-out has to be written down. An account that
+			// stays active with a token the site has refused is
+			// handed out again and again, and every request pays for
+			// a renewal that cannot work.
+			if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
+			}
 		}
 		return nil, err
 	}
@@ -124,32 +145,63 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 // near its end.
 //
 // It is what the gateway does when the site answers 401.
+//
+// The renewer is not told to forget the account. The token it holds
+// may be newer than the one in the store -- a renewal that worked but
+// whose writing failed leaves the store behind -- and it is the only
+// way out of that: the refresh token in the store is spent, and a spent
+// refresh token must not be sent again.
 func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Token, error) {
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("account %s is not signed in", accountID)
 	}
-	cur := &oauth.Token{
-		Access:  stored.Access,
-		Refresh: stored.Refresh,
-		Expires: stored.ExpiresAt,
-		Subject: stored.Subject,
+	if stored.Access == "" && stored.Refresh == "" {
+		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
-	// 让 renewer 忘记旧链，用库里那份 refresh 重新走一次
-	m.Renewer.Forget(accountID)
+	cur := &oauth.Token{
+		AccountID: accountID,
+		Access:    stored.Access,
+		Refresh:   stored.Refresh,
+		Expires:   stored.ExpiresAt,
+		Subject:   stored.Subject,
+	}
 	return m.Renew(ctx, accountID, cur)
 }
 
 // markSignedOut records that an account's sign-in is gone.
-func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) {
+//
+// The sign-in is taken away as well: an account whose sign-in the site
+// has refused must not keep a token that every request would try to
+// renew.
+//
+// The error is not swallowed: a sign-out that could not be written
+// down is an account that stays active with a token the site refuses.
+func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) error {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
-		return
+		return err
 	}
 	a.Status = store.StatusSignedOut
 	a.LastError = reason
 	a.UpdatedAt = time.Now()
-	_ = m.Store.UpdateAccount(ctx, a)
+	if err := m.Store.UpdateAccount(ctx, a); err != nil {
+		return err
+	}
+	// The token row is blanked: the sign-in is gone, so the token is
+	// of no use, and keeping it would send the account back to the
+	// site for a renewal that was already refused.
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: accountID,
+		UpdatedAt: time.Now(),
+	}); err != nil {
+		return err
+	}
+	// The renewer forgets the account too: a signed-out account must
+	// not be able to renew, and a token of the old sign-in must not be
+	// waiting when the account signs in again.
+	m.Renewer.Forget(accountID)
+	return nil
 }
 
 // accFor gives the account API client an account's calls go out with.
@@ -165,11 +217,15 @@ func (m *Manager) accFor(a store.Account) (*account.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.Acc.With(upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: tr})), nil
+	return m.Acc.With(upstream.New(upstream.Options{Timeout: accountTimeout, Transport: tr})), nil
 }
 
 // Client gives the HTTP client an account's requests go out with, and
 // the address of that way out.
+//
+// The address is redacted: it is shown to the user, and the proxy's
+// credentials are a secret. The client itself carries the real
+// address, so nothing is lost by hiding it here.
 func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, string, error) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
@@ -178,9 +234,9 @@ func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, s
 	url := m.Egress.Resolve(a)
 	c, err := m.Egress.Client(url)
 	if err != nil {
-		return nil, url, err
+		return nil, egress.Redacted(url), err
 	}
-	return c, url, nil
+	return c, egress.Redacted(url), nil
 }
 
 // RefreshUsage reads an account's credits and windows and saves them.
@@ -191,6 +247,10 @@ func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, s
 // A refused sign-in is not a missing reading: the account is marked
 // signed out, so that a plan that could not be read is not mistaken
 // for a plan without windows.
+//
+// A reading that failed is written down as well: the snapshot of the
+// failed reading says so, so the numbers of the reading before it are
+// not passed off as current.
 func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
@@ -214,21 +274,50 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		snap.Balance = mem.Balance
 		snap.PlanUntil = mem.ExpiresAt
 		group = mem.GroupID
-	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+	} else {
+		// The error is kept: a membership that could not be read is
+		// not a membership without a group, and the windows are
+		// asked for under that group.
+		snap.MembershipError = err.Error()
+		if isRefusal(err) {
+			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+				return store.UsageSnapshot{}, err
+			}
+		}
 	}
 
 	batches, err := acc.Ledger(ctx, tok.Access, a.UserID)
 	if err != nil {
-		return store.UsageSnapshot{}, err
+		// The reading failed. It is written down, so that a consumer
+		// can say "the last reading of this account failed" instead
+		// of showing the numbers of the reading before it as if they
+		// were current.
+		snap.HasAmounts = false
+		if sErr := m.Store.SaveUsageSnapshot(ctx, snap); sErr != nil {
+			return store.UsageSnapshot{}, errors.Join(err, sErr)
+		}
+		return snap, err
+	}
+	if batches == nil {
+		// The ledger could not be read. The credits are unknown, and
+		// an unknown share is not a share of zero. The reading is
+		// written down all the same, so that it is known to have
+		// failed.
+		snap.HasAmounts = false
+		if sErr := m.Store.SaveUsageSnapshot(ctx, snap); sErr != nil {
+			return store.UsageSnapshot{}, sErr
+		}
+		return snap, nil
 	}
 	now := time.Now()
 	var granted, consumed, remaining float64
-	have := false
+	live := false
 	unknown := false
+	expired := false
 	var soonest time.Time
+	var lastExpiry time.Time
 	for _, b := range batches {
-		if b.CreditType != 1 && b.CreditType != 2 {
+		if b.CreditType != account.CreditTypePurchase && b.CreditType != account.CreditTypeCheckin {
 			// A bucket the plan does not count.
 			continue
 		}
@@ -240,28 +329,43 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 			break
 		}
 		if !b.ExpiresAt.After(now) {
-			// Expired.
+			// The batch has run out. That is not a loss: the
+			// account's credits ran out, which is not the same as
+			// the credits being unknown.
+			expired = true
+			if b.ExpiresAt.After(lastExpiry) {
+				lastExpiry = b.ExpiresAt
+			}
 			continue
 		}
 		granted += b.Granted
 		consumed += b.Consumed
 		remaining += b.Remaining
-		have = true
+		live = true
 		if soonest.IsZero() || b.ExpiresAt.Before(soonest) {
 			soonest = b.ExpiresAt
 		}
 	}
-	if unknown {
+	switch {
+	case unknown:
 		// A part of the ledger would tell a wrong share, so no
 		// share is told at all.
-		have = false
-	}
-	if have {
+		snap.HasAmounts = false
+	default:
+		// The ledger was read: the account has what it has. A ledger
+		// with nothing live in it means the account has no credits
+		// left, which is not the same as a ledger that could not be
+		// read.
 		snap.HasAmounts = true
-		snap.Granted = granted
-		snap.Consumed = consumed
-		snap.Remaining = remaining
-		snap.ExpiresAt = soonest
+		snap.Granted, snap.Consumed, snap.Remaining = granted, consumed, remaining
+		switch {
+		case live:
+			snap.ExpiresAt = soonest
+		case expired:
+			// Every batch had run out: the account ran out at this
+			// time, and the summary can say so.
+			snap.ExpiresAt = lastExpiry
+		}
 	}
 
 	if ws, err := acc.PlanWindows(ctx, tok.Access, group); err == nil {
@@ -270,13 +374,23 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 				snap.WindowsJSON = string(b)
 			}
 		}
-	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+	} else {
+		// The error is kept: a plan whose windows could not be read
+		// is not a plan without windows, and the caller decides what
+		// to do with the account.
+		snap.WindowsError = err.Error()
+		if isRefusal(err) {
+			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+				return store.UsageSnapshot{}, err
+			}
+		}
 	}
 	if title, err := acc.PlanTitle(ctx, tok.Access, group); err == nil {
 		snap.Plan = title
 	} else if isRefusal(err) {
-		m.markSignedOut(ctx, accountID, err.Error())
+		if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			return store.UsageSnapshot{}, err
+		}
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
@@ -303,7 +417,7 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
-	day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	day := store.DayKey(time.Now())
 	_ = m.Store.SaveCheckin(ctx, store.Checkin{
 		AccountID: accountID,
 		Day:       day,
@@ -317,22 +431,28 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 }
 
 // LatestWindows gives an account's saved windows.
+//
+// It is the windows of the account's newest reading: an earlier
+// reading's windows are not looked at. When that reading could not
+// read the windows, the error is given: a plan whose windows could
+// not be read is not a plan without windows, and the caller decides
+// what to do with the account.
 func (m *Manager) LatestWindows(ctx context.Context, accountID string) ([]account.Window, error) {
-	snaps, err := m.Store.LatestUsageSnapshots(ctx)
+	snap, err := m.Store.LatestUsageSnapshot(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-	for _, s := range snaps {
-		if s.AccountID != accountID || s.WindowsJSON == "" {
-			continue
-		}
-		var ws []account.Window
-		if err := json.Unmarshal([]byte(s.WindowsJSON), &ws); err != nil {
-			return nil, err
-		}
-		return ws, nil
+	if snap.WindowsError != "" {
+		return nil, fmt.Errorf("the plan's windows could not be read: %s", snap.WindowsError)
 	}
-	return nil, nil
+	if snap.WindowsJSON == "" {
+		return nil, nil
+	}
+	var ws []account.Window
+	if err := json.Unmarshal([]byte(snap.WindowsJSON), &ws); err != nil {
+		return nil, err
+	}
+	return ws, nil
 }
 
 // asOAuthError unwraps an error into an OAuth error.

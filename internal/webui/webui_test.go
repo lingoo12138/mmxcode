@@ -166,3 +166,91 @@ func TestAPIDeleteAccount(t *testing.T) {
 		t.Fatal("the account is still there")
 	}
 }
+
+// TestAPIAccountsHideTheProxyCredentials says the account list does not
+// carry the proxy's credentials.
+//
+// 账号列表是要给人看的，代理的账号密码不能跟着出去。
+func TestAPIAccountsHideTheProxyCredentials(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "secret") {
+		t.Fatalf("the credentials are in the answer: %s", body)
+	}
+	if !strings.Contains(body, "127.0.0.1:7890") {
+		t.Fatalf("the address is not there either: %s", body)
+	}
+}
+
+// TestAccountsPageHideTheProxyCredentials says the page does not carry
+// the proxy's credentials either.
+func TestAccountsPageHideTheProxyCredentials(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "secret") {
+		t.Fatalf("the credentials are in the page: %s", rec.Body.String())
+	}
+}
+
+// TestPatchKeepsTheProxyBehindTheShownAddress says the address the page
+// shows is not written over the one that is stored.
+//
+// 页面上看到的是没有凭据的地址，它原样回去的时候不能把存着的凭据抹掉。
+func TestPatchKeepsTheProxyBehindTheShownAddress(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ProxyURL = "http://user:secret@127.0.0.1:7890"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.NewReader(`{"proxy_url":"http://***@127.0.0.1:7890"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01", body)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyURL != "http://user:secret@127.0.0.1:7890" {
+		t.Fatalf("proxy_url = %q, want the one that is stored", got.ProxyURL)
+	}
+}

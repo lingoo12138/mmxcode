@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS usage_snapshots (
   plan_until  INTEGER,
   windows_json TEXT,
   balance     TEXT,
+  membership_error TEXT,
+  windows_error TEXT,
   created_at  INTEGER NOT NULL
 );
 

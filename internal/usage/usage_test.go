@@ -7,6 +7,21 @@ import (
 	"mmxcode/internal/store"
 )
 
+// accountOf gives the entry of one account.
+//
+// The accounts are sorted by id, but a test that counts on the order
+// breaks when an account is added: the account is asked for by name.
+func accountOf(t *testing.T, s Summary, id string) AccountUsage {
+	t.Helper()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			return a
+		}
+	}
+	t.Fatalf("no entry for %s in %+v", id, s.Accounts)
+	return AccountUsage{}
+}
+
 func TestAggregate(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	snaps := []store.UsageSnapshot{
@@ -14,11 +29,13 @@ func TestAggregate(t *testing.T) {
 			AccountID: "acc_01", HasAmounts: true,
 			Granted: 600, Consumed: 120.5, Remaining: 479.5,
 			ExpiresAt: now.Add(48 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
 		},
 		{
 			AccountID: "acc_02", HasAmounts: true,
 			Granted: 300, Consumed: 0, Remaining: 300,
 			ExpiresAt: now.Add(24 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
 		},
 	}
 	s := Aggregate(snaps, now)
@@ -37,6 +54,17 @@ func TestAggregate(t *testing.T) {
 	if len(s.Accounts) != 2 {
 		t.Fatalf("accounts = %d", len(s.Accounts))
 	}
+	a1 := accountOf(t, s, "acc_01")
+	if a1.Granted == nil || *a1.Granted != 600 {
+		t.Fatalf("acc_01 = %+v", a1)
+	}
+	if a1.State != StateRead {
+		t.Fatalf("acc_01 state = %q, want %q", a1.State, StateRead)
+	}
+	a2 := accountOf(t, s, "acc_02")
+	if a2.Remaining == nil || *a2.Remaining != 300 {
+		t.Fatalf("acc_02 = %+v", a2)
+	}
 }
 
 func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
@@ -52,8 +80,12 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 	if s.AccountsUnavailable != 1 {
 		t.Fatalf("unavailable = %d, want 1", s.AccountsUnavailable)
 	}
-	if s.Accounts[1].Granted != nil {
+	a := accountOf(t, s, "acc_02")
+	if a.Granted != nil {
 		t.Fatal("an account without amounts must not carry a number")
+	}
+	if a.State != StateUnavailable {
+		t.Fatalf("state = %q, want %q", a.State, StateUnavailable)
 	}
 }
 
@@ -64,5 +96,152 @@ func TestAggregateEmpty(t *testing.T) {
 	}
 	if s.ExpiresAt != nil {
 		t.Fatal("no expiry without accounts")
+	}
+}
+
+// TestAggregateCountsAnAccountOnce says two readings of one account are
+// one account.
+//
+// 同一个账号的两行读数都被加起来，积分就翻倍：一个 100 积分的账号
+// 会被报成 300。
+func TestAggregateCountsAnAccountOnce(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			ID: 1, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+		{
+			// 同一毫秒里的第二次刷新
+			ID: 2, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 100 {
+		t.Fatalf("granted = %v, want 100: one account is one account", s.TotalGranted)
+	}
+	if s.TotalRemaining != 100 {
+		t.Fatalf("remaining = %v, want 100", s.TotalRemaining)
+	}
+	if len(s.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(s.Accounts))
+	}
+}
+
+// TestAggregateKeepsTheNewestReading says the newer reading of an
+// account is the one that counts.
+func TestAggregateKeepsTheNewestReading(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			ID: 1, AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 0, Remaining: 100,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now.Add(-time.Minute),
+		},
+		{
+			ID: 2, AccountID: "acc_01", HasAmounts: true,
+			Granted: 300, Consumed: 0, Remaining: 300,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 300 {
+		t.Fatalf("granted = %v, want 300: the newest reading counts", s.TotalGranted)
+	}
+	if len(s.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(s.Accounts))
+	}
+}
+
+// TestAggregateTellsExpiredFromUnread says an account whose credits ran
+// out and an account whose credits were never read are not the same.
+//
+// 两个都说成“读不到”，总数就短了一截，却没有人知道为什么。
+func TestAggregateTellsExpiredFromUnread(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 100, Consumed: 100, Remaining: 0,
+			ExpiresAt: now.Add(-time.Hour), CreatedAt: now,
+		},
+		{
+			AccountID: "acc_02", HasAmounts: false, CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.TotalGranted != 0 {
+		t.Fatalf("granted = %v, want 0: expired credits are not counted", s.TotalGranted)
+	}
+	if s.AccountsExpired != 1 {
+		t.Fatalf("expired = %d, want 1", s.AccountsExpired)
+	}
+	if s.AccountsUnavailable != 1 {
+		t.Fatalf("unavailable = %d, want 1", s.AccountsUnavailable)
+	}
+	expired := accountOf(t, s, "acc_01")
+	if expired.State != StateExpired {
+		t.Fatalf("acc_01 state = %q, want %q", expired.State, StateExpired)
+	}
+	if expired.ExpiresAt == nil {
+		t.Fatal("an expired reading has to say when it ran out")
+	}
+	unread := accountOf(t, s, "acc_02")
+	if unread.State != StateUnavailable {
+		t.Fatalf("acc_02 state = %q, want %q", unread.State, StateUnavailable)
+	}
+	if unread.Granted != nil {
+		t.Fatal("a reading that never happened has no numbers")
+	}
+}
+
+// TestAggregateTellsZeroFromUnread says an account with nothing left is
+// not an account that was never read.
+//
+// 真的 0 和读不到不是一回事：读不到的账号不计入总数，真的 0 计入。
+func TestAggregateTellsZeroFromUnread(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 0, Consumed: 0, Remaining: 0, CreatedAt: now,
+		},
+	}
+	s := Aggregate(snaps, now)
+	if s.AccountsUnavailable != 0 {
+		t.Fatalf("unavailable = %d, want 0: a zero is not an unknown", s.AccountsUnavailable)
+	}
+	if s.AccountsExpired != 0 {
+		t.Fatalf("expired = %d, want 0", s.AccountsExpired)
+	}
+	a := accountOf(t, s, "acc_01")
+	if a.State != StateRead {
+		t.Fatalf("state = %q, want %q", a.State, StateRead)
+	}
+	if a.Remaining == nil || *a.Remaining != 0 {
+		t.Fatalf("acc_01 = %+v, want a zero that is there", a)
+	}
+}
+
+// TestAggregateUpdatedAtIsTheReadingTime says the summary says when
+// the numbers were read, not when the summary was made.
+//
+// 汇总时间当成读数时间，陈旧的数字看起来就是新的。
+func TestAggregateUpdatedAtIsTheReadingTime(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	read := now.Add(-2 * time.Minute)
+	s := Aggregate([]store.UsageSnapshot{
+		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: read},
+	}, now)
+	if !s.UpdatedAt.Equal(read) {
+		t.Fatalf("updated_at = %v, want the reading time %v", s.UpdatedAt, read)
+	}
+	// 没有读数时退回汇总时间
+	empty := Aggregate(nil, now)
+	if !empty.UpdatedAt.Equal(now) {
+		t.Fatalf("updated_at = %v, want %v", empty.UpdatedAt, now)
 	}
 }

@@ -339,6 +339,30 @@ func TestTheCredentialsAreNotInTheErrorText(t *testing.T) {
 	}
 }
 
+// TestRedacted says the credentials are taken out of an address that is
+// shown, and the rest of it stays.
+//
+// 地址要给用户看，凭据是秘密：换掉凭据，scheme、主机和端口都还在。
+func TestRedacted(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://user:secret@host:1080", "http://***@host:1080"},
+		{"socks5h://user:secret@host:1080", "socks5h://***@host:1080"},
+		{"http://user@host:1080", "http://***@host:1080"},
+		{"http://host:1080", "http://host:1080"},
+		{"direct", "direct"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got := Redacted(c.in)
+		if got != c.want {
+			t.Fatalf("Redacted(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if strings.Contains(got, "secret") || strings.Contains(got, "user") {
+			t.Fatalf("Redacted(%q) = %q, want no credentials", c.in, got)
+		}
+	}
+}
+
 func TestCheckTreatsA407AsAFailure(t *testing.T) {
 	// 代理拒绝我们的凭据，就是不能用，不是健康。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -2,8 +2,10 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -449,5 +451,396 @@ func TestRefreshUsageRefusedSignIn(t *testing.T) {
 	}
 	if a.Status != store.StatusSignedOut {
 		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+}
+
+// TestRefreshUsageExpiredBatch says a ledger that was read and has
+// nothing live in it is not a ledger that could not be read.
+//
+// 账本读到了，但里面的批次都已经过期：这是“用完了”，不是“读不到”。
+func TestRefreshUsageExpiredBatch(t *testing.T) {
+	expired := time.Now().Add(-time.Hour).UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":` +
+				fmt.Sprint(expired) + `}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want the reading that was made", snap)
+	}
+	if snap.Remaining != 0 || snap.Granted != 0 {
+		t.Fatalf("snapshot = %+v, want nothing left", snap)
+	}
+	if snap.ExpiresAt.IsZero() {
+		t.Fatal("the reading has to say when the credits ran out")
+	}
+	if snap.ExpiresAt.After(time.Now()) {
+		t.Fatalf("expires_at = %v, want a time in the past", snap.ExpiresAt)
+	}
+}
+
+// TestRefreshUsageEmptyLedger says a ledger that was read and is empty
+// is an account with nothing left, not an account that was never read.
+//
+// 读到空账本是 0，读不到账本是不知道：两回事。
+func TestRefreshUsageEmptyLedger(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":0,"details":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want a reading of zero", snap)
+	}
+	if snap.Remaining != 0 {
+		t.Fatalf("snapshot = %+v, want nothing left", snap)
+	}
+}
+
+// TestRefreshUsageUnreadableLedger says a ledger that cannot be read
+// leaves the credits unknown.
+//
+// 账本读不出来的时候没有数：没有数不是 0。
+func TestRefreshUsageUnreadableLedger(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			// 这一批的数额读不出来，整个账本就读不出来
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"abc","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.HasAmounts {
+		t.Fatalf("snapshot = %+v, want no amounts", snap)
+	}
+	// 存下来的也是没有数的那一份
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HasAmounts {
+		t.Fatalf("stored = %+v, want no amounts", stored)
+	}
+}
+
+// TestRefreshUsageRecordsAFailedReading says a failed reading is
+// written down.
+//
+// 读失败时什么都不写，上一份读数就还是这个账号当前的读数，陈旧的数字
+// 看起来是新的。
+func TestRefreshUsageRecordsAFailedReading(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"the ledger is down"}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	if _, err := m.RefreshUsage(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HasAmounts {
+		t.Fatalf("stored = %+v, want the failed reading", stored)
+	}
+	if stored.CreatedAt.IsZero() {
+		t.Fatal("the failed reading has to say when it was made")
+	}
+}
+
+// TestRefreshUsageKeepsThePlanWindowError says a plan whose windows
+// could not be read is not a plan without windows.
+//
+// 读不到窗口和没有窗口不是一回事：调用方要能分清，不然就会把账号放上
+// 错误的冷却。
+func TestRefreshUsageKeepsThePlanWindowError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend/account/token_plan/remains_percent",
+			"/v1/api/openplatform/coding_plan/remains":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"the console is down"}`))
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	snap, err := m.RefreshUsage(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.WindowsError == "" {
+		t.Fatalf("snapshot = %+v, want the error of the windows", snap)
+	}
+	if snap.WindowsJSON != "" {
+		t.Fatalf("snapshot = %+v, want no windows", snap)
+	}
+	// 读数存下来了，调用方也能问出来
+	stored, err := m.Store.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WindowsError == "" {
+		t.Fatalf("stored = %+v, want the error of the windows", stored)
+	}
+	if _, err := m.LatestWindows(ctx, "acc_01"); err == nil {
+		t.Fatal("the caller has to be told that the windows are unknown")
+	}
+}
+
+// TestForceRenew says a forced renewal gives a new token.
+//
+// 这是网关收到 401 时做的事。
+func TestForceRenew(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.Write([]byte(`{"access_token":"acc2","refresh_token":"ref2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc1", Refresh: "ref1",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	tok, err := m.ForceRenew(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "acc2" {
+		t.Fatalf("token = %+v, want the renewed one", tok)
+	}
+	if len(sent) != 1 || sent[0] != "ref1" {
+		t.Fatalf("the refresh tokens sent = %v, want [ref1]", sent)
+	}
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc2" || stored.Refresh != "ref2" {
+		t.Fatalf("stored = %+v, want the new token", stored)
+	}
+}
+
+// TestForceRenewWalksTheChainWhenTheStoreIsBehind says an account
+// whose store did not get the last renewal can still be renewed.
+//
+// 续期成功了但写库失败时，库里那份 refresh 已经用掉了，renewer 手里
+// 的新 token 是唯一的出路。
+func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.Write([]byte(`{"access_token":"acc3","refresh_token":"ref3","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	// 库里还是老的那份：写库失败了
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc1", Refresh: "ref1",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+	// renewer 手里有更新的一份
+	if _, err := m.Renewer.Renew(ctx, "acc_01",
+		&oauth.Token{AccountID: "acc_01", Access: "acc1", Refresh: "ref1"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{AccountID: "acc_01", Access: "acc2", Refresh: "ref2",
+				Expires: time.Now().Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := m.ForceRenew(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "acc3" {
+		t.Fatalf("token = %+v, want the renewed one", tok)
+	}
+	if len(sent) != 1 || sent[0] != "ref2" {
+		t.Fatalf("the refresh tokens sent = %v, want the newer one [ref2]", sent)
+	}
+}
+
+// TestSignedOutAccountFailsFast says a signed-out account is not
+// handed out with a token the site has refused.
+//
+// 登出的账号要把令牌抹掉，不然每次请求都要白白付一次续期。
+func TestSignedOutAccountFailsFast(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(time.Minute), UpdatedAt: now,
+	})
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "" || stored.Refresh != "" {
+		t.Fatalf("stored = %+v, want the token taken away", stored)
+	}
+	// 再要一次令牌也是错，不会再去续期
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh was sent %d times, want 1", calls)
+	}
+}
+
+// TestClientHidesTheProxyCredentials says the proxy address the manager
+// hands out has no credentials in it.
+func TestClientHidesTheProxyCredentials(t *testing.T) {
+	ctx := context.Background()
+	m := newTestManager(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive,
+		ProxyURL: "http://user:secret@127.0.0.1:7890", CreatedAt: now, UpdatedAt: now,
+	})
+	_, url, err := m.Client(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(url, "secret") {
+		t.Fatalf("url = %q, want no credentials", url)
+	}
+	if !strings.Contains(url, "127.0.0.1:7890") {
+		t.Fatalf("url = %q, want the host and the port", url)
 	}
 }
