@@ -1439,8 +1439,8 @@ Expected: FAIL —— `undefined: Sign`、`undefined: Options`、`undefined: KV`
 // query and the body, and "x-signature" over the time and the body. The
 // secret is MiniMax Code's own.
 //
-// Two details make this different from an ordinary query builder, and
-// both come from how JavaScript does it:
+// Three details make this different from an ordinary query builder, and
+// all three come from how JavaScript does it:
 //
 //   - the query keeps its insertion order. URLSearchParams does not sort
 //     its keys, and the signature is over the encoded text, so the order
@@ -1449,13 +1449,19 @@ Expected: FAIL —— `undefined: Sign`、`undefined: Options`、`undefined: KV`
 //   - the encoding is JavaScript's. URLSearchParams keeps "*-._", encodes
 //     a space as "+" and encodes "~"; encodeURIComponent keeps
 //     "!*'()~", encodes a space as "%20" and does not touch "~". Go's
-//     url.QueryEscape does neither exactly.
+//     url.QueryEscape does neither exactly;
+//   - the path is resolved before it is signed. The reference resolves
+//     the path against the origin with `new URL(path, origin)` and signs
+//     the resolved, percent-encoded path, so a path without a leading
+//     slash, a path with a space in it and a path with a query of its own
+//     all sign something other than what they look like.
 package sign
 
 import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -1475,21 +1481,47 @@ type KV struct {
 type Options struct {
 	// Access is the account's access token, put in Authorization.
 	Access string
-	// UserID is the account's MiniMax user id. An empty one becomes "0".
+	// UserID is the account's MiniMax user id. It is trimmed the way
+	// JavaScript trims a string — the WhiteSpace and LineTerminator
+	// characters, which is not quite what strings.TrimSpace does — and
+	// an empty one becomes "0".
 	UserID string
-	// Body is the request's JSON body. A nil body means a GET.
+	// Body is the request's JSON body. Its bytes go into both hashes
+	// as they are, so the caller must pass exactly the bytes it will
+	// put on the wire. Go's json.Marshal is not JSON.stringify: it
+	// escapes "<", ">" and "&" and it sorts a map's keys, and
+	// JSON.stringify does neither. A body that has to match the
+	// reference byte for byte is built by hand.
+	//
+	// A nil or empty body means a GET.
 	Body []byte
-	// Query holds the caller's extra query parameters, in order. A key
-	// that repeats one of the defaults changes its value and keeps its
-	// place, as the reference's object spread does.
+	// Query holds the caller's extra query parameters, in order.
+	//
+	// The reference builds its query as an object literal with the
+	// caller's query spread into the middle of it, and the two halves
+	// do not treat a repeated key the same way:
+	//
+	//   - the four leading defaults — device_platform, biz_id, app_id
+	//     and version_code — come before the spread, so a repeated key
+	//     takes the caller's value and keeps the caller's place;
+	//   - the trailing defaults — unix, timezone_offset, sys_language,
+	//     lang, device_id, os_name, browser_name, user_id and client —
+	//     come after it, so a repeated key keeps the caller's place but
+	//     takes the reference's value. "lang" and "client" are the
+	//     reference's, "user_id" is the option's.
 	Query []KV
 	// Now is the request's time in Unix milliseconds.
+	//
+	// It is required. There is no default on purpose — a default of
+	// time.Now() would make a signed request unreproducible — and the
+	// zero value signs the Unix epoch, which the server reads as a
+	// stale request.
 	Now int64
 	// TZOffset is the client's timezone offset in seconds.
 	TZOffset int
-	// OSName is the client's platform name.
+	// OSName is the client's platform name. An empty one is "linux".
 	OSName string
-	// Lang is the site's language.
+	// Lang is the site's language. An empty one is the site's own.
 	Lang string
 }
 
@@ -1547,19 +1579,39 @@ func Sign(origin, path string, o Options) Signed {
 	p.set("device_id", "0")
 	p.set("os_name", osName)
 	p.set("browser_name", "mcode")
-	p.set("user_id", strings.TrimSpace(o.UserID))
+	p.set("user_id", jsTrim(o.UserID))
 	if p.get("user_id") == "" {
 		p.set("user_id", "0")
 	}
 	p.set("client", "mcode")
 
 	query := p.encode()
-	at := path + "?" + query
+	target, at := resolveURL(origin, path, query)
 	ts := o.Now / 1000
+	if o.Now < 0 && o.Now%1000 != 0 {
+		// The reference floors the seconds and Go's division truncates
+		// towards zero, so -1500 milliseconds is -2 seconds there and
+		// -1 second here.
+		ts--
+	}
 	nowText := strconv.FormatInt(o.Now, 10)
 
+	// The reference's signed() — packages/minimax/index.mjs of
+	// @magpie-community/opencode-minimax-auth, the one copied verbatim
+	// into testdata/regen-vectors.mjs — builds the two hashes out of
+	// the same parts:
+	//
+	//	yy:          md5(encodeURIComponent(at) + "_" + body + md5(now) + "ooui")
+	//	x-signature: md5(seconds + secret + body)
+	//
+	// The "_" separator, the md5 of the time and the "ooui" salt are
+	// the reference's, verbatim. They read like typos and are not.
 	var yy, signature string
-	if o.Body == nil {
+	if len(o.Body) == 0 {
+		// The reference has no body for a GET, and signs a literal
+		// "{}" in the body's place. The "{}" is the reference's too,
+		// and not a placeholder to be tidied away: dropping it changes
+		// every GET signature.
 		yy = md5Hex(encodeURIComponent(at) + "_" + "{}" + md5Hex(nowText) + "ooui")
 		signature = md5Hex(strconv.FormatInt(ts, 10) + Secret)
 	} else {
@@ -1569,12 +1621,60 @@ func Sign(origin, path string, o Options) Signed {
 	}
 
 	return Signed{
-		URL:       strings.TrimRight(origin, "/") + at,
+		URL:       target,
 		YY:        yy,
 		Timestamp: strconv.FormatInt(ts, 10),
 		Signature: signature,
 		access:    o.Access,
 	}
+}
+
+// resolveURL gives the URL a signed request goes to and the string the
+// reference signs.
+//
+// The reference resolves the path against the origin with
+// `new URL(path, origin)` and signs url.pathname, which is the
+// resolved and percent-encoded path. So a path without a leading slash
+// is resolved against the origin's own path, a space in the path is
+// escaped, and a query in the path is dropped — the reference assigns
+// the defaults to url.search afterwards, and that replaces it.
+//
+// The fragment is left out of the signed string, as it is in the
+// reference, and kept in the URL, as it is there too.
+func resolveURL(origin, path, query string) (target, at string) {
+	base, err := url.Parse(origin)
+	if err != nil || base.Host == "" {
+		// An origin that is not a URL is used as the prefix as it is,
+		// and the path is taken as an absolute path.
+		escaped := absolutePath(path)
+		return strings.TrimRight(origin, "/") + escaped + "?" + query, escaped + "?" + query
+	}
+	if base.Scheme == "" {
+		base.Scheme = "https"
+	}
+	ref, err := url.Parse(path)
+	if err != nil {
+		// url.Parse rejects a path with an invalid percent escape
+		// ("/v1/100%"), which JavaScript keeps as it is. Such a path
+		// is escaped here the way JavaScript escapes a path.
+		escaped := absolutePath(path)
+		return base.Scheme + "://" + base.Host + escaped + "?" + query, escaped + "?" + query
+	}
+	resolved := base.ResolveReference(ref)
+	// The reference replaces the search with the defaults, so the
+	// path's own query is dropped.
+	resolved.RawQuery = ""
+	resolved.ForceQuery = false
+	escaped := resolved.EscapedPath()
+	if escaped == "" {
+		// A URL always has a path, at least a slash.
+		escaped = "/"
+	}
+	target = resolved.Scheme + "://" + resolved.Host + escaped + "?" + query
+	if resolved.Fragment != "" {
+		target += "#" + resolved.EscapedFragment()
+	}
+	return target, escaped + "?" + query
 }
 
 // params is an ordered query parameter set: setting a key that is
@@ -1644,10 +1744,63 @@ func encodeURIComponent(s string) string {
 	return b.String()
 }
 
+// absolutePath escapes a path the way JavaScript escapes one and makes
+// it absolute.
+func absolutePath(path string) string {
+	escaped := jsPath(path)
+	if !strings.HasPrefix(escaped, "/") {
+		escaped = "/" + escaped
+	}
+	return escaped
+}
+
+// jsPath escapes a path the way JavaScript's URL parser escapes one:
+// the C0 controls, everything above "~" and " # < > ? ` { }" are
+// percent-encoded and the rest is left as it is. A "%" that is not a
+// valid escape is left alone, as JavaScript leaves it.
+func jsPath(s string) string {
+	const escaped = "\"#<>?`{}"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c <= 0x20 || c >= 0x7F:
+			fmt.Fprintf(&b, "%%%02X", c)
+		case strings.IndexByte(escaped, c) >= 0:
+			fmt.Fprintf(&b, "%%%02X", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// jsTrim trims a string the way JavaScript's String.prototype.trim
+// does: the WhiteSpace and LineTerminator characters.
+//
+// It is not quite strings.TrimSpace, which differs on two code points —
+// JavaScript strips U+FEFF and keeps U+0085 — and the difference
+// matters here, because the user id goes into the signed query.
+func jsTrim(s string) string {
+	return strings.TrimFunc(s, isJSSpace)
+}
+
+// isJSSpace says whether a rune is one of JavaScript's WhiteSpace and
+// LineTerminator characters.
+func isJSSpace(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', ' ', 0x00A0, 0xFEFF,
+		0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200A
+}
+
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
+
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -2773,6 +2926,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -2800,22 +2954,107 @@ func (e *OtherSiteError) Error() string {
 	return fmt.Sprintf("%s sent the request on to %s (HTTP %d), which doesn't take this site's sign-in. Set a proxy outside mainland China for it.", e.From, e.To, e.Status)
 }
 
+// SchemeDowngradeError is a redirect that took the request from https
+// to http.
+//
+// The host may well be the same one, and that is exactly what makes
+// it dangerous: the Authorization header would go out in cleartext, and
+// whoever is on the way can read it and replay it. A redirect that
+// downgrades the scheme is refused, never followed.
+type SchemeDowngradeError struct {
+	// From is the address the request was sent to.
+	From string
+	// To is the address it was sent on to.
+	To string
+	// Status is the redirect's status code.
+	Status int
+}
+
+// Error is the error's text.
+func (e *SchemeDowngradeError) Error() string {
+	return fmt.Sprintf("%s sent the request on to %s (HTTP %d), which downgrades the scheme to http. The sign-in would go out in cleartext, so the redirect is refused.", e.From, e.To, e.Status)
+}
+
+// StaleSignatureError is a redirect that would have replayed a
+// signature made for another path or query.
+//
+// MiniMax signs each account API request: "yy" is computed over the
+// path and the query, so a signature made for one path is not a
+// signature for another. Replaying the old one is refused by the
+// upstream, and that refusal reads as a dead token — a false one that
+// costs a refresh token. The redirect is refused instead.
+type StaleSignatureError struct {
+	// From is the address the request was sent to.
+	From string
+	// To is the address it was sent on to.
+	To string
+	// Status is the redirect's status code.
+	Status int
+}
+
+// Error is the error's text.
+func (e *StaleSignatureError) Error() string {
+	return fmt.Sprintf("%s sent the request on to %s (HTTP %d), which changes the path or the query. The signature is made over the path and the query, so it cannot be replayed; the redirect is refused.", e.From, e.To, e.Status)
+}
+
+// signInRefusedCode is the business code MiniMax answers with when it
+// refuses the sign-in.
+const signInRefusedCode = 1000048
+
+// ErrSignInRefused says the upstream refused the sign-in.
+//
+// It is what errors.Is is used with to tell a stale token from any
+// other business error.
+var ErrSignInRefused = errors.New("the sign-in was refused")
+
+// BusinessError is a 200 answer whose body says it failed.
+//
+// The body of a successful HTTP status carries MiniMax's own code, and
+// that code is what says what went wrong. Keeping it makes it
+// possible to react to one code and not to another.
+type BusinessError struct {
+	// What is what was asked for.
+	What string
+	// Code is the business code the body carried.
+	Code int
+	// Message is the text the body carried.
+	Message string
+}
+
+// Error is the error's text.
+func (e *BusinessError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("%s: status %d", e.What, e.Code)
+	}
+	return fmt.Sprintf("%s: %s", e.What, e.Message)
+}
+
+// Is says whether the error is the refusal of the sign-in.
+func (e *BusinessError) Is(target error) bool {
+	return target == ErrSignInRefused && e.Code == signInRefusedCode
+}
+
 // quotaPattern says a refusal is about the account's credits or plan
 // running out.
 var quotaPattern = regexp.MustCompile(`(?i)insufficient|balance|credit|quota|exhaust|limit|余额|积分|额度|不足|用完|上限`)
 
+// rateLimitPattern says a body is about being sent too fast.
+//
+// It is taken out before the quota words are looked for: a rate limit
+// is a different thing, the account is fine and the answer comes when
+// the caller slows down. Rotating away from the account and marking
+// its window spent would be the wrong answer.
+var rateLimitPattern = regexp.MustCompile(`(?i)rate[\s_-]*limits?|too\s+many\s+requests|throttl\w*`)
+
 // IsQuotaRefusal says whether a body is a refusal for running out of
 // credits or plan.
 //
-// A rate limit is a different thing: the account is fine and the
-// answer comes when the caller slows down. Rotating away from the
-// account and marking its window spent would be the wrong answer, so
-// the rate-limit words are taken out before the rest are looked for.
+// A rate limit is not: the account is fine and the answer comes when
+// the caller slows down, so the rate-limit wording is taken out
+// before the rest is looked for.
 func IsQuotaRefusal(body []byte) bool {
 	s := strings.ToLower(string(body))
-	for _, w := range []string{"rate limit", "rate_limit", "too many requests"} {
-		s = strings.ReplaceAll(s, w, "")
-	}
+	s = rateLimitPattern.ReplaceAllString(s, "")
 	return quotaPattern.MatchString(s)
 }
 
@@ -2837,14 +3076,21 @@ type envelope struct {
 //
 // A successful HTTP status is not a successful answer here: MiniMax's
 // gateway checks its own business codes and puts a refusal in the body.
+// The error that comes back is a *BusinessError, which carries the
+// code; errors.Is(err, ErrSignInRefused) tells a refused sign-in from
+// any other business error.
 func CheckEnvelope(what string, raw []byte) error {
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return fmt.Errorf("%s: not JSON", what)
 	}
 	if si := env.StatusInfo; si != nil && si.Code != 0 {
-		if si.Code == 1000048 {
-			return fmt.Errorf("%s: the sign-in was refused", what)
+		if si.Code == signInRefusedCode {
+			return &BusinessError{
+				What:    what,
+				Code:    si.Code,
+				Message: "the sign-in was refused",
+			}
 		}
 		msg := si.Message
 		if msg == "" {
@@ -2853,14 +3099,14 @@ func CheckEnvelope(what string, raw []byte) error {
 		if msg == "" {
 			msg = fmt.Sprintf("status %d", si.Code)
 		}
-		return fmt.Errorf("%s: %s", what, msg)
+		return &BusinessError{What: what, Code: si.Code, Message: msg}
 	}
 	if br := env.BaseResp; br != nil && br.StatusCode != 0 {
 		msg := br.StatusMsg
 		if msg == "" {
 			msg = fmt.Sprintf("status %d", br.StatusCode)
 		}
-		return fmt.Errorf("%s: %s", what, msg)
+		return &BusinessError{What: what, Code: br.StatusCode, Message: msg}
 	}
 	return nil
 }
@@ -2880,6 +3126,12 @@ func CheckEnvelope(what string, raw []byte) error {
 //   - it asks for no compression, because MiniMax answers a chat it is
 //     asked to compress as one gzip member flushed at the end, which
 //     turns a streamed answer into one lump.
+//
+// It refuses two more redirects for the same kind of reason: one that
+// downgrades https to http, because the sign-in would go out in
+// cleartext, and one that changes the path or the query of a signed
+// request, because the signature is made over the path and the query
+// and cannot be replayed.
 package upstream
 
 import (
@@ -2941,6 +3193,11 @@ func New(opts Options) *Client {
 // It asks for no compression and does not add Accept-Encoding of its
 // own: MiniMax's behaviour with compression is worse than useless for a
 // stream.
+//
+// Many accounts share one transport, so it is tuned for that: HTTP/2 is
+// negotiated, and up to 32 idle connections per host are kept. Without
+// that, a third request to the same host would have its connection
+// closed instead of pooled.
 func defaultTransport() *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -2948,7 +3205,9 @@ func defaultTransport() *http.Transport {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -2959,12 +3218,22 @@ func defaultTransport() *http.Transport {
 // redirectStatuses are the statuses a redirect can have.
 var redirectStatuses = map[int]bool{301: true, 302: true, 303: true, 307: true, 308: true}
 
+// maxBody is the most a response body may be.
+const maxBody = 32 << 20
+
 // sameHost says whether two URLs are on the same host.
 //
 // The name is compared without the case, and the port by what it
 // means: ":443" on https and no port at all are the same place, but
 // another port is another service.
+//
+// The scheme has to be the same too. A redirect that keeps the host
+// but changes https to http would send the Authorization header out
+// in cleartext, and whoever is on the way could read it and replay it.
 func sameHost(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
 	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
 		return false
 	}
@@ -2985,11 +3254,66 @@ func effectivePort(u *url.URL) string {
 	return ""
 }
 
+// sameAddress says whether two URLs are on the same host and port,
+// whatever the scheme is.
+func sameAddress(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return a.Port() == b.Port()
+}
+
+// sameRequest says whether a redirect keeps the path and the query.
+//
+// The signature of a signed request is computed over the path and the
+// query, so a redirect that changes either of them cannot carry the
+// old signature.
+func sameRequest(a, b *url.URL) bool {
+	return a.Path == b.Path && a.RawQuery == b.RawQuery
+}
+
+// signed says whether a request carries a signature.
+//
+// The two headers are the ones internal/sign makes: "yy" over the
+// path, the query and the body, and "x-signature" over the time and
+// the body.
+func signed(h http.Header) bool {
+	return h.Get("yy") != "" || h.Get("x-signature") != ""
+}
+
+// copyRequest makes the request the redirect loop sends.
+//
+// The caller's request is left as it is: the copy is what the
+// User-Agent goes into, and a request with no header map at all is
+// given an empty one so that writing into it cannot panic.
+func copyRequest(req *http.Request) *http.Request {
+	out := req.Clone(req.Context())
+	if out.Header == nil {
+		out.Header = http.Header{}
+	}
+	return out
+}
+
+// isDowngrade says whether a redirect takes the request from https to
+// http.
+func isDowngrade(from, to *url.URL) bool {
+	return strings.EqualFold(from.Scheme, "https") && strings.EqualFold(to.Scheme, "http")
+}
+
+// schemeHost is what an address is called in an error: the scheme and
+// the host, without the path.
+func schemeHost(u *url.URL) string {
+	return u.Scheme + "://" + u.Host
+}
+
 // Do sends a request, following a redirect that stays on the host and
 // refusing one that does not.
 //
 // A redirect to another host is an OtherSiteError: the answer says
-// where the request was sent and what to do about it.
+// where the request was sent and what to do about it. A redirect that
+// downgrades the scheme is a SchemeDowngradeError, and one that would
+// replay a signature made for another path is a StaleSignatureError.
+// None of them is followed.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// The redirect handling is done here, not by http.Client, so the
 	// cross-host case can be told apart from the same-host one.
@@ -3000,13 +3324,16 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			return http.ErrUseLastResponse
 		},
 	}
+	// The caller's request is not touched: the User-Agent goes into a
+	// copy, and a request with no header map at all is given one, so
+	// writing into it cannot panic.
+	current := copyRequest(req)
 	// A request that names its own User-Agent keeps it; one that does
 	// not says who it is. Without this the account API calls itself
 	// Go-http-client.
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", c.userAgent)
+	if current.Header.Get("User-Agent") == "" {
+		current.Header.Set("User-Agent", c.userAgent)
 	}
-	current := req
 	for hop := 0; ; hop++ {
 		resp, err := client.Do(current)
 		if err != nil {
@@ -3020,6 +3347,14 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return resp, nil
 		}
+		if isDowngrade(current.URL, next) && sameAddress(current.URL, next) {
+			resp.Body.Close()
+			return nil, &SchemeDowngradeError{
+				From:   schemeHost(current.URL),
+				To:     schemeHost(next),
+				Status: resp.StatusCode,
+			}
+		}
 		if !sameHost(next, current.URL) {
 			resp.Body.Close()
 			return nil, &OtherSiteError{
@@ -3028,8 +3363,24 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				Status: resp.StatusCode,
 			}
 		}
+		if signed(current.Header) && !sameRequest(current.URL, next) {
+			// The signature is over the path and the query. Sending the
+			// old one to another path is a request the upstream refuses,
+			// and that refusal reads as a dead token — a false one that
+			// costs a refresh token. The redirect is refused instead.
+			resp.Body.Close()
+			return nil, &StaleSignatureError{
+				From:   schemeHost(current.URL),
+				To:     schemeHost(next),
+				Status: resp.StatusCode,
+			}
+		}
 		if hop >= 5 {
-			return resp, nil
+			// Too many redirects is an error, not an answer: handing
+			// back the redirect itself would leave the caller with a
+			// body nobody read.
+			resp.Body.Close()
+			return nil, fmt.Errorf("too many redirects")
 		}
 		// 307 and 308 keep the method and the body; the others turn a
 		// non-GET into a GET without a body.
@@ -3116,11 +3467,21 @@ func (c *Client) PostJSON(ctx context.Context, rawURL string, body []byte) (*htt
 }
 
 // ReadBody reads a response's body and closes it.
+//
+// The body is read through a limit: an upstream that streams without
+// end must not be able to take all the memory. A body over the limit
+// is an error, not a truncated answer.
 func ReadBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("read body: no body")
+	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(b) > maxBody {
+		return nil, fmt.Errorf("read body: the body is larger than %d bytes", maxBody)
 	}
 	return b, nil
 }
@@ -3303,11 +3664,18 @@ Expected: FAIL —— `undefined: New`
 // The resolution follows magpie's model: an account's own address wins,
 // then the group it is pointed at, then the global default. "direct"
 // means no proxy, and a loopback address never goes through one.
+//
+// Both "socks5://" and "socks5h://" resolve the name at the proxy,
+// not here: the address is sent to the proxy as it is written, and the
+// proxy looks it up where the proxy is. That is what curl's "socks5h://"
+// does; curl's "socks5://" resolves the name locally, and this package
+// does not do that.
 package egress
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -3323,12 +3691,19 @@ import (
 // Direct is the value that means "no proxy".
 const Direct = "direct"
 
+// checkTimeout is how long a health check waits for its answer.
+//
+// It is a variable so that the test can shorten it.
+var checkTimeout = 10 * time.Second
+
 // Resolver resolves an account's egress and hands out clients for it.
 type Resolver struct {
 	mu sync.Mutex
-	// groups are the named ways out.
+	// groups are the named ways out. They are set when the resolver is
+	// made and are not written to afterwards.
 	groups map[string]string
-	// def is the global way out.
+	// def is the global way out. Like the groups, it is set when the
+	// resolver is made and is not written to afterwards.
 	def string
 	// clients are the HTTP clients, by way out.
 	clients map[string]*http.Client
@@ -3355,13 +3730,25 @@ func New(groups map[string]string, def string) *Resolver {
 //
 // Nothing configured means direct: the account has no proxy of its
 // own, no group, and there is no global default either.
+//
+// A group whose value is empty is not a way out: it falls through to
+// the global default. An empty value that resolved to nothing would
+// send the traffic out direct, which is the one mistake a proxy
+// support must not make.
+//
+// The lock is taken, so that the maps are read the same way the caches
+// are.
 func (r *Resolver) Resolve(a store.Account) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if u := strings.TrimSpace(a.ProxyURL); u != "" {
 		return u
 	}
 	if g := strings.TrimSpace(a.ProxyGroup); g != "" {
 		if u, ok := r.groups[g]; ok {
-			return u
+			if v := strings.TrimSpace(u); v != "" {
+				return v
+			}
 		}
 	}
 	v := strings.TrimSpace(r.def)
@@ -3397,12 +3784,11 @@ func isLoopback(host string) bool {
 // there yet.
 //
 // Clients are cached by URL: the proxy is a property of the transport,
-// so one URL means one client, however many accounts use it.
+// so one URL means one client, however many accounts use it. The key is
+// the normalised URL, so the same address written two ways is one
+// client.
 func (r *Resolver) Client(proxyURL string) (*http.Client, error) {
-	key := strings.TrimSpace(proxyURL)
-	if key == "" {
-		key = Direct
-	}
+	key := cacheKey(proxyURL)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c, ok := r.clients[key]; ok {
@@ -3428,10 +3814,7 @@ func (r *Resolver) Client(proxyURL string) (*http.Client, error) {
 // transport, so one URL means one transport, however many accounts use
 // it.
 func (r *Resolver) Transport(proxyURL string) (http.RoundTripper, error) {
-	key := strings.TrimSpace(proxyURL)
-	if key == "" {
-		key = Direct
-	}
+	key := cacheKey(proxyURL)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.transportLocked(key)
@@ -3452,24 +3835,95 @@ func (r *Resolver) transportLocked(key string) (http.RoundTripper, error) {
 
 // Invalidate drops the cached client for a proxy URL, so a changed
 // address is picked up.
+//
+// The dropped transport's idle connections are closed: they belong to
+// the old address and would otherwise stay open until they time out.
 func (r *Resolver) Invalidate(proxyURL string) {
-	key := strings.TrimSpace(proxyURL)
-	if key == "" {
-		key = Direct
-	}
+	key := cacheKey(proxyURL)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.clients, key)
-	delete(r.transports, key)
+	if tr, ok := r.transports[key]; ok {
+		delete(r.transports, key)
+		if t, ok := tr.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+	}
 }
 
 // Groups gives the configured groups.
+//
+// The lock is taken, so that the maps are read the same way the caches
+// are.
 func (r *Resolver) Groups() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	out := make(map[string]string, len(r.groups))
 	for k, v := range r.groups {
 		out[k] = v
 	}
 	return out
+}
+
+// cacheKey is the key a proxy URL is cached under.
+//
+// The same address written two ways is the same address: the scheme is
+// lowercased, the host is lowercased, the default port is dropped, and
+// the rest is trimmed. Without this, "HTTP://h:1" and "http://h:1"
+// would be two clients, and Invalidate would drop only one of them.
+func cacheKey(proxyURL string) string {
+	s := strings.TrimSpace(proxyURL)
+	if s == "" {
+		return Direct
+	}
+	if strings.EqualFold(s, Direct) {
+		return Direct
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	u.Host = host
+	if port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	}
+	return u.String()
+}
+
+// isDirect says whether a value means "no proxy".
+//
+// The comparison is without the case and without the space around it:
+// "Direct" and "DIRECT" mean the same thing as "direct".
+func isDirect(proxyURL string) bool {
+	return strings.EqualFold(strings.TrimSpace(proxyURL), Direct)
+}
+
+// redacted is a proxy URL as it may be shown.
+//
+// The credentials are taken out: they are a secret, and the health
+// check's error is stored in the database.
+func redacted(proxyURL string) string {
+	s := strings.TrimSpace(proxyURL)
+	i := strings.Index(s, "://")
+	if i < 0 {
+		return s
+	}
+	rest := s[i+3:]
+	authority, tail := rest, ""
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		authority, tail = rest[:slash], rest[slash:]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return s
+	}
+	return s[:i+3] + "***@" + authority[at+1:] + tail
 }
 
 // newTransport makes the transport for a proxy URL.
@@ -3484,24 +3938,32 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
 	}
-	if proxyURL == Direct {
+	if isDirect(proxyURL) {
 		return base, nil
 	}
-	u, err := url.Parse(proxyURL)
+	u, err := url.Parse(strings.TrimSpace(proxyURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy %q: %w", proxyURL, err)
+		return nil, fmt.Errorf("parse proxy %q: %w", redacted(proxyURL), err)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("proxy %q: no host, write an address like http://host:port", redacted(proxyURL))
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
 		base.Proxy = http.ProxyURL(u)
 		return base, nil
 	case "socks5", "socks5h":
+		if u.Port() == "" {
+			return nil, fmt.Errorf("proxy %q: no port, write an address like socks5h://host:port", redacted(proxyURL))
+		}
 		var auth *proxy.Auth
 		if u.User != nil {
 			pw, _ := u.User.Password()
@@ -3509,11 +3971,11 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		}
 		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
 		if err != nil {
-			return nil, fmt.Errorf("socks5 proxy %q: %w", proxyURL, err)
+			return nil, fmt.Errorf("socks5 proxy %q: %w", redacted(proxyURL), err)
 		}
 		ctxDialer, ok := dialer.(proxy.ContextDialer)
 		if !ok {
-			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", proxyURL)
+			return nil, fmt.Errorf("socks5 proxy %q: no context dialer", redacted(proxyURL))
 		}
 		base.DialContext = ctxDialer.DialContext
 		base.Proxy = nil
@@ -3521,9 +3983,9 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 	case "":
 		// 没有 scheme 就不是一个地址。默默直连是最坏的一种错：它
 		// 看起来跑通了，其实请求根本没走代理。
-		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", proxyURL)
+		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", redacted(proxyURL))
 	default:
-		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", proxyURL, u.Scheme)
+		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", redacted(proxyURL), u.Scheme)
 	}
 }
 
@@ -3531,23 +3993,41 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 //
 // It is what the egress health check runs. The target is a small
 // address that answers fast; a proxy that cannot reach it is not usable.
+//
+// The check has its own deadline, so a proxy that takes the connection
+// and never answers fails the check instead of hanging it.
 func (r *Resolver) Check(ctx context.Context, proxyURL, target string) error {
 	c, err := r.Client(proxyURL)
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept-Encoding", "identity")
-	resp, err := c.Do(req)
+	// A redirect means the target is not usable as a health probe, so it
+	// is not followed: the answer has to come from the target itself.
+	client := &http.Client{
+		Transport: c.Transport,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("proxy %q: HTTP %d", proxyURL, resp.StatusCode)
+	// The body is drained so the connection goes back into the pool.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	// A redirect is not followed: the answer has to come from the target
+	// itself, and a redirect says the target is somewhere else. It is
+	// not a failure either — the proxy did carry the request through.
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return fmt.Errorf("proxy %q: HTTP %d", redacted(proxyURL), resp.StatusCode)
 	}
 	return nil
 }

@@ -753,10 +753,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```go
 // Do sends a request through the client's own transport.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", c.userAgent)
-	}
-	return doWith(req, c.http.Transport, c.timeout)
+	return doWith(req, c.http.Transport, c.timeout, c.userAgent)
 }
 
 // DoWith sends a request through a given transport.
@@ -771,11 +768,15 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // There is no timeout here: a chat streams for as long as it needs,
 // and the caller's context carries the deadline.
 func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, error) {
-	return doWith(req, transport, 0)
+	return doWith(req, transport, 0, "")
 }
 
 // doWith is the redirect loop both of them share.
-func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duration) (*http.Response, error) {
+//
+// The caller's request is not touched: the User-Agent goes into a
+// copy, and a request with no header map at all is given one, so
+// writing into it cannot panic.
+func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duration, userAgent string) (*http.Response, error) {
 	if transport == nil {
 		transport = defaultTransport()
 	}
@@ -786,7 +787,10 @@ func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duratio
 			return http.ErrUseLastResponse
 		},
 	}
-	current := req
+	current := copyRequest(req)
+	if current.Header.Get("User-Agent") == "" && userAgent != "" {
+		current.Header.Set("User-Agent", userAgent)
+	}
 	for hop := 0; ; hop++ {
 		resp, err := client.Do(current)
 		if err != nil {
@@ -800,6 +804,16 @@ func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duratio
 		if err != nil {
 			return resp, nil
 		}
+		if isDowngrade(current.URL, next) && sameAddress(current.URL, next) {
+			// The sign-in would go out in cleartext, so the redirect is
+			// refused and never followed.
+			resp.Body.Close()
+			return nil, &SchemeDowngradeError{
+				From:   schemeHost(current.URL),
+				To:     schemeHost(next),
+				Status: resp.StatusCode,
+			}
+		}
 		if !sameHost(next, current.URL) {
 			resp.Body.Close()
 			return nil, &OtherSiteError{
@@ -808,8 +822,23 @@ func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duratio
 				Status: resp.StatusCode,
 			}
 		}
+		if signed(current.Header) && !sameRequest(current.URL, next) {
+			// The signature is made over the path and the query, so the
+			// old one cannot be replayed. Sending it would be refused by
+			// the upstream, and that refusal reads as a dead token.
+			resp.Body.Close()
+			return nil, &StaleSignatureError{
+				From:   schemeHost(current.URL),
+				To:     schemeHost(next),
+				Status: resp.StatusCode,
+			}
+		}
 		if hop >= 5 {
-			return resp, nil
+			// Too many redirects is an error, not an answer: handing back
+			// the redirect itself would leave the caller with a body
+			// nobody read.
+			resp.Body.Close()
+			return nil, fmt.Errorf("too many redirects")
 		}
 		// The body has to be read again: http.Request.Body is a reader
 		// the previous request already consumed, so replaying it as it
@@ -860,10 +889,12 @@ func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duratio
 
 `DoWith` 里 `client.Do(current)` 的第二个返回值在 `err != nil` 时，Go 会把它包进 `*url.Error`，所以 `OtherSiteError` 会被包一层。用 `errors.As` 取。
 
-`sameHost`、`effectivePort` 和 `time` 在 `client.go` 里已经有了（计划 A 的 Task 4
+`sameHost`、`effectivePort`、`copyRequest`、`isDowngrade`、`sameAddress`、`signed`、
+`sameRequest`、`schemeHost` 和 `time` 在 `client.go` 里已经有了（计划 A 的 Task 4
 写的），这里直接用。
 
-同时删掉 `client.go` 里旧的 `Do` 函数体（保留 `defaultTransport`、`redirectStatuses`、`sameHost`）。
+同时删掉 `client.go` 里旧的 `Do` 函数体（保留 `defaultTransport`、`redirectStatuses`、
+`sameHost` 和上面那几个小函数）。
 
 - [ ] **Step 2: 写失败的测试**
 
