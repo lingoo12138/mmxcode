@@ -891,12 +891,12 @@ const (
 	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
 
 	// The account API's endpoints, on AgentHost.
-	IdentityPath      = "/v1/api/user/info"
-	WorkspacePath     = "/matrix/api/v1/user/get_user_extra_info"
-	MembershipPath    = "/matrix/api/v1/commerce/get_membership_info"
-	CreditPath        = "/minimax-cloud/api/v1/credit/details"
-	SigninStatusPath  = "/minimax-cloud/api/v1/signin/status"
-	SigninClaimPath   = "/minimax-cloud/api/v1/signin/claim"
+	IdentityPath     = "/v1/api/user/info"
+	WorkspacePath    = "/matrix/api/v1/user/get_user_extra_info"
+	MembershipPath   = "/matrix/api/v1/commerce/get_membership_info"
+	CreditPath       = "/minimax-cloud/api/v1/credit/details"
+	SigninStatusPath = "/minimax-cloud/api/v1/signin/status"
+	SigninClaimPath  = "/minimax-cloud/api/v1/signin/claim"
 
 	// The plan console's endpoints, on PlatformHost.
 	PlanRemainsPath = "/backend/account/token_plan/remains_percent"
