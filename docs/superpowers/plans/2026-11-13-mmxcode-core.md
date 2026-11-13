@@ -1849,7 +1849,8 @@ func TestUsageSnapshot(t *testing.T) {
 	s := openTest(t)
 	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
 		AccountID: "acc_01", Granted: 600, Consumed: 120.5, Remaining: 479.5,
-		ExpiresAt: time.Now().Add(time.Hour), Plan: "M Plan",
+		HasAmounts: true,
+		ExpiresAt:  time.Now().Add(time.Hour), Plan: "M Plan",
 		CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1860,6 +1861,30 @@ func TestUsageSnapshot(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Remaining != 479.5 {
 		t.Fatalf("got %+v", got)
+	}
+	if !got[0].HasAmounts {
+		t.Fatal("the amounts were lost")
+	}
+}
+
+func TestUsageSnapshotWithoutAmounts(t *testing.T) {
+	// 读不到账本和读到 0 是两回事：读不到就没有数
+	ctx := context.Background()
+	s := openTest(t)
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_02", Plan: "M Plan", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	if got[0].HasAmounts {
+		t.Fatalf("a reading with no amounts says it has amounts: %+v", got[0])
 	}
 }
 ```
@@ -2083,6 +2108,13 @@ func Open(path string) (*Store, error) {
 	// One writer at a time; SQLite serializes them anyway and this keeps
 	// the Go side from piling up.
 	db.SetMaxOpenConns(1)
+	// The database is opened lazily, so a path that cannot be used
+	// would only show up at the first query. Open it now: the caller
+	// wants to know now.
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -2126,8 +2158,11 @@ func (s *Store) CreateAccount(ctx context.Context, a Account) error {
 }
 
 // UpdateAccount writes an account's fields.
+//
+// An account that is not there is an error, not a quiet success: the
+// caller believes it wrote something.
 func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE accounts SET name=?, user_id=?, email=?, status=?, proxy_group=?, proxy_url=?,
 			pending_persist=?, exhausted_until=?, last_error=?, updated_at=?
 		WHERE id=?`,
@@ -2136,11 +2171,22 @@ func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
 	if err != nil {
 		return fmt.Errorf("update account: %w", err)
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("update account %s: no such account", a.ID)
+	}
 	return nil
 }
 
 // DeleteAccount removes an account and everything under it.
+//
+// The deletes belong together: half of them done is an account with
+// its tokens gone and its history still there. So they are one
+// transaction.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete account: %w", err)
+	}
 	for _, q := range []string{
 		"DELETE FROM tokens WHERE account_id=?",
 		"DELETE FROM exhausted_windows WHERE account_id=?",
@@ -2149,9 +2195,13 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 		"DELETE FROM sessions WHERE account_id=?",
 		"DELETE FROM accounts WHERE id=?",
 	} {
-		if _, err := s.db.ExecContext(ctx, q, id); err != nil {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			tx.Rollback()
 			return fmt.Errorf("delete account: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete account: %w", err)
 	}
 	return nil
 }
@@ -2299,12 +2349,21 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 }
 
 // SaveUsageSnapshot writes a usage reading.
+//
+// A reading that could not be made is not a reading of zero. Without
+// the amounts the three numbers are NULL, so the reader can tell "no
+// idea" from "nothing left" -- and an account with no idea is not an
+// account with nothing left.
 func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
+	var granted, consumed, remaining any
+	if u.HasAmounts {
+		granted, consumed, remaining = u.Granted, u.Consumed, u.Remaining
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO usage_snapshots (account_id, granted, consumed, remaining,
 			expires_at, plan, plan_until, windows_json, balance, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		u.AccountID, u.Granted, u.Consumed, u.Remaining, ms(u.ExpiresAt),
+		u.AccountID, granted, consumed, remaining, ms(u.ExpiresAt),
 		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance, ms(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("save usage snapshot: %w", err)
@@ -2552,7 +2611,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2686,28 +2745,15 @@ func TestQuotaRefusalDetection(t *testing.T) {
 		`{"message":"积分已用完"}`:                          true,
 		`{"message":"model not available"}`:            false,
 		`{"message":"quota exceeded"}`:                 true,
+		`{"message":"rate limit exceeded"}`:            false,
+		`{"message":"too many requests"}`:              false,
 	}
 	for body, want := range cases {
-		if got := IsQuotaRefusal(body); got != want {
+		if got := IsQuotaRefusal([]byte(body)); got != want {
 			t.Errorf("IsQuotaRefusal(%s) = %v, want %v", body, got, want)
 		}
 	}
 }
-```
-
-把测试文件顶部的 import 补全：
-
-```go
-import (
-	"context"
-	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
-	"time"
-)
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2729,6 +2775,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // OtherSiteError is a redirect that left the host we asked.
@@ -2759,8 +2806,17 @@ var quotaPattern = regexp.MustCompile(`(?i)insufficient|balance|credit|quota|exh
 
 // IsQuotaRefusal says whether a body is a refusal for running out of
 // credits or plan.
+//
+// A rate limit is a different thing: the account is fine and the
+// answer comes when the caller slows down. Rotating away from the
+// account and marking its window spent would be the wrong answer, so
+// the rate-limit words are taken out before the rest are looked for.
 func IsQuotaRefusal(body []byte) bool {
-	return quotaPattern.Match(body)
+	s := strings.ToLower(string(body))
+	for _, w := range []string{"rate limit", "rate_limit", "too many requests"} {
+		s = strings.ReplaceAll(s, w, "")
+	}
+	return quotaPattern.MatchString(s)
 }
 
 // envelope is the shape MiniMax's account API answers with.
@@ -2827,12 +2883,14 @@ func CheckEnvelope(what string, raw []byte) error {
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -2849,6 +2907,7 @@ type Options struct {
 // Client talks to MiniMax's hosts.
 type Client struct {
 	http      *http.Client
+	timeout   time.Duration
 	userAgent string
 }
 
@@ -2867,9 +2926,12 @@ func New(opts Options) *Client {
 		transport = defaultTransport()
 	}
 	return &Client{
-		// No timeout on the client itself: a chat streams for as long as
-		// it needs, and the caller's context carries the deadline.
+		// The timeout is not on the shared client but on the request
+		// this client makes: a chat streams for as long as it needs and
+		// goes through its own client, while the account API and the
+		// token endpoint answer in seconds and must not hang.
 		http:      &http.Client{Transport: transport},
+		timeout:   timeout,
 		userAgent: ua,
 	}
 }
@@ -2897,6 +2959,32 @@ func defaultTransport() *http.Transport {
 // redirectStatuses are the statuses a redirect can have.
 var redirectStatuses = map[int]bool{301: true, 302: true, 303: true, 307: true, 308: true}
 
+// sameHost says whether two URLs are on the same host.
+//
+// The name is compared without the case, and the port by what it
+// means: ":443" on https and no port at all are the same place, but
+// another port is another service.
+func sameHost(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort is the port a URL really uses.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
+}
+
 // Do sends a request, following a redirect that stays on the host and
 // refusing one that does not.
 //
@@ -2907,9 +2995,16 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// cross-host case can be told apart from the same-host one.
 	client := &http.Client{
 		Transport: c.http.Transport,
+		Timeout:   c.timeout,
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+	// A request that names its own User-Agent keeps it; one that does
+	// not says who it is. Without this the account API calls itself
+	// Go-http-client.
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", c.userAgent)
 	}
 	current := req
 	for hop := 0; ; hop++ {
@@ -2925,7 +3020,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return resp, nil
 		}
-		if next.Host != current.URL.Host {
+		if !sameHost(next, current.URL) {
 			resp.Body.Close()
 			return nil, &OtherSiteError{
 				From:   current.URL.Host,
@@ -2992,7 +3087,6 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept-Encoding", "identity")
 	return c.Do(req)
 }
@@ -3003,7 +3097,6 @@ func (c *Client) PostForm(ctx context.Context, rawURL string, form url.Values) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
@@ -3016,7 +3109,6 @@ func (c *Client) PostJSON(ctx context.Context, rawURL string, body []byte) (*htt
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
@@ -3033,8 +3125,6 @@ func ReadBody(resp *http.Response) ([]byte, error) {
 	return b, nil
 }
 ```
-
-把 `client.go` 的 import 补上 `bytes` 与 `strings`。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -3235,10 +3325,15 @@ const Direct = "direct"
 
 // Resolver resolves an account's egress and hands out clients for it.
 type Resolver struct {
-	mu      sync.Mutex
-	groups  map[string]string
-	def     string
+	mu sync.Mutex
+	// groups are the named ways out.
+	groups map[string]string
+	// def is the global way out.
+	def string
+	// clients are the HTTP clients, by way out.
 	clients map[string]*http.Client
+	// transports are the transports, by way out.
+	transports map[string]http.RoundTripper
 }
 
 // New makes a resolver over the configured groups and the global
@@ -3248,12 +3343,18 @@ func New(groups map[string]string, def string) *Resolver {
 	for k, v := range groups {
 		g[k] = v
 	}
-	return &Resolver{groups: g, def: def, clients: map[string]*http.Client{}}
+	return &Resolver{
+		groups:     g,
+		def:        def,
+		clients:    map[string]*http.Client{},
+		transports: map[string]http.RoundTripper{},
+	}
 }
 
 // Resolve gives the proxy URL an account's requests go through.
 //
-// An empty result means no proxy.
+// Nothing configured means direct: the account has no proxy of its
+// own, no group, and there is no global default either.
 func (r *Resolver) Resolve(a store.Account) string {
 	if u := strings.TrimSpace(a.ProxyURL); u != "" {
 		return u
@@ -3263,7 +3364,11 @@ func (r *Resolver) Resolve(a store.Account) string {
 			return u
 		}
 	}
-	return strings.TrimSpace(r.def)
+	v := strings.TrimSpace(r.def)
+	if v == "" {
+		return Direct
+	}
+	return v
 }
 
 // ResolveForHost is Resolve for a host, except that a loopback address
@@ -3303,13 +3408,46 @@ func (r *Resolver) Client(proxyURL string) (*http.Client, error) {
 	if c, ok := r.clients[key]; ok {
 		return c, nil
 	}
-	tr, err := newTransport(key)
+	tr, err := r.transportLocked(key)
 	if err != nil {
 		return nil, err
 	}
 	c := &http.Client{Transport: tr}
 	r.clients[key] = c
 	return c, nil
+}
+
+// Transport gives the transport for a proxy URL, making it if it is not
+// there yet.
+//
+// This is what a caller that has its own client needs: the upstream
+// client takes a transport, and the transport is what carries the
+// proxy.
+//
+// Transports are cached by URL: the proxy is a property of the
+// transport, so one URL means one transport, however many accounts use
+// it.
+func (r *Resolver) Transport(proxyURL string) (http.RoundTripper, error) {
+	key := strings.TrimSpace(proxyURL)
+	if key == "" {
+		key = Direct
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.transportLocked(key)
+}
+
+// transportLocked is Transport, with the lock held.
+func (r *Resolver) transportLocked(key string) (http.RoundTripper, error) {
+	if tr, ok := r.transports[key]; ok {
+		return tr, nil
+	}
+	tr, err := newTransport(key)
+	if err != nil {
+		return nil, err
+	}
+	r.transports[key] = tr
+	return tr, nil
 }
 
 // Invalidate drops the cached client for a proxy URL, so a changed
@@ -3322,6 +3460,7 @@ func (r *Resolver) Invalidate(proxyURL string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.clients, key)
+	delete(r.transports, key)
 }
 
 // Groups gives the configured groups.
@@ -3380,7 +3519,9 @@ func newTransport(proxyURL string) (*http.Transport, error) {
 		base.Proxy = nil
 		return base, nil
 	case "":
-		return base, nil
+		// 没有 scheme 就不是一个地址。默默直连是最坏的一种错：它
+		// 看起来跑通了，其实请求根本没走代理。
+		return nil, fmt.Errorf("proxy %q: no scheme, write http:// or socks5h://", proxyURL)
 	default:
 		return nil, fmt.Errorf("proxy %q: unsupported scheme %q", proxyURL, u.Scheme)
 	}
@@ -3487,7 +3628,7 @@ func TestStartDevice(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
 	if err != nil {
 		t.Fatal(err)
@@ -3516,7 +3657,7 @@ func TestStartDeviceUserCodeVariant(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
 	if err != nil {
 		t.Fatal(err)
@@ -3542,7 +3683,7 @@ func TestStartDeviceExpiredInSeconds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
 	if err != nil {
 		t.Fatal(err)
@@ -3561,7 +3702,7 @@ func TestStartDeviceBadAnswer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	if _, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code"); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -3589,9 +3730,9 @@ func TestPollDeviceSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode:  "ABCD",
+		UserCode:  "ABCD",
 		verifier:  "v",
 		pollField: "device_code",
 		pollValue: "dev-1",
@@ -3630,9 +3771,9 @@ func TestPollKeepsWaitingWhilePending(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode: "ABCD", verifier: "v",
+		UserCode: "ABCD", verifier: "v",
 		pollField: "device_code", pollValue: "dev-1",
 		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
 	}
@@ -3665,9 +3806,9 @@ func TestPollKeepsWaitingByStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode: "ABCD", verifier: "v",
+		UserCode: "ABCD", verifier: "v",
 		pollField: "device_code", pollValue: "dev-1",
 		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
 	}
@@ -3680,6 +3821,9 @@ func TestPollKeepsWaitingByStatus(t *testing.T) {
 }
 
 func TestPollSlowDown(t *testing.T) {
+	old := slowDownWait
+	slowDownWait = time.Millisecond
+	defer func() { slowDownWait = old }()
 	// slow_down 是让我们等久一点，不是失败。
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3696,9 +3840,9 @@ func TestPollSlowDown(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode: "ABCD", verifier: "v",
+		UserCode: "ABCD", verifier: "v",
 		pollField: "device_code", pollValue: "dev-1",
 		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
 	}
@@ -3716,9 +3860,9 @@ func TestPollDeviceDenied(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode: "ABCD", verifier: "v",
+		UserCode: "ABCD", verifier: "v",
 		pollField: "device_code", pollValue: "dev-1",
 		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
 	}
@@ -3736,9 +3880,9 @@ func TestOAuthErrorCodes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	d := &Device{
-		userCode: "ABCD", verifier: "v",
+		UserCode: "ABCD", verifier: "v",
 		pollField: "device_code", pollValue: "dev-1",
 		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
 	}
@@ -3759,7 +3903,7 @@ func TestOAuthErrorCodes(t *testing.T) {
 测试文件顶部还需要这个助手：
 
 ```go
-func testClient(t *testing.T, srv *httptest.Server) *upstream.Client {
+func testClient(t *testing.T) *upstream.Client {
 	t.Helper()
 	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
 }
@@ -3795,7 +3939,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -3811,6 +3954,32 @@ const DeviceGrant = site.DeviceGrant
 // answer gives no end of its own.
 const signInTimeout = 10 * time.Minute
 
+// slowDownWait is how much longer to wait when the site says slow
+// down. It is a variable so that a test does not have to wait five
+// seconds to see it happen.
+var slowDownWait = 5 * time.Second
+
+// expiresDuration reads an expires_in that may be seconds or
+// milliseconds.
+//
+// The site sends both: a token that lasts an hour comes as 3600, and a
+// token that lasts an hour in milliseconds comes as 3600000. Read as
+// seconds, the second one lasts a hundred years: the token never
+// ends, the account is never refreshed, and every request is answered
+// with 401.
+//
+// A duration in seconds that is over a million is longer than eleven
+// days, which no token is; that is the tell.
+func expiresDuration(v int64) time.Duration {
+	if v <= 0 {
+		return 0
+	}
+	if v > 1e6 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return time.Duration(v) * time.Second
+}
+
 // Error is an answer from MiniMax's sign-in server.
 type Error struct {
 	// Code is the "error" the answer carried.
@@ -3822,9 +3991,12 @@ type Error struct {
 }
 
 // Error is the error's text.
+//
+// The code comes first: it is what says what went wrong, and the
+// message is the site's own words for it.
 func (e *Error) Error() string {
 	if e.Message != "" {
-		return e.Message
+		return fmt.Sprintf("%s: %s", e.Code, e.Message)
 	}
 	if e.HTTPStatus != 0 {
 		return fmt.Sprintf("MiniMax's sign-in server said %s (HTTP %d)", e.Code, e.HTTPStatus)
@@ -3937,7 +4109,7 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	var expires time.Duration
 	switch {
 	case b.ExpiresIn > 0:
-		expires = time.Duration(b.ExpiresIn) * time.Second
+		expires = expiresDuration(b.ExpiresIn)
 	case b.ExpiredIn > 0:
 		// expired_in 有时是还剩多少秒，有时是一个绝对的毫秒时间戳。
 		// 靠大小分：毫秒时间戳不会是 1970 年。
@@ -3954,8 +4126,10 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 
 	interval := 5 * time.Second
 	if b.Interval > 0 {
-		if byUser {
-			// MiniMax 自己的变体给的是毫秒
+		// The site sends the interval in seconds and in milliseconds.
+		// A poll that waits more than a minute is not a poll, so a
+		// number that big is milliseconds.
+		if b.Interval > 60 {
 			interval = time.Duration(b.Interval) * time.Millisecond
 		} else {
 			interval = time.Duration(b.Interval) * time.Second
@@ -4027,7 +4201,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			continue
 		}
 		if code == "slow_down" {
-			wait += 5 * time.Second
+			wait += slowDownWait
 			continue
 		}
 		if !httpOK {
@@ -4037,7 +4211,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		case "pending":
 			continue
 		case "slow_down":
-			wait += 5 * time.Second
+			wait += slowDownWait
 			continue
 		case "denied", "access_denied":
 			return nil, &Error{Code: "access_denied"}
@@ -4053,7 +4227,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		tok := &Token{
 			Access:  b.AccessToken,
 			Refresh: b.RefreshToken,
-			Expires: time.Now().Add(time.Duration(b.ExpiresIn) * time.Second),
+			Expires: time.Now().Add(expiresDuration(b.ExpiresIn)),
 		}
 		tok.Subject, tok.AccountID = claims(b.AccessToken)
 		return tok, nil
@@ -4159,7 +4333,7 @@ func TestRefreshToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
 	if err != nil {
 		t.Fatal(err)
@@ -4178,7 +4352,7 @@ func TestRefreshKeepsOldTokenWhenNoNewOneGiven(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
 	if err != nil {
 		t.Fatal(err)
@@ -4195,7 +4369,7 @@ func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := testClient(t, srv)
+	c := testClient(t)
 	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
 	oe, ok := err.(*Error)
 	if !ok {
@@ -4254,9 +4428,13 @@ func TestRenewerDoesNotSpendASpentTokenAgain(t *testing.T) {
 	if _, err := r.Renew(context.Background(), "acc_01", current, spend); err != nil {
 		t.Fatal(err)
 	}
-	// 同一个 refresh 再来一次：不能��再发出去
-	if _, err := r.Renew(context.Background(), "acc_01", current, spend); err == nil {
-		t.Fatal("expected an error for an already spent token")
+	// 同一个 refresh 再来一次：不能再发出去，但要把最新的那个给它
+	tok, err := r.Renew(context.Background(), "acc_01", current, spend)
+	if err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if tok == nil || tok.Access != "new-access" {
+		t.Fatalf("expected the newest token to be given, got %+v", tok)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("spend called %d times, want 1", got)
@@ -4350,7 +4528,7 @@ func Refresh(ctx context.Context, c *upstream.Client, endpoint, refresh string) 
 	tok := &Token{
 		Access:  b.AccessToken,
 		Refresh: newRefresh,
-		Expires: time.Now().Add(time.Duration(b.ExpiresIn) * time.Second),
+		Expires: time.Now().Add(expiresDuration(b.ExpiresIn)),
 	}
 	tok.Subject, tok.AccountID = claims(b.AccessToken)
 	return tok, nil
@@ -4362,17 +4540,23 @@ type SpendFunc func(ctx context.Context, refresh string) (*Token, error)
 // Renewer spends refresh tokens, once each.
 //
 // MiniMax spends a refresh token once: sent a second time it is
-// invalid_grant, which signs the account out. So a refresh token is
-// never sent twice from here, whatever the concurrency.
+// invalid_grant, which signs the account out. So a refresh token that
+// was already spent is never sent again from here, whatever the
+// concurrency. A refresh that failed for a network reason is the one
+// exception: it may not have reached the site, so it is sent again.
 //
-// The renewer keeps, per account, the newest token it got and the set
-// of refresh tokens already spent. A request that comes while a renewal
+// The renewer keeps, per account, the newest token it got and the
+// refresh tokens already spent. A request that comes while a renewal
 // is running waits for it and uses what it gave.
 type Renewer struct {
 	mu       sync.Mutex
 	inflight map[string]*renewCall
 	latest   map[string]*Token
-	spent    map[string]bool
+	// spent holds, per account, the refresh tokens already spent.
+	// Only the last few are kept: a caller can only be holding one
+	// that was recent, and a list that grew with every refresh would
+	// grow for as long as the process runs.
+	spent map[string][]string
 }
 
 type renewCall struct {
@@ -4386,7 +4570,7 @@ func NewRenewer() *Renewer {
 	return &Renewer{
 		inflight: map[string]*renewCall{},
 		latest:   map[string]*Token{},
-		spent:    map[string]bool{},
+		spent:    map[string][]string{},
 	}
 }
 
@@ -4411,7 +4595,7 @@ func (r *Renewer) Renew(ctx context.Context, accountID string, current *Token, s
 			return nil, ctx.Err()
 		}
 	}
-	if r.spent[current.Refresh] {
+	if isSpent(r.spent[accountID], current.Refresh) {
 		newest := r.latest[accountID]
 		r.mu.Unlock()
 		if newest != nil {
@@ -4434,7 +4618,10 @@ func (r *Renewer) Renew(ctx context.Context, accountID string, current *Token, s
 	delete(r.inflight, accountID)
 	if err == nil && tok != nil {
 		r.latest[accountID] = tok
-		r.spent[current.Refresh] = true
+		r.spent[accountID] = append(r.spent[accountID], current.Refresh)
+		if len(r.spent[accountID]) > spentCount {
+			r.spent[accountID] = r.spent[accountID][len(r.spent[accountID])-spentCount:]
+		}
 	}
 	c.token, c.err = tok, err
 	close(c.done)
@@ -4444,23 +4631,28 @@ func (r *Renewer) Renew(ctx context.Context, accountID string, current *Token, s
 
 // Latest gives the newest token this renewer holds for an account.
 //
-// It follows the chain: a token that was renewed gives another, and
-// another, and the newest of them is what a request should use.
+// The renewer keeps only the newest one per account, so this is that
+// one, or the caller's own when there is none.
 func (r *Renewer) Latest(accountID string, current *Token) *Token {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	best := current
-	for i := 0; i < 16; i++ {
-		l, ok := r.latest[accountID]
-		if !ok || l == nil {
-			break
-		}
-		if best != nil && l.Refresh == best.Refresh {
-			break
-		}
-		best = l
+	if l, ok := r.latest[accountID]; ok && l != nil {
+		return l
 	}
-	return best
+	return current
+}
+
+// spentCount is how many spent refresh tokens are kept per account.
+const spentCount = 4
+
+// isSpent says whether a refresh token is one of the spent ones.
+func isSpent(list []string, refresh string) bool {
+	for _, s := range list {
+		if s == refresh {
+			return true
+		}
+	}
+	return false
 }
 
 // Forget drops an account's tokens, for when it is signed out.
@@ -4533,7 +4725,8 @@ func TestIdentity(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	id, err := c.Identity(context.Background(), "tok", "1234567890")
 	if err != nil {
 		t.Fatal(err)
@@ -4549,7 +4742,8 @@ func TestIdentityNoUserIDInAnswer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	if _, err := c.Identity(context.Background(), "tok", ""); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -4571,7 +4765,8 @@ func TestLedgerPaging(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
 	if err != nil {
 		t.Fatal(err)
@@ -4590,7 +4785,8 @@ func TestLedgerBusinessError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	if _, err := c.Ledger(context.Background(), "tok", "1234567890"); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -4632,7 +4828,8 @@ func TestPlanWindows(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	ws, err := c.PlanWindows(context.Background(), "tok", "")
 	if err != nil {
 		t.Fatal(err)
@@ -4640,8 +4837,9 @@ func TestPlanWindows(t *testing.T) {
 	if len(ws) != 2 {
 		t.Fatalf("got %d windows: %+v", len(ws), ws)
 	}
-	if ws[0].Used != 90 {
-		t.Fatalf("interval used = %v, want 90", ws[0].Used)
+	// status 2 是用完了，所以是 100%
+	if ws[0].Used != 100 {
+		t.Fatalf("interval used = %v, want 100", ws[0].Used)
 	}
 	if ws[0].Amount != 150 || ws[0].Limit != 150 {
 		t.Fatalf("window = %+v", ws[0])
@@ -4654,7 +4852,8 @@ func TestPlanWindowsEmpty(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	ws, err := c.PlanWindows(context.Background(), "tok", "")
 	if err != nil {
 		t.Fatal(err)
@@ -4673,7 +4872,8 @@ func TestPlanTitle(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testClient(t, srv))
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
 	title, err := c.PlanTitle(context.Background(), "tok", "")
 	if err != nil {
 		t.Fatal(err)
@@ -4696,7 +4896,7 @@ func TestModelsFallback(t *testing.T) {
 测试文件的 import 补上 `"mmxcode/internal/upstream"`，并加助手：
 
 ```go
-func testClient(t *testing.T, srv *httptest.Server) *upstream.Client {
+func testClient(t *testing.T) *upstream.Client {
 	t.Helper()
 	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
 }
@@ -4817,9 +5017,31 @@ type Membership struct {
 	Balance string
 }
 
+// Sender sends a request.
+//
+// It is an interface so that an account with its own proxy can have
+// every one of its calls go out through it: the caller hands over the
+// sender that belongs to the account.
+type Sender interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+// nowOffset gives the timezone offset in seconds east of UTC.
+//
+// It is the value the reference sends as getTimezoneOffset() * -60.
+// time.Time has no Offset() method: Zone()'s second value is it.
+func nowOffset() int {
+	_, offset := time.Now().Zone()
+	return offset
+}
+
 // Client reads the account API.
 type Client struct {
-	up *upstream.Client
+	up Sender
+	// base is the host the account API is on.
+	base string
+	// platform is the host the plan console is on.
+	platform string
 	// now gives the time; a test can set it.
 	now func() time.Time
 	// tzOffset is the client's timezone offset in seconds.
@@ -4829,15 +5051,37 @@ type Client struct {
 }
 
 // New makes a client.
-func New(up *upstream.Client) *Client {
+func New(up Sender) *Client {
 	return &Client{
 		up:       up,
+		base:     site.AgentHost,
+		platform: site.PlatformHost,
 		now:      time.Now,
 		// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
-		// 和 Go 的 Offset() 是同一个值。
-		tzOffset: int(time.Now().Offset()),
+		// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
+		// 方法，Zone() 的第二个返回值就是它。
+		tzOffset: nowOffset(),
 		osName:   runtime.GOOS,
 	}
+}
+
+// SetBase sends the calls to other hosts, for a test.
+//
+// The account API and the plan console live on two hosts, so both are
+// given. Without this the tests talk to MiniMax itself, and fail
+// wherever the site is out of reach.
+func (c *Client) SetBase(base, platform string) {
+	c.base = base
+	c.platform = platform
+}
+
+// With gives a copy of the client that sends through another sender.
+//
+// Every fetch an account makes goes through the account's own way out,
+// or the global one. An account behind a proxy that is not used for
+// its usage reading is an account whose reading never arrives.
+func (c *Client) With(up Sender) *Client {
+	return &Client{up: up, now: c.now, tzOffset: c.tzOffset, osName: c.osName}
 }
 
 // SetClock replaces the clock, for a test.
@@ -5031,7 +5275,7 @@ func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Win
 }
 
 func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.PlatformURL(path), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.platform+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -5057,7 +5301,7 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 
 // PlanTitle reads the plan's name as the console says it.
 func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string, error) {
-	path := site.PlatformURL(site.PlanTitlePath) + "?biz_line=2&cycle_type=1&resource_package_type=7"
+	path := c.platform + site.PlanTitlePath + "?biz_line=2&cycle_type=1&resource_package_type=7"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
@@ -5185,7 +5429,7 @@ type signKV = sign.KV
 // it. The answer's business codes are checked before it is handed back.
 func (c *Client) call(ctx context.Context, access, userID, method, path string, body []byte, query []signKV) ([]byte, error) {
 	now := c.now()
-	signed := sign.Sign(site.AgentHost, path, sign.Options{
+	signed := sign.Sign(c.base, path, sign.Options{
 		Access:   access,
 		UserID:   userID,
 		Body:     body,
@@ -5308,6 +5552,13 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		if name == "" {
 			continue
 		}
+		// A model whose two windows are both unlimited and both have no
+		// count is a bucket the plan does not have.
+		if isThree(m.CurrentIntervalStatus) && isThree(m.CurrentWeeklyStatus) &&
+			isZeroCount(m.CurrentIntervalTotalCnt) && isZeroCount(m.CurrentWeeklyTotalCnt) {
+			continue
+		}
+		general := strings.EqualFold(name, "general")
 		for _, x := range []struct {
 			status    *float64
 			remaining *float64
@@ -5329,7 +5580,10 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 				status = *x.status
 			}
 			if status == 3 {
-				out = append(out, Window{Name: windowName(x.weekly), ModelName: name, Unlimited: true})
+				// An unlimited window is said so on the general model.
+				if general {
+					out = append(out, Window{Name: windowName(x.weekly), ModelName: name, Unlimited: true})
+				}
 				continue
 			}
 			if x.status == nil && x.remaining == nil && x.used == nil {
@@ -5352,9 +5606,24 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			if x.end > 0 {
 				w.ResetsAt = time.UnixMilli(x.end)
 			}
-			if x.usedCnt != nil && x.totalCnt != nil && *x.totalCnt > 0 {
-				w.Amount = *x.usedCnt
-				w.Limit = *x.totalCnt
+			// The site counts the items a window has. A count that is
+			// not there is zero, the way the reference reads it, so a
+			// window with a limit and no count yet is "0 of 150" and
+			// not "unknown".
+			items, of := 0.0, 0.0
+			if x.usedCnt != nil {
+				items = *x.usedCnt
+			}
+			if x.totalCnt != nil {
+				of = *x.totalCnt
+			}
+			if of > 0 && items <= of {
+				w.Amount = items
+				if status == 2 {
+					// A spent window counts its whole limit.
+					w.Amount = of
+				}
+				w.Limit = of
 				if strings.EqualFold(name, "video") {
 					w.Unit = "videos"
 				}
@@ -5368,6 +5637,12 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 	}
 	return out, nil
 }
+
+// isThree says whether a number is 3.
+func isThree(v *float64) bool { return v != nil && *v == 3 }
+
+// isZeroCount says whether a count is missing or zero.
+func isZeroCount(v *float64) bool { return v == nil || *v == 0 }
 
 func windowName(weekly bool) string {
 	if weekly {
@@ -5656,7 +5931,9 @@ import (
 func testAccountClient(t *testing.T, srv *httptest.Server) *account.Client {
 	t.Helper()
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	return account.New(up)
+	c := account.New(up)
+	c.SetBase(srv.URL, srv.URL)
+	return c
 }
 ```
 
@@ -5701,7 +5978,6 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"time"
 
 	"mmxcode/internal/account"
 )
@@ -5880,9 +6156,9 @@ func streakFrom(days []day, i int) int {
 // checkinQuery is the query MiniMax Code's own check-in sends.
 func checkinQuery() []account.QueryKV {
 	return []account.QueryKV{
-		{Key: "device_platform", Value: "web"},
-		{Key: "is_desktop", Value: "1"},
-		{Key: "desktop_version", Value: "0.6.12"},
+		{K: "device_platform", V: "web"},
+		{K: "is_desktop", V: "1"},
+		{K: "desktop_version", V: "0.6.12"},
 	}
 }
 
@@ -6249,8 +6525,14 @@ func newRoot() *cobra.Command {
 			return err
 		}
 		e.store = s
-		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second})
 		e.egr = egress.New(cfg.Proxy.Groups, cfg.Proxy.Default)
+		// 登录和账户 API 也走代理。配了不用等于没配：国内的网络
+		// 连不上国际站，登录就停在第一步。
+		tr, err := e.egr.Transport(e.egr.Resolve(store.Account{}))
+		if err != nil {
+			return err
+		}
+		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
 		return nil
 	}
@@ -6266,6 +6548,19 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
 	return root
+}
+
+// accFor gives the account API client an account's calls go out with.
+//
+// Every fetch an account makes goes through the account's own way out,
+// or the global one. The transport is cached by the resolver, so making
+// a client for it is cheap.
+func (e *env) accFor(a store.Account) (*account.Client, error) {
+	tr, err := e.egr.Transport(e.egr.Resolve(a))
+	if err != nil {
+		return nil, err
+	}
+	return e.acc.With(upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})), nil
 }
 
 // tokenFor gives an account's token, or says it is not signed in.
@@ -6538,7 +6833,6 @@ func newCheckinCmd(e *env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c := checkin.New(e.acc)
 			failed := false
 			for _, a := range list {
 				if accountID != "" && a.ID != accountID {
@@ -6550,7 +6844,14 @@ func newCheckinCmd(e *env) *cobra.Command {
 					failed = true
 					continue
 				}
-				out, err := c.Run(ctx, tok.Access, a.UserID)
+				// 每个账号走自己的出口
+				acc, err := e.accFor(a)
+				if err != nil {
+					fmt.Printf("%s\t失败：%v\n", a.Name, err)
+					failed = true
+					continue
+				}
+				out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
 				if err != nil {
 					fmt.Printf("%s\t失败：%v\n", a.Name, err)
 					failed = true

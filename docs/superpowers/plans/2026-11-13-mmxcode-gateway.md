@@ -524,6 +524,22 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) {
 	_ = m.Store.UpdateAccount(ctx, a)
 }
 
+// accFor gives the account API client an account's calls go out with.
+//
+// Every fetch an account makes goes through the account's own way out,
+// or the global one. An account behind a proxy that is not used for
+// its usage reading is an account whose reading never arrives.
+//
+// The transport is cached by the resolver, so making a client for it is
+// cheap.
+func (m *Manager) accFor(a store.Account) (*account.Client, error) {
+	tr, err := m.Egress.Transport(m.Egress.Resolve(a))
+	if err != nil {
+		return nil, err
+	}
+	return m.Acc.With(upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: tr})), nil
+}
+
 // Client gives the HTTP client an account's requests go out with, and
 // the address of that way out.
 func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, string, error) {
@@ -551,7 +567,11 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 	}
 	snap := store.UsageSnapshot{AccountID: accountID, CreatedAt: time.Now()}
 
-	batches, err := m.Acc.Ledger(ctx, tok.Access, a.UserID)
+	acc, err := m.accFor(a)
+	if err != nil {
+		return store.UsageSnapshot{}, err
+	}
+	batches, err := acc.Ledger(ctx, tok.Access, a.UserID)
 	if err != nil {
 		return store.UsageSnapshot{}, err
 	}
@@ -585,15 +605,15 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		snap.ExpiresAt = soonest
 	}
 
-	if ws, err := m.Acc.PlanWindows(ctx, tok.Access, ""); err == nil && len(ws) > 0 {
+	if ws, err := acc.PlanWindows(ctx, tok.Access, ""); err == nil && len(ws) > 0 {
 		if b, err := json.Marshal(ws); err == nil {
 			snap.WindowsJSON = string(b)
 		}
 	}
-	if title, err := m.Acc.PlanTitle(ctx, tok.Access, ""); err == nil {
+	if title, err := acc.PlanTitle(ctx, tok.Access, ""); err == nil {
 		snap.Plan = title
 	}
-	if mem, err := m.Acc.Membership(ctx, tok.Access, a.UserID); err == nil {
+	if mem, err := acc.Membership(ctx, tok.Access, a.UserID); err == nil {
 		snap.Balance = mem.Balance
 		snap.PlanUntil = mem.ExpiresAt
 	}
@@ -614,8 +634,11 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
-	c := checkin.New(m.Acc)
-	out, err := c.Run(ctx, tok.Access, a.UserID)
+	acc, err := m.accFor(a)
+	if err != nil {
+		return checkin.Outcome{}, err
+	}
+	out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
@@ -715,7 +738,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```go
 // Do sends a request through the client's own transport.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	return DoWith(req, c.http.Transport)
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
+	return doWith(req, c.http.Transport, c.timeout)
 }
 
 // DoWith sends a request through a given transport.
@@ -726,12 +752,21 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // The transport is a parameter because the proxy is a property of the
 // transport: an account with its own exit needs its own client, and
 // the same client is shared by every account that shares an exit.
+//
+// There is no timeout here: a chat streams for as long as it needs,
+// and the caller's context carries the deadline.
 func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, error) {
+	return doWith(req, transport, 0)
+}
+
+// doWith is the redirect loop both of them share.
+func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duration) (*http.Response, error) {
 	if transport == nil {
 		transport = defaultTransport()
 	}
 	client := &http.Client{
 		Transport: transport,
+		Timeout:   timeout,
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -750,7 +785,7 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 		if err != nil {
 			return resp, nil
 		}
-		if next.Host != current.URL.Host {
+		if !sameHost(next, current.URL) {
 			resp.Body.Close()
 			return nil, &OtherSiteError{
 				From:   current.URL.Host,
@@ -810,7 +845,10 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 
 `DoWith` 里 `client.Do(current)` 的第二个返回值在 `err != nil` 时，Go 会把它包进 `*url.Error`，所以 `OtherSiteError` 会被包一层。用 `errors.As` 取。
 
-同时删掉 `client.go` 里旧的 `Do` 函数体（保留 `defaultTransport`、`redirectStatuses`）。
+`sameHost`、`effectivePort` 和 `time` 在 `client.go` 里已经有了（计划 A 的 Task 4
+写的），这里直接用。
+
+同时删掉 `client.go` 里旧的 `Do` 函数体（保留 `defaultTransport`、`redirectStatuses`、`sameHost`）。
 
 - [ ] **Step 2: 写失败的测试**
 
@@ -3236,6 +3274,15 @@ import (
 	"mmxcode/internal/upstream"
 )
 
+// nowOffset gives the timezone offset in seconds east of UTC.
+//
+// It is the value the reference sends as getTimezoneOffset() * -60.
+// time.Time has no Offset() method: Zone()'s second value is it.
+func nowOffset() int {
+	_, offset := time.Now().Zone()
+	return offset
+}
+
 // Server is the gateway.
 type Server struct {
 	// Mgr holds the accounts.
@@ -3410,8 +3457,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			Access:    tok.Access,
 			SessionID: sess.UpstreamID,
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
-			// 和 Go 的 Offset() 是同一个值。
-			TZOffset:  int(time.Now().Offset()),
+			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
+			// 方法，Zone() 的第二个返回值就是它。
+			TZOffset:  nowOffset(),
 			Body:      upBody,
 			Stream:    stream,
 			Anthropic: upPath == site.MessagesPath,
@@ -3470,6 +3518,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		case rotator.ActionRenew:
 			newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
 			if rerr != nil {
+				// 跨站：不换号、不消耗 refresh token
+				var oe *upstream.OtherSiteError
+				if errors.As(rerr, &oe) {
+					writeError(w, http.StatusBadGateway, oe.Error())
+					return
+				}
 				lastErr = rerr
 				continue
 			}
@@ -3477,6 +3531,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			chatReq.Access = newTok.Access
 			resp2, raw2, err2 := s.attempt(r.Context(), chatReq, client.Transport, stream)
 			if err2 != nil {
+				var oe *upstream.OtherSiteError
+				if errors.As(err2, &oe) {
+					writeError(w, http.StatusBadGateway, oe.Error())
+					return
+				}
 				lastErr = err2
 				continue
 			}
@@ -5525,7 +5584,7 @@ FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
-# 先只拷依赖清单，依赖没变���这一层就不用重建
+# 先只拷依赖清单，依赖没变这一层就不用重建
 COPY go.mod go.sum ./
 RUN go mod download
 

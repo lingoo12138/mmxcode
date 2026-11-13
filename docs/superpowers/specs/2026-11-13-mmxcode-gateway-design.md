@@ -487,7 +487,7 @@ CREATE TABLE accounts (
   proxy_group   TEXT,                    -- 出口组名，对应 proxy.groups.<name>
   proxy_url     TEXT,                    -- 账号级代理地址，优先于出口组
   pending_persist INTEGER NOT NULL DEFAULT 0,
-  exhausted_until TEXT,                  -- 账号级耗尽的恢复时刻
+  exhausted_until INTEGER,               -- 账号级耗尽的恢复时刻（毫秒）
   last_error    TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
