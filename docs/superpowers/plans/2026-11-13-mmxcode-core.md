@@ -3056,6 +3056,31 @@ func TestStartDeviceUserCodeVariant(t *testing.T) {
 	}
 }
 
+func TestStartDeviceExpiredInSeconds(t *testing.T) {
+	// expired_in 小于 1e12 时是"还剩多少秒"，不是绝对时间。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"device_code":        "dev-2",
+			"user_code":          "ABCD-EFGH",
+			"verification_uri":   "https://example.invalid/activate",
+			"expired_in":         600,
+			"interval":           5,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv)
+	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 十分钟，不多不少
+	left := time.Until(d.deadline)
+	if left < 9*time.Minute || left > 10*time.Minute {
+		t.Fatalf("deadline is %v away, want about 10m", left)
+	}
+}
+
 func TestStartDeviceBadAnswer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -3341,7 +3366,13 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	case b.ExpiresIn > 0:
 		expires = time.Duration(b.ExpiresIn) * time.Second
 	case b.ExpiredIn > 0:
-		expires = time.Until(time.UnixMilli(b.ExpiredIn))
+		// expired_in 有时是还剩多少秒，有时是一个绝对的毫秒时间戳。
+		// 靠大小分：毫秒时间戳不会是 1970 年。
+		if b.ExpiredIn < 1e12 {
+			expires = time.Duration(b.ExpiredIn) * time.Second
+		} else {
+			expires = time.Until(time.UnixMilli(b.ExpiredIn))
+		}
 	}
 	if expires <= 0 {
 		expires = signInTimeout
