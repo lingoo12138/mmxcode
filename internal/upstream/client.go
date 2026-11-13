@@ -189,33 +189,45 @@ func schemeHost(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// Do sends a request, following a redirect that stays on the host and
-// refusing one that does not.
-//
-// A redirect to another host is an OtherSiteError: the answer says
-// where the request was sent and what to do about it. A redirect that
-// downgrades the scheme is a SchemeDowngradeError, and one that would
-// replay a signature made for another path is a StaleSignatureError.
-// None of them is followed.
+// Do sends a request through the client's own transport.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	// The redirect handling is done here, not by http.Client, so the
-	// cross-host case can be told apart from the same-host one.
+	return doWith(req, c.http.Transport, c.timeout, c.userAgent)
+}
+
+// DoWith sends a request through a given transport.
+//
+// A redirect that stays on the host is followed; one that leaves it is
+// an OtherSiteError, and the request is not sent on.
+//
+// The transport is a parameter because the proxy is a property of the
+// transport: an account with its own exit needs its own client, and
+// the same client is shared by every account that shares an exit.
+//
+// There is no timeout here: a chat streams for as long as it needs,
+// and the caller's context carries the deadline.
+func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, error) {
+	return doWith(req, transport, 0, "")
+}
+
+// doWith is the redirect loop both of them share.
+//
+// The caller's request is not touched: the User-Agent goes into a
+// copy, and a request with no header map at all is given one, so
+// writing into it cannot panic.
+func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duration, userAgent string) (*http.Response, error) {
+	if transport == nil {
+		transport = defaultTransport()
+	}
 	client := &http.Client{
-		Transport: c.http.Transport,
-		Timeout:   c.timeout,
+		Transport: transport,
+		Timeout:   timeout,
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	// The caller's request is not touched: the User-Agent goes into a
-	// copy, and a request with no header map at all is given one, so
-	// writing into it cannot panic.
 	current := copyRequest(req)
-	// A request that names its own User-Agent keeps it; one that does
-	// not says who it is. Without this the account API calls itself
-	// Go-http-client.
-	if current.Header.Get("User-Agent") == "" {
-		current.Header.Set("User-Agent", c.userAgent)
+	if current.Header.Get("User-Agent") == "" && userAgent != "" {
+		current.Header.Set("User-Agent", userAgent)
 	}
 	for hop := 0; ; hop++ {
 		resp, err := client.Do(current)
@@ -231,6 +243,8 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			return resp, nil
 		}
 		if isDowngrade(current.URL, next) && sameAddress(current.URL, next) {
+			// The sign-in would go out in cleartext, so the redirect is
+			// refused and never followed.
 			resp.Body.Close()
 			return nil, &SchemeDowngradeError{
 				From:   schemeHost(current.URL),
@@ -247,10 +261,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 		}
 		if signed(current.Header) && !sameRequest(current.URL, next) {
-			// The signature is over the path and the query. Sending the
-			// old one to another path is a request the upstream refuses,
-			// and that refusal reads as a dead token — a false one that
-			// costs a refresh token. The redirect is refused instead.
+			// The signature is made over the path and the query, so the
+			// old one cannot be replayed. Sending it would be refused by
+			// the upstream, and that refusal reads as a dead token.
 			resp.Body.Close()
 			return nil, &StaleSignatureError{
 				From:   schemeHost(current.URL),
@@ -259,21 +272,17 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 		}
 		if hop >= 5 {
-			// Too many redirects is an error, not an answer: handing
-			// back the redirect itself would leave the caller with a
-			// body nobody read.
+			// Too many redirects is an error, not an answer: handing back
+			// the redirect itself would leave the caller with a body
+			// nobody read.
 			resp.Body.Close()
 			return nil, fmt.Errorf("too many redirects")
 		}
-		// 307 and 308 keep the method and the body; the others turn a
-		// non-GET into a GET without a body.
-		//
 		// The body has to be read again: http.Request.Body is a reader
 		// the previous request already consumed, so replaying it as it
-		// is would send an empty body — and a signed request with the
-		// wrong body is refused. GetBody is what reads it a second time;
-		// http.NewRequest prepares it for bytes.Reader and
-		// strings.Reader. Without it the body cannot be replayed, so the
+		// is would send an empty body — and a chat with an empty body is
+		// not the chat that was asked for. GetBody is what reads it a
+		// second time; without it the body cannot be replayed, so the
 		// answer is handed back as it came.
 		method, body, length := current.Method, current.Body, current.ContentLength
 		replay := false
