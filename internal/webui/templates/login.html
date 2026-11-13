@@ -1,0 +1,11 @@
+{{define "content"}}
+<h2>登录</h2>
+{{if .Pending}}
+<p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
+   <a href="{{.Pending.URL}}" target="_blank">这个页面</a>。</p>
+<p id="poll-result" class="muted">正在等……</p>
+{{else}}
+<button id="start-login">开始登录</button>
+<div id="login-result"></div>
+{{end}}
+{{end}}

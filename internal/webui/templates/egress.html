@@ -1,0 +1,14 @@
+{{define "content"}}
+<h2>出口</h2>
+<table>
+<tr><th>名字</th><th>地址</th><th>健康</th><th></th></tr>
+{{range .Egress}}
+<tr>
+  <td>{{.Name}}</td>
+  <td class="muted">{{.URL}}</td>
+  <td>{{if .OK}}<span class="good">可用</span>{{else if .Checked}}<span class="bad">不可用：{{.Error}}</span>{{else}}<span class="muted">未检查</span>{{end}}</td>
+  <td><button data-egress="{{.Name}}">测试</button></td>
+</tr>
+{{end}}
+</table>
+{{end}}

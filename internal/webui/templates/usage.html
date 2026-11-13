@@ -1,0 +1,22 @@
+{{define "content"}}
+<h2>用量</h2>
+<div class="cards">
+  <div class="card"><div class="muted">总积分</div><div class="n">{{printf "%.2f" .Summary.TotalGranted}}</div></div>
+  <div class="card"><div class="muted">总消耗</div><div class="n">{{printf "%.2f" .Summary.TotalConsumed}}</div></div>
+  <div class="card"><div class="muted">总剩余</div><div class="n">{{printf "%.2f" .Summary.TotalRemaining}}</div></div>
+</div>
+{{if .Summary.ExpiresAt}}<p class="muted">最近过期：{{.Summary.ExpiresAt.Format "2006-01-02 15:04"}}</p>{{end}}
+{{if .Summary.AccountsUnavailable}}<p class="bad">有 {{.Summary.AccountsUnavailable}} 个账号的积分读不到。</p>{{end}}
+<table>
+<tr><th>账号</th><th>积分</th><th>消耗</th><th>剩余</th><th>过期</th></tr>
+{{range .Summary.Accounts}}
+<tr>
+  <td>{{if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}</td>
+  <td>{{if .Granted}}{{printf "%.2f" (num .Granted)}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td>{{if .Consumed}}{{printf "%.2f" (num .Consumed)}}{{else}}0{{end}}</td>
+  <td>{{if .Remaining}}{{printf "%.2f" (num .Remaining)}}{{else}}0{{end}}</td>
+  <td class="muted">{{if .ExpiresAt}}{{.ExpiresAt.Format "2006-01-02"}}{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{end}}

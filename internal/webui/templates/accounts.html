@@ -1,0 +1,25 @@
+{{define "content"}}
+<h2>账号</h2>
+<table>
+<tr><th>标签</th><th>邮箱</th><th>状态</th><th>积分</th><th>套餐</th><th>出口</th><th>今日签到</th><th></th></tr>
+{{range $acc := .Accounts}}
+<tr>
+  <td>{{$acc.Name}}<div class="muted">{{$acc.ID}}</div></td>
+  <td>{{$acc.Email}}</td>
+  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}</td>
+  <td>{{if $acc.HasAmounts}}{{printf "%.2f / %.2f" $acc.Remaining $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td>{{$acc.Plan}}<div class="muted">{{$acc.WindowSummary}}</div></td>
+  <td>
+    <select data-account="{{$acc.ID}}" data-field="proxy_group">
+      <option value="">（跟随全局）</option>
+      {{range $.Groups}}<option value="{{.Name}}"{{if eq .Name $acc.ProxyGroup}} selected{{end}}>{{.Name}}</option>{{end}}
+    </select>
+    <input size="18" placeholder="单独代理地址" data-account="{{$acc.ID}}" data-field="proxy_url" value="{{$acc.ProxyURL}}">
+  </td>
+  <td>{{if $acc.CheckedIn}}<span class="good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="muted">未签</span>{{end}}</td>
+  <td><button data-checkin="{{$acc.ID}}">立即签到</button></td>
+</tr>
+{{end}}
+</table>
+{{if not .Accounts}}<p class="muted">还没有账号。<a href="/login">去登录</a>。</p>{{end}}
+{{end}}

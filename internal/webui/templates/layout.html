@@ -1,0 +1,41 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>{{.Title}} · mmxcode</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 14px/1.6 system-ui, sans-serif; margin: 0; padding: 0 1rem 3rem; }
+header { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #8884; }
+header h1 { font-size: 1.1rem; margin: 0; }
+nav a { margin-right: 1rem; text-decoration: none; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8883; }
+th { font-weight: 600; }
+.bad { color: #c0392b; }
+.good { color: #27ae60; }
+.muted { color: #888; }
+button { padding: .25rem .6rem; cursor: pointer; }
+input, select { padding: .25rem; }
+.cards { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
+.card { border: 1px solid #8884; border-radius: 6px; padding: .8rem 1.2rem; }
+.card .n { font-size: 1.6rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mmxcode</h1>
+  <nav>
+    <a href="/">账号</a>
+    <a href="/egress">出口</a>
+    <a href="/usage">用量</a>
+    <a href="/login">登录</a>
+  </nav>
+  <span class="muted" id="status"></span>
+</header>
+<main>
+{{template "content" .}}
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>{{end}}
