@@ -2012,9 +2012,9 @@ import (
 
 // The account states.
 const (
-	StatusActive     = "active"
-	StatusSignedOut  = "signed_out"
-	StatusError      = "error"
+	StatusActive    = "active"
+	StatusSignedOut = "signed_out"
+	StatusError     = "error"
 )
 
 // Store is the database.
@@ -2024,18 +2024,18 @@ type Store struct {
 
 // Account is one MiniMax account.
 type Account struct {
-	ID              string
-	Name            string
-	UserID          string
-	Email           string
-	Status          string
-	ProxyGroup      string
-	ProxyURL        string
-	PendingPersist  bool
-	ExhaustedUntil  time.Time
-	LastError       string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID             string
+	Name           string
+	UserID         string
+	Email          string
+	Status         string
+	ProxyGroup     string
+	ProxyURL       string
+	PendingPersist bool
+	ExhaustedUntil time.Time
+	LastError      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Token is an account's sign-in.
@@ -2244,12 +2244,12 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanAccount(sc scanner) (Account, error) {
 	var (
-		a                       Account
-		userID, email, pg, pu   sql.NullString
-		lastErr                  sql.NullString
-		exhausted                sql.NullInt64
-		pending                  int
-		createdAt, updatedAt     int64
+		a                     Account
+		userID, email, pg, pu sql.NullString
+		lastErr               sql.NullString
+		exhausted             sql.NullInt64
+		pending               int
+		createdAt, updatedAt  int64
 	)
 	if err := sc.Scan(&a.ID, &a.Name, &userID, &email, &a.Status, &pg, &pu,
 		&pending, &exhausted, &lastErr, &createdAt, &updatedAt); err != nil {
@@ -2330,11 +2330,11 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 	var out []Checkin
 	for rows.Next() {
 		var (
-			c                      Checkin
-			credit                 sql.NullFloat64
-			streak                 sql.NullInt64
-			message                sql.NullString
-			createdAt              int64
+			c         Checkin
+			credit    sql.NullFloat64
+			streak    sql.NullInt64
+			message   sql.NullString
+			createdAt int64
 		)
 		if err := rows.Scan(&c.ID, &c.AccountID, &c.Day, &c.Outcome, &credit, &streak, &message, &createdAt); err != nil {
 			return nil, err
@@ -2387,12 +2387,12 @@ func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, erro
 	var out []UsageSnapshot
 	for rows.Next() {
 		var (
-			u                              UsageSnapshot
-			granted, consumed, remaining   sql.NullFloat64
-			expiresAt                      sql.NullInt64
-			plan, windowsJSON, balance     sql.NullString
-			planUntil                      sql.NullInt64
-			createdAt                      int64
+			u                            UsageSnapshot
+			granted, consumed, remaining sql.NullFloat64
+			expiresAt                    sql.NullInt64
+			plan, windowsJSON, balance   sql.NullString
+			planUntil                    sql.NullInt64
+			createdAt                    int64
 		)
 		if err := rows.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
 			&plan, &planUntil, &windowsJSON, &balance, &createdAt); err != nil {
@@ -2448,8 +2448,8 @@ func (s *Store) ListExhausted(ctx context.Context) ([]Exhausted, error) {
 	var out []Exhausted
 	for rows.Next() {
 		var (
-			e     Exhausted
-			until int64
+			e      Exhausted
+			until  int64
 			reason sql.NullString
 		)
 		if err := rows.Scan(&e.AccountID, &e.WindowKey, &until, &reason); err != nil {
@@ -4033,11 +4033,11 @@ type Device struct {
 	// URL is where the user goes.
 	URL string
 
-	verifier   string
-	pollField  string
-	pollValue  string
-	deadline   time.Time
-	interval   time.Duration
+	verifier  string
+	pollField string
+	pollValue string
+	deadline  time.Time
+	interval  time.Duration
 }
 
 // StartDevice asks MiniMax for a sign-in code.
@@ -4311,7 +4311,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 追加失败的测试**
 
-在 `internal/oauth/oauth_test.go` 末尾追加：
+在 `internal/oauth/oauth_test.go` 末尾追加（import 补上 `"mmxcode/internal/upstream"`、`"sync"` 与 `"sync/atomic"`）：
 
 ```go
 func TestRefreshToken(t *testing.T) {
@@ -4454,8 +4454,6 @@ func TestRenewerLatestWins(t *testing.T) {
 	}
 }
 ```
-
-import 补上 `"sync"` 与 `"sync/atomic"`。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -5081,7 +5079,9 @@ func (c *Client) SetBase(base, platform string) {
 // or the global one. An account behind a proxy that is not used for
 // its usage reading is an account whose reading never arrives.
 func (c *Client) With(up Sender) *Client {
-	return &Client{up: up, now: c.now, tzOffset: c.tzOffset, osName: c.osName}
+	// The hosts go with it: a client made for an account's own exit
+	// must still call the same hosts, or the request goes nowhere.
+	return &Client{up: up, base: c.base, platform: c.platform, now: c.now, tzOffset: c.tzOffset, osName: c.osName}
 }
 
 // SetClock replaces the clock, for a test.
@@ -5094,9 +5094,9 @@ func (c *Client) SetClock(now func() time.Time, tzOffset int) {
 //
 // The check-in comes from the desktop client, so it says so.
 var checkinQuery = []signKV{
-	{"device_platform", "web"},
-	{"is_desktop", "1"},
-	{"desktop_version", "0.6.12"},
+	{K: "device_platform", V: "web"},
+	{K: "is_desktop", V: "1"},
+	{K: "desktop_version", V: "0.6.12"},
 }
 
 // Identity reads who the account is.
@@ -5108,15 +5108,15 @@ func (c *Client) Identity(ctx context.Context, access, userID string) (Identity,
 	var env struct {
 		Data struct {
 			UserInfo struct {
-				RealUserID   string `json:"realUserID"`
-				RealUserID2  string `json:"real_user_id"`
-				UserEmail    string `json:"userEmail"`
-				Email        string `json:"email"`
-				UserMail     string `json:"userMail"`
-				UserEmail2   string `json:"user_email"`
-				Name         string `json:"name"`
-				UserName     string `json:"userName"`
-				UserName2    string `json:"user_name"`
+				RealUserID  string `json:"realUserID"`
+				RealUserID2 string `json:"real_user_id"`
+				UserEmail   string `json:"userEmail"`
+				Email       string `json:"email"`
+				UserMail    string `json:"userMail"`
+				UserEmail2  string `json:"user_email"`
+				Name        string `json:"name"`
+				UserName    string `json:"userName"`
+				UserName2   string `json:"user_name"`
 			} `json:"userInfo"`
 		} `json:"data"`
 		UserInfo *struct {
@@ -5166,15 +5166,15 @@ func (c *Client) membershipOnce(ctx context.Context, access, userID, groupID str
 		return Membership{}, err
 	}
 	var env struct {
-		HasTokenPlan     *bool  `json:"has_token_plan"`
-		TokenPlanTier    string `json:"token_plan_tier"`
+		HasTokenPlan     *bool       `json:"has_token_plan"`
+		TokenPlanTier    string      `json:"token_plan_tier"`
 		TokenPlanExpires json.Number `json:"token_plan_expires_at"`
-		OpGroupID        string `json:"op_group_id"`
+		OpGroupID        string      `json:"op_group_id"`
 		OpCreditSummary  *struct {
 			TotalRemainingAmount string `json:"total_remaining_amount"`
 		} `json:"op_credit_summary"`
-		OpCreditBalance json.RawMessage `json:"opcredit_balance"`
-		Data map[string]json.RawMessage `json:"data"`
+		OpCreditBalance json.RawMessage            `json:"opcredit_balance"`
+		Data            map[string]json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return Membership{}, fmt.Errorf("membership: not JSON")
@@ -5208,9 +5208,9 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 	var out []Batch
 	for page := 1; page <= maxPages; page++ {
 		query := append(append([]signKV{}, checkinQuery...),
-			signKV{"page_number", strconv.Itoa(page)},
-			signKV{"page_size", strconv.Itoa(pageSize)},
-			signKV{"include_expired", "true"},
+			signKV{K: "page_number", V: strconv.Itoa(page)},
+			signKV{K: "page_size", V: strconv.Itoa(pageSize)},
+			signKV{K: "include_expired", V: "true"},
 		)
 		body, err := c.call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
 		if err != nil {
@@ -5914,20 +5914,9 @@ func TestNoPanel(t *testing.T) {
 }
 ```
 
-测试文件顶部加 import 与助手：
+测试文件的 import 补上 `"mmxcode/internal/account"` 与 `"mmxcode/internal/upstream"`，并加助手：
 
 ```go
-import (
-	"context"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-	"time"
-
-	"mmxcode/internal/account"
-	"mmxcode/internal/upstream"
-)
-
 func testAccountClient(t *testing.T, srv *httptest.Server) *account.Client {
 	t.Helper()
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
@@ -6438,22 +6427,21 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 // Command mmxcode is a gateway for MiniMax Code accounts.
 package main
 
-import (
-	"os"
-
-	"mmxcode/cmd/mmxcode"
-)
+import "os"
 
 func main() {
-	os.Exit(mmxcode.Execute())
+	os.Exit(Execute())
 }
 ```
 
 创建 `cmd/mmxcode/root.go`：
 
 ```go
-// Package mmxcode holds the command line.
-package mmxcode
+// This file holds the mmxcode command line.
+//
+// Everything in this directory is package main: the directory is the
+// binary, and a directory holds one package.
+package main
 
 import (
 	"context"
@@ -6495,8 +6483,8 @@ func newRoot() *cobra.Command {
 		dbPath     string
 	)
 	root := &cobra.Command{
-		Use:   "mmxcode",
-		Short: "MiniMax Code 多账号网关",
+		Use:          "mmxcode",
+		Short:        "MiniMax Code 多账号网关",
 		SilenceUsage: true,
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", os.Getenv("MMXCODE_CONFIG"), "配置文件路径")
@@ -6583,12 +6571,11 @@ func (e *env) tokenFor(ctx context.Context, accountID string) (*oauth.Token, err
 创建 `cmd/mmxcode/login.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -6687,7 +6674,7 @@ func firstNonEmpty(vals ...string) string {
 创建 `cmd/mmxcode/accounts.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"context"
@@ -6696,8 +6683,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
-
-	"mmxcode/internal/store"
 )
 
 func newAccountsCmd(e *env) *cobra.Command {
@@ -6789,7 +6774,7 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 }
 ```
 
-在 `root.go` 加一个 `nowUTC` 助手：
+在 `cmd/mmxcode/root.go` 加一个 `nowUTC` 助手（import 补上 `"sort"` 与 `"strings"`）：
 
 ```go
 func nowUTC() time.Time { return time.Now().UTC() }
@@ -6810,7 +6795,7 @@ func groupNames(groups map[string]string) string {
 创建 `cmd/mmxcode/checkin.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"context"
@@ -6883,7 +6868,7 @@ import 补上 `"time"`。
 创建 `cmd/mmxcode/usage.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"context"
@@ -6945,7 +6930,7 @@ func newUsageCmd(e *env) *cobra.Command {
 创建 `cmd/mmxcode/models.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"fmt"

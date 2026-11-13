@@ -115,6 +115,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -130,7 +131,16 @@ func newTestManager(t *testing.T, srv *httptest.Server) *Manager {
 	}
 	t.Cleanup(func() { s.Close() })
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	return New(s, up, account.New(up), egress.New(nil, ""), oauth.NewRenewer())
+	acc := account.New(up)
+	m := New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	if srv != nil {
+		// The token endpoint and the account API are pointed at the
+		// test server. Without this the test talks to MiniMax itself,
+		// and a refresh token it invents is spent for real.
+		m.TokenURL = srv.URL + site.TokenPath
+		acc.SetBase(srv.URL, srv.URL)
+	}
+	return m
 }
 
 func TestTokenReturnsStoredToken(t *testing.T) {
@@ -421,11 +431,16 @@ type Manager struct {
 	Egress *egress.Resolver
 	// Renewer spends refresh tokens, once each.
 	Renewer *oauth.Renewer
+	// TokenURL is where a refresh token is traded in.
+	TokenURL string
 }
 
 // New makes a manager.
 func New(s *store.Store, up *upstream.Client, acc *account.Client, egr *egress.Resolver, rw *oauth.Renewer) *Manager {
-	return &Manager{Store: s, Up: up, Acc: acc, Egress: egr, Renewer: rw}
+	return &Manager{
+		Store: s, Up: up, Acc: acc, Egress: egr, Renewer: rw,
+		TokenURL: site.AccountURL(site.TokenPath),
+	}
 }
 
 // Accounts gives every account.
@@ -470,7 +485,7 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 		return nil, fmt.Errorf("no token to renew")
 	}
 	tok, err := m.Renewer.Renew(ctx, accountID, cur, func(ctx context.Context, refresh string) (*oauth.Token, error) {
-		return oauth.Refresh(ctx, m.Up, site.AccountURL(site.TokenPath), refresh)
+		return oauth.Refresh(ctx, m.Up, m.TokenURL, refresh)
 	})
 	if err != nil {
 		var oe *oauth.Error
@@ -1096,6 +1111,30 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 
+	// A nil transport means the client's own: the client was made with
+	// the transport of the account's exit, and falling back to a fresh
+	// default one would quietly drop the proxy.
+	if transport == nil {
+		transport = c.http.Transport
+	}
+	// A nil transport means the client's own: the client was made with
+	// the transport of the account's exit, and falling back to a fresh
+	// default one would quietly drop the proxy.
+	if transport == nil {
+		transport = c.http.Transport
+	}
+	// A nil transport means the client's own: the client was made with
+	// the transport of the account's exit, and falling back to a fresh
+	// default one would quietly drop the proxy.
+	if transport == nil {
+		transport = c.http.Transport
+	}
+	// A nil transport means the client's own: the client was made with
+	// the transport of the account's exit, and falling back to a fresh
+	// default one would quietly drop the proxy.
+	if transport == nil {
+		transport = c.http.Transport
+	}
 	resp, err := DoWith(httpReq, transport)
 	if err != nil {
 		return nil, err
@@ -1118,7 +1157,7 @@ func (c *Client) Models(ctx context.Context, baseURL, access string) ([]byte, er
 	if access != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+access)
 	}
-	resp, err := DoWith(httpReq, nil)
+	resp, err := DoWith(httpReq, c.http.Transport)
 	if err != nil {
 		return nil, err
 	}
@@ -2851,7 +2890,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -2859,7 +2897,6 @@ import (
 	"time"
 
 	"mmxcode/internal/account"
-	"mmxcode/internal/checkin"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
@@ -2976,8 +3013,12 @@ func TestCodexUsesAnthropicFallback(t *testing.T) {
 }
 
 func TestQuotaRefusalFailsOverToAnotherAccount(t *testing.T) {
+	// The count is a local one: the handler is given before the
+	// harness that holds it exists.
+	hits := 0
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if h.hits == 1 {
+		hits++
+		if hits == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(`{"message":"insufficient balance"}`))
 			return
@@ -3306,12 +3347,12 @@ type Server struct {
 // New makes a gateway.
 func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Handler) *Server {
 	g := &Server{
-		Mgr:           mgr,
-		Cfg:           cfg,
-		Store:         s,
-		UpstreamBase:  site.LLMHost,
+		Mgr:             mgr,
+		Cfg:             cfg,
+		Store:           s,
+		UpstreamBase:    site.LLMHost,
 		NativeResponses: true,
-		WebUI:         webui,
+		WebUI:           webui,
 	}
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
@@ -3657,7 +3698,7 @@ func sseHasError(head []byte) bool {
 			continue
 		}
 		var ev struct {
-			Type       string `json:"type"`
+			Type       string          `json:"type"`
 			Error      json.RawMessage `json:"error"`
 			StatusInfo *struct {
 				Code int `json:"code"`
@@ -4034,8 +4075,14 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	mgr := manager.New(s, up, account.New(up), egress.New(map[string]string{"warp": "socks5h://warp:4000"}, ""), oauth.NewRenewer())
-	return New(mgr, config.Default(), s), s
+	groups := map[string]string{"warp": "socks5h://warp:4000"}
+	mgr := manager.New(s, up, account.New(up), egress.New(groups, ""), oauth.NewRenewer())
+	cfg := config.Default()
+	// The outlet groups are the configuration's; the resolver is built
+	// from the same map, so the page and the resolver agree on which
+	// groups there are.
+	cfg.Proxy.Groups = groups
+	return New(mgr, cfg, s), s
 }
 
 func TestAccountsPage(t *testing.T) {
@@ -4421,7 +4468,7 @@ package webui
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -4470,7 +4517,10 @@ type WebUI struct {
 
 // New makes the WebUI.
 func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
-	tmpl := template.Must(template.ParseFS(templateFS, "templates/*.html"))
+	// Only the layout is parsed here. Every page defines "content",
+	// and one set of templates for all of them would keep only the
+	// last page's content, so every page would render the last one.
+	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
 		Mgr:     mgr,
 		Cfg:     cfg,
@@ -4526,6 +4576,18 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// num is a number that may not be there.
+//
+// The credits are pointers, so that an account whose ledger could not
+// be read is left out rather than counted as zero. A page has to show
+// a number, so the pointer is read here.
+func num(v *float64) float64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // serveStatic gives the script.
 func (w *WebUI) serveStatic(rw http.ResponseWriter, r *http.Request) {
 	b, err := staticFS.ReadFile("static/app.js")
@@ -4545,8 +4607,19 @@ func (w *WebUI) page(rw http.ResponseWriter, r *http.Request, name string, data 
 		return
 	}
 	d["Title"] = strings.TrimSuffix(name, ".html")
+	// The page brings its own "content", so it is parsed into a copy
+	// of the layout.
+	tmpl, err := w.tmpl.Clone()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := tmpl.ParseFS(templateFS, "templates/"+name); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	var buf strings.Builder
-	if err := w.tmpl.ExecuteTemplate(&buf, "layout", d); err != nil {
+	if err := tmpl.ExecuteTemplate(&buf, "layout", d); err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -4576,18 +4649,18 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 		out = append(out, map[string]any{
 			"ID":            a.ID,
 			"Name":          a.Name,
-			"Email":        a.Email,
-			"Status":       a.Status,
-			"ProxyGroup":   a.ProxyGroup,
-			"ProxyURL":     a.ProxyURL,
-			"Current":      a.ProxyGroup,
-			"HasAmounts":   snap.HasAmounts,
-			"Granted":      snap.Granted,
-			"Remaining":    snap.Remaining,
-			"Plan":         snap.Plan,
+			"Email":         a.Email,
+			"Status":        a.Status,
+			"ProxyGroup":    a.ProxyGroup,
+			"ProxyURL":      a.ProxyURL,
+			"Current":       a.ProxyGroup,
+			"HasAmounts":    snap.HasAmounts,
+			"Granted":       snap.Granted,
+			"Remaining":     snap.Remaining,
+			"Plan":          snap.Plan,
 			"WindowSummary": w.windowSummary(ctx, a.ID),
-			"CheckedIn":    checkedIn,
-			"Streak":       streak,
+			"CheckedIn":     checkedIn,
+			"Streak":        streak,
 		})
 	}
 	return map[string]any{"Accounts": out, "Groups": groups}, nil
@@ -4866,9 +4939,9 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPatch:
 		var body struct {
-			Name      *string `json:"name"`
+			Name       *string `json:"name"`
 			ProxyGroup *string `json:"proxy_group"`
-			ProxyURL  *string `json:"proxy_url"`
+			ProxyURL   *string `json:"proxy_url"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		a, err := w.Store.GetAccount(r.Context(), id)
@@ -5089,7 +5162,12 @@ func TestUsageRefresh(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	mgr := manager.New(s, up, account.New(up), egress.New(nil, ""), oauth.NewRenewer())
+	acc := account.New(up)
+	// The account API is pointed at the test server. Without this the
+	// test asks MiniMax for the numbers and waits for an answer that
+	// never comes.
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	sc.RefreshUsage(ctx)
@@ -5139,7 +5217,12 @@ func TestCheckinAll(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	mgr := manager.New(s, up, account.New(up), egress.New(nil, ""), oauth.NewRenewer())
+	acc := account.New(up)
+	// The account API is pointed at the test server. Without this the
+	// test asks MiniMax for the numbers and waits for an answer that
+	// never comes.
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	results := sc.CheckinAll(ctx)
@@ -5394,7 +5477,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 创建 `cmd/mmxcode/serve.go`：
 
 ```go
-package mmxcode
+package main
 
 import (
 	"context"
