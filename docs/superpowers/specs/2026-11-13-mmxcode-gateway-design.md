@@ -19,6 +19,7 @@
 - 账号轮转：粘性会话绑定 + 配额耗尽故障转移
 - HTTP 网关：`/v1/messages`（Anthropic）、`/v1/chat/completions`（OpenAI）、`/v1/responses`（Codex）
 - 用量聚合接口 `GET /api/usage`
+- 代理出口：账号级 / 出口组 / 全局三级（对齐 magpie 的代理模型），支持 Cloudflare WARP 作为额外出口（默认关闭，Docker 配置开启）
 - Web 管理界面（服务端渲染）
 - CLI + Docker 部署
 
@@ -84,11 +85,12 @@ mmxcode-api/
 │   ├── account/    账户 API 客户端：identity / membership / 积分账本 / 套餐窗口
 │   ├── checkin/    签到：读面板 → 判定 → claim → 结果归一
 │   ├── store/      SQLite 存储层
+│   ├── egress/     出口解析与 HTTP client 缓存（账号级代理、组、健康检查）
 │   ├── rotator/    粘性会话 + 配额故障转移（只做决策，不发 HTTP）
 │   ├── gateway/    三协议 HTTP 路由、上游请求改写、重放
-│   ├── proxy/      上游 HTTP 客户端：代理、重定向策略、超时、业务错误码检查
+│   ├── upstream/   上游 HTTP 客户端：重定向策略、超时、业务错误码检查
 │   ├── webui/      服务端渲染页面 + SSE
-│   └── scheduler/  定时任务（自动签到、token 续期、用量刷新）
+│   └── scheduler/  定时任务（自动签到、token 续期、用量刷新、出口健康检查）
 ├── web/            templates + static
 ├── Dockerfile / docker-compose.yml / config.example.yaml
 └── docs/superpowers/specs/
@@ -275,18 +277,108 @@ SSE 一旦开始吐字节就不能再切换账号——客户端已收到部分�
 | 模型列表 | 10s |
 | 套餐 console 端点 | 5s（回退端点 10s） |
 
-### 8.2 代理
+### 8.2 代理模型
 
-出站代理可配置（`proxy:`），用于访问国际站。参考插件记录的问题：国内网络直连 `agent.minimax.io` 会被 Akamai 307 到中国站。
+对齐 magpie 的代理模型（magpie 文档原文："Every fetch a plugin makes for a provider or an account goes through the proxy the user set for that provider or account. Otherwise it goes through magpie's own proxy, unless the setting is `direct`. Loopback addresses never go through a proxy."）。
 
-### 8.3 重定向策略
+magpie 的三层是"账号级 → provider 级 → 全局"。我们只有一个 provider，但用户需要"一组账号统一走一个代理"，因此把 provider 级那一层称为**出口组**。
+
+**解析顺序**（第一个命中即用）：
+
+1. `accounts.proxy_url` —— 账号级单独指定的地址
+2. `accounts.proxy_group` → 查配置里的 `proxy.groups.<name>`
+3. `proxy.default` —— 全局默认
+4. 都没有 → 直连
+
+`direct` 是特殊值，表示不走代理（与 magpie 一致）。
+
+**回环地址永不走代理**（保留 magpie 的这条规则，防止将来接入本地 mock 时被代理）。
+
+**出口组**在配置里定义，是具名的、可在 WebUI 上选择的：
+
+```yaml
+proxy:
+  default: "http://127.0.0.1:7890"
+  groups:
+    clash:  "http://127.0.0.1:7890"
+    warp:   "socks5h://warp:4000"
+    direct: "direct"
+```
+
+### 8.3 代理协议与实现
+
+| scheme | 实现 |
+|---|---|
+| `http://` | `http.Transport.Proxy` |
+| `https://` | `http.Transport.Proxy`（CONNECT） |
+| `socks5://` | `golang.org/x/net/proxy` 的 SOCKS5 dialer，**域名透传给代理** |
+| `socks5h://` | 同上 |
+
+**Go 内置 SOCKS5 的坑**：`http.Transport` 内置的 socks5 会在**本地**解析 DNS。国内 DNS 解析 `agent.minimax.io` 可能被污染，会连到错误地址。必须用 `x/net/proxy` 自己 dial，域名直接透传，由代理侧解析。
+
+因此我们的 `socks5://` 与 `socks5h://` 行为一致，都是远端 DNS。文档与 WebUI 上均注明这一点。
+
+**HTTP client 必须按账号缓存**：代理是账号级属性，而 `Transport.Proxy` 是 Transport 级属性，一个 Transport 只能一个代理。按 `(账号, 出口 URL)` 缓存 `*http.Client`；账号换组或出口配置变更时，失效对应的缓存条目。
+
+### 8.4 Cloudflare WARP
+
+WARP 作为**额外的出口**，默认关闭，通过 Docker 配置开启。
+
+**接入方式：SOCKS5 出口**（不是全局透明代理）。这样一部分账号走 WARP、一部分走 Clash，互不影响。
+
+**开启方式**：compose profile，改 `.env` 一处即可。
+
+```yaml
+# .env
+COMPOSE_PROFILES=warp        # 删掉这行 = 不启动 WARP
+```
+
+```yaml
+# docker-compose.yml
+  warp:
+    image: cloudflare/warp:latest
+    profiles: ["warp"]
+    restart: unless-stopped
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - warp-state:/var/lib/cloudflare-warp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        warp-cli --accept-tos registration new || true
+        warp-cli mode proxy
+        warp-cli proxy port 4000
+        warp-cli proxy bind 0.0.0.0
+        warp-cli connect
+        tail -f /dev/null
+    expose: ["4000"]
+```
+
+- **地址约定而非配置**：`socks5h://warp:4000` 固定，`proxy.groups.warp` 预置指向它。账号选了 `warp` 组就走 WARP；WARP 没启动时该出口不可用，由健康检查标出。
+- **状态卷**持久化 WARP 注册信息，避免每次 `docker compose up` 都重新注册。
+- **启动有延迟**：WARP 起来要几秒，第一次请求可能失败。健康检查负责把这件事暴露出来。
+- **WARP 的固有限制**：WARP 用 Cloudflare 边缘 IP 回源，部分机房段会被 WARP 直接拒绝（连接断开）。这在配置层绕不开，只能靠健康检查暴露。
+
+**全局透明代理是另一种模式**（`network_mode: "service:warp"`，所有出站流量透明走 WARP），实现更简单，但与"按账号选代理"互斥。本项目采用 SOCKS5 出口模式，不实现透明模式。
+
+### 8.5 出口健康检查
+
+后台任务定期探测各出口是否可用（走该出口请求一个轻量地址），结果写进 `egress_health` 表，WebUI 把不可用出口标红。
+
+用途：WARP 未启动、WARP 被拒绝、代理地址写错——这些在账号真正用到该出口之前都是不可见的。
+
+### 8.6 重定向策略
 
 - **同 host**：跟随，最多 5 跳。307/308 保留 method 与 body 重发；301/302/303 的非 GET/HEAD 请求转为 GET 且丢弃 body。
 - **跨 host**：抛 `OtherSite` 错误，对外返回 `502` + 明确提示（需要境外网络的代理），**不当作登录被拒、不消耗 refresh token、不切换账号**。
 
 这是参考插件踩过的坑：两个站的 token 不通用，跟着跳会被误判成"登录被拒"，白白消耗一次性的 refresh token。
 
-### 8.4 业务错误码
+### 8.7 业务错误码
 
 见 6.4 第 1 条。
 
@@ -392,6 +484,8 @@ CREATE TABLE accounts (
   user_id       TEXT,                    -- MiniMax realUserID
   email         TEXT,
   status        TEXT NOT NULL,           -- active | signed_out | error
+  proxy_group   TEXT,                    -- 出口组名，对应 proxy.groups.<name>
+  proxy_url     TEXT,                    -- 账号级代理地址，优先于出口组
   pending_persist INTEGER NOT NULL DEFAULT 0,
   exhausted_until TEXT,                  -- 账号级耗尽的恢复时刻
   last_error    TEXT,
@@ -450,6 +544,13 @@ CREATE TABLE settings (
   key           TEXT PRIMARY KEY,
   value         TEXT NOT NULL
 );
+
+CREATE TABLE egress_health (
+  url           TEXT PRIMARY KEY,        -- 出口 URL；"direct" 表示直连
+  ok            INTEGER NOT NULL,
+  error         TEXT,
+  checked_at    INTEGER NOT NULL
+);
 ```
 
 ### 12.2 并发
@@ -480,6 +581,9 @@ SQLite 开启 WAL，busy_timeout 5s。写操作集中在一个 goroutine 的串�
 | `GET /api/accounts/{id}/usage` | 单账号额度（magpie 卡片形状） |
 | `POST /api/accounts/{id}/checkin` | 触发单账号签到，返回 `{outcome, credit?, streak?, message?}` |
 | `GET /api/usage` | 全网关积分汇总（见 10.3） |
+| `GET /api/egress` | 出口组列表与健康状态 |
+| `POST /api/egress/test` | 立即测试某个出口 |
+| `PATCH /api/accounts/{id}` | 改账号的出口组 / 代理地址 / 标签 |
 | `GET /api/sessions` | 当前会话绑定 |
 | `GET /api/events` | SSE 状态推送（签到结果、额度刷新、账号状态变化） |
 
@@ -489,7 +593,8 @@ SQLite 开启 WAL，busy_timeout 5s。写操作集中在一个 goroutine 的串�
 
 服务端渲染（Go `html/template`）+ 少量原生 JS + SSE 推送。页面：
 
-- **账号总览**：账号列表、状态、套餐、积分、窗口用量、签到连续天数、今日签到状态；每行一个「立即签到」按钮
+- **账号总览**：账号列表、状态、套餐、积分、窗口用量、签到连续天数、今日签到状态；每行一个「立即签到」按钮；每行可选**出口组**（下拉，列出 `proxy.groups` 的名字 + `direct`），也可为单账号单独填代理地址
+- **出口**：所有出口组与全局默认的健康状态，不可用的标红；一键测试
 - **用量汇总**：总积分 / 总消耗 / 总剩余 / 最近过期时间
 - **登录**：显示 user_code 与链接，JS 轮询结果
 - **日志**：最近的错误与轮转记录
@@ -500,7 +605,12 @@ SQLite 开启 WAL，busy_timeout 5s。写操作集中在一个 goroutine 的串�
 server:
   listen: ":8080"
   api_keys: ["sk-local-xxxx"]        # 空 = 不鉴权，此时只听 127.0.0.1
-proxy: "http://127.0.0.1:7890"        # 可选，出站代理
+proxy:
+  default: "http://127.0.0.1:7890"   # 全局默认；"direct" = 不走代理
+  groups:                            # 出口组，可在 WebUI 上按账号选择
+    clash:  "http://127.0.0.1:7890"
+    warp:   "socks5h://warp:4000"    # WARP 默认关闭，见 8.4
+    direct: "direct"
 upstream:
   timeout: 120s                      # 聊天请求超时
   site: global
@@ -512,8 +622,11 @@ schedule:
   checkin_at: "09:00"                # 北京时间，每账号加 0-30min 随机抖动
   usage_refresh: 15m
   token_refresh: 5m
+  egress_health: 2m                  # 出口健康检查间隔
 db: "/data/mmxcode.db"
 ```
+
+配置里的出口组只提供**默认名单**；账号在 WebUI 上选择哪个组存在数据库里（`accounts.proxy_group` / `accounts.proxy_url`）。配置改了出口组的地址，已选中该组的账号自动跟随，不需要逐个改账号。
 
 ## 15. CLI
 
@@ -535,10 +648,54 @@ mmxcode models                   # 上游模型列表
 
 ### 16.2 docker-compose.yml
 
-- 服务 `mmxcode`，映射 8080
-- 卷：`/data` 挂载宿主机目录（存 SQLite）
-- 环境变量 `MMXCODE_PROXY` 覆盖代理（容器内访问宿主机的 7890 需要 `host.docker.internal` 或网关模式）
-- `restart: unless-stopped`
+```yaml
+services:
+  mmxcode:
+    build: .
+    image: mmxcode-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      MMXCODE_CONFIG: /app/config.yaml
+      # 容器内访问宿主机的代理需要 host.docker.internal
+      MMXCODE_PROXY_DEFAULT: "http://host.docker.internal:7890"
+
+  warp:                      # 默认不启动，见 8.4
+    image: cloudflare/warp:latest
+    profiles: ["warp"]
+    restart: unless-stopped
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - warp-state:/var/lib/cloudflare-warp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        warp-cli --accept-tos registration new || true
+        warp-cli mode proxy
+        warp-cli proxy port 4000
+        warp-cli proxy bind 0.0.0.0
+        warp-cli connect
+        tail -f /dev/null
+    expose: ["4000"]
+
+volumes:
+  warp-state:
+```
+
+**开启 WARP**：在 `.env` 里写 `COMPOSE_PROFILES=warp`，然后 `docker compose up -d`。删掉这行即关闭。
+
+- 端口默认只绑 `127.0.0.1`，避免把管理界面暴露到公网
+- 容器内访问宿主机的 7890 代理需要 `host.docker.internal`（Linux 上需 `extra_hosts: ["host.docker.internal:host-gateway"]`）
+- `MMXCODE_PROXY_DEFAULT` 环境变量覆盖配置里的 `proxy.default`，方便同一镜像在不同部署里切换
+- WARP 的 SOCKS5 端口只在 compose 网络内 `expose`，不发布到宿主机
 
 ### 16.3 备份
 
@@ -553,11 +710,14 @@ SQLite 单文件，备份即复制 `.db` 文件（WAL 模式下需一并处理 `
 | `account` | 业务错误码检查、账本分页与金额解析 | httptest 假服务器 + 表驱动 |
 | `checkin` | 7 天面板各种状态组合、连续天数 | 表驱动单测 |
 | `rotator` | 选号、耗尽判定、401→刷新重试、429→换号、会话亲和与改绑 | 假账号池 + 假上游，纯逻辑不碰网络 |
+| `egress` | 出口解析顺序（账号级 → 组 → 全局 → 直连）、`direct`、回环不走代理、http/socks5 拨号选择 | 表驱动单测 + httptest 假代理 |
 | `store` | 迁移、并发写 | 临时 SQLite |
 | `gateway` | 三协议路由、头部改写、错误改写、重放边界 | httptest 假上游 |
 | 协议转换 | Responses→Anthropic→Responses SSE | 固定 SSE 样本回放 |
 
 不写真实 MiniMax 账号的自动化集成测试（refresh token 一次性，测试跑两次就废账号）。集成验证手工执行一次 `login` + `checkin` + `usage`。
+
+WARP 的集成验证也是手工的：启动 `warp` profile，在 WebUI 上把一个账号指到 `warp` 组，看出口健康检查是否变绿。
 
 ## 18. 实现顺序
 
@@ -565,13 +725,15 @@ SQLite 单文件，备份即复制 `.db` 文件（WAL 模式下需一并处理 `
 2. `store`（schema 与迁移）
 3. `oauth`（登录 + 刷新 + 单飞）
 4. `account` + `checkin`（账户 API 与签到）
-5. `rotator`（选号与故障转移）
-6. `proxy` + `gateway`（三协议路由与重放）
-7. `webui` + `scheduler`
-8. CLI 收口、Docker 部署
+5. `egress`（出口解析 + HTTP client 缓存 + 健康检查）
+6. `rotator`（选号与故障转移）
+7. `proxy` + `gateway`（三协议路由与重放）
+8. `webui` + `scheduler`
+9. CLI 收口、Docker 部署（含 WARP profile）
 
 ## 19. 待实测项
 
 1. 上游 `/mavis/api/v1/llm/v1/responses` 是否原生支持 —— 决定 Codex 路径是直通还是走本地转换。**回退已定义**：探到 404 / 不支持就启用本地转换，两条路径输出行为一致
 2. 国际站的 `/minimax-cloud/api/v1/credit/details` 是否可用 —— 参考插件只记录了会员接口 404。**回退已定义**：账本不可用时该账号积分置 `null`，`/api/usage` 的 `total_*` 只累加有数据的账号，并带 `accounts_unavailable` 计数
 3. `token_plan/remains_percent` 在国际站是否返回数据 —— 决定耗尽标记能否精确到窗口组。**回退已定义**：拿不到窗口映射时退化为账号级耗尽 + `exhausted_cooldown` 冷却
+4. WARP 出口在当前网络下能否连通 `agent.minimax.io` —— WARP 的免费线路有区域限制，且部分机房段被 WARP 直接拒绝。**验证方式**：手工启动 `warp` profile，在 WebUI 的出口页看健康检查结果；不可用时该组就不选它
