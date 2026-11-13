@@ -14,14 +14,14 @@ import (
 	"mmxcode/internal/upstream"
 )
 
-// signKV is one query parameter for a signed call.
-type signKV = sign.KV
+// QueryKV is one query parameter for a signed call.
+type QueryKV = sign.KV
 
-// call sends one signed account API request.
+// Call sends one signed account API request.
 //
 // The body is "{}" for a POST and nil for a GET, as MiniMax Code sends
 // it. The answer's business codes are checked before it is handed back.
-func (c *Client) call(ctx context.Context, access, userID, method, path string, body []byte, query []signKV) ([]byte, error) {
+func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []QueryKV) ([]byte, error) {
 	now := c.now()
 	signed := sign.Sign(c.base, path, sign.Options{
 		Access:   access,

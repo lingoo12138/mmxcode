@@ -178,7 +178,7 @@ func (c *Client) SetClock(now func() time.Time, tzOffset int) {
 // checkinQuery is the query MiniMax Code's own check-in sends.
 //
 // The check-in comes from the desktop client, so it says so.
-var checkinQuery = []signKV{
+var checkinQuery = []QueryKV{
 	{K: "device_platform", V: "web"},
 	{K: "is_desktop", V: "1"},
 	{K: "desktop_version", V: "0.6.12"},
@@ -186,7 +186,7 @@ var checkinQuery = []signKV{
 
 // Identity reads who the account is.
 func (c *Client) Identity(ctx context.Context, access, userID string) (Identity, error) {
-	body, err := c.call(ctx, access, userID, http.MethodGet, site.IdentityPath, nil, nil)
+	body, err := c.Call(ctx, access, userID, http.MethodGet, site.IdentityPath, nil, nil)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -238,7 +238,7 @@ func (c *Client) Membership(ctx context.Context, access, userID string) (Members
 }
 
 func (c *Client) membershipOnce(ctx context.Context, access, userID string) (Membership, error) {
-	body, err := c.call(ctx, access, userID, http.MethodPost,
+	body, err := c.Call(ctx, access, userID, http.MethodPost,
 		site.MembershipPath, []byte("{}"), nil)
 	if err != nil {
 		return Membership{}, err
@@ -285,12 +285,12 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 	const maxPages = 10
 	var out []Batch
 	for page := 1; page <= maxPages; page++ {
-		query := append(append([]signKV{}, checkinQuery...),
-			signKV{K: "page_number", V: strconv.Itoa(page)},
-			signKV{K: "page_size", V: strconv.Itoa(pageSize)},
-			signKV{K: "include_expired", V: "true"},
+		query := append(append([]QueryKV{}, checkinQuery...),
+			QueryKV{K: "page_number", V: strconv.Itoa(page)},
+			QueryKV{K: "page_size", V: strconv.Itoa(pageSize)},
+			QueryKV{K: "include_expired", V: "true"},
 		)
-		body, err := c.call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
+		body, err := c.Call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
 		if err != nil {
 			return nil, err
 		}
