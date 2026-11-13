@@ -203,6 +203,9 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"WindowSummary": w.windowSummary(ctx, a.ID),
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
+			// 账号在 error 或者 signed_out 的时候，光有状态是没用的：
+			// 上一次为什么失败，才是那个人要做的事。
+			"LastError": a.LastError,
 		})
 	}
 	return map[string]any{"Accounts": out, "Groups": groups}, nil

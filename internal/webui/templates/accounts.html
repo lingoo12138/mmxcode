@@ -6,7 +6,7 @@
 <tr>
   <td>{{$acc.Name}}<div class="muted">{{$acc.ID}}</div></td>
   <td>{{$acc.Email}}</td>
-  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}</td>
+  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err">{{$acc.LastError}}</div>{{end}}</td>
   <td>{{if $acc.HasAmounts}}{{printf "%.2f / %.2f" $acc.Remaining $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
   <td>{{$acc.Plan}}<div class="muted">{{$acc.WindowSummary}}</div></td>
   <td>

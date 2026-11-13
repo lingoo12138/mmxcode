@@ -7663,6 +7663,122 @@ func TestPatchKeepsTheProxyBehindTheShownAddress(t *testing.T) {
 		t.Fatalf("proxy_url = %q, want the one that is stored", got.ProxyURL)
 	}
 }
+
+// TestTheAccountListCarriesTheLastError says the accounts API says why
+// an account is in trouble.
+//
+// 账号在 error 或者 signed_out 的时候，光有状态是没用的：人要知道
+// 该做什么。
+func TestTheAccountListCarriesTheLastError(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Status = store.StatusError
+	a.LastError = "the refresh chain is broken: the account has to be signed in again"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var out struct {
+		Accounts []struct {
+			ID        string `json:"id"`
+			LastError string `json:"lasterror"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Accounts) != 1 {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if out.Accounts[0].LastError != a.LastError {
+		t.Fatalf("last error = %q, want %q", out.Accounts[0].LastError, a.LastError)
+	}
+}
+
+// TestTheAccountPageShowsTheLastError says the page says it too.
+func TestTheAccountPageShowsTheLastError(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Status = store.StatusError
+	a.LastError = "the outcome of the last refresh is not known: the account has to be signed in again"
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), a.LastError) {
+		t.Fatalf("the last error is not on the page: %s", rec.Body.String())
+	}
+}
+
+// TestTheAccountPageSaysNothingWhenThereIsNoError says a healthy
+// account does not get a place for an error that is not there.
+//
+// 没有错就别占地方：一页账号，一半是空的说明，就成了一堵墙。
+func TestTheAccountPageSaysNothingWhenThereIsNoError(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `class="err"`) {
+		t.Fatalf("there is an error box for an account that is fine: %s", rec.Body.String())
+	}
+}
+
+// TestTheLastErrorIsNotMarkup says the last error is shown as text, not
+// as markup.
+//
+// 那句话是上游答上来的，里面可能有 <、& 和引号。它是给人看的，不是
+// 给人执行的。
+func TestTheLastErrorIsNotMarkup(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Status = store.StatusError
+	a.LastError = `<script>alert("x")</script>`
+	if err := s.UpdateAccount(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `<script>alert`) {
+		t.Fatalf("the last error was written as markup: %s", body)
+	}
+	if !strings.Contains(body, `&lt;script&gt;`) {
+		t.Fatalf("the last error is not escaped: %s", body)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -7695,6 +7811,8 @@ th { font-weight: 600; }
 .bad { color: #c0392b; }
 .good { color: #27ae60; }
 .muted { color: #888; }
+/* 上一次的错是一整句：给它一块地方，别让它撑着整张表。 */
+.err { color: #c0392b; max-width: 28rem; overflow-wrap: anywhere; }
 button { padding: .25rem .6rem; cursor: pointer; }
 input, select { padding: .25rem; }
 .cards { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
@@ -7750,7 +7868,7 @@ document.addEventListener('click', async (ev) => {
 <tr>
   <td>{{$acc.Name}}<div class="muted">{{$acc.ID}}</div></td>
   <td>{{$acc.Email}}</td>
-  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}</td>
+  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err">{{$acc.LastError}}</div>{{end}}</td>
   <td>{{if $acc.HasAmounts}}{{printf "%.2f / %.2f" $acc.Remaining $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
   <td>{{$acc.Plan}}<div class="muted">{{$acc.WindowSummary}}</div></td>
   <td>
@@ -8157,6 +8275,9 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"WindowSummary": w.windowSummary(ctx, a.ID),
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
+			// 账号在 error 或者 signed_out 的时候，光有状态是没用的：
+			// 上一次为什么失败，才是那个人要做的事。
+			"LastError": a.LastError,
 		})
 	}
 	return map[string]any{"Accounts": out, "Groups": groups}, nil
