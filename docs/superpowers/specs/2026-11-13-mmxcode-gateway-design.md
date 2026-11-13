@@ -737,6 +737,7 @@ WARP 的集成验证也是手工的：启动 `warp` profile，在 WebUI 上把�
 2. 国际站的 `/minimax-cloud/api/v1/credit/details` 是否可用 —— 参考插件只记录了会员接口 404。**回退已定义**：账本不可用时该账号积分置 `null`，`/api/usage` 的 `total_*` 只累加有数据的账号，并带 `accounts_unavailable` 计数
 3. `token_plan/remains_percent` 在国际站是否返回数据 —— 决定耗尽标记能否精确到窗口组。**回退已定义**：拿不到窗口映射时退化为账号级耗尽 + `exhausted_cooldown` 冷却
 4. WARP 出口在当前网络下能否连通 `agent.minimax.io` —— WARP 的免费线路有区域限制，且部分机房段被 WARP 直接拒绝。**验证方式**：手工启动 `warp` profile，在 WebUI 的出口页看健康检查结果；不可用时该组就不选它
+5. 上游 `/mavis/api/v1/llm/v1/chat/completions` 是否原生支持 —— 参考实现只用 Anthropic 的 `/messages`（它接的是 `@ai-sdk/anthropic`），从没走过 OpenAI 的路径；这条路是按同目录下 `/messages` 的样子推的，加上用户说 mcode 原生支持 OpenAI 协议。**回退已定义**：探到 404 / 不支持就把 OpenAI 的请求本地转成 Anthropic 的 `/messages`，再把上游的回答转回 OpenAI 的形状。和 Codex 那条回退共用同一套转换骨架，只是进出形状不同
 
 ## 20. 已与参考实现核对过的部分
 
