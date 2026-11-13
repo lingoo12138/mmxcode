@@ -737,3 +737,40 @@ WARP 的集成验证也是手工的：启动 `warp` profile，在 WebUI 上把�
 2. 国际站的 `/minimax-cloud/api/v1/credit/details` 是否可用 —— 参考插件只记录了会员接口 404。**回退已定义**：账本不可用时该账号积分置 `null`，`/api/usage` 的 `total_*` 只累加有数据的账号，并带 `accounts_unavailable` 计数
 3. `token_plan/remains_percent` 在国际站是否返回数据 —— 决定耗尽标记能否精确到窗口组。**回退已定义**：拿不到窗口映射时退化为账号级耗尽 + `exhausted_cooldown` 冷却
 4. WARP 出口在当前网络下能否连通 `agent.minimax.io` —— WARP 的免费线路有区域限制，且部分机房段被 WARP 直接拒绝。**验证方式**：手工启动 `warp` profile，在 WebUI 的出口页看健康检查结果；不可用时该组就不选它
+
+## 20. 已与参考实现核对过的部分
+
+参考实现：magpie-community/plugins 的 `packages/minimax/index.mjs`
+（`main` 分支，2026-11-14 取）。下面这些是照着它逐条核对过的，不是猜的：
+
+| 项目 | 参考实现里的值 | 我们的位置 |
+|---|---|---|
+| 国际站的四个 host | `account/llm/agent` 都是 `https://agent.minimax.io`（OAuth 是 `https://account.minimax.io`），`platform` 是 `https://platform.minimax.io` | `site.AccountHost` / `LLMHost` / `AgentHost` / `PlatformHost` |
+| 站点 region / lang | `en` / `en` | `site.Region` / `site.Lang` |
+| 签名密钥 | `I*7Cf%WZ#S&%1RlZJ&C2` | `sign.Secret` |
+| OAuth 参数 | client `mcode-public`、scope `agent.default`、audience `agent-backend`、device grant | `site.ClientID` / `Scope` / `Audience` / `DeviceGrant` |
+| 聊天的头 | `Authorization`、`x-api-key: sk-xxx`、`User-Agent: MiniMaxAgent`、`X-Mavis-Agent-Id: main`、`X-Mavis-Timezone-Offset`、`X-Mavis-Session-Id`、`anthropic-version: 2023-06-01`、`accept-encoding: identity` | `site.PlaceholderKey` / `UserAgent` / `AgentID`，其余在 §6.2 |
+| 聊天 base URL | `<llm>/mavis/api/v1/llm/v1` | `site.MessagesPath` 等 |
+| 模型列表 | `<llm>/mavis/api/v1/models?region=<region>&buildEnv=prod` | `site.ModelsPath`（查询串由调用方拼） |
+| 签到的查询参数 | `device_platform=web&is_desktop=1&desktop_version=0.6.12` | 签到调用 |
+| 积分账本的查询参数 | 签到的三个 + `page_number`、`page_size=20`、`include_expired=true` | 账本调用 |
+| 签到面板的状态码 | `1` 未开始、`2` 可领、`3` 已领、`4` 不可领；`claim_result` `1` 领到、`2` 已是今天 | §9 |
+| 账号 API 的端点 | `/v1/api/user/info`、`/matrix/api/v1/user/get_user_extra_info`、`/matrix/api/v1/commerce/get_membership_info`、`/minimax-cloud/api/v1/credit/details`、`/minimax-cloud/api/v1/signin/status`、`/minimax-cloud/api/v1/signin/claim` | `site` 里对应的常量 |
+| 套餐窗口的端点 | `/backend/account/token_plan/remains_percent`、`/v1/api/openplatform/coding_plan/remains`、`/v1/api/openplatform/charge/combo/cycle_audio_resource_package` | `site.PlanRemainsPath` 等 |
+
+签名的算法核对得最细，因为它错一点点就是全部请求被拒。
+`internal/sign/testdata/regen-vectors.mjs` 里抄了参考实现的 `signed()` 原文，
+跑一下就能重新算出六个金标准向量：
+
+```bash
+node internal/sign/testdata/regen-vectors.mjs
+```
+
+两个容易踩的 JavaScript 的坑，参考实现就是那样，我们的实现照抄：
+
+1. **查询参数的顺序是签名的一部分。** 参考实现用对象展开建参数，
+   第一个出现的键决定位置、最后一个出现的键决定值。Go 的
+   `url.Values.Encode()` 会排序，签名就变了。
+2. **编码是 JavaScript 的编码，不是 Go 的。** `URLSearchParams` 保留
+   `*-._`、空格编成 `+`、`~` 编成 `%7E`；`encodeURIComponent` 保留
+   `-_.!~*'()`、空格编成 `%20`。Go 的 `url.QueryEscape` 两边都不是。
