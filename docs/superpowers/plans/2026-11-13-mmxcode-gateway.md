@@ -5304,6 +5304,12 @@ func newServeCmd(e *env) *cobra.Command {
 				return fmt.Errorf("upstream.site = %q; only \"global\" is supported", s)
 			}
 
+			// 签到时间写错的话，调度器会默默按 09:00 跑。用户以为自己
+			// 配了别的点，就永远等不到那个点的签到。起不来比悄悄跑错好。
+			if _, err := time.Parse("15:04", e.cfg.Schedule.CheckinAt); err != nil {
+				return fmt.Errorf("schedule.checkin_at = %q; want HH:MM", e.cfg.Schedule.CheckinAt)
+			}
+
 			// 没配 key 时只听本机，不然就是把模型白送出去
 			listen := e.cfg.Server.Listen
 			if len(e.cfg.Server.APIKeys) == 0 && !isLoopback(listen) {
