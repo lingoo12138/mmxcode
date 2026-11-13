@@ -4072,13 +4072,39 @@ package oauth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"mmxcode/internal/upstream"
 )
+
+func testClient(t *testing.T) *upstream.Client {
+	t.Helper()
+	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
+}
+
+// testDevice makes a device that polls at once, for a test that does
+// not care about the waiting.
+func testDevice() *Device {
+	return &Device{
+		UserCode:  "ABCD",
+		verifier:  "v",
+		pollField: "device_code",
+		pollValue: "dev-1",
+		deadline:  time.Now().Add(time.Minute),
+		interval:  time.Millisecond,
+		slowDown:  time.Millisecond,
+	}
+}
 
 func TestStartDevice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4175,6 +4201,33 @@ func TestStartDeviceExpiredInSeconds(t *testing.T) {
 	}
 }
 
+func TestStartDeviceWithADeadCode(t *testing.T) {
+	// 站点说这个码已经过期了：不该再等十分钟。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"device_code":      "dev-3",
+			"user_code":        "ABCD-EFGH",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       time.Now().Add(-time.Minute).UnixMilli(),
+			"interval":         5,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "expired_token" {
+		t.Fatalf("error = %+v", oe)
+	}
+}
+
 func TestStartDeviceBadAnswer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -4211,14 +4264,7 @@ func TestPollDeviceSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode:  "ABCD",
-		verifier:  "v",
-		pollField: "device_code",
-		pollValue: "dev-1",
-		deadline:  time.Now().Add(time.Minute),
-		interval:  time.Millisecond,
-	}
+	d := testDevice()
 	tok, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
 	if err != nil {
 		t.Fatal(err)
@@ -4235,10 +4281,9 @@ func TestPollKeepsWaitingWhilePending(t *testing.T) {
 	// 用户还没点授权：token 端点用 400 加 authorization_pending 回答。
 	// 这是正常状态，接着等就是了 —— 当成失败的话，每一次登录都死在
 	// 第一轮轮询上。
-	var calls int
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls < 3 {
+		if atomic.AddInt32(&calls, 1) < 3 {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"authorization_pending"}`))
 			return
@@ -4252,17 +4297,13 @@ func TestPollKeepsWaitingWhilePending(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode: "ABCD", verifier: "v",
-		pollField: "device_code", pollValue: "dev-1",
-		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
-	}
+	d := testDevice()
 	tok, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 3 {
-		t.Fatalf("polled %d times, want 3", calls)
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("polled %d times, want 3", got)
 	}
 	if tok.Access != "acc-token" {
 		t.Fatalf("token = %+v", tok)
@@ -4271,10 +4312,9 @@ func TestPollKeepsWaitingWhilePending(t *testing.T) {
 
 func TestPollKeepsWaitingByStatus(t *testing.T) {
 	// 另一种写法：200 加 status=pending。
-	var calls int
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls < 2 {
+		if atomic.AddInt32(&calls, 1) < 2 {
 			json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
 			return
 		}
@@ -4287,28 +4327,20 @@ func TestPollKeepsWaitingByStatus(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode: "ABCD", verifier: "v",
-		pollField: "device_code", pollValue: "dev-1",
-		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
-	}
+	d := testDevice()
 	if _, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token"); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("polled %d times, want 2", calls)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("polled %d times, want 2", got)
 	}
 }
 
 func TestPollSlowDown(t *testing.T) {
-	old := slowDownWait
-	slowDownWait = time.Millisecond
-	defer func() { slowDownWait = old }()
 	// slow_down 是让我们等久一点，不是失败。
-	var calls int
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls < 2 {
+		if atomic.AddInt32(&calls, 1) < 2 {
 			json.NewEncoder(w).Encode(map[string]any{"error": "slow_down"})
 			return
 		}
@@ -4321,16 +4353,12 @@ func TestPollSlowDown(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode: "ABCD", verifier: "v",
-		pollField: "device_code", pollValue: "dev-1",
-		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
-	}
+	d := testDevice()
 	if _, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token"); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("polled %d times, want 2", calls)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("polled %d times, want 2", got)
 	}
 }
 
@@ -4341,15 +4369,37 @@ func TestPollDeviceDenied(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode: "ABCD", verifier: "v",
-		pollField: "device_code", pollValue: "dev-1",
-		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
-	}
+	d := testDevice()
 	if _, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token"); err == nil {
 		t.Fatal("expected an error")
 	} else if !strings.Contains(err.Error(), "access_denied") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPollNeedsARefreshToken(t *testing.T) {
+	// 没有 refresh token 的账号活不过一小时：与其建一个这样的账号，
+	// 不如让这次登录失败。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "acc-token",
+			"expires_in":   3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	d := testDevice()
+	_, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "missing_refresh_token" {
+		t.Fatalf("error = %+v", oe)
 	}
 }
 
@@ -4361,11 +4411,7 @@ func TestOAuthErrorCodes(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d := &Device{
-		UserCode: "ABCD", verifier: "v",
-		pollField: "device_code", pollValue: "dev-1",
-		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
-	}
+	d := testDevice()
 	_, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
 	if err == nil {
 		t.Fatal("expected an error")
@@ -4378,6 +4424,114 @@ func TestOAuthErrorCodes(t *testing.T) {
 		t.Fatalf("error = %+v", oe)
 	}
 }
+
+func TestDeviceTextKeepsTheVerifierSecret(t *testing.T) {
+	d := &Device{
+		UserCode: "ABCD-EFGH",
+		URL:      "https://example.invalid/activate",
+		verifier: "the-pkce-verifier",
+	}
+	texts := []string{
+		d.String(),
+		fmt.Sprintf("%+v", d),
+		fmt.Sprintf("%v", d),
+		fmt.Sprintf("%s", d),
+	}
+	for _, text := range texts {
+		if strings.Contains(text, "the-pkce-verifier") {
+			t.Fatalf("the verifier is in the text: %s", text)
+		}
+	}
+	if !strings.Contains(d.String(), "ABCD-EFGH") {
+		t.Fatalf("the text says nothing useful: %s", d.String())
+	}
+}
+
+func TestClaims(t *testing.T) {
+	payload := `{"sub":"user-1","account_id":"site-1"}`
+	// 没有点号的东西不是 JWT。
+	if _, _, ok := claims("not-a-jwt"); ok {
+		t.Fatal("a string that is not a JWT was read as one")
+	}
+	// 补了填充的 payload 也是 JWT。
+	padded := "x." + base64.URLEncoding.EncodeToString([]byte(payload)) + ".y"
+	sub, account, ok := claims(padded)
+	if !ok {
+		t.Fatal("a padded payload was not read")
+	}
+	if sub != "user-1" || account != "site-1" {
+		t.Fatalf("claims = %q/%q", sub, account)
+	}
+	// 没补填充的也是。
+	raw := "x." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".y"
+	sub, account, ok = claims(raw)
+	if !ok || sub != "user-1" || account != "site-1" {
+		t.Fatalf("claims = %q/%q, ok = %v", sub, account, ok)
+	}
+	// 读不出 payload 的不是 JWT。
+	if _, _, ok := claims("x.!!!.y"); ok {
+		t.Fatal("a payload that cannot be decoded was read as one")
+	}
+}
+
+func TestTheUnitsOfTheSite(t *testing.T) {
+	// expires_in 的单位
+	for _, c := range []struct {
+		name string
+		in   int64
+		want time.Duration
+	}{
+		{"an hour in seconds", 3600, time.Hour},
+		{"an hour in milliseconds", 3600000, time.Hour},
+		{"ten minutes in milliseconds", 600000, 10 * time.Minute},
+		{"a day in seconds", 86400, 24 * time.Hour},
+		{"nothing", 0, 0},
+	} {
+		if got := expiresDuration(c.in); got != c.want {
+			t.Errorf("expiresDuration(%d) = %v, want %v (%s)", c.in, got, c.want, c.name)
+		}
+	}
+	// 轮询间隔的单位
+	for _, c := range []struct {
+		name string
+		in   int64
+		want time.Duration
+	}{
+		{"five seconds", 5, 5 * time.Second},
+		{"five minutes", 300, 5 * time.Minute},
+		{"three seconds in milliseconds", 3000, 3 * time.Second},
+		{"nothing", 0, 0},
+	} {
+		if got := pollInterval(c.in); got != c.want {
+			t.Errorf("pollInterval(%d) = %v, want %v (%s)", c.in, got, c.want, c.name)
+		}
+	}
+	// expired_in 的单位
+	now := time.Now()
+	for _, c := range []struct {
+		name string
+		in   int64
+		want time.Time
+	}{
+		{"ten minutes left in seconds", 600, now.Add(10 * time.Minute)},
+		{"ten minutes left in milliseconds", 600000, now.Add(10 * time.Minute)},
+		{"an absolute time in milliseconds", now.Add(10 * time.Minute).UnixMilli(), now.Add(10 * time.Minute)},
+		{"an absolute time in seconds", now.Add(10 * time.Minute).Unix(), now.Add(10 * time.Minute)},
+	} {
+		got, ok := siteDeadline(c.in)
+		if !ok {
+			t.Errorf("siteDeadline(%d) said nothing (%s)", c.in, c.name)
+			continue
+		}
+		if diff := got.Sub(c.want); diff < -time.Minute || diff > time.Minute {
+			t.Errorf("siteDeadline(%d) = %v, want about %v (%s)", c.in, got, c.want, c.name)
+		}
+	}
+	if _, ok := siteDeadline(0); ok {
+		t.Error("siteDeadline(0) said something")
+	}
+}
+
 ```
 
 测试文件顶部还需要这个助手：
@@ -4430,37 +4584,114 @@ import (
 // DeviceGrant is the grant type of the device flow.
 const DeviceGrant = site.DeviceGrant
 
+// What an answer came from.
+//
+// The text of an error says which endpoint answered, so a failure of
+// the refresh does not read as a failure of the sign-in.
+const (
+	// WhatSignIn is the device flow: the sign-in server.
+	WhatSignIn = "sign-in"
+	// WhatRefresh is the token endpoint, where a refresh token is
+	// traded in.
+	WhatRefresh = "refresh"
+)
+
 // signInTimeout is how long a device code is waited for when the
 // answer gives no end of its own.
 const signInTimeout = 10 * time.Minute
 
 // slowDownWait is how much longer to wait when the site says slow
-// down. It is a variable so that a test does not have to wait five
-// seconds to see it happen.
-var slowDownWait = 5 * time.Second
+// down.
+//
+// It is a constant and not a variable: a test hook that production
+// behaviour depends on is one t.Parallel() away from a race, and a
+// test that needs a shorter wait sets the field on its own device.
+const slowDownWait = 5 * time.Second
 
-// expiresDuration reads an expires_in that may be seconds or
-// milliseconds.
+// The units of the numbers the site gives.
 //
-// The site sends both: a token that lasts an hour comes as 3600, and a
-// token that lasts an hour in milliseconds comes as 3600000. Read as
-// seconds, the second one lasts a hundred years: the token never
-// ends, the account is never refreshed, and every request is answered
-// with 401.
+// The site is not consistent about the unit: some of its answers are in
+// seconds and some in milliseconds, and nothing in the answer says
+// which. One rule is used for every number, and it lives in one place:
 //
-// A duration in seconds that is over a million is longer than eleven
-// days, which no token is; that is the tell.
-func expiresDuration(v int64) time.Duration {
+//	a number that is longer than the longest length of time the field
+//	can plausibly hold is in milliseconds; every other number is in
+//	seconds.
+//
+// The longest plausible length is given by the field that reads the
+// number, so the rule is applied the same way everywhere and every
+// field says what it believes.
+const (
+	// maxTokenSeconds is the longest an access token can live: a day.
+	// A number longer than that is not a number of seconds.
+	maxTokenSeconds = 24 * 60 * 60
+	// maxPollSeconds is the longest a poll interval can be: ten
+	// minutes. A longer wait is not a poll.
+	maxPollSeconds = 10 * 60
+	// epochSecondsFloor is the first Unix second of this century
+	// (2001-09-09). A number above it is a timestamp, not a length of
+	// time.
+	epochSecondsFloor = 1_000_000_000
+	// epochMillisFloor is the first Unix millisecond of a time in this
+	// century (1973-03-03). A timestamp above it is in milliseconds.
+	epochMillisFloor = 100_000_000_000
+)
+
+// siteDuration reads a length of time the site gave.
+//
+// The number is in seconds, unless it is longer than the longest
+// length of time the field can plausibly hold, in which case it is in
+// milliseconds. See the unit rules above.
+func siteDuration(v int64, longestSeconds int64) time.Duration {
 	if v <= 0 {
 		return 0
 	}
-	if v > 1e6 {
+	if v > longestSeconds {
 		return time.Duration(v) * time.Millisecond
 	}
 	return time.Duration(v) * time.Second
 }
 
-// Error is an answer from MiniMax's sign-in server.
+// expiresDuration reads how long an access token lives.
+//
+// The site sends an hour as 3600 and an hour as 3600000; the rule in
+// siteDuration tells the two apart. A ten-minute token sent as 600000
+// is ten minutes and not a hundred and sixty-six hours.
+func expiresDuration(v int64) time.Duration {
+	return siteDuration(v, maxTokenSeconds)
+}
+
+// pollInterval reads how long to wait between two polls.
+//
+// A poll that waits more than ten minutes is not a poll, so a number
+// that big is a number of milliseconds: 3000 is three seconds and not
+// fifty minutes, and 300 is five minutes and not a third of a second.
+func pollInterval(v int64) time.Duration {
+	return siteDuration(v, maxPollSeconds)
+}
+
+// siteDeadline reads when a device code ends.
+//
+// The site gives either a remaining time or an absolute timestamp, and
+// the timestamp comes in seconds or in milliseconds. The rule: a
+// number at or below epochSecondsFloor is a remaining time — in
+// seconds, or in milliseconds when it is too long to be seconds — and a
+// bigger one is an absolute timestamp, in milliseconds when it is above
+// epochMillisFloor and in seconds otherwise.
+func siteDeadline(v int64) (time.Time, bool) {
+	if v <= 0 {
+		return time.Time{}, false
+	}
+	if v > epochSecondsFloor {
+		if v > epochMillisFloor {
+			return time.UnixMilli(v), true
+		}
+		return time.Unix(v, 0), true
+	}
+	return time.Now().Add(siteDuration(v, maxTokenSeconds)), true
+}
+
+// Error is an answer from MiniMax.
 type Error struct {
 	// Code is the "error" the answer carried.
 	Code string
@@ -4468,6 +4699,9 @@ type Error struct {
 	HTTPStatus int
 	// Message is the text to show.
 	Message string
+	// What says which endpoint answered: WhatSignIn for the device
+	// flow, WhatRefresh for the token endpoint.
+	What string
 }
 
 // Error is the error's text.
@@ -4475,21 +4709,27 @@ type Error struct {
 // The code comes first: it is what says what went wrong, and the
 // message is the site's own words for it.
 func (e *Error) Error() string {
+	who := "MiniMax's sign-in server"
+	if e.What == WhatRefresh {
+		who = "MiniMax's token endpoint"
+	}
 	if e.Message != "" {
-		return fmt.Sprintf("%s: %s", e.Code, e.Message)
+		return fmt.Sprintf("%s said %s: %s", who, e.Code, e.Message)
 	}
 	if e.HTTPStatus != 0 {
-		return fmt.Sprintf("MiniMax's sign-in server said %s (HTTP %d)", e.Code, e.HTTPStatus)
+		return fmt.Sprintf("%s said %s (HTTP %d)", who, e.Code, e.HTTPStatus)
 	}
-	return fmt.Sprintf("MiniMax's sign-in server said %s", e.Code)
+	return fmt.Sprintf("%s said %s", who, e.Code)
 }
 
 // IsSignedOut says the answer is the one that signs an account out.
 //
-// Only invalid_grant with HTTP 400 is a sign-out. Any other failure is
-// passing, and the sign-in is kept.
+// The sign-out is invalid_grant. The site sends it with a 400, but it
+// also puts its business errors in the body of a 200, so the code is
+// what is looked at and not the status: a sign-out is a sign-out
+// however it arrives.
 func (e *Error) IsSignedOut() bool {
-	return e.Code == "invalid_grant" && e.HTTPStatus == 400
+	return e.Code == "invalid_grant"
 }
 
 // Token is an account's sign-in.
@@ -4502,8 +4742,37 @@ type Token struct {
 	Expires time.Time
 	// Subject is the MiniMax user id the access token carries.
 	Subject string
-	// AccountID is the account id the access token carries.
+	// AccountID is the account id the access token carries, as the
+	// site says it.
+	//
+	// It is the site's own id and not the store's: the renewer is
+	// keyed by the store's account id, and the two are not the same
+	// thing. A caller that keyed the renewer by this id would walk a
+	// second renewal chain for one account and spend two refresh
+	// tokens, which signs the account out. The store's id is the one
+	// to use.
+	//
+	// The name is kept as it is: renaming an exported field breaks
+	// every caller that reads it, and nothing reads it today. Use
+	// SiteAccountID to make the difference plain.
 	AccountID string
+	// HasClaims says the access token's claims could be read.
+	//
+	// It is false for a token that is not a JWT and for one whose
+	// payload cannot be decoded. The claim names themselves are
+	// guesses, so a true here does not mean they are the right ones.
+	HasClaims bool
+}
+
+// SiteAccountID is the account id the site's own token carries.
+//
+// It is not the store's account id, which is what the renewer is keyed
+// by. See Token.AccountID.
+func (t *Token) SiteAccountID() string {
+	if t == nil {
+		return ""
+	}
+	return t.AccountID
 }
 
 // Device is a sign-in waiting for the user.
@@ -4518,6 +4787,16 @@ type Device struct {
 	pollValue string
 	deadline  time.Time
 	interval  time.Duration
+	slowDown  time.Duration
+}
+
+// String is the device's text.
+//
+// The PKCE verifier is a secret: it is what lets anybody holding it
+// finish this sign-in. So it is not in the text, and %+v prints this
+// instead of the fields, so a debug log cannot leak it.
+func (d Device) String() string {
+	return fmt.Sprintf("Device{UserCode:%q URL:%q}", d.UserCode, d.URL)
 }
 
 // StartDevice asks MiniMax for a sign-in code.
@@ -4548,7 +4827,7 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, oauthError(resp.StatusCode, body)
+		return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 	}
 	var b struct {
 		DeviceCode              string `json:"device_code"`
@@ -4561,7 +4840,7 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		Interval                int64  `json:"interval"`
 	}
 	if err := json.Unmarshal(body, &b); err != nil {
-		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 	userCode := strings.TrimSpace(b.UserCode)
 	deviceCode := strings.TrimSpace(b.DeviceCode)
@@ -4570,10 +4849,10 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		uri = strings.TrimSpace(b.VerificationURL)
 	}
 	if userCode == "" || uri == "" {
-		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 
-	d := &Device{UserCode: userCode, verifier: verifier}
+	d := &Device{UserCode: userCode, verifier: verifier, slowDown: slowDownWait}
 	// MiniMax's own variant has no device_code: the user code is polled
 	// for, and the end may be an absolute time in milliseconds.
 	byUser := deviceCode == "" && b.ExpiredIn != 0
@@ -4583,37 +4862,32 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	case deviceCode != "":
 		d.pollField, d.pollValue = "device_code", deviceCode
 	default:
-		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 
-	var expires time.Duration
+	// The end of the code comes in two shapes: a lifetime (expires_in)
+	// and a deadline (expired_in). The fallback is only for the case
+	// where the site said nothing at all: a deadline that is already
+	// in the past is a dead code, and waiting ten minutes for it would
+	// be waiting for nothing.
+	var deadline time.Time
 	switch {
 	case b.ExpiresIn > 0:
-		expires = expiresDuration(b.ExpiresIn)
+		deadline = time.Now().Add(expiresDuration(b.ExpiresIn))
 	case b.ExpiredIn > 0:
-		// expired_in 有时是还剩多少秒，有时是一个绝对的毫秒时间戳。
-		// 靠大小分：毫秒时间戳不会是 1970 年。
-		if b.ExpiredIn < 1e12 {
-			expires = time.Duration(b.ExpiredIn) * time.Second
-		} else {
-			expires = time.Until(time.UnixMilli(b.ExpiredIn))
-		}
+		deadline, _ = siteDeadline(b.ExpiredIn)
 	}
-	if expires <= 0 {
-		expires = signInTimeout
+	if deadline.IsZero() {
+		deadline = time.Now().Add(signInTimeout)
 	}
-	d.deadline = time.Now().Add(expires)
+	if !deadline.After(time.Now()) {
+		return nil, &Error{Code: "expired_token", What: WhatSignIn}
+	}
+	d.deadline = deadline
 
 	interval := 5 * time.Second
 	if b.Interval > 0 {
-		// The site sends the interval in seconds and in milliseconds.
-		// A poll that waits more than a minute is not a poll, so a
-		// number that big is milliseconds.
-		if b.Interval > 60 {
-			interval = time.Duration(b.Interval) * time.Millisecond
-		} else {
-			interval = time.Duration(b.Interval) * time.Second
-		}
+		interval = pollInterval(b.Interval)
 	}
 	d.interval = interval
 
@@ -4634,7 +4908,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 	wait := d.interval
 	for {
 		if time.Now().After(d.deadline) {
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 		select {
 		case <-ctx.Done():
@@ -4642,7 +4916,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		case <-time.After(wait):
 		}
 		if time.Now().After(d.deadline) {
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 
 		form := url.Values{}
@@ -4668,7 +4942,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			Status       string `json:"status"`
 		}
 		if err := json.Unmarshal(body, &b); err != nil {
-			return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
+			return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 		}
 		httpOK := resp.StatusCode >= 200 && resp.StatusCode <= 299
 		code := strings.ToLower(b.Error)
@@ -4681,65 +4955,102 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			continue
 		}
 		if code == "slow_down" {
-			wait += slowDownWait
+			wait += d.slowDownWait()
 			continue
 		}
 		if !httpOK {
-			return nil, oauthError(resp.StatusCode, body)
+			return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 		}
 		switch status {
 		case "pending":
 			continue
 		case "slow_down":
-			wait += slowDownWait
+			wait += d.slowDownWait()
 			continue
 		case "denied", "access_denied":
-			return nil, &Error{Code: "access_denied"}
+			return nil, &Error{Code: "access_denied", What: WhatSignIn}
 		case "expired", "expired_token":
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 		if b.Error != "" {
-			return nil, oauthError(resp.StatusCode, body)
+			return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 		}
 		if b.AccessToken == "" || b.ExpiresIn <= 0 {
-			return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode}
+			return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
+		}
+		if b.RefreshToken == "" {
+			// 没有 refresh token 的账号活不过一小时：它再也换不到
+			// 新的 access token 了。与其建一个这样的账号，不如让这次
+			// 登录失败，用户再登一次。
+			return nil, &Error{Code: "missing_refresh_token", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 		}
 		tok := &Token{
 			Access:  b.AccessToken,
 			Refresh: b.RefreshToken,
 			Expires: time.Now().Add(expiresDuration(b.ExpiresIn)),
 		}
-		tok.Subject, tok.AccountID = claims(b.AccessToken)
+		tok.Subject, tok.AccountID, tok.HasClaims = claims(b.AccessToken)
 		return tok, nil
 	}
 }
 
+// slowDownWait is how much longer to wait when the site says slow
+// down.
+func (d *Device) slowDownWait() time.Duration {
+	if d.slowDown > 0 {
+		return d.slowDown
+	}
+	return slowDownWait
+}
+
 // claims reads the JWT's payload, when the access token is one.
-func claims(access string) (subject, accountID string) {
+//
+// The claim names are guesses: nobody has shown what MiniMax puts in
+// its access tokens, so "sub" and "account_id" may be the wrong names,
+// and the claim may be missing from a token that is a JWT all the
+// same. The answer says whether the payload could be read at all, so a
+// caller can tell "not a JWT" from "a JWT without that claim". The
+// names have to be checked against a real token before they are
+// trusted.
+//
+// The signature is not checked either: the token is only read, never
+// trusted for anything.
+func claims(access string) (subject, accountID string, ok bool) {
 	parts := strings.Split(access, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return "", "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", ""
+		// A payload may be padded, and a padded one is a JWT all the
+		// same.
+		raw, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", "", false
+		}
 	}
 	var p struct {
 		Sub       string `json:"sub"`
 		AccountID string `json:"account_id"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return "", ""
+		return "", "", false
 	}
-	return p.Sub, p.AccountID
+	return p.Sub, p.AccountID, true
 }
 
 // oauthError reads an error answer.
-func oauthError(status int, body []byte) *Error {
+//
+// The text is taken from error_description, then description, then
+// message: a 4xx that carries only "message" would lose its
+// explanation otherwise, and that explanation is what the account's
+// last error says.
+func oauthError(status int, body []byte, what string) *Error {
 	var b struct {
 		Error       string `json:"error"`
 		ErrorDesc   string `json:"error_description"`
 		Description string `json:"description"`
+		Message     string `json:"message"`
 	}
 	_ = json.Unmarshal(body, &b)
 	code := b.Error
@@ -4750,7 +5061,10 @@ func oauthError(status int, body []byte) *Error {
 	if msg == "" {
 		msg = b.Description
 	}
-	return &Error{Code: code, HTTPStatus: status, Message: msg}
+	if msg == "" {
+		msg = b.Message
+	}
+	return &Error{Code: code, HTTPStatus: status, Message: msg, What: what}
 }
 
 // randomVerifier makes the PKCE verifier.
@@ -4860,22 +5174,103 @@ func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
 	}
 }
 
+func TestRefreshSignOutInA200Body(t *testing.T) {
+	// MiniMax 把业务错误放在 200 的 body 里。签出也是这么来的。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.HTTPStatus != 200 {
+		t.Fatalf("error = %+v", oe)
+	}
+	if !oe.IsSignedOut() {
+		t.Fatal("a sign-out in a 200 body was not a sign-out")
+	}
+}
+
+func TestRefreshKeepsTheMessage(t *testing.T) {
+	// 有的 4xx 只带 message：这个说明是账号的 last error。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_request","message":"the code is wrong"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "the code is wrong") {
+		t.Fatalf("err = %v, want the message", err)
+	}
+	// 刷新的错误说的是 token 端点，不是登录服务器。
+	if !strings.Contains(err.Error(), "token endpoint") {
+		t.Fatalf("err = %v, want it to name the token endpoint", err)
+	}
+}
+
+func TestRefreshWithALostAnswer(t *testing.T) {
+	// 请求到了站点，答案没了：站点可能已经把 refresh token 用了。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+}
+
+func TestRefreshWithARefusedConnection(t *testing.T) {
+	// 连都没连上：请求肯定没到站点，同一个 token 再来一次是安全的。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpoint := srv.URL + "/oauth2/token"
+	srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, endpoint, "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want a plain failure", err)
+	}
+}
+
 func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
 	var calls int32
+	release := make(chan struct{})
 	r := NewRenewer()
 	spend := func(ctx context.Context, refresh string) (*Token, error) {
 		atomic.AddInt32(&calls, 1)
-		time.Sleep(50 * time.Millisecond)
+		<-release
 		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
 	}
 	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
 
 	var wg sync.WaitGroup
+	var started sync.WaitGroup
+	started.Add(8)
 	results := make([]*Token, 8)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			started.Done()
 			tok, err := r.Renew(context.Background(), "acc_01", current, spend)
 			if err != nil {
 				t.Errorf("Renew: %v", err)
@@ -4884,6 +5279,10 @@ func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
 			results[i] = tok
 		}(i)
 	}
+	started.Wait()
+	// 让每个 goroutine 都进到 Renew 里去：它们都得等同一个刷新。
+	time.Sleep(200 * time.Millisecond)
+	close(release)
 	wg.Wait()
 
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -4896,41 +5295,515 @@ func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestRenewerDoesNotSpendASpentTokenAgain(t *testing.T) {
+func TestRenewerWalksTheChainOnAfterALostStoreWrite(t *testing.T) {
+	// 站点给了新 token，存库失败，库里还是那个已经用过的。
+	// renewer 手上有新的：它得把它用掉，链才走得下去。
+	var calls int32
+	var mu sync.Mutex
+	var spent []string
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		spent = append(spent, refresh)
+		mu.Unlock()
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	first, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 存库失败：调用方手上还是那个旧 token。
+	second, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the chain was walked %d times, want 2", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if spent[1] != "new-old-refresh" {
+		t.Fatalf("the second spend used %q, want the token the renewer held", spent[1])
+	}
+	if second.Refresh == first.Refresh {
+		t.Fatalf("the chain did not move on: %+v", second)
+	}
+}
+
+func TestRenewerSpendsAgainWhenTheSiteDoesNotRotate(t *testing.T) {
+	// 站点不给新的 refresh token：它没有把旧的用掉，
+	// 所以下一次刷新还得再发一次。
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{
+			Access:  fmt.Sprintf("acc-%d", atomic.LoadInt32(&calls)),
+			Refresh: refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "same-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was spent %d times, want 2", got)
+	}
+	if tok.Access == "old-access" {
+		t.Fatalf("the token = %+v, want a new one", tok)
+	}
+}
+
+func TestRenewerFollowsTheCallersNewerToken(t *testing.T) {
+	// renewer 手上的 token 调用方不知道：调用方拿的是新的
+	// （刚登录的，或者别的进程写进去的）。调用方说了算。
+	var calls int32
+	var mu sync.Mutex
+	var spent []string
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		spent = append(spent, refresh)
+		mu.Unlock()
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	newer := &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
+	tok, err := r.Renew(context.Background(), "acc_01", newer, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spent) != 2 || spent[1] != "r2" {
+		t.Fatalf("spent = %v, want the caller's token", spent)
+	}
+	if tok.Access != "acc-for-r2" {
+		t.Fatalf("token = %+v, want the answer of the caller's own renewal", tok)
+	}
+}
+
+func TestRenewerDoesNotMarkAFailedRefreshSpent(t *testing.T) {
+	// 这个包的全部承诺：失败的刷新不把 token 记成用掉了。
+	var calls int32
+	var fail atomic.Bool
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		if fail.Load() {
+			return nil, errors.New("the network is down")
+		}
+		return &Token{
+			Access:  "new-access",
+			Refresh: "new-refresh",
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	fail.Store(true)
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err == nil {
+		t.Fatal("expected an error")
+	}
+	fail.Store(false)
+	// 失败过的 token 还能再发：它多半没有到站点。
+	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was sent %d times, want 2", got)
+	}
+	if tok.Access != "new-access" {
+		t.Fatalf("token = %+v", tok)
+	}
+}
+
+func TestRenewerDoesNotSendATokenOfUnknownOutcomeAgain(t *testing.T) {
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, fmt.Errorf("the answer was lost: %w", ErrRefreshOutcomeUnknown)
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+	// 再来一次：答案不知道的 token 不再发。
+	_, err = r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", got)
+	}
+}
+
+func TestRenewerGivesEveryCallerItsOwnToken(t *testing.T) {
+	// 两个调用方各拿一个 refresh token：各发各的，
+	// 谁也不能拿别人的答案。
+	var calls int32
+	release := make(chan struct{})
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		seen[refresh] = true
+		mu.Unlock()
+		<-release
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	tokens := map[string]*Token{
+		"r1": {Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)},
+		"r2": {Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)},
+	}
+	results := map[string]*Token{}
+	var wg sync.WaitGroup
+	var mu2 sync.Mutex
+	for name, tok := range tokens {
+		wg.Add(1)
+		go func(name string, tok *Token) {
+			defer wg.Done()
+			got, err := r.Renew(context.Background(), "acc_01", tok, spend)
+			if err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+			mu2.Lock()
+			results[name] = got
+			mu2.Unlock()
+		}(name, tok)
+	}
+	// 等两个刷新都开始了。
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) < 2; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !seen["r1"] || !seen["r2"] {
+		t.Fatalf("spent = %v, want both tokens", seen)
+	}
+	for name, tok := range results {
+		if tok == nil {
+			t.Fatalf("%s got nothing", name)
+		}
+		if want := "acc-for-" + name; tok.Access != want {
+			t.Fatalf("%s got %+v, want the answer of its own renewal", name, tok)
+		}
+	}
+}
+
+func TestRenewerLeaderCancellationDoesNotKillTheFollowers(t *testing.T) {
+	// 第一个来的调用方断线了，别的调用方还在等：
+	// 刷新不该跟着死。
+	var calls int32
+	release := make(chan struct{})
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := r.Renew(leaderCtx, "acc_01", stored, spend)
+		leaderErr <- err
+	}()
+	// 等刷新真的开始了。
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	followerErr := make(chan error, 1)
+	followerTok := make(chan *Token, 1)
+	go func() {
+		tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+		followerTok <- tok
+		followerErr <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// 第一个来的调用方走了。
+	cancel()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the leader got %v, want the cancellation", err)
+	}
+	close(release)
+	if err := <-followerErr; err != nil {
+		t.Fatalf("the follower got %v", err)
+	}
+	if tok := <-followerTok; tok == nil || tok.Access != "new-access" {
+		t.Fatalf("the follower got %+v", tok)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
+	}
+}
+
+func TestRenewerForget(t *testing.T) {
+	r := NewRenewer()
+	var calls int32
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Newest("acc_01"); !ok {
+		t.Fatal("the renewer holds nothing")
+	}
+	r.Forget("acc_01")
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token is still held after Forget")
+	}
+	// 已经用掉的记录也没了：这个账号签出了，它的东西都不作数了。
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatalf("Renew after Forget: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was spent %d times, want 2", got)
+	}
+}
+
+func TestRenewerForgetLeavesARunningRenewalAlone(t *testing.T) {
+	// 账号正在签出时在跑的刷新，完了不能把 token 放回来。
+	var calls int32
+	release := make(chan struct{})
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Renew(context.Background(), "acc_01", stored, spend)
+	}()
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.Forget("acc_01")
+	close(release)
+	<-done
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token came back from the dead")
+	}
+}
+
+func TestRenewerReset(t *testing.T) {
+	// Reset 把链忘掉，"用掉了"的记录还在。
 	var calls int32
 	r := NewRenewer()
 	spend := func(ctx context.Context, refresh string) (*Token, error) {
 		atomic.AddInt32(&calls, 1)
 		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
 	}
-	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
 
-	if _, err := r.Renew(context.Background(), "acc_01", current, spend); err != nil {
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
 		t.Fatal(err)
 	}
-	// 同一个 refresh 再来一次：不能再发出去，但要把最新的那个给它
-	tok, err := r.Renew(context.Background(), "acc_01", current, spend)
-	if err != nil {
-		t.Fatalf("Renew: %v", err)
+	r.Reset("acc_01")
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token is still held after Reset")
 	}
-	if tok == nil || tok.Access != "new-access" {
-		t.Fatalf("expected the newest token to be given, got %+v", tok)
+	// 用掉的 token 不能再发：链断了，账号得重新登录。
+	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("spend called %d times, want 1", got)
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
 	}
 }
 
-func TestRenewerLatestWins(t *testing.T) {
+func TestRenewerChainBroken(t *testing.T) {
+	// renewer 手上的 token 也用掉了：链断了，没有能走的路了。
+	var calls int32
 	r := NewRenewer()
-	first := &Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}
-	second := &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
-	r.Renew(context.Background(), "acc_01", first, func(ctx context.Context, refresh string) (*Token, error) {
-		return second, nil
-	})
-	got := r.Latest("acc_01", first)
-	if got == nil || got.Access != "a2" {
-		t.Fatalf("latest = %+v", got)
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	r.mu.Lock()
+	r.latest["acc_01"] = &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
+	r.spent["acc_01"] = map[string]bool{
+		tokenHash("r1"): true,
+		tokenHash("r2"): true,
+	}
+	r.mu.Unlock()
+
+	_, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend)
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("a spent token was sent %d times", got)
+	}
+}
+
+func TestRenewerRefusesAnotherAccountsToken(t *testing.T) {
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		return &Token{
+			Access:  "new-access",
+			Refresh: "new-refresh",
+			Expires: time.Now().Add(time.Hour),
+			Subject: "user-1",
+		}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Subject: "user-1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a9", Refresh: "r9", Subject: "user-2", Expires: time.Now().Add(time.Hour)}, spend)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "another account") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRenewerNewestGivesACopy(t *testing.T) {
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := r.Newest("acc_01")
+	if !ok || got.Access != "new-access" {
+		t.Fatalf("newest = %+v, ok = %v", got, ok)
+	}
+	got.Access = "changed"
+	again, _ := r.Newest("acc_01")
+	if again.Access == "changed" {
+		t.Fatal("the caller changed what the renewer holds")
+	}
+	// 没有 token 时 Latest 给的是调用方自己的。
+	empty := NewRenewer()
+	cur := &Token{Access: "mine"}
+	if got := empty.Latest("acc_02", cur); got != cur {
+		t.Fatalf("latest = %+v, want the caller's own token", got)
+	}
+	if _, ok := empty.Newest("acc_02"); ok {
+		t.Fatal("the renewer holds a token it does not have")
+	}
+}
+
+func TestNoSecretIsInAnyErrorOrURL(t *testing.T) {
+	const secret = "the-secret-refresh-token"
+	const verifier = "the-secret-pkce-verifier"
+
+	// 刷新的错误。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant","message":"no"}`))
+	}))
+	defer srv.Close()
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", secret)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+
+	// renewer 的错误。
+	r := NewRenewer()
+	_, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return nil, errors.New("nope")
+		})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+	// 链断了的错误也不带 token。
+	// 先成功一次：那个 token 就用掉了。
+	if _, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	r.Reset("acc_01")
+	_, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
+		})
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+
+	// 设备码的错误和地址。
+	d := &Device{
+		UserCode: "ABCD",
+		URL:      "https://example.invalid/activate?code=ABCD",
+		verifier: verifier,
+	}
+	for _, text := range []string{d.String(), fmt.Sprintf("%+v", d), d.URL} {
+		if strings.Contains(text, verifier) {
+			t.Fatalf("the verifier is in %q", text)
+		}
 	}
 }
 ```
@@ -4952,8 +5825,12 @@ package oauth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"sync"
 	"time"
@@ -4962,9 +5839,43 @@ import (
 	"mmxcode/internal/upstream"
 )
 
+// ErrRefreshOutcomeUnknown says a refresh may have been spent.
+//
+// The request reached the site, or may have, and the answer was lost on
+// the way back. The site may have spent the refresh token already, and
+// sending it again would be answered with invalid_grant, which signs
+// the account out. So a token whose outcome is unknown is not sent
+// again.
+var ErrRefreshOutcomeUnknown = errors.New("the outcome of the refresh is not known")
+
+// ErrRefreshChainBroken says the renewal chain cannot go on.
+//
+// The chain is the run of refresh tokens one account walks: each token
+// is spent once and buys the next. The chain breaks when the token at
+// hand was spent already and there is no newer one to walk from, and
+// when the account was signed out while a renewal was running. No
+// token is left that the site would take, so the account has to be
+// signed in again by hand.
+var ErrRefreshChainBroken = errors.New("the refresh chain is broken")
+
+// spendTimeout is how long a renewal may take.
+//
+// The renewal runs under a context of its own, so that the cancellation
+// of one caller does not kill the renewal the other callers wait for.
+// The deadline is what stops it from running forever.
+const spendTimeout = 30 * time.Second
+
 // Refresh trades a refresh token for a new access token.
 //
 // The caller's refresh token is kept when the answer gives no new one.
+//
+// The failure says which kind it is. A failure before the request left
+// — a name that does not resolve, a connection that is refused — is
+// safe to try again with the same token. A failure after the request
+// was written — a read that times out, a connection that is cut —
+// leaves the answer unknown: the site may have spent the token
+// already. That error is ErrRefreshOutcomeUnknown, and the token is
+// not sent again.
 func Refresh(ctx context.Context, c *upstream.Client, endpoint, refresh string) (*Token, error) {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
@@ -4975,14 +5886,19 @@ func Refresh(ctx context.Context, c *upstream.Client, endpoint, refresh string) 
 
 	resp, err := c.PostForm(ctx, endpoint, form)
 	if err != nil {
-		return nil, fmt.Errorf("refresh: %w", err)
+		if requestNeverLeft(err) {
+			return nil, fmt.Errorf("refresh: %w", err)
+		}
+		return nil, &UnknownOutcomeError{Err: err}
 	}
 	body, err := upstream.ReadBody(resp)
 	if err != nil {
-		return nil, err
+		// The site answered and the answer could not be read. The
+		// token may have been spent all the same.
+		return nil, &UnknownOutcomeError{Err: err}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, oauthError(resp.StatusCode, body)
+		return nil, oauthError(resp.StatusCode, body, WhatRefresh)
 	}
 	var b struct {
 		AccessToken  string `json:"access_token"`
@@ -4991,13 +5907,13 @@ func Refresh(ctx context.Context, c *upstream.Client, endpoint, refresh string) 
 		Error        string `json:"error"`
 	}
 	if err := json.Unmarshal(body, &b); err != nil {
-		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatRefresh}
 	}
 	if b.Error != "" {
-		return nil, oauthError(resp.StatusCode, body)
+		return nil, oauthError(resp.StatusCode, body, WhatRefresh)
 	}
 	if b.AccessToken == "" || b.ExpiresIn <= 0 {
-		return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode, What: WhatRefresh}
 	}
 	newRefresh := b.RefreshToken
 	if newRefresh == "" {
@@ -5008,8 +5924,48 @@ func Refresh(ctx context.Context, c *upstream.Client, endpoint, refresh string) 
 		Refresh: newRefresh,
 		Expires: time.Now().Add(expiresDuration(b.ExpiresIn)),
 	}
-	tok.Subject, tok.AccountID = claims(b.AccessToken)
+	tok.Subject, tok.AccountID, tok.HasClaims = claims(b.AccessToken)
 	return tok, nil
+}
+
+// UnknownOutcomeError is a refresh whose answer was lost.
+//
+// The request reached the site, or may have, and the answer was lost on
+// the way back. The site may have spent the refresh token, so the
+// token must not be sent again. errors.Is says so: the error is
+// ErrRefreshOutcomeUnknown.
+type UnknownOutcomeError struct {
+	// Err is what the transport said.
+	Err error
+}
+
+// Error is the error's text.
+func (e *UnknownOutcomeError) Error() string {
+	return fmt.Sprintf("the refresh answer was lost: %v", e.Err)
+}
+
+// Unwrap gives the transport's error and ErrRefreshOutcomeUnknown.
+func (e *UnknownOutcomeError) Unwrap() []error {
+	return []error{e.Err, ErrRefreshOutcomeUnknown}
+}
+
+// requestNeverLeft says the request provably did not reach the site.
+//
+// A name that does not resolve and a connection that is refused are
+// the two failures that happen before anything is written: the site
+// cannot have spent a token it never heard of. Everything else — a
+// read that times out, a connection that is cut halfway — leaves the
+// answer unknown.
+func requestNeverLeft(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	return false
 }
 
 // SpendFunc spends a refresh token and gives what it bought.
@@ -5023,24 +5979,46 @@ type SpendFunc func(ctx context.Context, refresh string) (*Token, error)
 // concurrency. A refresh that failed for a network reason is the one
 // exception: it may not have reached the site, so it is sent again.
 //
-// The renewer keeps, per account, the newest token it got and the
-// refresh tokens already spent. A request that comes while a renewal
-// is running waits for it and uses what it gave.
+// The renewer keeps, per account, the newest token it got, the refresh
+// tokens already spent, and the refresh tokens whose outcome is not
+// known. A request that comes while a renewal is running waits for it
+// and uses what it gave.
 type Renewer struct {
 	mu       sync.Mutex
 	inflight map[string]*renewCall
 	latest   map[string]*Token
-	// spent holds, per account, the refresh tokens already spent.
-	// Only the last few are kept: a caller can only be holding one
-	// that was recent, and a list that grew with every refresh would
-	// grow for as long as the process runs.
-	spent map[string][]string
+	// spent holds, per account, the hashes of the refresh tokens
+	// already spent. A token in here is never sent again.
+	//
+	// The tokens are remembered by their hash and not by themselves: a
+	// refresh token is a secret, and a hash keeps no secret in memory
+	// longer than it has to be there. The set grows with every
+	// renewal, which is what makes it right: a set that kept only the
+	// last few would let an old token be sent again.
+	spent map[string]map[string]bool
+	// unknown holds, per account, the hashes of the refresh tokens
+	// whose outcome is not known. The site may have spent them, so
+	// they are not sent again either.
+	unknown map[string]map[string]bool
+	// gen is the generation of each account's chain. A renewal takes
+	// the generation it started in and writes nothing when it has
+	// moved on, so a renewal that was running when the account was
+	// signed out does not bring it back.
+	gen map[string]uint64
 }
 
+// renewCall is one renewal in flight.
 type renewCall struct {
-	done  chan struct{}
+	done chan struct{}
+	// token and err are what the renewal gave.
 	token *Token
 	err   error
+	// accountID is the account the renewal is for.
+	accountID string
+	// refresh is the refresh token the renewal spends.
+	refresh string
+	// gen is the generation the renewal started in.
+	gen uint64
 }
 
 // NewRenewer makes a renewer.
@@ -5048,96 +6026,272 @@ func NewRenewer() *Renewer {
 	return &Renewer{
 		inflight: map[string]*renewCall{},
 		latest:   map[string]*Token{},
-		spent:    map[string][]string{},
+		spent:    map[string]map[string]bool{},
+		unknown:  map[string]map[string]bool{},
+		gen:      map[string]uint64{},
 	}
 }
 
 // Renew gives an account a fresh token, spending the refresh token at
 // hand once.
 //
-// When the renewal is already running for the account, the caller waits
-// for it and takes what it gave. When the refresh token was already
-// spent, the newest token this renewer has is given instead, and the
-// spent token is not sent again.
+// When the renewal is already running for the account and the token,
+// the caller waits for it and takes what it gave. When the refresh
+// token was already spent, the chain goes on from the newest token this
+// renewer holds: that is the only way past a store that did not get
+// the last token, and without it the chain never advances on its own.
+//
+// When the renewer does not know the token the caller holds, the
+// caller has a newer one — a fresh sign-in, or a token another process
+// wrote — so the caller is the one who is right and what this renewer
+// holds is dropped.
+//
+// When the chain cannot go on at all, the error is
+// ErrRefreshChainBroken, and the caller has to sign the account in
+// again by hand.
 func (r *Renewer) Renew(ctx context.Context, accountID string, current *Token, spend SpendFunc) (*Token, error) {
 	if current == nil {
 		return nil, fmt.Errorf("no token to renew")
 	}
+	if current.Refresh == "" {
+		return nil, fmt.Errorf("no refresh token to renew")
+	}
+	if spend == nil {
+		return nil, fmt.Errorf("no way to spend the refresh token")
+	}
+
+	key := tokenHash(current.Refresh)
+
 	r.mu.Lock()
-	if c, ok := r.inflight[accountID]; ok {
+	// A renewal with this token is already running for this account:
+	// wait for it rather than sending the token twice.
+	if c, ok := r.inflight[flightKey(accountID, key)]; ok {
 		r.mu.Unlock()
-		select {
-		case <-c.done:
-			return c.token, c.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		return waitFor(ctx, c)
+	}
+	// The outcome of the last renewal with this token is not known:
+	// the site may have spent it. It is not sent again.
+	if r.unknown[accountID][key] {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("the outcome of the last refresh with this token is not known, so it is not sent again: %w", ErrRefreshOutcomeUnknown)
+	}
+	head := r.latest[accountID]
+	if head != nil && head.Subject != "" && current.Subject != "" && head.Subject != current.Subject {
+		// The token is of another account: renewing it here would put
+		// its token under this account.
+		r.mu.Unlock()
+		return nil, fmt.Errorf("the token belongs to another account")
+	}
+	switch {
+	case r.spent[accountID][key]:
+		// The caller's token was spent already. The chain goes on from
+		// the newest token this renewer holds.
+		if head == nil || head.Refresh == current.Refresh {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("the refresh token was already spent and no newer token is held: %w", ErrRefreshChainBroken)
 		}
-	}
-	if isSpent(r.spent[accountID], current.Refresh) {
-		newest := r.latest[accountID]
-		r.mu.Unlock()
-		if newest != nil {
-			return newest, nil
+		headKey := tokenHash(head.Refresh)
+		if r.spent[accountID][headKey] || r.unknown[accountID][headKey] {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("the refresh token was already spent and no newer token is held: %w", ErrRefreshChainBroken)
 		}
-		return nil, fmt.Errorf("the refresh token was already spent and no newer token is held")
+		current, key = head, headKey
+	case head == nil || head.Refresh != current.Refresh:
+		// The renewer does not know the caller's token, so the caller
+		// has a newer one. The caller is the one who is right, so what
+		// this renewer holds is dropped.
+		delete(r.latest, accountID)
 	}
-	if l, ok := r.latest[accountID]; ok && l != nil && l.Refresh != current.Refresh {
-		// 已经刷新过了，用新的那个
-		r.mu.Unlock()
-		return l, nil
+
+	// The flight takes the account's chain over: any renewal running
+	// for this account is left behind, and its answer does not become
+	// the chain's.
+	r.gen[accountID]++
+	c := &renewCall{
+		done:      make(chan struct{}),
+		accountID: accountID,
+		refresh:   current.Refresh,
+		gen:       r.gen[accountID],
 	}
-	c := &renewCall{done: make(chan struct{})}
-	r.inflight[accountID] = c
+	r.inflight[flightKey(accountID, key)] = c
 	r.mu.Unlock()
 
-	tok, err := spend(ctx, current.Refresh)
+	go r.run(ctx, c, spend)
+	return waitFor(ctx, c)
+}
+
+// run spends a refresh token and puts what it bought into the renewer.
+//
+// The spend runs under a context of its own: the caller's cancellation
+// must not kill the renewal that every other caller is waiting for.
+// The caller's context is only for waiting.
+func (r *Renewer) run(ctx context.Context, c *renewCall, spend SpendFunc) {
+	spendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), spendTimeout)
+	defer cancel()
+
+	tok, err := spendSafely(spend, spendCtx, c.refresh)
 
 	r.mu.Lock()
-	delete(r.inflight, accountID)
+	defer r.mu.Unlock()
+	delete(r.inflight, flightKey(c.accountID, tokenHash(c.refresh)))
 	if err == nil && tok != nil {
-		r.latest[accountID] = tok
-		r.spent[accountID] = append(r.spent[accountID], current.Refresh)
-		if len(r.spent[accountID]) > spentCount {
-			r.spent[accountID] = r.spent[accountID][len(r.spent[accountID])-spentCount:]
+		// The site took the token, whatever happens to the chain now,
+		// so it is never sent again. A site that does not rotate the
+		// refresh token is the exception: it hands the same token
+		// back, so it did not take it.
+		if tok.Refresh != c.refresh {
+			r.markSpent(c.accountID, c.refresh)
 		}
+		if r.gen[c.accountID] == c.gen {
+			// A copy: the caller may change what it holds, and what
+			// the renewer holds is not the caller's to change.
+			held := *tok
+			r.latest[c.accountID] = &held
+		}
+	}
+	if err != nil && errors.Is(err, ErrRefreshOutcomeUnknown) {
+		// The site may have taken the token. It is not sent again.
+		r.markUnknown(c.accountID, c.refresh)
 	}
 	c.token, c.err = tok, err
 	close(c.done)
-	r.mu.Unlock()
-	return tok, err
+}
+
+// spendSafely spends a refresh token, and a panic is an error like any
+// other.
+//
+// The spend runs in a goroutine of its own, and a panic there would
+// take the whole process down with it.
+func spendSafely(spend SpendFunc, ctx context.Context, refresh string) (tok *Token, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			tok, err = nil, fmt.Errorf("refresh: %v", p)
+		}
+	}()
+	return spend(ctx, refresh)
+}
+
+// waitFor waits for a renewal to finish.
+//
+// The caller's context is only for waiting: the renewal runs under a
+// context of its own, so a caller that goes away does not kill the
+// renewal the other callers are waiting for.
+func waitFor(ctx context.Context, c *renewCall) (*Token, error) {
+	select {
+	case <-c.done:
+		return c.token, c.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Latest gives the newest token this renewer holds for an account.
 //
 // The renewer keeps only the newest one per account, so this is that
 // one, or the caller's own when there is none.
+//
+// Newest says the same thing without the guessing: it says whether
+// there is one.
 func (r *Renewer) Latest(accountID string, current *Token) *Token {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if l, ok := r.latest[accountID]; ok && l != nil {
-		return l
+	tok, ok := r.Newest(accountID)
+	if ok {
+		return tok
 	}
 	return current
 }
 
-// spentCount is how many spent refresh tokens are kept per account.
-const spentCount = 4
-
-// isSpent says whether a refresh token is one of the spent ones.
-func isSpent(list []string, refresh string) bool {
-	for _, s := range list {
-		if s == refresh {
-			return true
-		}
+// Newest gives the newest token this renewer holds for an account.
+//
+// The second answer says whether there is one: without it a caller
+// cannot tell "the renewer holds nothing" from "the renewer holds the
+// token you already have". The token is a copy, so the caller cannot
+// change what the renewer holds.
+func (r *Renewer) Newest(accountID string) (*Token, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tok := r.latest[accountID]
+	if tok == nil {
+		return nil, false
 	}
-	return false
+	c := *tok
+	return &c, true
 }
 
 // Forget drops an account's tokens, for when it is signed out.
+//
+// Everything about the account goes: the newest token, the record of
+// the tokens already spent, and the renewal that may be running. A
+// renewal that is running when the account is signed out is abandoned:
+// its answer is not written back, so a token does not come back from
+// the dead.
+//
+// A renewal that gets a token while the account is being signed out
+// still has that token spent at the site, so the record of it stays:
+// a token the site took is never sent again.
 func (r *Renewer) Forget(accountID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.latest, accountID)
+	delete(r.spent, accountID)
+	delete(r.unknown, accountID)
+	r.gen[accountID]++
+}
+
+// Reset forgets an account's chain, so that the next renewal walks it
+// again from the token the caller holds.
+//
+// The tokens already spent stay spent: a token the site took must never
+// be sent again, whatever happens to the chain around it. So Reset is
+// for "the chain I was walking is wrong, start again from here", and
+// not for "this account is signed out" — that is Forget.
+//
+// A renewal that is running is abandoned, like in Forget: its answer
+// belongs to the chain that was walked, not to the new one.
+func (r *Renewer) Reset(accountID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.latest, accountID)
+	r.gen[accountID]++
+}
+
+// markSpent remembers that a refresh token was spent.
+func (r *Renewer) markSpent(accountID, refresh string) {
+	set := r.spent[accountID]
+	if set == nil {
+		set = map[string]bool{}
+		r.spent[accountID] = set
+	}
+	set[tokenHash(refresh)] = true
+}
+
+// markUnknown remembers that the outcome of a refresh is not known.
+func (r *Renewer) markUnknown(accountID, refresh string) {
+	set := r.unknown[accountID]
+	if set == nil {
+		set = map[string]bool{}
+		r.unknown[accountID] = set
+	}
+	set[tokenHash(refresh)] = true
+}
+
+// tokenHash is what a refresh token is remembered by.
+//
+// The tokens are remembered by their hash and not by themselves: a
+// refresh token is a secret, and a hash keeps no secret in memory
+// longer than it has to be there. The hash is of the token alone, so a
+// hash of one account's token says nothing about another's.
+func tokenHash(refresh string) string {
+	sum := sha256.Sum256([]byte(refresh))
+	return hex.EncodeToString(sum[:])
+}
+
+// flightKey says which renewal a request belongs to.
+//
+// The key is the account and the token, not the account alone: a
+// caller that holds another token has another renewal to make, and
+// giving it the answer of somebody else's renewal loses its token.
+func flightKey(accountID, key string) string {
+	return accountID + "\x00" + key
 }
 ```
 

@@ -24,37 +24,114 @@ import (
 // DeviceGrant is the grant type of the device flow.
 const DeviceGrant = site.DeviceGrant
 
+// What an answer came from.
+//
+// The text of an error says which endpoint answered, so a failure of
+// the refresh does not read as a failure of the sign-in.
+const (
+	// WhatSignIn is the device flow: the sign-in server.
+	WhatSignIn = "sign-in"
+	// WhatRefresh is the token endpoint, where a refresh token is
+	// traded in.
+	WhatRefresh = "refresh"
+)
+
 // signInTimeout is how long a device code is waited for when the
 // answer gives no end of its own.
 const signInTimeout = 10 * time.Minute
 
 // slowDownWait is how much longer to wait when the site says slow
-// down. It is a variable so that a test does not have to wait five
-// seconds to see it happen.
-var slowDownWait = 5 * time.Second
+// down.
+//
+// It is a constant and not a variable: a test hook that production
+// behaviour depends on is one t.Parallel() away from a race, and a
+// test that needs a shorter wait sets the field on its own device.
+const slowDownWait = 5 * time.Second
 
-// expiresDuration reads an expires_in that may be seconds or
-// milliseconds.
+// The units of the numbers the site gives.
 //
-// The site sends both: a token that lasts an hour comes as 3600, and a
-// token that lasts an hour in milliseconds comes as 3600000. Read as
-// seconds, the second one lasts a hundred years: the token never
-// ends, the account is never refreshed, and every request is answered
-// with 401.
+// The site is not consistent about the unit: some of its answers are in
+// seconds and some in milliseconds, and nothing in the answer says
+// which. One rule is used for every number, and it lives in one place:
 //
-// A duration in seconds that is over a million is longer than eleven
-// days, which no token is; that is the tell.
-func expiresDuration(v int64) time.Duration {
+//	a number that is longer than the longest length of time the field
+//	can plausibly hold is in milliseconds; every other number is in
+//	seconds.
+//
+// The longest plausible length is given by the field that reads the
+// number, so the rule is applied the same way everywhere and every
+// field says what it believes.
+const (
+	// maxTokenSeconds is the longest an access token can live: a day.
+	// A number longer than that is not a number of seconds.
+	maxTokenSeconds = 24 * 60 * 60
+	// maxPollSeconds is the longest a poll interval can be: ten
+	// minutes. A longer wait is not a poll.
+	maxPollSeconds = 10 * 60
+	// epochSecondsFloor is the first Unix second of this century
+	// (2001-09-09). A number above it is a timestamp, not a length of
+	// time.
+	epochSecondsFloor = 1_000_000_000
+	// epochMillisFloor is the first Unix millisecond of a time in this
+	// century (1973-03-03). A timestamp above it is in milliseconds.
+	epochMillisFloor = 100_000_000_000
+)
+
+// siteDuration reads a length of time the site gave.
+//
+// The number is in seconds, unless it is longer than the longest
+// length of time the field can plausibly hold, in which case it is in
+// milliseconds. See the unit rules above.
+func siteDuration(v int64, longestSeconds int64) time.Duration {
 	if v <= 0 {
 		return 0
 	}
-	if v > 1e6 {
+	if v > longestSeconds {
 		return time.Duration(v) * time.Millisecond
 	}
 	return time.Duration(v) * time.Second
 }
 
-// Error is an answer from MiniMax's sign-in server.
+// expiresDuration reads how long an access token lives.
+//
+// The site sends an hour as 3600 and an hour as 3600000; the rule in
+// siteDuration tells the two apart. A ten-minute token sent as 600000
+// is ten minutes and not a hundred and sixty-six hours.
+func expiresDuration(v int64) time.Duration {
+	return siteDuration(v, maxTokenSeconds)
+}
+
+// pollInterval reads how long to wait between two polls.
+//
+// A poll that waits more than ten minutes is not a poll, so a number
+// that big is a number of milliseconds: 3000 is three seconds and not
+// fifty minutes, and 300 is five minutes and not a third of a second.
+func pollInterval(v int64) time.Duration {
+	return siteDuration(v, maxPollSeconds)
+}
+
+// siteDeadline reads when a device code ends.
+//
+// The site gives either a remaining time or an absolute timestamp, and
+// the timestamp comes in seconds or in milliseconds. The rule: a
+// number at or below epochSecondsFloor is a remaining time — in
+// seconds, or in milliseconds when it is too long to be seconds — and a
+// bigger one is an absolute timestamp, in milliseconds when it is above
+// epochMillisFloor and in seconds otherwise.
+func siteDeadline(v int64) (time.Time, bool) {
+	if v <= 0 {
+		return time.Time{}, false
+	}
+	if v > epochSecondsFloor {
+		if v > epochMillisFloor {
+			return time.UnixMilli(v), true
+		}
+		return time.Unix(v, 0), true
+	}
+	return time.Now().Add(siteDuration(v, maxTokenSeconds)), true
+}
+
+// Error is an answer from MiniMax.
 type Error struct {
 	// Code is the "error" the answer carried.
 	Code string
@@ -62,6 +139,9 @@ type Error struct {
 	HTTPStatus int
 	// Message is the text to show.
 	Message string
+	// What says which endpoint answered: WhatSignIn for the device
+	// flow, WhatRefresh for the token endpoint.
+	What string
 }
 
 // Error is the error's text.
@@ -69,21 +149,27 @@ type Error struct {
 // The code comes first: it is what says what went wrong, and the
 // message is the site's own words for it.
 func (e *Error) Error() string {
+	who := "MiniMax's sign-in server"
+	if e.What == WhatRefresh {
+		who = "MiniMax's token endpoint"
+	}
 	if e.Message != "" {
-		return fmt.Sprintf("%s: %s", e.Code, e.Message)
+		return fmt.Sprintf("%s said %s: %s", who, e.Code, e.Message)
 	}
 	if e.HTTPStatus != 0 {
-		return fmt.Sprintf("MiniMax's sign-in server said %s (HTTP %d)", e.Code, e.HTTPStatus)
+		return fmt.Sprintf("%s said %s (HTTP %d)", who, e.Code, e.HTTPStatus)
 	}
-	return fmt.Sprintf("MiniMax's sign-in server said %s", e.Code)
+	return fmt.Sprintf("%s said %s", who, e.Code)
 }
 
 // IsSignedOut says the answer is the one that signs an account out.
 //
-// Only invalid_grant with HTTP 400 is a sign-out. Any other failure is
-// passing, and the sign-in is kept.
+// The sign-out is invalid_grant. The site sends it with a 400, but it
+// also puts its business errors in the body of a 200, so the code is
+// what is looked at and not the status: a sign-out is a sign-out
+// however it arrives.
 func (e *Error) IsSignedOut() bool {
-	return e.Code == "invalid_grant" && e.HTTPStatus == 400
+	return e.Code == "invalid_grant"
 }
 
 // Token is an account's sign-in.
@@ -96,8 +182,37 @@ type Token struct {
 	Expires time.Time
 	// Subject is the MiniMax user id the access token carries.
 	Subject string
-	// AccountID is the account id the access token carries.
+	// AccountID is the account id the access token carries, as the
+	// site says it.
+	//
+	// It is the site's own id and not the store's: the renewer is
+	// keyed by the store's account id, and the two are not the same
+	// thing. A caller that keyed the renewer by this id would walk a
+	// second renewal chain for one account and spend two refresh
+	// tokens, which signs the account out. The store's id is the one
+	// to use.
+	//
+	// The name is kept as it is: renaming an exported field breaks
+	// every caller that reads it, and nothing reads it today. Use
+	// SiteAccountID to make the difference plain.
 	AccountID string
+	// HasClaims says the access token's claims could be read.
+	//
+	// It is false for a token that is not a JWT and for one whose
+	// payload cannot be decoded. The claim names themselves are
+	// guesses, so a true here does not mean they are the right ones.
+	HasClaims bool
+}
+
+// SiteAccountID is the account id the site's own token carries.
+//
+// It is not the store's account id, which is what the renewer is keyed
+// by. See Token.AccountID.
+func (t *Token) SiteAccountID() string {
+	if t == nil {
+		return ""
+	}
+	return t.AccountID
 }
 
 // Device is a sign-in waiting for the user.
@@ -112,6 +227,16 @@ type Device struct {
 	pollValue string
 	deadline  time.Time
 	interval  time.Duration
+	slowDown  time.Duration
+}
+
+// String is the device's text.
+//
+// The PKCE verifier is a secret: it is what lets anybody holding it
+// finish this sign-in. So it is not in the text, and %+v prints this
+// instead of the fields, so a debug log cannot leak it.
+func (d Device) String() string {
+	return fmt.Sprintf("Device{UserCode:%q URL:%q}", d.UserCode, d.URL)
 }
 
 // StartDevice asks MiniMax for a sign-in code.
@@ -142,7 +267,7 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, oauthError(resp.StatusCode, body)
+		return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 	}
 	var b struct {
 		DeviceCode              string `json:"device_code"`
@@ -155,7 +280,7 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		Interval                int64  `json:"interval"`
 	}
 	if err := json.Unmarshal(body, &b); err != nil {
-		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 	userCode := strings.TrimSpace(b.UserCode)
 	deviceCode := strings.TrimSpace(b.DeviceCode)
@@ -164,10 +289,10 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		uri = strings.TrimSpace(b.VerificationURL)
 	}
 	if userCode == "" || uri == "" {
-		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 
-	d := &Device{UserCode: userCode, verifier: verifier}
+	d := &Device{UserCode: userCode, verifier: verifier, slowDown: slowDownWait}
 	// MiniMax's own variant has no device_code: the user code is polled
 	// for, and the end may be an absolute time in milliseconds.
 	byUser := deviceCode == "" && b.ExpiredIn != 0
@@ -177,37 +302,32 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	case deviceCode != "":
 		d.pollField, d.pollValue = "device_code", deviceCode
 	default:
-		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode}
+		return nil, &Error{Code: "invalid_device_authorization_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 	}
 
-	var expires time.Duration
+	// The end of the code comes in two shapes: a lifetime (expires_in)
+	// and a deadline (expired_in). The fallback is only for the case
+	// where the site said nothing at all: a deadline that is already
+	// in the past is a dead code, and waiting ten minutes for it would
+	// be waiting for nothing.
+	var deadline time.Time
 	switch {
 	case b.ExpiresIn > 0:
-		expires = expiresDuration(b.ExpiresIn)
+		deadline = time.Now().Add(expiresDuration(b.ExpiresIn))
 	case b.ExpiredIn > 0:
-		// expired_in 有时是还剩多少秒，有时是一个绝对的毫秒时间戳。
-		// 靠大小分：毫秒时间戳不会是 1970 年。
-		if b.ExpiredIn < 1e12 {
-			expires = time.Duration(b.ExpiredIn) * time.Second
-		} else {
-			expires = time.Until(time.UnixMilli(b.ExpiredIn))
-		}
+		deadline, _ = siteDeadline(b.ExpiredIn)
 	}
-	if expires <= 0 {
-		expires = signInTimeout
+	if deadline.IsZero() {
+		deadline = time.Now().Add(signInTimeout)
 	}
-	d.deadline = time.Now().Add(expires)
+	if !deadline.After(time.Now()) {
+		return nil, &Error{Code: "expired_token", What: WhatSignIn}
+	}
+	d.deadline = deadline
 
 	interval := 5 * time.Second
 	if b.Interval > 0 {
-		// The site sends the interval in seconds and in milliseconds.
-		// A poll that waits more than a minute is not a poll, so a
-		// number that big is milliseconds.
-		if b.Interval > 60 {
-			interval = time.Duration(b.Interval) * time.Millisecond
-		} else {
-			interval = time.Duration(b.Interval) * time.Second
-		}
+		interval = pollInterval(b.Interval)
 	}
 	d.interval = interval
 
@@ -228,7 +348,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 	wait := d.interval
 	for {
 		if time.Now().After(d.deadline) {
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 		select {
 		case <-ctx.Done():
@@ -236,7 +356,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		case <-time.After(wait):
 		}
 		if time.Now().After(d.deadline) {
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 
 		form := url.Values{}
@@ -262,7 +382,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			Status       string `json:"status"`
 		}
 		if err := json.Unmarshal(body, &b); err != nil {
-			return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
+			return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 		}
 		httpOK := resp.StatusCode >= 200 && resp.StatusCode <= 299
 		code := strings.ToLower(b.Error)
@@ -275,65 +395,102 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			continue
 		}
 		if code == "slow_down" {
-			wait += slowDownWait
+			wait += d.slowDownWait()
 			continue
 		}
 		if !httpOK {
-			return nil, oauthError(resp.StatusCode, body)
+			return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 		}
 		switch status {
 		case "pending":
 			continue
 		case "slow_down":
-			wait += slowDownWait
+			wait += d.slowDownWait()
 			continue
 		case "denied", "access_denied":
-			return nil, &Error{Code: "access_denied"}
+			return nil, &Error{Code: "access_denied", What: WhatSignIn}
 		case "expired", "expired_token":
-			return nil, &Error{Code: "expired_token"}
+			return nil, &Error{Code: "expired_token", What: WhatSignIn}
 		}
 		if b.Error != "" {
-			return nil, oauthError(resp.StatusCode, body)
+			return nil, oauthError(resp.StatusCode, body, WhatSignIn)
 		}
 		if b.AccessToken == "" || b.ExpiresIn <= 0 {
-			return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode}
+			return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
+		}
+		if b.RefreshToken == "" {
+			// 没有 refresh token 的账号活不过一小时：它再也换不到
+			// 新的 access token 了。与其建一个这样的账号，不如让这次
+			// 登录失败，用户再登一次。
+			return nil, &Error{Code: "missing_refresh_token", HTTPStatus: resp.StatusCode, What: WhatSignIn}
 		}
 		tok := &Token{
 			Access:  b.AccessToken,
 			Refresh: b.RefreshToken,
 			Expires: time.Now().Add(expiresDuration(b.ExpiresIn)),
 		}
-		tok.Subject, tok.AccountID = claims(b.AccessToken)
+		tok.Subject, tok.AccountID, tok.HasClaims = claims(b.AccessToken)
 		return tok, nil
 	}
 }
 
+// slowDownWait is how much longer to wait when the site says slow
+// down.
+func (d *Device) slowDownWait() time.Duration {
+	if d.slowDown > 0 {
+		return d.slowDown
+	}
+	return slowDownWait
+}
+
 // claims reads the JWT's payload, when the access token is one.
-func claims(access string) (subject, accountID string) {
+//
+// The claim names are guesses: nobody has shown what MiniMax puts in
+// its access tokens, so "sub" and "account_id" may be the wrong names,
+// and the claim may be missing from a token that is a JWT all the
+// same. The answer says whether the payload could be read at all, so a
+// caller can tell "not a JWT" from "a JWT without that claim". The
+// names have to be checked against a real token before they are
+// trusted.
+//
+// The signature is not checked either: the token is only read, never
+// trusted for anything.
+func claims(access string) (subject, accountID string, ok bool) {
 	parts := strings.Split(access, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return "", "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", ""
+		// A payload may be padded, and a padded one is a JWT all the
+		// same.
+		raw, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", "", false
+		}
 	}
 	var p struct {
 		Sub       string `json:"sub"`
 		AccountID string `json:"account_id"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return "", ""
+		return "", "", false
 	}
-	return p.Sub, p.AccountID
+	return p.Sub, p.AccountID, true
 }
 
 // oauthError reads an error answer.
-func oauthError(status int, body []byte) *Error {
+//
+// The text is taken from error_description, then description, then
+// message: a 4xx that carries only "message" would lose its
+// explanation otherwise, and that explanation is what the account's
+// last error says.
+func oauthError(status int, body []byte, what string) *Error {
 	var b struct {
 		Error       string `json:"error"`
 		ErrorDesc   string `json:"error_description"`
 		Description string `json:"description"`
+		Message     string `json:"message"`
 	}
 	_ = json.Unmarshal(body, &b)
 	code := b.Error
@@ -344,7 +501,10 @@ func oauthError(status int, body []byte) *Error {
 	if msg == "" {
 		msg = b.Description
 	}
-	return &Error{Code: code, HTTPStatus: status, Message: msg}
+	if msg == "" {
+		msg = b.Message
+	}
+	return &Error{Code: code, HTTPStatus: status, Message: msg, What: what}
 }
 
 // randomVerifier makes the PKCE verifier.
