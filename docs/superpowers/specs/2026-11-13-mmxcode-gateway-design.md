@@ -555,7 +555,17 @@ CREATE TABLE egress_health (
 
 ### 12.2 并发
 
-SQLite 开启 WAL，busy_timeout 5s。写操作集中在一个 goroutine 的串行队列里，读操作并发。会话亲和表 `sessions` 与耗尽表 `exhausted_windows` 是热路径，写入频率低。
+SQLite 开启 WAL，`busy_timeout` 5 秒，`foreign_keys` 打开（这三个 pragma 走
+DSN 的 `_pragma=` 参数，`modernc.org/sqlite` 每条连接都套得上）。
+
+连接池设成 **一条连接**（`SetMaxOpenConns(1)`）。WAL 本来能让读并发，
+这里没有并发：每次聊天请求要读账号、读耗尽表、写会话绑定，每一次
+都是一条语句，SQLite 在 WAL 下单条语句是微秒级的，排队不疼；而多一条
+连接就多一份"database is locked"的风险，换来的并发收益在这个量级上
+看不出来。一条连接把这个风险整个消掉了。
+
+会话亲和表 `sessions` 与耗尽表 `exhausted_windows` 是热路径，写入频率低，
+走同一条连接也没有争用。
 
 ## 13. HTTP 接口
 
