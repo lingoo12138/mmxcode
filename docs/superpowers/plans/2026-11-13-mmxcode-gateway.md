@@ -5041,6 +5041,8 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/rotator"
+	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -5052,12 +5054,21 @@ type harness struct {
 	store  *store.Store
 	hits   int
 	tokens []string
+	// renewals counts the token renewals the gateway asked for.
+	renewals int
 }
 
 func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	t.Helper()
 	h := &harness{}
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.TokenPath {
+			// 续签也走假服务器：测试永远不碰 MiniMax 自己。
+			h.renewals++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"access_token":"tok2","refresh_token":"ref2","expires_in":3600}`))
+			return
+		}
 		h.hits++
 		h.tokens = append(h.tokens, r.Header.Get("Authorization"))
 		handler(w, r)
@@ -5085,6 +5096,9 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	mgr := manager.New(s, up, account.New(up), egress.New(nil, ""), oauth.NewRenewer())
+	// 续签的地址指到假服务器：一个测试碰到续签的时候，也不该去
+	// MiniMax 自己那里。
+	mgr.TokenURL = h.srv.URL + site.TokenPath
 	cfg := config.Default()
 	cfg.Server.APIKeys = nil
 	h.store = s
@@ -5296,6 +5310,356 @@ func TestStreamIsForwarded(t *testing.T) {
 		t.Fatalf("content type = %q", ct)
 	}
 }
+
+// countingStore counts the questions the pool adapter asks the store.
+//
+// 包一层是为了数问题，不是为了改 store。
+type countingStore struct {
+	*store.Store
+	readings int
+}
+
+func (c *countingStore) LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error) {
+	c.readings++
+	return c.Store.LatestUsageSnapshots(ctx)
+}
+
+// TestRemainingAllReadsTheCreditsOfEveryAccountAtOnce says the credits
+// of a whole list of accounts come from one read.
+//
+// 一次挑选要问所有候选账号的余额。一次读就够了：每个账号读一次，
+// N 个账号就是 N 次读。
+func TestRemainingAllReadsTheCreditsOfEveryAccountAtOnce(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	ctx := context.Background()
+	now := time.Now()
+	for _, id := range []string{"acc_02", "acc_03"} {
+		h.store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	// acc_02 的余额读到了，acc_01 没有
+	h.store.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_02", HasAmounts: true, Granted: 600, Consumed: 100, Remaining: 500,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+
+	c := &countingStore{Store: h.store}
+	p := poolAdapter{c}
+	got := p.RemainingAll(ctx, []string{"acc_01", "acc_02", "acc_03"})
+	if c.readings != 1 {
+		t.Fatalf("the readings were read %d times, want 1", c.readings)
+	}
+	rem, ok := got["acc_02"]
+	if !ok {
+		t.Fatalf("the account whose credits are known is not in the map: %+v", got)
+	}
+	if !rem.Known || rem.Left != 500 {
+		t.Fatalf("remaining = %+v", rem)
+	}
+	if _, ok := got["acc_01"]; ok {
+		t.Fatalf("an account whose credits are not known is in the map: %+v", got)
+	}
+
+	// 单个账号那条路走的是同一份数据，两边不能对不上
+	left, known := p.Remaining(ctx, "acc_02")
+	if !known || left != 500 {
+		t.Fatalf("remaining = %v, known = %v", left, known)
+	}
+	if _, known := p.Remaining(ctx, "acc_01"); known {
+		t.Fatal("the account without a reading says it has credits")
+	}
+}
+
+// TestPickReadsTheCreditsOfTheAccountsAtOnce says one pick asks for the
+// credits of every account it may choose in one question.
+//
+// 一个请求要挑账号时，余额是一次读完的，不是一个账号一次。
+func TestPickReadsTheCreditsOfTheAccountsAtOnce(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	ctx := context.Background()
+	now := time.Now()
+	for _, id := range []string{"acc_02", "acc_03"} {
+		h.store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		})
+		h.store.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+			AccountID: id, HasAmounts: true, Granted: 600, Remaining: 400,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		})
+	}
+	c := &countingStore{Store: h.store}
+	rot := rotator.New(poolAdapter{c}, rotator.Options{MaxAttempts: 3, WindowGroup: manager.WindowGroup})
+	if _, err := rot.Pick(ctx, "sess-1", "m", map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	if c.readings != 1 {
+		t.Fatalf("the credits were read %d times for one pick, want 1", c.readings)
+	}
+}
+
+// TestQuotaRefusalThatNamesTheCreditsSpendsTheWindow says a refusal
+// that names the credits spends the account's window.
+//
+// 说了额度用完就是额度用完：这个账号的窗口记成用完，换一个账号。
+func TestQuotaRefusalThatNamesTheCreditsSpendsTheWindow(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+
+	ex, err := h.store.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ex) != 1 || ex[0].AccountID != "acc_01" {
+		t.Fatalf("exhausted = %+v", ex)
+	}
+	if ex[0].WindowKey != "general" {
+		t.Fatalf("window key = %q, want the group", ex[0].WindowKey)
+	}
+	if ex[0].Reason != "quota" {
+		t.Fatalf("reason = %q", ex[0].Reason)
+	}
+}
+
+// TestForbiddenThatDoesNotNameTheCreditsDoesNotSpendTheWindow says a
+// 403 that only mentions a limit is not a spent account.
+//
+// 说了"限制"不等于说了"额度用完"。把窗口记成用完，这个账号就白等
+// 一整个窗口。
+func TestForbiddenThatDoesNotNameTheCreditsDoesNotSpendTheWindow(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden","detail":"the limit of the requests"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+
+	ex, err := h.store.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ex) != 0 {
+		t.Fatalf("the window was spent: %+v", ex)
+	}
+}
+
+// TestTheClientIsToldTheLimitWasReached says the 429 the client gets
+// when the credits are gone says the limit was reached.
+//
+// 上游自己说额度用完了，客户端就该看到这句话：等一会儿再来，而不是
+// 以为哪里坏了。
+func TestTheClientIsToldTheLimitWasReached(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "usage limit reached: insufficient balance") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
+// TestUnauthorizedRenewsTheToken says a 401 renews the token and asks
+// the same account again.
+//
+// 401 是令牌旧了：续签之后还是这个账号。
+func TestUnauthorizedRenewsTheToken(t *testing.T) {
+	// 次数是本地的一份：handler 是先给的，那时 h还不存在。
+	hits := 0
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"the sign-in was refused"}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if h.renewals != 1 {
+		t.Fatalf("the token was renewed %d times, want 1", h.renewals)
+	}
+	if len(h.tokens) < 2 || h.tokens[0] == h.tokens[1] {
+		t.Fatalf("the account was asked again with the same token: %v", h.tokens)
+	}
+}
+
+// TestForbiddenRenewsTheToken says a 403 renews the token too.
+//
+// 站点用 403 拒签到，账号这一边也是这么读的：令牌旧了，续签。
+func TestForbiddenRenewsTheToken(t *testing.T) {
+	// 次数是本地的一份：handler 是先给的，那时 h还不存在。
+	hits := 0
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"message":"forbidden"}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if h.renewals != 1 {
+		t.Fatalf("the token was renewed %d times, want 1", h.renewals)
+	}
+	if len(h.tokens) < 2 || h.tokens[0] == h.tokens[1] {
+		t.Fatalf("the account was asked again with the same token: %v", h.tokens)
+	}
+}
+
+// TestRefusedSignInInTheBodyRenewsTheToken says the site's own code for
+// a refused sign-in renews the token.
+//
+// 200 的身体里带着 1000048：站点说签到被拒了。令牌旧了，续签。
+func TestRefusedSignInInTheBodyRenewsTheToken(t *testing.T) {
+	// 次数是本地的一份：handler 是先给的，那时 h还不存在。
+	hits := 0
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.Write([]byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if h.renewals != 1 {
+		t.Fatalf("the token was renewed %d times, want 1", h.renewals)
+	}
+}
+
+// brokenStream writes one event and then breaks the connection.
+//
+// 上游断了：客户端要看到一个收尾的事件，而不是一条断掉的流。
+func brokenStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Write([]byte("event: message_start\ndata: {}\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	panic(http.ErrAbortHandler)
+}
+
+// brokenResponsesStream is a Responses stream that breaks.
+func brokenResponsesStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"model\":\"m\",\"status\":\"in_progress\"}}\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	panic(http.ErrAbortHandler)
+}
+
+// TestBrokenStreamEndsWithTheProtocolsOwnFailure says a stream that
+// breaks ends with one failure event, in the shape of the protocol the
+// client speaks.
+//
+// 断了的流要给一个收尾事件，形状得是客户端认得的那个：OpenAI 的
+// 客户端不认 Anthropic 的 error 事件，Codex 的客户端认 response.failed。
+func TestBrokenStreamEndsWithTheProtocolsOwnFailure(t *testing.T) {
+	t.Run("anthropic", func(t *testing.T) {
+		h := newHarness(t, brokenStream)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","stream":true}`))
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		body := w.Body.String()
+		if n := strings.Count(body, "event: error"); n != 1 {
+			t.Fatalf("the stream has %d error events, want 1: %s", n, body)
+		}
+		if strings.Contains(body, "response.failed") {
+			t.Fatalf("the stream has a Responses event in it: %s", body)
+		}
+	})
+	t.Run("openai", func(t *testing.T) {
+		h := newHarness(t, brokenStream)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true}`))
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		body := w.Body.String()
+		if n := strings.Count(body, `"error"`); n != 1 {
+			t.Fatalf("the stream has %d errors, want 1: %s", n, body)
+		}
+		if !strings.Contains(body, `data: {"error"`) {
+			t.Fatalf("the error is not an OpenAI one: %s", body)
+		}
+		if strings.Contains(body, "event: error") {
+			t.Fatalf("the stream has an Anthropic event in it: %s", body)
+		}
+	})
+	t.Run("codex", func(t *testing.T) {
+		h := newHarness(t, brokenResponsesStream)
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","stream":true}`))
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		body := w.Body.String()
+		if n := strings.Count(body, "event: response.failed"); n != 1 {
+			t.Fatalf("the stream has %d failures, want 1: %s", n, body)
+		}
+		if strings.Contains(body, "event: error") {
+			t.Fatalf("the stream has an Anthropic event in it: %s", body)
+		}
+		if !strings.Contains(body, `"id":"resp_1"`) {
+			t.Fatalf("the failure does not name the response: %s", body)
+		}
+	})
+}
+
+// TestCodexFallbackStreamHasOneFailure says the Codex fallback does not
+// end the stream twice.
+//
+// 上游说不了 Responses 的时候，本地把 Anthropic 的流转成 Responses 的。
+// 那一层断了的时候自己会写 response.failed，网关再写一个 Anthropic 的
+// error 事件，客户端就看到两次失败，形状还不一样。
+func TestCodexFallbackStreamHasOneFailure(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.ResponsesPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		brokenStream(w, r)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","stream":true}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	body := w.Body.String()
+	if n := strings.Count(body, "event: response.failed"); n != 1 {
+		t.Fatalf("the stream has %d failures, want 1: %s", n, body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("the stream has an Anthropic event in it: %s", body)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5354,8 +5718,6 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
-
-	"mmxcode/internal/upstream"
 )
 
 // writeError writes a plain error answer.
@@ -5387,38 +5749,6 @@ func writeRateLimit(w http.ResponseWriter, message string) {
 		},
 	})
 }
-
-// quotaMessage says what the answer's message is.
-func quotaMessage(body []byte) string {
-	var env struct {
-		Message string `json:"message"`
-		Error   *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Msg string `json:"msg"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return string(body)
-	}
-	switch {
-	case env.Error != nil && env.Error.Message != "":
-		return env.Error.Message
-	case env.Message != "":
-		return env.Message
-	case env.Msg != "":
-		return env.Msg
-	}
-	return "the account's credits or plan are used up"
-}
-
-// isQuotaRefusal says the answer is a refusal for the credits.
-func isQuotaRefusal(status int, body []byte) bool {
-	switch status {
-	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
-		return upstream.IsQuotaRefusal(body)
-	}
-	return false
-}
 ```
 
 - [ ] **Step 5: 实现网关**
@@ -5443,6 +5773,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -5503,8 +5834,22 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	return g
 }
 
+// poolStore is what the pool adapter reads from the store.
+//
+// It is an interface and not the store itself, so that a test can count
+// the questions the adapter asks without the store knowing about
+// counting.
+type poolStore interface {
+	ListAccounts(ctx context.Context) ([]store.Account, error)
+	ListExhausted(ctx context.Context) ([]store.Exhausted, error)
+	BindSession(ctx context.Context, sessionKey, accountID string) error
+	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
+	LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error)
+}
+
 // poolAdapter makes the store into a rotator pool.
-type poolAdapter struct{ s *store.Store }
+type poolAdapter struct{ s poolStore }
 
 func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
 	return p.s.ListAccounts(ctx)
@@ -5526,21 +5871,51 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 	return p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
 }
 
-func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, bool) {
+// RemainingAll gives the credits left of a whole list of accounts.
+//
+// The rotator asks for every account it may pick in one question, so
+// the answer comes out of one read of the readings and not one read
+// per account.
+//
+// The map holds only the accounts whose credits are known: an account
+// that is not in it has not been read yet, and the rotator takes it
+// after the ones whose balance it knows.
+func (p poolAdapter) RemainingAll(ctx context.Context, accountIDs []string) map[string]rotator.Remaining {
+	out := map[string]rotator.Remaining{}
+	if len(accountIDs) == 0 {
+		return out
+	}
+	wanted := make(map[string]bool, len(accountIDs))
+	for _, id := range accountIDs {
+		wanted[id] = true
+	}
 	snaps, err := p.s.LatestUsageSnapshots(ctx)
 	if err != nil {
-		return 0, false
+		return out
 	}
 	for _, s := range snaps {
-		if s.AccountID != accountID {
+		if !wanted[s.AccountID] {
 			continue
 		}
 		if !s.HasAmounts {
-			return 0, false
+			// 没读到余额的账号不算有余额：留空，让 rotator 把它排在后面。
+			continue
 		}
-		return s.Remaining, true
+		out[s.AccountID] = rotator.Remaining{Left: s.Remaining, Known: true}
 	}
-	return 0, false
+	return out
+}
+
+// Remaining gives one account's credits left.
+//
+// It goes through the same read as RemainingAll, so that the two
+// cannot disagree about one account.
+func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, bool) {
+	rem, ok := p.RemainingAll(ctx, []string{accountID})[accountID]
+	if !ok {
+		return 0, false
+	}
+	return rem.Left, true
 }
 
 // ServeHTTP routes a request.
@@ -5604,15 +5979,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 
 	used := map[string]bool{}
 	var lastErr error
+	// quota 说最后一次失败是“额度用完了”，quotaMsg 是上游自己说的那句。
+	// 客户端最后看到的是上游的话，不是网关自己编的一句。
+	var quota bool
+	var quotaMsg string
 	attempts := s.Cfg.Rotation.MaxAttempts
 	if attempts <= 0 {
 		attempts = 3
 	}
+accountLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
 			if lastErr != nil {
-				writeError(w, http.StatusTooManyRequests, lastErr.Error())
+				s.writeFailure(w, quota, quotaMsg, lastErr)
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, err.Error())
@@ -5647,114 +6027,180 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			Extra:     clientHeaders(r),
 		}
 
-		resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
-		if err != nil {
-			var oe *upstream.OtherSiteError
-			if errors.As(err, &oe) {
-				// 跨站：不换号、不消耗 refresh token
-				writeError(w, http.StatusBadGateway, oe.Error())
-				return
-			}
-			lastErr = err
-			time.Sleep(backoff(attempt))
-			continue
-		}
-
-		// 上游没有 /responses：改用本地转换，同一个账号再来一次
-		if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses {
-			s.NativeResponses = false
-			upBody, upPath, convertBack = s.upstreamShape(body, proto)
-			chatReq.Body = upBody
-			chatReq.Path = upPath
-			chatReq.Anthropic = upPath == site.MessagesPath
-			resp, raw, err = s.attempt(r.Context(), chatReq, client.Transport, stream)
+		// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
+		// 只能用一次，续第二次会把账号签死。
+		renewed := false
+		// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
+		// 再来一次就好。
+		for try := 0; try < attempts; try++ {
+			resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
 			if err != nil {
+				var oe *upstream.OtherSiteError
+				if errors.As(err, &oe) {
+					// 跨站：不换号、不消耗 refresh token
+					writeError(w, http.StatusBadGateway, oe.Error())
+					return
+				}
+				// 网络没通：还是这个账号，等一等再来。
 				lastErr = err
-				time.Sleep(backoff(attempt))
+				time.Sleep(backoff(try))
 				continue
 			}
-		}
 
-		// 200 且是流：直接转出去
-		if resp.StatusCode == http.StatusOK && raw == nil {
-			s.writeStream(w, resp, proto, convertBack, model)
-			return
-		}
+			// 上游没有 /responses：改用本地转换，同一个账号再来一次
+			if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses {
+				s.NativeResponses = false
+				upBody, upPath, convertBack = s.upstreamShape(body, proto)
+				chatReq.Body = upBody
+				chatReq.Path = upPath
+				chatReq.Anthropic = upPath == site.MessagesPath
+				resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+				if err != nil {
+					var oe *upstream.OtherSiteError
+					if errors.As(err, &oe) {
+						writeError(w, http.StatusBadGateway, oe.Error())
+						return
+					}
+					lastErr = err
+					time.Sleep(backoff(try))
+					continue
+				}
+			}
 
-		// 200 但身体里有业务错误
-		if resp.StatusCode == http.StatusOK {
-			if err := upstream.CheckEnvelope("chat", raw); err == nil {
-				s.writeJSON(w, resp, raw, proto, convertBack)
+			// 200 且是流：直接转出去
+			if resp.StatusCode == http.StatusOK && raw == nil {
+				s.writeStream(w, resp, proto, convertBack, model)
 				return
 			}
-		}
 
-		failure := rotator.Failure{Status: resp.StatusCode, Body: raw}
-		switch rotator.Decide(failure) {
-		case rotator.ActionFailover:
-			until := s.windowReset(ctx, plan.AccountID, plan.WindowKey)
-			_ = s.Rot.MarkExhausted(ctx, plan.AccountID, plan.WindowKey, "quota", until)
-			lastErr = fmt.Errorf("the account's credits or plan are used up")
-			continue
-		case rotator.ActionRenew:
-			newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
-			if rerr != nil {
-				// 跨站：不换号、不消耗 refresh token
-				var oe *upstream.OtherSiteError
-				if errors.As(rerr, &oe) {
-					writeError(w, http.StatusBadGateway, oe.Error())
-					return
-				}
-				lastErr = rerr
-				continue
-			}
-			// 用新 token 再来一次，还是这个账号
-			chatReq.Access = newTok.Access
-			resp2, raw2, err2 := s.attempt(r.Context(), chatReq, client.Transport, stream)
-			if err2 != nil {
-				var oe *upstream.OtherSiteError
-				if errors.As(err2, &oe) {
-					writeError(w, http.StatusBadGateway, oe.Error())
-					return
-				}
-				lastErr = err2
-				continue
-			}
-			if resp2.StatusCode == http.StatusOK && raw2 == nil {
-				s.writeStream(w, resp2, proto, convertBack, model)
-				return
-			}
-			if resp2.StatusCode == http.StatusOK {
-				if err := upstream.CheckEnvelope("chat", raw2); err == nil {
-					s.writeJSON(w, resp2, raw2, proto, convertBack)
+			// 200 但身体里有业务错误
+			if resp.StatusCode == http.StatusOK {
+				if err := upstream.CheckEnvelope("chat", raw); err == nil {
+					s.writeJSON(w, resp, raw, proto, convertBack)
 					return
 				}
 			}
-			lastErr = fmt.Errorf("HTTP %d", resp2.StatusCode)
-			continue
-		case rotator.ActionRetrySame:
-			if isQuotaRefusal(resp.StatusCode, raw) {
-				writeRateLimit(w, quotaMessage(raw))
+
+			failure := s.failure(resp.StatusCode, raw)
+			switch s.action(failure) {
+			case rotator.ActionFailover:
+				// 额度用完了：这个账号的窗口记成用完，换一个账号。
+				until := s.windowReset(ctx, plan.AccountID, plan.GroupKey)
+				_ = s.Rot.MarkWindowExhausted(ctx, plan.AccountID, plan.GroupKey, until, "quota")
+				lastErr = fmt.Errorf("the account's credits or plan are used up")
+				quota = true
+				quotaMsg = failure.Message
+				continue accountLoop
+			case rotator.ActionRenew:
+				if renewed {
+					// 续过一次还是被拒：这个账号先放着，换一个。
+					lastErr = fmt.Errorf("the sign-in was refused (HTTP %d)", resp.StatusCode)
+					quota = false
+					quotaMsg = ""
+					continue accountLoop
+				}
+				newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
+				if rerr != nil {
+					// 跨站：不换号、不消耗 refresh token
+					var oe *upstream.OtherSiteError
+					if errors.As(rerr, &oe) {
+						writeError(w, http.StatusBadGateway, oe.Error())
+						return
+					}
+					lastErr = rerr
+					quota = false
+					quotaMsg = ""
+					continue accountLoop
+				}
+				// 用新 token 再来一次，还是这个账号
+				renewed = true
+				chatReq.Access = newTok.Access
+				quota = false
+				quotaMsg = ""
+				continue
+			case rotator.ActionRetrySame:
+				// 限流、5xx：这个账号等一等，再问它一次。
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				quota = false
+				quotaMsg = ""
+				time.Sleep(backoff(try))
+				continue
+			default:
+				// 给不出别的说法：上游的答案原样给客户端。
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(raw)
 				return
 			}
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			time.Sleep(backoff(attempt))
-			continue
-		default:
-			if isQuotaRefusal(resp.StatusCode, raw) {
-				writeRateLimit(w, quotaMessage(raw))
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			w.Write(raw)
-			return
 		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("the request could not be served")
 	}
-	writeError(w, http.StatusTooManyRequests, lastErr.Error())
+	s.writeFailure(w, quota, quotaMsg, lastErr)
+}
+
+// failure says what went wrong upstream.
+//
+// The code and the message come out of the parsed answer, so that the
+// decision the rotator makes and the words the client is given are read
+// from one thing and not from two.
+func (s *Server) failure(status int, raw []byte) rotator.Failure {
+	f := rotator.Failure{Status: status, Body: raw}
+	err := upstream.CheckEnvelope("chat", raw)
+	if err == nil {
+		return f
+	}
+	var be *upstream.BusinessError
+	if !errors.As(err, &be) {
+		return f
+	}
+	f.Code = be.Code
+	f.Message = be.Message
+	// 1000048：站点说签到被拒了。令牌照旧了，账号本身没问题。
+	if errors.Is(err, upstream.ErrSignInRefused) {
+		f.Refused = true
+	}
+	return f
+}
+
+// action says what to do about the answer.
+//
+// The rotator owns the rule. The one thing it cannot know is that the
+// site refuses a sign-in with a 403 as well as with a 401 — the account
+// package reads both that way — so the gateway says the sign-in was
+// refused.
+//
+// It says it only when the rotator did not read the answer as a
+// refusal to spend: an answer that names the credits is about the
+// credits, and spending the window is the right answer for it.
+func (s *Server) action(failure rotator.Failure) rotator.Action {
+	action := rotator.Decide(failure)
+	if action == rotator.ActionFailover {
+		return action
+	}
+	if failure.Status != http.StatusUnauthorized && failure.Status != http.StatusForbidden {
+		return action
+	}
+	failure.Refused = true
+	return rotator.Decide(failure)
+}
+
+// writeFailure writes the answer of a request that could not be served.
+//
+// The words the client is given are the upstream's own when it said the
+// credits are gone: "usage limit reached: …" tells the client to wait
+// and try again, which a plain error does not.
+func (s *Server) writeFailure(w http.ResponseWriter, quota bool, quotaMsg string, err error) {
+	if quota {
+		message := quotaMsg
+		if message == "" {
+			message = "the account's credits or plan are used up"
+		}
+		writeRateLimit(w, message)
+		return
+	}
+	writeError(w, http.StatusTooManyRequests, err.Error())
 }
 
 // attempt sends the request upstream and gives the answer back.
@@ -5904,6 +6350,10 @@ func copyHeaders(w http.ResponseWriter, resp *http.Response) {
 // account cannot be changed any more; if the stream then breaks, the
 // client is told the stream ended early rather than being sent a
 // second, different answer.
+//
+// The event that says so has the shape of the protocol the client
+// speaks: an OpenAI client does not read Anthropic's error event, and a
+// Codex client reads the Responses one.
 func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto protocol, convertBack bool, model string) {
 	copyHeaders(w, resp)
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -5913,19 +6363,94 @@ func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto p
 
 	var err error
 	if convertBack {
+		// 转换器自己收尾：它失败的时候已经写了一个 response.failed，
+		// 网关再写一个就是第二次失败，形状还不一样。
 		err = convert.StreamResponses(resp.Body, w, model)
 	} else {
-		_, err = io.Copy(w, resp.Body)
-	}
-	if err != nil {
-		// 流到一半断了：给客户端一个错误事件收尾，不重放
-		fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"the stream ended early: %v\"}}\n\n", err)
+		sniffer := &idSniffer{w: w}
+		_, err = io.Copy(sniffer, resp.Body)
+		if err != nil {
+			writeStreamError(sniffer, proto, err, model, sniffer.responseID())
+		}
 	}
 	if flusher != nil {
 		flusher.Flush()
 	}
 	resp.Body.Close()
 }
+
+// writeStreamError writes the event that says the stream broke.
+//
+// The shape is the one of the protocol the client speaks.
+func writeStreamError(w io.Writer, proto protocol, err error, model, responseID string) {
+	message := "the stream ended early: " + err.Error()
+	switch proto {
+	case protocolOpenAI:
+		// OpenAI 的流里，错误也是一行 data。
+		b, _ := json.Marshal(map[string]any{
+			"error": map[string]any{"message": message, "type": "api_error"},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", b)
+	case protocolCodex:
+		// Codex 读的是 Responses 的形状，和本地转换写出来的一样。
+		response := map[string]any{
+			"object": "response",
+			"model":  model,
+			"status": "failed",
+			"error":  map[string]any{"code": "upstream_error", "message": message},
+		}
+		if responseID != "" {
+			response["id"] = responseID
+		}
+		b, _ := json.Marshal(map[string]any{
+			"type":     "response.failed",
+			"response": response,
+		})
+		fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", b)
+	default:
+		b, _ := json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": message},
+		})
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
+	}
+}
+
+// idSniffer keeps the first bytes of a stream, to find the response id.
+//
+// The Responses protocol names the response in its first event, and the
+// failure at the end of a broken stream has to carry the same id: the
+// client matches the two.
+type idSniffer struct {
+	w   io.Writer
+	buf []byte
+}
+
+// maxSniff is how many bytes are looked at for the response id.
+const maxSniff = 8 << 10
+
+func (s *idSniffer) Write(p []byte) (int, error) {
+	if len(s.buf) < maxSniff {
+		n := maxSniff - len(s.buf)
+		if n > len(p) {
+			n = len(p)
+		}
+		s.buf = append(s.buf, p[:n]...)
+	}
+	return s.w.Write(p)
+}
+
+// responseID gives the id of the response the stream is about.
+func (s *idSniffer) responseID() string {
+	m := responseIDPattern.FindSubmatch(s.buf)
+	if m == nil {
+		return ""
+	}
+	return string(m[1])
+}
+
+// responseIDPattern finds the id of the response in the first events.
+var responseIDPattern = regexp.MustCompile(`"id"\s*:\s*"(resp[^"]*)"`)
 
 // writeJSON writes a whole answer to the client.
 func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []byte, proto protocol, convertBack bool) {
@@ -6013,13 +6538,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // windowReset gives the moment a spent window comes back.
-func (s *Server) windowReset(ctx context.Context, accountID, windowKey string) time.Time {
+//
+// The key is the plan group, not one window: the windows "5 hours" and
+// "7 days" belong to a group, and the group comes back as a whole.
+func (s *Server) windowReset(ctx context.Context, accountID, groupKey string) time.Time {
 	ws, err := s.Mgr.LatestWindows(ctx, accountID)
 	if err != nil {
 		return time.Time{}
 	}
 	for _, w := range ws {
-		if w.ModelName == windowKey && !w.ResetsAt.IsZero() {
+		if w.ModelName == groupKey && !w.ResetsAt.IsZero() {
 			return w.ResetsAt
 		}
 	}

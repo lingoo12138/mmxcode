@@ -3,8 +3,6 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
-
-	"mmxcode/internal/upstream"
 )
 
 // writeError writes a plain error answer.
@@ -35,36 +33,4 @@ func writeRateLimit(w http.ResponseWriter, message string) {
 			"message": "usage limit reached: " + message,
 		},
 	})
-}
-
-// quotaMessage says what the answer's message is.
-func quotaMessage(body []byte) string {
-	var env struct {
-		Message string `json:"message"`
-		Error   *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Msg string `json:"msg"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return string(body)
-	}
-	switch {
-	case env.Error != nil && env.Error.Message != "":
-		return env.Error.Message
-	case env.Message != "":
-		return env.Message
-	case env.Msg != "":
-		return env.Msg
-	}
-	return "the account's credits or plan are used up"
-}
-
-// isQuotaRefusal says the answer is a refusal for the credits.
-func isQuotaRefusal(status int, body []byte) bool {
-	switch status {
-	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
-		return upstream.IsQuotaRefusal(body)
-	}
-	return false
 }
