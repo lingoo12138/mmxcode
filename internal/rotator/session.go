@@ -44,6 +44,16 @@ type Session struct {
 //
 // When there is neither a header nor a message to hash, the session is
 // empty and the request is handled by round robin.
+//
+// The upstream id of a conversation that brought no header of its own
+// is the hash of its first message. Two users whose first messages
+// happen to be the same therefore share one upstream id, and one
+// account: the upstream sees one conversation as two, and one user's
+// messages can turn up in another user's conversation. A random id per
+// conversation would not, but the id has to be kept from one turn to
+// the next and there is nowhere to keep it: the sessions table holds
+// the key and the account and nothing else. It needs a column of its
+// own before this can be done.
 func SessionOf(headers map[string][]string, system, firstUser string) Session {
 	for _, h := range sessionHeaders {
 		for _, v := range headers[h] {
