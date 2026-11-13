@@ -4,11 +4,27 @@
 // MiniMax Code speaks the Anthropic Messages protocol natively. The
 // Responses protocol is turned into it here: the request is rewritten,
 // and the upstream's stream is rewritten back into Responses events.
+//
+// Two rules hold for the whole package:
+//
+//   - A piece of the answer that the Responses protocol has no shape
+//     for is left out, not faked. An Anthropic image block, a document
+//     or a tool result has no output item of its own in the Responses
+//     protocol, so it gets no item at all. Turning it into an empty
+//     message would tell the client that the model said nothing,
+//     which is not what happened.
+//
+//   - A tool call's arguments have to be a JSON object on the
+//     Anthropic side and a JSON string on the Responses side.
+//     Arguments that are neither are refused rather than turned into
+//     an empty object: an empty object is a tool call with arguments
+//     the caller never wrote.
 package convert
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // responsesRequest is the part of a Responses request that is read.
@@ -19,6 +35,7 @@ type responsesRequest struct {
 	MaxOutputTokens int             `json:"max_output_tokens"`
 	Stream          bool            `json:"stream"`
 	Tools           []responsesTool `json:"tools"`
+	ToolChoice      json.RawMessage `json:"tool_choice"`
 	Reasoning       *struct {
 		Effort string `json:"effort"`
 	} `json:"reasoning"`
@@ -34,13 +51,14 @@ type responsesTool struct {
 
 // anthropicRequest is the Anthropic Messages request that comes out.
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	MaxTokens int                `json:"max_tokens"`
-	Stream    bool               `json:"stream,omitempty"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
-	Thinking  *thinking          `json:"thinking,omitempty"`
+	Model      string               `json:"model"`
+	System     string               `json:"system,omitempty"`
+	Messages   []anthropicMessage   `json:"messages"`
+	MaxTokens  int                  `json:"max_tokens"`
+	Stream     bool                 `json:"stream,omitempty"`
+	Tools      []anthropicTool      `json:"tools,omitempty"`
+	ToolChoice *anthropicToolChoice `json:"tool_choice,omitempty"`
+	Thinking   *thinking            `json:"thinking,omitempty"`
 }
 
 // anthropicMessage is one message.
@@ -67,6 +85,15 @@ type anthropicTool struct {
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
+// anthropicToolChoice is Anthropic's tool_choice.
+//
+// Anthropic always wants an object, even for the choices that the
+// Responses protocol writes as a plain string.
+type anthropicToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
+}
+
 // thinking is the Anthropic thinking setting.
 type thinking struct {
 	Type string `json:"type"`
@@ -75,9 +102,9 @@ type thinking struct {
 // ToAnthropic turns a Responses request into an Anthropic Messages
 // request.
 //
-// The model, the messages, the tools and the streaming flag all come
-// across. The Responses protocol's tool calls and tool results become
-// Anthropic's tool_use and tool_result blocks.
+// The model, the messages, the tools, the tool choice and the
+// streaming flag all come across. The Responses protocol's tool calls
+// and tool results become Anthropic's tool_use and tool_result blocks.
 func ToAnthropic(body []byte) ([]byte, error) {
 	var in responsesRequest
 	if err := json.Unmarshal(body, &in); err != nil {
@@ -106,6 +133,7 @@ func ToAnthropic(body []byte) ([]byte, error) {
 			InputSchema: schema,
 		})
 	}
+	out.ToolChoice = toolChoice(in.ToolChoice)
 	if in.Reasoning != nil && in.Reasoning.Effort != "" {
 		out.Thinking = &thinking{Type: "adaptive"}
 	}
@@ -115,6 +143,41 @@ func ToAnthropic(body []byte) ([]byte, error) {
 	}
 	out.Messages = msgs
 	return json.Marshal(out)
+}
+
+// toolChoice turns the Responses tool_choice into Anthropic's.
+//
+// The Responses protocol says "required" where Anthropic says "any",
+// and it names a function where Anthropic names a tool. A choice that
+// has no counterpart is left out: a different choice would silently
+// change what the model is allowed to do.
+func toolChoice(raw json.RawMessage) *anthropicToolChoice {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		switch s {
+		case "auto":
+			return &anthropicToolChoice{Type: "auto"}
+		case "none":
+			return &anthropicToolChoice{Type: "none"}
+		case "required":
+			return &anthropicToolChoice{Type: "any"}
+		}
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	if obj.Type == "function" && obj.Name != "" {
+		return &anthropicToolChoice{Type: "tool", Name: obj.Name}
+	}
+	return nil
 }
 
 // messages turns the Responses input into Anthropic messages.
@@ -140,16 +203,16 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 		switch typ {
 		case "function_call":
 			var fc struct {
-				CallID    string `json:"call_id"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
+				CallID    string          `json:"call_id"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
 			}
 			if err := json.Unmarshal(mustMarshal(item), &fc); err != nil {
 				return nil, err
 			}
-			input := json.RawMessage(fc.Arguments)
-			if len(input) == 0 {
-				input = json.RawMessage(`{}`)
+			input, err := toolInput(fc.Arguments)
+			if err != nil {
+				return nil, err
 			}
 			out = append(out, anthropicMessage{
 				Role: "assistant",
@@ -202,6 +265,49 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 		}}
 	}
 	return out, nil
+}
+
+// toolInput turns the arguments of a Responses tool call into the
+// input of an Anthropic tool_use.
+//
+// Anthropic wants an object and the Responses protocol carries the
+// arguments as a JSON string. Arguments that are not a JSON object
+// cannot be used, so they are refused: an empty object would be a
+// tool call with arguments the caller never wrote.
+func toolInput(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			// 没有参数的工具就是这样写的。
+			return json.RawMessage(`{}`), nil
+		}
+		if _, err := jsonObject([]byte(s)); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(s), nil
+	}
+	if _, err := jsonObject(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// jsonObject says whether a piece of JSON is an object.
+func jsonObject(raw []byte) (map[string]json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("responses: the tool call's arguments are not a JSON object")
+	}
+	if obj == nil {
+		// "null" reads as an object with nothing in it, but it is
+		// not one.
+		return nil, fmt.Errorf("responses: the tool call's arguments are not a JSON object")
+	}
+	return obj, nil
 }
 
 // blocks turns a Responses message's content into Anthropic blocks.
