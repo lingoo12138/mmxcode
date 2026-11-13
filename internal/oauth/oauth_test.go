@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,5 +315,145 @@ func TestOAuthErrorCodes(t *testing.T) {
 	}
 	if oe.Code != "invalid_grant" || oe.HTTPStatus != 400 {
 		t.Fatalf("error = %+v", oe)
+	}
+}
+
+func TestRefreshToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("grant_type"); got != "refresh_token" {
+			t.Errorf("grant_type = %q", got)
+		}
+		if got := r.Form.Get("refresh_token"); got != "old-refresh" {
+			t.Errorf("refresh_token = %q", got)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new-access" || tok.Refresh != "new-refresh" {
+		t.Fatalf("token = %+v", tok)
+	}
+}
+
+func TestRefreshKeepsOldTokenWhenNoNewOneGiven(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access",
+			"expires_in":   3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Refresh != "old-refresh" {
+		t.Fatalf("refresh = %q, want the old one", tok.Refresh)
+	}
+}
+
+func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if !oe.IsSignedOut() {
+		t.Fatal("expected the error to be a sign-out")
+	}
+}
+
+func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(50 * time.Millisecond)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	var wg sync.WaitGroup
+	results := make([]*Token, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tok, err := r.Renew(context.Background(), "acc_01", current, spend)
+			if err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+			results[i] = tok
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
+	}
+	for i, tok := range results {
+		if tok == nil || tok.Access != "new-access" {
+			t.Fatalf("result %d = %+v", i, tok)
+		}
+	}
+}
+
+func TestRenewerDoesNotSpendASpentTokenAgain(t *testing.T) {
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", current, spend); err != nil {
+		t.Fatal(err)
+	}
+	// 同一个 refresh 再来一次：不能再发出去，但要把最新的那个给它
+	tok, err := r.Renew(context.Background(), "acc_01", current, spend)
+	if err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if tok == nil || tok.Access != "new-access" {
+		t.Fatalf("expected the newest token to be given, got %+v", tok)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("spend called %d times, want 1", got)
+	}
+}
+
+func TestRenewerLatestWins(t *testing.T) {
+	r := NewRenewer()
+	first := &Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}
+	second := &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
+	r.Renew(context.Background(), "acc_01", first, func(ctx context.Context, refresh string) (*Token, error) {
+		return second, nil
+	})
+	got := r.Latest("acc_01", first)
+	if got == nil || got.Access != "a2" {
+		t.Fatalf("latest = %+v", got)
 	}
 }
