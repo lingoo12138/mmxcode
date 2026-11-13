@@ -12,3 +12,6 @@ config.yaml
 
 # 审查临时目录
 .tmp-review/
+
+# 差分测试用的临时探针
+.scratch-probe/
