@@ -135,6 +135,7 @@ cmd/mmxcode
 - Create: `internal/site/site.go`
 - Create: `internal/site/models.go`
 - Create: `internal/site/models_test.go`
+- Create: `internal/site/site_test.go`
 
 - [ ] **Step 1: 初始化模块**
 
@@ -160,8 +161,11 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -200,7 +204,7 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
-	path := dir + "/config.yaml"
+	path := filepath.Join(dir, "config.yaml")
 	body := `
 server:
   listen: ":9090"
@@ -259,10 +263,64 @@ db: "./local.db"
 	}
 }
 
-func TestDurationYAML(t *testing.T) {
+func TestDurationString(t *testing.T) {
 	d := Duration(90 * time.Second)
 	if got := d.String(); got != "1m30s" {
 		t.Fatalf("String() = %q", got)
+	}
+}
+
+func TestDurationYAML(t *testing.T) {
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"1h30m"`), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Duration() != 90*time.Minute {
+		t.Fatalf("d = %v", d.Duration())
+	}
+	b, err := yaml.Marshal(Duration(90 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "\"1h30m\"
+" {
+		t.Fatalf("marshalled = %q", b)
+	}
+}
+
+func TestDurationRejectsGarbage(t *testing.T) {
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"5x"`), &d); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestLoadEmptyPath(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.Listen != ":8080" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadMissingFile(t *testing.T) {
+	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestLoadRejectsUnknownKey(t *testing.T) {
+	// 键名写错时必须报错。拼错一个出口组名，静默走全局默认是很坏的失败方式。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:
+  listenn: \":9090\"
+"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the unknown key")
 	}
 }
 ```
@@ -295,6 +353,7 @@ Expected: FAIL —— `undefined: Default`、`undefined: Load`、`undefined: Dur
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"time"
@@ -404,7 +463,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("read config: %w", err)
 	}
-	if err := yaml.Unmarshal(raw, &c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {
@@ -472,36 +534,47 @@ const (
 	AgentID = "main"
 )
 
-// The OAuth paths.
+// The paths of the endpoints.
+//
+// They are paths, not URLs. The host is decided by whoever sends the
+// request, so a test can point them at a stand-in server and a
+// deployment can move a host without touching the paths.
+//
+// The full URL of an endpoint is its host followed by its path:
+// site.AccountHost + site.DeviceCodePath.
 const (
-	DeviceCodePath = AccountHost + "/oauth2/device/code"
-	TokenPath      = AccountHost + "/oauth2/token"
+	// The OAuth endpoints, on AccountHost.
+	DeviceCodePath = "/oauth2/device/code"
+	TokenPath      = "/oauth2/token"
+
+	// The chat and model endpoints, on LLMHost.
+	ModelsPath          = "/mavis/api/v1/models"
+	MessagesPath        = "/mavis/api/v1/llm/v1/messages"
+	ChatCompletionsPath = "/mavis/api/v1/llm/v1/chat/completions"
+	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
+
+	// The account API's endpoints, on AgentHost.
+	IdentityPath   = "/v1/api/user/info"
+	WorkspacePath  = "/matrix/api/v1/user/get_user_extra_info"
+	MembershipPath = "/matrix/api/v1/commerce/get_membership_info"
+	CreditPath     = "/minimax-cloud/api/v1/credit/details"
+	SigninStatus   = "/minimax-cloud/api/v1/signin/status"
+	SigninClaim    = "/minimax-cloud/api/v1/signin/claim"
+
+	// The plan console's endpoints, on PlatformHost.
+	PlanRemainsPath = "/backend/account/token_plan/remains_percent"
+	CodingPlanPath  = "/v1/api/openplatform/coding_plan/remains"
+	PlanTitlePath   = "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
 )
 
-// The chat and model paths.
-const (
-	ModelsPath           = LLMHost + "/mavis/api/v1/models?region=en&buildEnv=prod"
-	MessagesPath         = LLMHost + "/mavis/api/v1/llm/v1/messages"
-	ChatCompletionsPath  = LLMHost + "/mavis/api/v1/llm/v1/chat/completions"
-	ResponsesPath        = LLMHost + "/mavis/api/v1/llm/v1/responses"
-)
+// AccountURL gives an account endpoint's full URL.
+func AccountURL(path string) string { return AccountHost + path }
 
-// The account API's paths.
-const (
-	IdentityPath   = AgentHost + "/v1/api/user/info"
-	WorkspacePath  = AgentHost + "/matrix/api/v1/user/get_user_extra_info"
-	MembershipPath = AgentHost + "/matrix/api/v1/commerce/get_membership_info"
-	CreditPath     = AgentHost + "/minimax-cloud/api/v1/credit/details"
-	SigninStatus   = AgentHost + "/minimax-cloud/api/v1/signin/status"
-	SigninClaim    = AgentHost + "/minimax-cloud/api/v1/signin/claim"
-)
+// LLMURL gives a chat endpoint's full URL.
+func LLMURL(path string) string { return LLMHost + path }
 
-// The plan console's paths.
-const (
-	PlanRemainsPath    = PlatformHost + "/backend/account/token_plan/remains_percent"
-	CodingPlanPath     = PlatformHost + "/v1/api/openplatform/coding_plan/remains"
-	PlanTitlePath      = PlatformHost + "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
-)
+// PlatformURL gives a plan console endpoint's full URL.
+func PlatformURL(path string) string { return PlatformHost + path }
 ```
 
 创建 `internal/site/models.go`：
@@ -537,6 +610,8 @@ type Model struct {
 
 // FallbackModels is the list used when the live one can't be had.
 //
+// It is read-only: a caller that wants to change it copies it first.
+//
 // The context and output limits are the ones the endpoint really allows,
 // not the ones MiniMax Code declares. Its model config says 512K/128K for
 // the M3 family, but the endpoint accepts 1,048,576 input tokens and
@@ -555,6 +630,7 @@ var FallbackModels = []Model{
 		Context: 1048576, Output: 524288,
 		Inputs:   []string{"text", "image", "video"},
 		Thinking: ThinkingSwitchable,
+		Efforts:  []string{"none", "high"},
 	},
 	{
 		ID: "MiniMax-M2.7", Name: "M2.7",
@@ -571,10 +647,77 @@ var FallbackModels = []Model{
 }
 
 // Limits returns a model's context and output limits.
-func (m Model) Limits() (context, output int) { return m.Context, m.Output }
+func (m Model) Limits() (ctxLimit, outputLimit int) { return m.Context, m.Output }
 ```
 
 - [ ] **Step 7: 写 site 包的测试**
+
+创建 `internal/site/site_test.go`：
+
+```go
+package site
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestPathsAreBare guards the convention: a path is a path and the host
+// is a separate thing.
+//
+// A path that grew a host would break the gateway's ability to point
+// the chats at another host, and would make every call site that
+// composes host+path produce a doubled host.
+func TestPathsAreBare(t *testing.T) {
+	paths := []string{
+		DeviceCodePath, TokenPath,
+		ModelsPath, MessagesPath, ChatCompletionsPath, ResponsesPath,
+		IdentityPath, WorkspacePath, MembershipPath, CreditPath,
+		SigninStatus, SigninClaim,
+		PlanRemainsPath, CodingPlanPath, PlanTitlePath,
+	}
+	for _, p := range paths {
+		if !strings.HasPrefix(p, "/") {
+			t.Errorf("path %q does not start with a slash", p)
+		}
+		if strings.Contains(p, "://") {
+			t.Errorf("path %q carries a host", p)
+		}
+	}
+}
+
+// TestURLHelpers checks that the helpers put the right host in front.
+func TestURLHelpers(t *testing.T) {
+	if got := AccountURL(DeviceCodePath); got != AccountHost+"/oauth2/device/code" {
+		t.Errorf("AccountURL = %q", got)
+	}
+	if got := LLMURL(MessagesPath); got != LLMHost+"/mavis/api/v1/llm/v1/messages" {
+		t.Errorf("LLMURL = %q", got)
+	}
+	if got := PlatformURL(PlanRemainsPath); got != PlatformHost+"/backend/account/token_plan/remains_percent" {
+		t.Errorf("PlatformURL = %q", got)
+	}
+}
+
+// TestHosts checks the hosts. Only the international site is here: the
+// China site's hosts are a different set, and its tokens do not work on
+// these.
+func TestHosts(t *testing.T) {
+	for name, h := range map[string]string{
+		"AccountHost":  AccountHost,
+		"LLMHost":      LLMHost,
+		"AgentHost":    AgentHost,
+		"PlatformHost": PlatformHost,
+	} {
+		if !strings.HasPrefix(h, "https://") {
+			t.Errorf("%s = %q, want an https URL", name, h)
+		}
+		if strings.Contains(h, "minimax.cn") || strings.Contains(h, "minimaxi.com") {
+			t.Errorf("%s = %q points at the China site", name, h)
+		}
+	}
+}
+```
 
 创建 `internal/site/models_test.go`：
 
@@ -615,7 +758,8 @@ func TestM3ThinkingVariants(t *testing.T) {
 	if m.Thinking != ThinkingSwitchable {
 		t.Fatalf("M3 thinking = %q", m.Thinking)
 	}
-	if len(m.Efforts) != 0 {
+	// 规格里 M3 是 switchable：none / high
+	if len(m.Efforts) != 2 || m.Efforts[0] != "none" || m.Efforts[1] != "high" {
 		t.Fatalf("M3 efforts = %v", m.Efforts)
 	}
 }
@@ -4044,7 +4188,7 @@ var checkinQuery = []signKV{
 
 // Identity reads who the account is.
 func (c *Client) Identity(ctx context.Context, access, userID string) (Identity, error) {
-	body, err := c.call(ctx, access, userID, http.MethodGet, "/v1/api/user/info", nil, nil)
+	body, err := c.call(ctx, access, userID, http.MethodGet, site.IdentityPath, nil, nil)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -4104,7 +4248,7 @@ func (c *Client) Membership(ctx context.Context, access, userID string) (Members
 
 func (c *Client) membershipOnce(ctx context.Context, access, userID, groupID string) (Membership, error) {
 	body, err := c.call(ctx, access, userID, http.MethodPost,
-		"/matrix/api/v1/commerce/get_membership_info", []byte("{}"), nil)
+		site.MembershipPath, []byte("{}"), nil)
 	if err != nil {
 		return Membership{}, err
 	}
@@ -4155,7 +4299,7 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 			signKV{"page_size", strconv.Itoa(pageSize)},
 			signKV{"include_expired", "true"},
 		)
-		body, err := c.call(ctx, access, userID, http.MethodGet, "/minimax-cloud/api/v1/credit/details", nil, query)
+		body, err := c.call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
 		if err != nil {
 			return nil, err
 		}
@@ -4206,11 +4350,11 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 // The console's own answer comes first; the open platform's is the
 // fallback.
 func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Window, error) {
-	ws, err := c.planWindowsOnce(ctx, access, groupID, "/backend/account/token_plan/remains_percent")
+	ws, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
 	if err == nil {
 		return ws, nil
 	}
-	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, "/v1/api/openplatform/coding_plan/remains")
+	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
 	if err2 != nil {
 		return nil, err2
 	}
@@ -4218,7 +4362,7 @@ func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Win
 }
 
 func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.PlatformHost+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.PlatformURL(path), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -4244,7 +4388,7 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 
 // PlanTitle reads the plan's name as the console says it.
 func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string, error) {
-	path := site.PlatformHost + "/v1/api/openplatform/charge/combo/cycle_audio_resource_package?biz_line=2&cycle_type=1&resource_package_type=7"
+	path := site.PlatformURL(site.PlanTitlePath) + "?biz_line=2&cycle_type=1&resource_package_type=7"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
@@ -4286,7 +4430,9 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 // is asked for by whoever needs it — the gateway's /v1/models — so
 // that a fallback and a live read are not confused with each other.
 func (c *Client) Models(access string) []site.Model {
-	return site.FallbackModels
+	out := make([]site.Model, len(site.FallbackModels))
+	copy(out, site.FallbackModels)
+	return out
 }
 
 // ParseAmount reads a ledger amount.
@@ -5497,7 +5643,7 @@ func newLoginCmd(e *env) *cobra.Command {
 		Short: "登录一个 MiniMax 账号",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
-			d, err := oauth.StartDevice(ctx, e.up, site.DeviceCodePath)
+			d, err := oauth.StartDevice(ctx, e.up, site.AccountURL(site.DeviceCodePath))
 			if err != nil {
 				return err
 			}
@@ -5505,7 +5651,7 @@ func newLoginCmd(e *env) *cobra.Command {
 			fmt.Printf("输入验证码：%s\n", d.UserCode)
 			fmt.Println("等待登录……")
 
-			tok, err := d.Poll(ctx, e.up, site.TokenPath)
+			tok, err := d.Poll(ctx, e.up, site.AccountURL(site.TokenPath))
 			if err != nil {
 				return err
 			}

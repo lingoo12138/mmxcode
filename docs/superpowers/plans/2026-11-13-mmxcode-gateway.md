@@ -470,7 +470,7 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 		return nil, fmt.Errorf("no token to renew")
 	}
 	tok, err := m.Renewer.Renew(ctx, accountID, cur, func(ctx context.Context, refresh string) (*oauth.Token, error) {
-		return oauth.Refresh(ctx, m.Up, site.TokenPath, refresh)
+		return oauth.Refresh(ctx, m.Up, site.AccountURL(site.TokenPath), refresh)
 	})
 	if err != nil {
 		var oe *oauth.Error
@@ -707,32 +707,6 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `internal/upstream/client.go`（把重定向循环提出来，支持按请求指定 transport）
 - Create: `internal/upstream/chat.go`
 - Create: `internal/upstream/chat_test.go`
-
-- [ ] **Step 0: 把三个聊天路径改成不带主机的路径**
-
-计划 A 的 `internal/site/site.go` 里这三个常量写的是完整 URL：
-
-```go
-	MessagesPath        = LLMHost + "/mavis/api/v1/llm/v1/messages"
-	ChatCompletionsPath = LLMHost + "/mavis/api/v1/llm/v1/chat/completions"
-	ResponsesPath       = LLMHost + "/mavis/api/v1/llm/v1/responses"
-```
-
-网关上要把它们拼在可改的主机后面（测试要指到假服务器），所以改成只有路径：
-
-```go
-// The paths of the chat endpoints.
-//
-// They are paths, not URLs: the host is decided by whoever sends the
-// request, so a test can point them at a stand-in.
-const (
-	MessagesPath        = "/mavis/api/v1/llm/v1/messages"
-	ChatCompletionsPath = "/mavis/api/v1/llm/v1/chat/completions"
-	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
-)
-```
-
-计划 A 的代码没有用到这三个常量（账户 API 那边用的是字面路径），所以改动不影响已写的包。
 
 - [ ] **Step 1: 改写 client.go 的 Do**
 
@@ -1065,7 +1039,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 //
 // The token is used when there is one; the site also answers without.
 func (c *Client) Models(ctx context.Context, baseURL, access string) ([]byte, error) {
-	u := strings.TrimRight(baseURL, "/") + "/mavis/api/v1/models?region=en&buildEnv=prod"
+	u := strings.TrimRight(baseURL, "/") + site.ModelsPath + "?region=" + site.Region + "&buildEnv=prod"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -1143,6 +1117,7 @@ type fakePool struct {
 	sessions  map[string]string
 	bound     []string
 	marked    []string
+	remaining map[string]float64
 }
 
 func newFakePool(accounts ...store.Account) *fakePool {
@@ -1162,6 +1137,11 @@ func (p *fakePool) BindSession(_ context.Context, key, accountID string) error {
 func (p *fakePool) SessionAccount(_ context.Context, key string) (string, bool, error) {
 	id, ok := p.sessions[key]
 	return id, ok, nil
+}
+
+func (p *fakePool) Remaining(_ context.Context, accountID string) (float64, bool) {
+	left, ok := p.remaining[accountID]
+	return left, ok
 }
 
 func (p *fakePool) MarkExhausted(_ context.Context, accountID, windowKey string, until time.Time, reason string) error {
@@ -1280,6 +1260,53 @@ func TestPickFailsWhenEveryAccountIsExhausted(t *testing.T) {
 	r := New(p, Options{MaxAttempts: 3})
 	if _, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestNoSessionRotates(t *testing.T) {
+	// 没有会话就没有可粘的东西，退化为轮询
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	r := New(p, Options{MaxAttempts: 3})
+	a, err := r.Pick(context.Background(), "", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.Pick(context.Background(), "", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AccountID == b.AccountID {
+		t.Fatalf("both requests went to %s", a.AccountID)
+	}
+}
+
+func TestRoundRobinIgnoresTheBinding(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.sessions["sess-1"] = "acc_01"
+	r := New(p, Options{MaxAttempts: 3, Strategy: "round-robin"})
+	a, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AccountID == b.AccountID {
+		t.Fatalf("both went to %s", a.AccountID)
+	}
+}
+
+func TestPrefersTheAccountWithCredits(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.remaining = map[string]float64{"acc_01": 10, "acc_02": 500}
+	r := New(p, Options{MaxAttempts: 3})
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("picked %s, want the one with credits", got.AccountID)
 	}
 }
 
@@ -1538,6 +1565,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"mmxcode/internal/store"
@@ -1555,6 +1583,9 @@ type Pool interface {
 	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
 	// MarkExhausted marks an account's window spent.
 	MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
+	// Remaining gives an account's credits left. The second value is
+	// false when the credits have not been read yet.
+	Remaining(ctx context.Context, accountID string) (float64, bool)
 }
 
 // Options configures a rotator.
@@ -1567,6 +1598,12 @@ type Options struct {
 	// WindowGroup says which plan window a model spends from. It
 	// defaults to the chat models' group.
 	WindowGroup func(model string) string
+	// Strategy says how an account is picked.
+	//
+	// "sticky" keeps a conversation on the account it was bound to, and
+	// only rotates when there is no conversation to keep.
+	// "round-robin" rotates every request, and the binding is not used.
+	Strategy string
 }
 
 // Plan is the account a request goes to.
@@ -1585,6 +1622,15 @@ type Plan struct {
 type Rotator struct {
 	pool Pool
 	opts Options
+
+	// mu guards the two fields below.
+	mu sync.Mutex
+	// cursor is where the rotation stands, so two requests in a row do
+	// not land on the same account.
+	cursor int
+	// lastUsed says when each account was last handed out, for the
+	// "least recently used first" rule.
+	lastUsed map[string]time.Time
 }
 
 // New makes a rotator.
@@ -1598,7 +1644,14 @@ func New(pool Pool, opts Options) *Rotator {
 	if opts.WindowGroup == nil {
 		opts.WindowGroup = defaultWindowGroup
 	}
-	return &Rotator{pool: pool, opts: opts}
+	if opts.Strategy == "" {
+		opts.Strategy = "sticky"
+	}
+	return &Rotator{
+		pool:     pool,
+		opts:     opts,
+		lastUsed: map[string]time.Time{},
+	}
 }
 
 // defaultWindowGroup is the chat models' group.
@@ -1617,8 +1670,19 @@ func (r *Rotator) WindowKey(model string) string {
 // Pick gives the account a request goes to.
 //
 // used holds the accounts already tried for this request, so a replay
-// does not pick the same one again. The session is bound to the
-// account that is picked.
+// does not pick the same one again.
+//
+// Which account it is comes down to three cases:
+//
+//   - a conversation that is bound to an account stays on it, as long as
+//     the account can still answer;
+//   - a conversation with no binding takes the account with the most
+//     credits left, and the least recently used one when those are
+//     equal;
+//   - a request with no conversation at all rotates: the next account
+//     in turn, so the load is spread.
+//
+// The "round-robin" strategy skips the first case and rotates always.
 func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[string]bool) (Plan, error) {
 	accounts, err := r.pool.Accounts(ctx)
 	if err != nil {
@@ -1635,22 +1699,25 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 		if a.Status != store.StatusActive {
 			continue
 		}
+		if used[a.ID] || r.isExhausted(exhausted, a.ID, window) {
+			continue
+		}
 		usable = append(usable, a)
 	}
 	if len(usable) == 0 {
-		return Plan{}, fmt.Errorf("no account is signed in")
+		return Plan{}, fmt.Errorf("every account is spent for the %s window", window)
 	}
 
+	sticky := r.opts.Strategy != "round-robin"
+
 	// 会话已绑定的账号能用就用
-	if sessionKey != "" {
+	if sticky && sessionKey != "" {
 		if id, ok, err := r.pool.SessionAccount(ctx, sessionKey); err == nil && ok {
 			for _, a := range usable {
 				if a.ID != id {
 					continue
 				}
-				if used[id] || r.isExhausted(exhausted, id, window) {
-					break
-				}
+				r.markUsed(id)
 				return Plan{
 					AccountID: id,
 					WindowKey: window,
@@ -1660,22 +1727,102 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 		}
 	}
 
-	// 否则从池子里挑一个没被用过的
-	for _, a := range usable {
-		if used[a.ID] || r.isExhausted(exhausted, a.ID, window) {
-			continue
+	// 会话没有绑定：挑余额最多的，其次最久没用的
+	if sticky && sessionKey != "" {
+		a, err := r.bestAccount(ctx, usable)
+		if err != nil {
+			return Plan{}, err
 		}
-		if sessionKey != "" {
-			_ = r.pool.BindSession(ctx, sessionKey, a.ID)
-		}
+		_ = r.pool.BindSession(ctx, sessionKey, a.ID)
+		r.markUsed(a.ID)
 		return Plan{
 			AccountID: a.ID,
 			WindowKey: window,
 			SessionID: SessionID(sessionKey),
-			Rebound:   sessionKey != "",
+			Rebound:   true,
 		}, nil
 	}
-	return Plan{}, fmt.Errorf("every account is spent for the %s window", window)
+
+	// 没有会话，或者就是要轮询：下一个
+	a := r.nextAccount(usable)
+	r.markUsed(a.ID)
+	return Plan{
+		AccountID: a.ID,
+		WindowKey: window,
+		SessionID: SessionID(sessionKey),
+	}, nil
+}
+
+// bestAccount gives the account with the most credits left, and the
+// least recently used one when two have the same.
+//
+// An account whose credits have not been read is not treated as empty:
+// it would be pushed to the back of the queue every time, and it is
+// more likely to be an account that was just added.
+func (r *Rotator) bestAccount(ctx context.Context, usable []store.Account) (store.Account, error) {
+	var best *scored
+	for _, a := range usable {
+		left, known := r.pool.Remaining(ctx, a.ID)
+		s := scored{acc: a, known: known, left: left, usedAt: r.usedAt(a.ID)}
+		if best == nil {
+			best = &s
+			continue
+		}
+		if better(s, *best) {
+			best = &s
+		}
+	}
+	if best == nil {
+		return store.Account{}, fmt.Errorf("no account is usable")
+	}
+	return best.acc, nil
+}
+
+// scored is an account with the numbers the choice is made on.
+type scored struct {
+	acc    store.Account
+	known  bool
+	left   float64
+	usedAt time.Time
+}
+
+// better says one account is a better pick than another.
+func better(a, b scored) bool {
+	if a.known != b.known {
+		// 余额没读到的排前面：它多半是刚加进来的账号
+		return a.known
+	}
+	if a.known && a.left != b.left {
+		return a.left > b.left
+	}
+	// 一样就用最久没用的那个
+	return a.usedAt.Before(b.usedAt)
+}
+
+// nextAccount gives the next account in the rotation.
+//
+// The cursor moves on every call, so two requests in a row do not land
+// on the same account.
+func (r *Rotator) nextAccount(usable []store.Account) store.Account {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i := r.cursor % len(usable)
+	r.cursor++
+	return usable[i]
+}
+
+// markUsed records that an account was handed out.
+func (r *Rotator) markUsed(accountID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastUsed[accountID] = time.Now()
+}
+
+// usedAt says when an account was last handed out.
+func (r *Rotator) usedAt(accountID string) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastUsed[accountID]
 }
 
 // MarkExhausted marks an account's window spent.
@@ -3063,6 +3210,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
 		WindowGroup: manager.WindowGroup,
+		Strategy:    cfg.Rotation.Strategy,
 	})
 	return g
 }
@@ -3088,6 +3236,23 @@ func (p poolAdapter) SessionAccount(ctx context.Context, key string) (string, bo
 
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
 	return p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
+}
+
+func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, bool) {
+	snaps, err := p.s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		return 0, false
+	}
+	for _, s := range snaps {
+		if s.AccountID != accountID {
+			continue
+		}
+		if !s.HasAmounts {
+			return 0, false
+		}
+		return s.Remaining, true
+	}
+	return 0, false
 }
 
 // ServeHTTP routes a request.
@@ -3137,6 +3302,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		writeError(w, http.StatusBadRequest, "the request body could not be read")
 		return
 	}
+	// 上游请求的时限就是配的那一个。流式对话也吃这份预算：想要更长的
+	// 就把 upstream.timeout 调大。
+	ctx := r.Context()
+	if d := s.Cfg.Upstream.Timeout.Duration(); d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
 	model := modelOf(body)
 	stream := isStream(body)
 	sessionKey := rotator.SessionKey(r.Header, systemOf(body), firstUserOf(body))
@@ -3149,7 +3322,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		attempts = 3
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		plan, err := s.Rot.Pick(r.Context(), sessionKey, model, used)
+		plan, err := s.Rot.Pick(ctx, sessionKey, model, used)
 		if err != nil {
 			if lastErr != nil {
 				writeError(w, http.StatusTooManyRequests, lastErr.Error())
@@ -3160,12 +3333,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		}
 		used[plan.AccountID] = true
 
-		tok, err := s.Mgr.Token(r.Context(), plan.AccountID)
+		tok, err := s.Mgr.Token(ctx, plan.AccountID)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		client, _, err := s.Mgr.Client(r.Context(), plan.AccountID)
+		client, _, err := s.Mgr.Client(ctx, plan.AccountID)
 		if err != nil {
 			lastErr = err
 			continue
@@ -3184,7 +3357,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			Extra:     clientHeaders(r),
 		}
 
-		resp, raw, err := s.attempt(r.Context(), chatReq, client.Transport, stream)
+		resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
 		if err != nil {
 			var oe *upstream.OtherSiteError
 			if errors.As(err, &oe) {
@@ -3229,12 +3402,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		failure := rotator.Failure{Status: resp.StatusCode, Body: raw}
 		switch rotator.Decide(failure) {
 		case rotator.ActionFailover:
-			until := s.windowReset(r.Context(), plan.AccountID, plan.WindowKey)
-			_ = s.Rot.MarkExhausted(r.Context(), plan.AccountID, plan.WindowKey, "quota", until)
+			until := s.windowReset(ctx, plan.AccountID, plan.WindowKey)
+			_ = s.Rot.MarkExhausted(ctx, plan.AccountID, plan.WindowKey, "quota", until)
 			lastErr = fmt.Errorf("the account's credits or plan are used up")
 			continue
 		case rotator.ActionRenew:
-			newTok, rerr := s.Mgr.ForceRenew(r.Context(), plan.AccountID)
+			newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
 			if rerr != nil {
 				lastErr = rerr
 				continue
@@ -4418,7 +4591,7 @@ func (w *WebUI) apiAccounts(rw http.ResponseWriter, r *http.Request) {
 
 // startLogin asks the site for a sign-in code.
 func (w *WebUI) startLogin(ctx context.Context) (map[string]any, error) {
-	d, err := oauth.StartDevice(ctx, w.Mgr.Up, site.DeviceCodePath)
+	d, err := oauth.StartDevice(ctx, w.Mgr.Up, site.AccountURL(site.DeviceCodePath))
 	if err != nil {
 		return nil, err
 	}
@@ -4438,7 +4611,7 @@ func (w *WebUI) startLogin(ctx context.Context) (map[string]any, error) {
 func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	tok, err := d.Poll(ctx, w.Mgr.Up, site.TokenPath)
+	tok, err := d.Poll(ctx, w.Mgr.Up, site.AccountURL(site.TokenPath))
 	w.mu.Lock()
 	p := w.pending[id]
 	w.mu.Unlock()
@@ -5118,6 +5291,11 @@ func newServeCmd(e *env) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+
+			// 只有国际站。中国站是另一套主机，token 不通用。
+			if s := e.cfg.Upstream.Site; s != "" && s != "global" {
+				return fmt.Errorf("upstream.site = %q; only \"global\" is supported", s)
+			}
 
 			// 没配 key 时只听本机，不然就是把模型白送出去
 			listen := e.cfg.Server.Listen
