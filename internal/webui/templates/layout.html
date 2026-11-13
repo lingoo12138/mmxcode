@@ -30,6 +30,7 @@ input, select { padding: .25rem; }
     <a href="/egress">出口</a>
     <a href="/usage">用量</a>
     <a href="/login">登录</a>
+    {{if .HasKeys}}<a href="/signin" id="sign-out">退出</a>{{end}}
   </nav>
   <span class="muted" id="status"></span>
 </header>
@@ -37,5 +38,22 @@ input, select { padding: .25rem; }
 {{template "content" .}}
 </main>
 <script src="/static/app.js"></script>
+{{if .HasKeys}}
+<script>
+// 退出：把浏览器里那张票删掉，再回到登录页。
+// 没有 key 的网关没有这张票，也就不用退出。
+document.addEventListener('click', async (ev) => {
+  const link = ev.target.closest('#sign-out');
+  if (!link) return;
+  ev.preventDefault();
+  try {
+    await fetch('/api/session', { method: 'DELETE' });
+  } catch (e) {
+    /* 签不出去也就还是那样 */
+  }
+  location.href = '/signin';
+});
+</script>
+{{end}}
 </body>
 </html>{{end}}

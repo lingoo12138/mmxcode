@@ -146,6 +146,8 @@ func (w *WebUI) page(rw http.ResponseWriter, r *http.Request, name string, data 
 		return
 	}
 	d["Title"] = strings.TrimSuffix(name, ".html")
+	// 配了 key 才有登录和退出可做：没配 key 的网关不用登录。
+	d["HasKeys"] = len(w.Cfg.Server.APIKeys) > 0
 	// The page brings its own "content", so it is parsed into a copy
 	// of the layout.
 	tmpl, err := w.tmpl.Clone()

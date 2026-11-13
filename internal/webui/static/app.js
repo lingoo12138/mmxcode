@@ -2,6 +2,9 @@
 //
 // 只做三件事：改账号的出口、触发签到、测出口。
 // 页面本身是服务端渲染的，这里不重新渲染。
+//
+// 这里不用带 API key：浏览器同源的 fetch 会自己带上 mmxcode_session
+// 那张票，页面的按钮因此不会 401。
 
 async function post(url, body) {
   const res = await fetch(url, {

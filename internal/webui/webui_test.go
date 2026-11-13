@@ -112,6 +112,86 @@ func TestAPIUsage(t *testing.T) {
 	}
 }
 
+// TestAPIUsageCarriesTheState says the usage API says what state every
+// account is in, and how many have run out.
+//
+// 新的 state 和 accounts_expired 要到客户端那里：页面才知道哪个账号的
+// 读数过期了，短掉的总数才有话说。
+func TestAPIUsageCarriesTheState(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 600, Consumed: 100, Remaining: 500,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_02", HasAmounts: true, Granted: 600, Consumed: 100, Remaining: 500,
+		ExpiresAt: now.Add(-time.Hour), CreatedAt: now,
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var out struct {
+		AccountsExpired int `json:"accounts_expired"`
+		Accounts        []struct {
+			ID    string `json:"id"`
+			State string `json:"state"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountsExpired != 1 {
+		t.Fatalf("accounts_expired = %d, body = %s", out.AccountsExpired, rec.Body.String())
+	}
+	states := map[string]string{}
+	for _, a := range out.Accounts {
+		states[a.ID] = a.State
+	}
+	if states["acc_01"] != "read" || states["acc_02"] != "expired" {
+		t.Fatalf("states = %v, body = %s", states, rec.Body.String())
+	}
+}
+
+// TestThePageHasAWayOut says the page offers a way out when the gateway
+// has a key to sign in with.
+//
+// 浏览器里那张票得能删掉，不然退出不了。
+func TestThePageHasAWayOut(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "/api/session") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+// TestThePageHasNoWayOutWithoutAKey says a gateway without a key does
+// not offer a sign-out it cannot do.
+//
+// 没配 key 的网关不用登录，也就没有那张票可删。
+func TestThePageHasNoWayOutWithoutAKey(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "/api/session") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
 func TestAPICheckin(t *testing.T) {
 	w, _ := newTestWebUI(t)
 	// 签到会打上游；这里只看路由认不认这个路径

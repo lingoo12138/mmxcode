@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -631,5 +632,224 @@ func TestCodexFallbackStreamHasOneFailure(t *testing.T) {
 	}
 	if strings.Contains(body, "event: error") {
 		t.Fatalf("the stream has an Anthropic event in it: %s", body)
+	}
+}
+
+// signIn signs the browser in and gives the cookie it got.
+func signIn(t *testing.T, h *harness, key string) *http.Cookie {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key="+url.QueryEscape(key)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie {
+			return c
+		}
+	}
+	t.Fatalf("no cookie was given: %v", w.Header()["Set-Cookie"])
+	return nil
+}
+
+// TestTheCookieIsAccepted says the browser's cookie opens the gateway.
+//
+// 浏览器不会替页面带上 x-api-key，cookie 是它能带的那张门票。
+func TestTheCookieIsAccepted(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.AddCookie(c)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTheSignInPageIsReachableWithoutASession says the page that signs
+// the browser in does not need a session.
+//
+// 没有会话的人正要来这里登录。
+func TestTheSignInPageIsReachableWithoutASession(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/signin", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("content type = %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), `<form`) {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	// 页面不回显 key，也不该被缓存
+	if strings.Contains(w.Body.String(), "sk-1") {
+		t.Fatalf("the key is in the page: %s", w.Body.String())
+	}
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Fatalf("cache control = %q", cc)
+	}
+}
+
+// TestAWrongKeySetsNoCookie says a wrong key is refused and leaves no
+// cookie behind.
+func TestAWrongKeySetsNoCookie(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key=sk-wrong"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for a wrong key: %+v", c)
+		}
+	}
+}
+
+// TestACookieOfARotatedKeyIsRefused says a cookie stops working when
+// the key it was made of is not configured any more.
+//
+// 换一把 key，旧的 cookie 自己就作废了：服务端不用存任何东西。
+func TestACookieOfARotatedKeyIsRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+	h.gw.Cfg.Server.APIKeys = []string{"sk-2"}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.AddCookie(c)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTheCookieIsOnlyForTheBrowser says the cookie is HttpOnly and
+// Strict.
+//
+// cookie 本身就是一张门票：谁拿到它谁就能用这个网关。所以脚本读不到
+// 它（HttpOnly），别的站点的表单也带不上它（SameSite=Strict）。
+func TestTheCookieIsOnlyForTheBrowser(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+	if !c.HttpOnly {
+		t.Fatal("a script can read the cookie")
+	}
+	if c.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("same site = %v, want strict", c.SameSite)
+	}
+	if c.Path != "/" {
+		t.Fatalf("path = %q", c.Path)
+	}
+	if c.Value == "" || c.Value == "sk-1" {
+		t.Fatalf("the cookie carries the key itself: %q", c.Value)
+	}
+}
+
+// TestAPageWithoutASessionGivesTheSignInPage says a browser that opens
+// a page is given the sign-in page.
+//
+// 浏览器打开的是页面，给它一段 JSON 等于什么也做不了。
+func TestAPageWithoutASessionGivesTheSignInPage(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("content type = %q, body = %s", ct, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `<form`) {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
+// TestAnAPIWithoutASessionGivesJSON says the API clients keep their
+// JSON answer.
+//
+// 脚本和模型客户端读得懂 JSON，读不懂一个登录页。
+func TestAnAPIWithoutASessionGivesJSON(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	for _, path := range []string{"/api/usage", "/v1/models"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: code = %d", path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Fatalf("%s: content type = %q", path, ct)
+		}
+	}
+}
+
+// TestWithoutAKeyNothingIsChecked says a gateway without keys lets
+// everything through.
+//
+// 没配 key 的时候网关不查：那时候它只该听在本机，serve 那一条命令管
+// 这件事。
+func TestWithoutAKeyNothingIsChecked(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[]}`))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the request was refused")
+	}
+}
+
+// TestSignOutTakesTheCookieAway says there is a way out.
+//
+// 签出要能删掉 cookie：不然浏览器里那张票一直在。
+func TestSignOutTakesTheCookieAway(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodDelete, "/api/session", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	cleared := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("the cookie was not taken away: %v", w.Result().Cookies())
 	}
 }

@@ -162,8 +162,23 @@ func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, 
 
 // ServeHTTP routes a request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/signin":
+		// 登录页不用会话：没有会话的人正要来这里登录。
+		s.signInPage(w, r, http.StatusOK, "")
+		return
+	case "/api/session":
+		// 发 cookie 和销 cookie 都不用会话。
+		s.session(w, r)
+		return
+	}
 	if !s.auth(r) {
-		writeError(w, http.StatusUnauthorized, "the key was refused")
+		if isAPIPath(r.URL.Path) {
+			writeError(w, http.StatusUnauthorized, "the key was refused")
+			return
+		}
+		// 浏览器来的是页面：给它登录页，不是一段 JSON。
+		s.signInPage(w, r, http.StatusOK, "")
 		return
 	}
 	switch r.URL.Path {

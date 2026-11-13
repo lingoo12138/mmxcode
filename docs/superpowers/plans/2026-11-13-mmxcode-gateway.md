@@ -5032,6 +5032,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -5660,6 +5661,225 @@ func TestCodexFallbackStreamHasOneFailure(t *testing.T) {
 		t.Fatalf("the stream has an Anthropic event in it: %s", body)
 	}
 }
+
+// signIn signs the browser in and gives the cookie it got.
+func signIn(t *testing.T, h *harness, key string) *http.Cookie {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key="+url.QueryEscape(key)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie {
+			return c
+		}
+	}
+	t.Fatalf("no cookie was given: %v", w.Header()["Set-Cookie"])
+	return nil
+}
+
+// TestTheCookieIsAccepted says the browser's cookie opens the gateway.
+//
+// 浏览器不会替页面带上 x-api-key，cookie 是它能带的那张门票。
+func TestTheCookieIsAccepted(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.AddCookie(c)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTheSignInPageIsReachableWithoutASession says the page that signs
+// the browser in does not need a session.
+//
+// 没有会话的人正要来这里登录。
+func TestTheSignInPageIsReachableWithoutASession(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/signin", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("content type = %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), `<form`) {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	// 页面不回显 key，也不该被缓存
+	if strings.Contains(w.Body.String(), "sk-1") {
+		t.Fatalf("the key is in the page: %s", w.Body.String())
+	}
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Fatalf("cache control = %q", cc)
+	}
+}
+
+// TestAWrongKeySetsNoCookie says a wrong key is refused and leaves no
+// cookie behind.
+func TestAWrongKeySetsNoCookie(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader("key=sk-wrong"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for a wrong key: %+v", c)
+		}
+	}
+}
+
+// TestACookieOfARotatedKeyIsRefused says a cookie stops working when
+// the key it was made of is not configured any more.
+//
+// 换一把 key，旧的 cookie 自己就作废了：服务端不用存任何东西。
+func TestACookieOfARotatedKeyIsRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+	h.gw.Cfg.Server.APIKeys = []string{"sk-2"}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.AddCookie(c)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTheCookieIsOnlyForTheBrowser says the cookie is HttpOnly and
+// Strict.
+//
+// cookie 本身就是一张门票：谁拿到它谁就能用这个网关。所以脚本读不到
+// 它（HttpOnly），别的站点的表单也带不上它（SameSite=Strict）。
+func TestTheCookieIsOnlyForTheBrowser(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	c := signIn(t, h, "sk-1")
+	if !c.HttpOnly {
+		t.Fatal("a script can read the cookie")
+	}
+	if c.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("same site = %v, want strict", c.SameSite)
+	}
+	if c.Path != "/" {
+		t.Fatalf("path = %q", c.Path)
+	}
+	if c.Value == "" || c.Value == "sk-1" {
+		t.Fatalf("the cookie carries the key itself: %q", c.Value)
+	}
+}
+
+// TestAPageWithoutASessionGivesTheSignInPage says a browser that opens
+// a page is given the sign-in page.
+//
+// 浏览器打开的是页面，给它一段 JSON 等于什么也做不了。
+func TestAPageWithoutASessionGivesTheSignInPage(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("content type = %q, body = %s", ct, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `<form`) {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
+// TestAnAPIWithoutASessionGivesJSON says the API clients keep their
+// JSON answer.
+//
+// 脚本和模型客户端读得懂 JSON，读不懂一个登录页。
+func TestAnAPIWithoutASessionGivesJSON(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	for _, path := range []string{"/api/usage", "/v1/models"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: code = %d", path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Fatalf("%s: content type = %q", path, ct)
+		}
+	}
+}
+
+// TestWithoutAKeyNothingIsChecked says a gateway without keys lets
+// everything through.
+//
+// 没配 key 的时候网关不查：那时候它只该听在本机，serve 那一条命令管
+// 这件事。
+func TestWithoutAKeyNothingIsChecked(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[]}`))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the request was refused")
+	}
+}
+
+// TestSignOutTakesTheCookieAway says there is a way out.
+//
+// 签出要能删掉 cookie：不然浏览器里那张票一直在。
+func TestSignOutTakesTheCookieAway(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodDelete, "/api/session", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	cleared := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("the cookie was not taken away: %v", w.Result().Cookies())
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5678,15 +5898,50 @@ Expected: FAIL —— `undefined: New`
 package gateway
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"html/template"
 	"net/http"
 	"strings"
 )
 
+// sessionCookie is the name of the cookie the browser carries.
+//
+// 网关的页面要过 auth，而浏览器不会替页面带上 x-api-key。这个 cookie
+// 就是浏览器能带的那张票。
+const sessionCookie = "mmxcode_session"
+
+// sessionContext is what the cookie's value is computed over.
+//
+// 它是固定的一串字：同一把 key 永远算出同一个值，换一把 key 就换一个
+// 值。
+const sessionContext = "mmxcode-webui-session-v1"
+
+// sessionValue gives the cookie's value for one key.
+//
+// 值是 key 的带钥匙的哈希：HMAC-SHA256(key = API key, message = 上面
+// 那串固定的字)。
+//
+// 这么做的取舍是：服务端不用存任何东西，转一把 key 旧的 cookie 自己
+// 就作废；代价是这个 cookie 本身就是一张票，谁拿到它谁就能用这个网关。
+// 所以它是 HttpOnly（脚本读不到它），也是 SameSite=Strict（别的站点
+// 的表单带不上它）。
+func sessionValue(apiKey string) string {
+	mac := hmac.New(sha256.New, []byte(apiKey))
+	mac.Write([]byte(sessionContext))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // auth checks the request's key.
 //
-// When no key is configured the gateway does not check: it is then
-// meant to listen on the loopback address only, which the server does.
+// The key comes in the header, the way it always did, or in the cookie
+// the browser carries.
+//
+// 没有配 key 的时候网关不查：那时候它只该听在本机，serve 那一条命令
+// 管这件事。
 func (s *Server) auth(r *http.Request) bool {
 	keys := s.Cfg.Server.APIKeys
 	if len(keys) == 0 {
@@ -5701,6 +5956,177 @@ func (s *Server) auth(r *http.Request) bool {
 	}
 	for _, k := range keys {
 		if subtle.ConstantTimeCompare([]byte(given), []byte(k)) == 1 {
+			return true
+		}
+	}
+	// 浏览器带来的 cookie：值是某一把配好的 key 算出来的
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(sessionValue(k))) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// session handles the sign-in cookie.
+//
+// POST gives the cookie, DELETE takes it away. Neither needs a session:
+// signing in is how one gets one, and signing out has to work even when
+// the cookie is already gone.
+func (s *Server) session(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		s.signIn(w, r)
+	case http.MethodDelete:
+		s.signOut(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// signIn takes the key and gives the cookie.
+//
+// The key comes from the form the browser posts, or from a JSON body a
+// script sends. The page that comes back never carries the key: it is a
+// secret, and the page might sit in a cache.
+func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
+	keys := s.Cfg.Server.APIKeys
+	if len(keys) == 0 {
+		writeError(w, http.StatusBadRequest, "this gateway has no api key configured")
+		return
+	}
+	key := submittedKey(r)
+	for _, k := range keys {
+		if subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
+			s.setSessionCookie(w, r, k)
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+	}
+	// 错的 key：不发 cookie
+	s.signInPage(w, r, http.StatusUnauthorized, "the key was refused")
+}
+
+// signOut takes the cookie away.
+func (s *Server) signOut(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// setSessionCookie gives the browser the cookie.
+//
+// The value is computed from the key, so the server keeps nothing.
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, apiKey string) {
+	c := &http.Cookie{
+		Name:     sessionCookie,
+		Value:    sessionValue(apiKey),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+	// 只有走 TLS 的连接才标 Secure：网关常常是局域网里的 http，标了
+	// Secure 的 cookie 浏览器根本不会带回来。
+	if r.TLS != nil {
+		c.Secure = true
+	}
+	http.SetCookie(w, c)
+}
+
+// submittedKey reads the key out of the request.
+//
+// 表单和 JSON 都认：浏览器发的是表单，脚本发的多半是 JSON。
+func submittedKey(r *http.Request) string {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var body struct {
+			Key string `json:"key"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) == nil {
+			return strings.TrimSpace(body.Key)
+		}
+		return ""
+	}
+	if err := r.ParseForm(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(r.PostFormValue("key"))
+}
+
+// signInPage is the page the browser signs in on.
+//
+// It is a page and not a JSON answer: the browser asked for a page. The
+// key never comes back into it, and it is not to be cached: a key left in
+// a shared machine's cache is a key left behind.
+//
+// The status says whether the page is the one the browser was after (200)
+// or the answer to a key that was refused (401).
+func (s *Server) signInPage(w http.ResponseWriter, r *http.Request, status int, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	signInTemplate.Execute(w, map[string]any{
+		"Error":   errMsg,
+		"HasKeys": len(s.Cfg.Server.APIKeys) > 0,
+	})
+}
+
+// signInTemplate is the page the browser signs in on.
+var signInTemplate = template.Must(template.New("signin").Parse(signInHTML))
+
+// signInHTML is the sign-in page.
+//
+// 表单里只有一个框：把 key 填进去。没有 key 的网关不需要登录，所以
+// 那时候页面只说一句。
+const signInHTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>登录 · mmxcode</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 14px/1.6 system-ui, sans-serif; margin: 0; padding: 2rem 1rem; }
+h1 { font-size: 1.1rem; }
+form { display: flex; gap: .5rem; align-items: center; max-width: 32rem; }
+input { flex: 1; padding: .4rem; }
+button { padding: .25rem .8rem; cursor: pointer; }
+.bad { color: #c0392b; }
+</style>
+</head>
+<body>
+<h1>mmxcode</h1>
+{{if .HasKeys}}
+<p>这个网关要一把 API key。填进去就能进管理页。</p>
+<form method="post" action="/api/session">
+<input type="password" name="key" placeholder="API key" autocomplete="current-password" autofocus>
+<button type="submit">进入</button>
+</form>
+{{if .Error}}<p class="bad">{{.Error}}</p>{{end}}
+{{else}}
+<p>这个网关没有配 API key，不用登录。</p>
+{{end}}
+</body>
+</html>
+`
+
+// isAPIPath says the path is one the API clients use.
+//
+// 脚本和模型客户端读得懂 JSON，读不懂一个登录页；浏览器打开的是页面，
+// 给它登录页才对。
+func isAPIPath(path string) bool {
+	for _, prefix := range []string{"/v1", "/api"} {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}
@@ -5920,8 +6346,23 @@ func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, 
 
 // ServeHTTP routes a request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/signin":
+		// 登录页不用会话：没有会话的人正要来这里登录。
+		s.signInPage(w, r, http.StatusOK, "")
+		return
+	case "/api/session":
+		// 发 cookie 和销 cookie 都不用会话。
+		s.session(w, r)
+		return
+	}
 	if !s.auth(r) {
-		writeError(w, http.StatusUnauthorized, "the key was refused")
+		if isAPIPath(r.URL.Path) {
+			writeError(w, http.StatusUnauthorized, "the key was refused")
+			return
+		}
+		// 浏览器来的是页面：给它登录页，不是一段 JSON。
+		s.signInPage(w, r, http.StatusOK, "")
 		return
 	}
 	switch r.URL.Path {
@@ -6817,6 +7258,86 @@ func TestAPIUsage(t *testing.T) {
 	}
 }
 
+// TestAPIUsageCarriesTheState says the usage API says what state every
+// account is in, and how many have run out.
+//
+// 新的 state 和 accounts_expired 要到客户端那里：页面才知道哪个账号的
+// 读数过期了，短掉的总数才有话说。
+func TestAPIUsageCarriesTheState(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 600, Consumed: 100, Remaining: 500,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_02", HasAmounts: true, Granted: 600, Consumed: 100, Remaining: 500,
+		ExpiresAt: now.Add(-time.Hour), CreatedAt: now,
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var out struct {
+		AccountsExpired int `json:"accounts_expired"`
+		Accounts        []struct {
+			ID    string `json:"id"`
+			State string `json:"state"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountsExpired != 1 {
+		t.Fatalf("accounts_expired = %d, body = %s", out.AccountsExpired, rec.Body.String())
+	}
+	states := map[string]string{}
+	for _, a := range out.Accounts {
+		states[a.ID] = a.State
+	}
+	if states["acc_01"] != "read" || states["acc_02"] != "expired" {
+		t.Fatalf("states = %v, body = %s", states, rec.Body.String())
+	}
+}
+
+// TestThePageHasAWayOut says the page offers a way out when the gateway
+// has a key to sign in with.
+//
+// 浏览器里那张票得能删掉，不然退出不了。
+func TestThePageHasAWayOut(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "/api/session") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+// TestThePageHasNoWayOutWithoutAKey says a gateway without a key does
+// not offer a sign-out it cannot do.
+//
+// 没配 key 的网关不用登录，也就没有那张票可删。
+func TestThePageHasNoWayOutWithoutAKey(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "/api/session") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
 func TestAPICheckin(t *testing.T) {
 	w, _ := newTestWebUI(t)
 	// 签到会打上游；这里只看路由认不认这个路径
@@ -7006,6 +7527,7 @@ input, select { padding: .25rem; }
     <a href="/egress">出口</a>
     <a href="/usage">用量</a>
     <a href="/login">登录</a>
+    {{if .HasKeys}}<a href="/signin" id="sign-out">退出</a>{{end}}
   </nav>
   <span class="muted" id="status"></span>
 </header>
@@ -7013,6 +7535,23 @@ input, select { padding: .25rem; }
 {{template "content" .}}
 </main>
 <script src="/static/app.js"></script>
+{{if .HasKeys}}
+<script>
+// 退出：把浏览器里那张票删掉，再回到登录页。
+// 没有 key 的网关没有这张票，也就不用退出。
+document.addEventListener('click', async (ev) => {
+  const link = ev.target.closest('#sign-out');
+  if (!link) return;
+  ev.preventDefault();
+  try {
+    await fetch('/api/session', { method: 'DELETE' });
+  } catch (e) {
+    /* 签不出去也就还是那样 */
+  }
+  location.href = '/signin';
+});
+</script>
+{{end}}
 </body>
 </html>{{end}}
 ```
@@ -7122,6 +7661,9 @@ input, select { padding: .25rem; }
 //
 // 只做三件事：改账号的出口、触发签到、测出口。
 // 页面本身是服务端渲染的，这里不重新渲染。
+//
+// 这里不用带 API key：浏览器同源的 fetch 会自己带上 mmxcode_session
+// 那张票，页面的按钮因此不会 401。
 
 async function post(url, body) {
   const res = await fetch(url, {
@@ -7375,6 +7917,8 @@ func (w *WebUI) page(rw http.ResponseWriter, r *http.Request, name string, data 
 		return
 	}
 	d["Title"] = strings.TrimSuffix(name, ".html")
+	// 配了 key 才有登录和退出可做：没配 key 的网关不用登录。
+	d["HasKeys"] = len(w.Cfg.Server.APIKeys) > 0
 	// The page brings its own "content", so it is parsed into a copy
 	// of the layout.
 	tmpl, err := w.tmpl.Clone()
