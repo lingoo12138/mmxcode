@@ -2,6 +2,8 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -752,10 +754,11 @@ func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	// renewer 手里有更新的一份
+	// 令牌里的 AccountID 是站点自己的账号 id，这里不知道，就空着
 	if _, err := m.Renewer.Renew(ctx, "acc_01",
-		&oauth.Token{AccountID: "acc_01", Access: "acc1", Refresh: "ref1"},
+		&oauth.Token{Access: "acc1", Refresh: "ref1"},
 		func(ctx context.Context, refresh string) (*oauth.Token, error) {
-			return &oauth.Token{AccountID: "acc_01", Access: "acc2", Refresh: "ref2",
+			return &oauth.Token{Access: "acc2", Refresh: "ref2",
 				Expires: time.Now().Add(time.Hour)}, nil
 		}); err != nil {
 		t.Fatal(err)
@@ -842,5 +845,355 @@ func TestClientHidesTheProxyCredentials(t *testing.T) {
 	}
 	if !strings.Contains(url, "127.0.0.1:7890") {
 		t.Fatalf("url = %q, want the host and the port", url)
+	}
+}
+
+// seedAccount makes an account with a token in the store.
+func seedAccount(t *testing.T, m *Manager, id, access, refresh string, expires time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: id, Access: access, Refresh: refresh,
+		ExpiresAt: expires, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// jwtWithAccountID makes an access token that carries an account id.
+//
+// The site hands out JWTs, and the claims are what the manager reads.
+func jwtWithAccountID(accountID string) string {
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"sub":"user1","account_id":"` + accountID + `"}`))
+	return "e30." + payload + ".sig"
+}
+
+// TestChainBrokenSignsTheAccountOut says a chain that cannot go on ends
+// the account's sign-in.
+//
+// 续期的链断了：库里那份 refresh 已经花掉了，renewer 手里也没有更新的
+// 一份，没有令牌可以再换。这个账号只能重新登录，状态要写成登出，最后
+// 一条错误要说明是链断了，而不是让它接着重试。
+func TestChainBrokenSignsTheAccountOut(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+	// renewer 手里那份是上一次续期买来的，"ref" 已经花掉了
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "old", Refresh: "ref"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc2", Refresh: "ref2", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	// 链被清掉了：没有更新的令牌可走，链就断了
+	m.Renewer.Reset("acc_01")
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshChainBroken) {
+		t.Fatalf("error = %v, want the broken chain", err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if !strings.Contains(a.LastError, "chain") {
+		t.Fatalf("last error = %q, want the broken chain", a.LastError)
+	}
+	if calls != 0 {
+		t.Fatalf("the site was asked %d times, want 0", calls)
+	}
+}
+
+// TestUnknownOutcomeIsNotASignOut says a refresh whose answer was lost
+// is not a sign-out.
+//
+// 刷新请求发出去了，回答没回来：站点可能已经把 refresh token 花掉了，
+// 所以它不能再发一次；但站点没有说这个登录失效了，账号不能写成登出。
+// 错误要记到账号上，WebUI 才看得出这个账号出了什么事。
+func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		// 回答还没写出来连接就断了：请求到了站点，回答没回来
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status == store.StatusSignedOut {
+		t.Fatalf("status = %q, the site never said the sign-in is no good", a.Status)
+	}
+	if !strings.Contains(a.LastError, "not known") {
+		t.Fatalf("last error = %q, want the unknown outcome", a.LastError)
+	}
+	// 再要一次令牌，那个 refresh token 不能再发一次
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	}
+}
+
+// TestAStaleRefusalDoesNotSignTheAccountOut says a refused token that is
+// only stale must not sign the account out.
+//
+// 站点对已经花掉的 refresh token 也回 invalid_grant，跟登录失效长得
+// 一模一样。renewer 手里还有更新的令牌时，被拒的那份只是旧了：账号还
+// 活着，不能把它登出，要用更新的那份。
+func TestAStaleRefusalDoesNotSignTheAccountOut(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 库里还是老的那份：写库失败了
+	seedAccount(t, m, "acc_01", "old", "ref-old", now.Add(time.Minute))
+	// renewer 手里有更新的一份
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc2", Refresh: "ref-new"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc3", Refresh: "ref-newer", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatalf("the account was signed out over a stale token: %v", err)
+	}
+	if tok.Access != "acc3" {
+		t.Fatalf("token = %+v, want the newer one", tok)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusActive {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusActive)
+	}
+	// 库里换成了更新的那份
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc3" {
+		t.Fatalf("stored = %+v, want the newer token", stored)
+	}
+	if len(sent) != 1 || sent[0] != "ref-old" {
+		t.Fatalf("the refresh tokens sent = %v, want [ref-old]", sent)
+	}
+}
+
+// TestTwoRenewalsKeepTheNewerTokenInTheStore says the store keeps the
+// newer of two tokens.
+//
+// 续期的链自己会往前走，两次续期可能带回两个不同的令牌，旧的那个还
+// 可能后到。旧令牌里的 refresh 已经被新令牌花掉了，写进库里，下一次
+// 续期就会拿到 invalid_grant，账号就被登出了。所以只有更新的令牌才
+// 写库。
+func TestTwoRenewalsKeepTheNewerTokenInTheStore(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.Form.Get("refresh_token") == "ref-old" {
+			// 旧的那次慢，旧令牌后到
+			time.Sleep(200 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-old","refresh_token":"ref-old2","expires_in":60}`))
+			return
+		}
+		w.Write([]byte(`{"access_token":"acc-new","refresh_token":"ref-new2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc0", "ref-old", now.Add(time.Minute))
+
+	old := make(chan *oauth.Token, 1)
+	go func() {
+		tok, err := m.Renew(ctx, "acc_01", &oauth.Token{
+			Access: "acc0", Refresh: "ref-old", Expires: now.Add(time.Minute),
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		old <- tok
+	}()
+	time.Sleep(20 * time.Millisecond)
+	newer, err := m.Renew(ctx, "acc_01", &oauth.Token{
+		Access: "acc1", Refresh: "ref-new", Expires: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newer.Access != "acc-new" {
+		t.Fatalf("token = %+v, want the newer one", newer)
+	}
+	<-old
+
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc-new" || stored.Refresh != "ref-new2" {
+		t.Fatalf("stored = %+v, want the newer token", stored)
+	}
+}
+
+// TestTheTokenCarriesTheSitesAccountID says the store's id is not put
+// where the site's id belongs.
+//
+// oauth.Token.AccountID 是站点自己的账号 id，renewer 是按库里的账号 id
+// 记链的，两个不是一个东西。把库里的 id 填进去，走链的人就会给一个账号
+// 走两条链，两个 refresh token 都花掉，账号就白登出了。
+func TestTheTokenCarriesTheSitesAccountID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"` + jwtWithAccountID("site-42") +
+			`","refresh_token":"ref2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc1", "ref1", now.Add(time.Minute))
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccountID != "site-42" {
+		t.Fatalf("account id = %q, want the site's one", tok.AccountID)
+	}
+	// 库里那份没有站点的账号 id：它就空着，不能拿库里的 id 顶上去
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc9", Refresh: "ref9",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tok, err = m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccountID != "" {
+		t.Fatalf("account id = %q, want nothing: the store does not keep the site's id", tok.AccountID)
+	}
+}
+
+// TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown says the renewer
+// is not told to forget an account that is not signed out.
+//
+// 答案没回来的时候不能把 renewer 忘干净：忘了它手里那份，令牌就走不
+// 了；更要紧的是忘了"已经花掉"的记录，那个 refresh token 就会被再发
+// 一次，站点会回 invalid_grant，账号就白登出了。
+func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 库里那份和 renewer 手里那份是同一个：走链不会动它
+	seedAccount(t, m, "acc_01", "acc3", "ref3", now.Add(time.Minute))
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc2", Refresh: "ref2"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc3", Refresh: "ref3", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	// renewer 手里那份还在
+	if held, ok := m.Renewer.Newest("acc_01"); !ok || held.Access != "acc3" {
+		t.Fatalf("the renewer holds %+v, want the token it had", held)
+	}
+	// 那份答案不明的令牌不会再发一次
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	}
+}
+
+// TestTheRenewerForgetsAnAccountThatIsSignedOut says a signed-out
+// account leaves nothing behind in the renewer.
+//
+// 登出的时候 renewer 要忘掉这个账号：忘掉之后这个账号再登进来，renewer
+// 手里不能还留着老令牌，那会把新登进来的令牌当成旧链上的一段。
+func TestTheRenewerForgetsAnAccountThatIsSignedOut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc1", "ref1", now.Add(time.Minute))
+	// renewer 手里有一份，"ref1" 已经花掉了
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc1", Refresh: "ref1"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc2", Refresh: "ref2", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if _, ok := m.Renewer.Newest("acc_01"); ok {
+		t.Fatal("the renewer still holds a token of a signed-out account")
 	}
 }

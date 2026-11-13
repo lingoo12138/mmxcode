@@ -106,6 +106,8 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -856,10 +858,11 @@ func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	// renewer 手里有更新的一份
+	// 令牌里的 AccountID 是站点自己的账号 id，这里不知道，就空着
 	if _, err := m.Renewer.Renew(ctx, "acc_01",
-		&oauth.Token{AccountID: "acc_01", Access: "acc1", Refresh: "ref1"},
+		&oauth.Token{Access: "acc1", Refresh: "ref1"},
 		func(ctx context.Context, refresh string) (*oauth.Token, error) {
-			return &oauth.Token{AccountID: "acc_01", Access: "acc2", Refresh: "ref2",
+			return &oauth.Token{Access: "acc2", Refresh: "ref2",
 				Expires: time.Now().Add(time.Hour)}, nil
 		}); err != nil {
 		t.Fatal(err)
@@ -948,6 +951,356 @@ func TestClientHidesTheProxyCredentials(t *testing.T) {
 		t.Fatalf("url = %q, want the host and the port", url)
 	}
 }
+
+// seedAccount makes an account with a token in the store.
+func seedAccount(t *testing.T, m *Manager, id, access, refresh string, expires time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: id, Access: access, Refresh: refresh,
+		ExpiresAt: expires, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// jwtWithAccountID makes an access token that carries an account id.
+//
+// The site hands out JWTs, and the claims are what the manager reads.
+func jwtWithAccountID(accountID string) string {
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"sub":"user1","account_id":"` + accountID + `"}`))
+	return "e30." + payload + ".sig"
+}
+
+// TestChainBrokenSignsTheAccountOut says a chain that cannot go on ends
+// the account's sign-in.
+//
+// 续期的链断了：库里那份 refresh 已经花掉了，renewer 手里也没有更新的
+// 一份，没有令牌可以再换。这个账号只能重新登录，状态要写成登出，最后
+// 一条错误要说明是链断了，而不是让它接着重试。
+func TestChainBrokenSignsTheAccountOut(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+	// renewer 手里那份是上一次续期买来的，"ref" 已经花掉了
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "old", Refresh: "ref"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc2", Refresh: "ref2", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	// 链被清掉了：没有更新的令牌可走，链就断了
+	m.Renewer.Reset("acc_01")
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshChainBroken) {
+		t.Fatalf("error = %v, want the broken chain", err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if !strings.Contains(a.LastError, "chain") {
+		t.Fatalf("last error = %q, want the broken chain", a.LastError)
+	}
+	if calls != 0 {
+		t.Fatalf("the site was asked %d times, want 0", calls)
+	}
+}
+
+// TestUnknownOutcomeIsNotASignOut says a refresh whose answer was lost
+// is not a sign-out.
+//
+// 刷新请求发出去了，回答没回来：站点可能已经把 refresh token 花掉了，
+// 所以它不能再发一次；但站点没有说这个登录失效了，账号不能写成登出。
+// 错误要记到账号上，WebUI 才看得出这个账号出了什么事。
+func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		// 回答还没写出来连接就断了：请求到了站点，回答没回来
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status == store.StatusSignedOut {
+		t.Fatalf("status = %q, the site never said the sign-in is no good", a.Status)
+	}
+	if !strings.Contains(a.LastError, "not known") {
+		t.Fatalf("last error = %q, want the unknown outcome", a.LastError)
+	}
+	// 再要一次令牌，那个 refresh token 不能再发一次
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	}
+}
+
+// TestAStaleRefusalDoesNotSignTheAccountOut says a refused token that is
+// only stale must not sign the account out.
+//
+// 站点对已经花掉的 refresh token 也回 invalid_grant，跟登录失效长得
+// 一模一样。renewer 手里还有更新的令牌时，被拒的那份只是旧了：账号还
+// 活着，不能把它登出，要用更新的那份。
+func TestAStaleRefusalDoesNotSignTheAccountOut(t *testing.T) {
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		sent = append(sent, r.Form.Get("refresh_token"))
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 库里还是老的那份：写库失败了
+	seedAccount(t, m, "acc_01", "old", "ref-old", now.Add(time.Minute))
+	// renewer 手里有更新的一份
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc2", Refresh: "ref-new"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc3", Refresh: "ref-newer", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatalf("the account was signed out over a stale token: %v", err)
+	}
+	if tok.Access != "acc3" {
+		t.Fatalf("token = %+v, want the newer one", tok)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusActive {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusActive)
+	}
+	// 库里换成了更新的那份
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc3" {
+		t.Fatalf("stored = %+v, want the newer token", stored)
+	}
+	if len(sent) != 1 || sent[0] != "ref-old" {
+		t.Fatalf("the refresh tokens sent = %v, want [ref-old]", sent)
+	}
+}
+
+// TestTwoRenewalsKeepTheNewerTokenInTheStore says the store keeps the
+// newer of two tokens.
+//
+// 续期的链自己会往前走，两次续期可能带回两个不同的令牌，旧的那个还
+// 可能后到。旧令牌里的 refresh 已经被新令牌花掉了，写进库里，下一次
+// 续期就会拿到 invalid_grant，账号就被登出了。所以只有更新的令牌才
+// 写库。
+func TestTwoRenewalsKeepTheNewerTokenInTheStore(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.Form.Get("refresh_token") == "ref-old" {
+			// 旧的那次慢，旧令牌后到
+			time.Sleep(200 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-old","refresh_token":"ref-old2","expires_in":60}`))
+			return
+		}
+		w.Write([]byte(`{"access_token":"acc-new","refresh_token":"ref-new2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc0", "ref-old", now.Add(time.Minute))
+
+	old := make(chan *oauth.Token, 1)
+	go func() {
+		tok, err := m.Renew(ctx, "acc_01", &oauth.Token{
+			Access: "acc0", Refresh: "ref-old", Expires: now.Add(time.Minute),
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		old <- tok
+	}()
+	time.Sleep(20 * time.Millisecond)
+	newer, err := m.Renew(ctx, "acc_01", &oauth.Token{
+		Access: "acc1", Refresh: "ref-new", Expires: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newer.Access != "acc-new" {
+		t.Fatalf("token = %+v, want the newer one", newer)
+	}
+	<-old
+
+	stored, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Access != "acc-new" || stored.Refresh != "ref-new2" {
+		t.Fatalf("stored = %+v, want the newer token", stored)
+	}
+}
+
+// TestTheTokenCarriesTheSitesAccountID says the store's id is not put
+// where the site's id belongs.
+//
+// oauth.Token.AccountID 是站点自己的账号 id，renewer 是按库里的账号 id
+// 记链的，两个不是一个东西。把库里的 id 填进去，走链的人就会给一个账号
+// 走两条链，两个 refresh token 都花掉，账号就白登出了。
+func TestTheTokenCarriesTheSitesAccountID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"` + jwtWithAccountID("site-42") +
+			`","refresh_token":"ref2","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc1", "ref1", now.Add(time.Minute))
+
+	tok, err := m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccountID != "site-42" {
+		t.Fatalf("account id = %q, want the site's one", tok.AccountID)
+	}
+	// 库里那份没有站点的账号 id：它就空着，不能拿库里的 id 顶上去
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc9", Refresh: "ref9",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tok, err = m.Token(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccountID != "" {
+		t.Fatalf("account id = %q, want nothing: the store does not keep the site's id", tok.AccountID)
+	}
+}
+
+// TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown says the renewer
+// is not told to forget an account that is not signed out.
+//
+// 答案没回来的时候不能把 renewer 忘干净：忘了它手里那份，令牌就走不
+// 了；更要紧的是忘了"已经花掉"的记录，那个 refresh token 就会被再发
+// 一次，站点会回 invalid_grant，账号就白登出了。
+func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 库里那份和 renewer 手里那份是同一个：走链不会动它
+	seedAccount(t, m, "acc_01", "acc3", "ref3", now.Add(time.Minute))
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc2", Refresh: "ref2"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc3", Refresh: "ref3", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	// renewer 手里那份还在
+	if held, ok := m.Renewer.Newest("acc_01"); !ok || held.Access != "acc3" {
+		t.Fatalf("the renewer holds %+v, want the token it had", held)
+	}
+	// 那份答案不明的令牌不会再发一次
+	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
+		t.Fatalf("error = %v, want the unknown outcome", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	}
+}
+
+// TestTheRenewerForgetsAnAccountThatIsSignedOut says a signed-out
+// account leaves nothing behind in the renewer.
+//
+// 登出的时候 renewer 要忘掉这个账号：忘掉之后这个账号再登进来，renewer
+// 手里不能还留着老令牌，那会把新登进来的令牌当成旧链上的一段。
+func TestTheRenewerForgetsAnAccountThatIsSignedOut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "acc1", "ref1", now.Add(time.Minute))
+	// renewer 手里有一份，"ref1" 已经花掉了
+	if _, err := m.Renewer.Renew(ctx, "acc_01", &oauth.Token{Access: "acc1", Refresh: "ref1"},
+		func(ctx context.Context, refresh string) (*oauth.Token, error) {
+			return &oauth.Token{Access: "acc2", Refresh: "ref2", Expires: now.Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if _, ok := m.Renewer.Newest("acc_01"); ok {
+		t.Fatal("the renewer still holds a token of a signed-out account")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -971,6 +1324,14 @@ Expected: FAIL —— `undefined: New`、`undefined: Manager`
 // through this package rather than touching the store and the upstream
 // client on its own, so that a token is renewed in one place and a
 // refresh token is never spent twice.
+//
+// There are two account ids, and they are not the same thing. The
+// store's id is the manager's own key for an account, and the renewer
+// is keyed by it. The site's own id is the one an access token carries,
+// in oauth.Token.AccountID. No account id goes into a token in this
+// package: the store's id there would have the renewer walk a second
+// chain for one account and spend two refresh tokens, which signs the
+// account out.
 package manager
 
 import (
@@ -980,6 +1341,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"mmxcode/internal/account"
@@ -1004,6 +1366,17 @@ const renewWindow = 10 * time.Minute
 // little of that, so that one account's reading does not hold up the
 // others'.
 const accountTimeout = 5 * time.Second
+
+// The reasons an account's last error says.
+//
+// They say which case it is, because the two are mended in different
+// ways: a broken chain needs a human, an unknown outcome does not.
+const (
+	// chainBrokenReason says the renewal chain cannot go on.
+	chainBrokenReason = "the refresh chain is broken: the refresh token was spent already and there is no newer one, so the account has to be signed in again"
+	// unknownOutcomeReason says a refresh was sent and its answer was lost.
+	unknownOutcomeReason = "the outcome of the last refresh is not known: the site may have spent the refresh token, so it was not sent again"
+)
 
 // Manager holds the gateway's accounts.
 type Manager struct {
@@ -1056,54 +1429,189 @@ func (m *Manager) Token(ctx context.Context, accountID string) (*oauth.Token, er
 		// paying for a renewal that cannot work.
 		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
-	cur := &oauth.Token{
-		AccountID: accountID,
-		Access:    stored.Access,
-		Refresh:   stored.Refresh,
-		Expires:   stored.ExpiresAt,
-		Subject:   stored.Subject,
-	}
+	cur := tokenFromStore(stored)
 	if cur.Expires.After(time.Now().Add(renewWindow)) {
 		return cur, nil
 	}
 	return m.Renew(ctx, accountID, cur)
 }
 
+// tokenFromStore gives the token the store holds.
+//
+// The site's own account id is not in the store, so the field stays
+// empty: the store's id is the manager's key for the account, the
+// renewer is keyed by it, and a token that carried it would be a token
+// whose account id is the wrong one. The site puts its own id in the
+// tokens it hands out, and that one is kept.
+func tokenFromStore(stored store.Token) *oauth.Token {
+	return &oauth.Token{
+		Access:  stored.Access,
+		Refresh: stored.Refresh,
+		Expires: stored.ExpiresAt,
+		Subject: stored.Subject,
+	}
+}
+
 // Renew trades an account's refresh token for a new one.
 //
-// When the site says the refresh token is no good, the account is
-// marked signed out and no token is given.
+// The failures are told apart, because they are mended in different
+// ways:
+//
+//   - The site refuses the refresh token (invalid_grant). The account
+//     is signed out — unless the renewer holds a newer token: a token
+//     that is spent already is refused the same way a revoked sign-in
+//     is, and a stale token must not sign out an account that is alive.
+//   - The chain cannot go on (oauth.ErrRefreshChainBroken). No token
+//     is left that the site would take, so the account has to be signed
+//     in again by hand.
+//   - The answer was lost (oauth.ErrRefreshOutcomeUnknown). The site
+//     may have spent the token, so it is not sent again, but the site
+//     never said the sign-in is no good: the account is not signed out.
 func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token) (*oauth.Token, error) {
 	if cur == nil {
 		return nil, fmt.Errorf("no token to renew")
 	}
+	// What the renewer holds is asked for before the renewal: a
+	// renewal that walks the chain drops what the renewer holds, so
+	// afterwards there may be nothing left to ask about.
+	held, _ := m.Renewer.Newest(accountID)
+	// The token that really goes to the site is remembered: the
+	// renewer may walk the chain and spend a token other than the
+	// caller's, and a refusal is about the token that was sent.
+	var sent spentRefresh
 	tok, err := m.Renewer.Renew(ctx, accountID, cur, func(ctx context.Context, refresh string) (*oauth.Token, error) {
+		sent.set(refresh)
 		return oauth.Refresh(ctx, m.Up, m.TokenURL, refresh)
 	})
 	if err != nil {
-		var oe *oauth.Error
-		if asOAuthError(err, &oe) && oe.IsSignedOut() {
-			// The sign-out has to be written down. An account that
-			// stays active with a token the site has refused is
-			// handed out again and again, and every request pays for
-			// a renewal that cannot work.
-			if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
-			}
+		return m.renewFailed(ctx, accountID, cur, sent.get(), held, err)
+	}
+	if err := m.saveToken(ctx, accountID, tok); err != nil {
+		return nil, err
+	}
+	return tok, nil
+}
+
+// renewFailed says what a failed renewal means for the account.
+//
+// It gives the token to use when there is one — a refused token that
+// was only stale is not the end of the account — and the error to give
+// back when there is not.
+func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.Token,
+	refused string, held *oauth.Token, err error) (*oauth.Token, error) {
+	switch {
+	case errors.Is(err, oauth.ErrRefreshChainBroken):
+		// The chain cannot go on: the token in hand is spent and there
+		// is no newer one the site would take. Only a human can mend
+		// this, by signing the account in again.
+		if mErr := m.markSignedOut(ctx, accountID, chainBrokenReason); mErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("the broken chain could not be saved: %w", mErr))
+		}
+		return nil, err
+	case errors.Is(err, oauth.ErrRefreshOutcomeUnknown):
+		// The request went out and the answer was lost: the site may
+		// have spent the token, so it is not sent again — the renewer
+		// knows that — but the site never said the sign-in is no good,
+		// so the account is not signed out. The error is written down
+		// all the same, so that the WebUI shows that this account is
+		// in trouble.
+		if mErr := m.markError(ctx, accountID, unknownOutcomeReason); mErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("the error could not be saved: %w", mErr))
 		}
 		return nil, err
 	}
-	if err := m.Store.SaveToken(ctx, store.Token{
+	var oe *oauth.Error
+	if !asOAuthError(err, &oe) || !oe.IsSignedOut() {
+		return nil, err
+	}
+	// The site refused a refresh token. The account is signed out —
+	// unless the refused token was stale and the renewer holds a newer
+	// one: a token that is spent already is refused the same way a
+	// revoked sign-in is, and an account that is alive must not be
+	// signed out over a token nobody uses any more.
+	//
+	// What the renewer holds is asked for again: a renewal that walks
+	// the chain may have left it with nothing, and what it held before
+	// is then the only thing there is to say.
+	newest, ok := m.Renewer.Newest(accountID)
+	if !ok {
+		newest = held
+	}
+	if newer := m.newerToken(cur, refused, newest); newer != nil {
+		if sErr := m.saveToken(ctx, accountID, newer); sErr != nil {
+			return nil, errors.Join(err, sErr)
+		}
+		return newer, nil
+	}
+	// The sign-out has to be written down. An account that stays active
+	// with a token the site has refused is handed out again and again,
+	// and every request pays for a renewal that cannot work.
+	if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+		return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
+	}
+	return nil, err
+}
+
+// newerToken gives the token to use when the token that was refused was
+// only stale.
+//
+// The site answers invalid_grant for a refresh token that is spent
+// already, and that is what a revoked sign-in looks like too. So a
+// refusal is only the end of the account when there is nothing newer
+// to try: the renewer may hold a token from a sign-in or from another
+// process, and then the refused token was merely stale.
+//
+// The token the renewer holds has to be a different one — the refused
+// token is the one it holds too when the chain was walked, and that one
+// is dead — and a newer one: the renewer may hold the older of the two,
+// and a fresh sign-in in the store is newer than what the renewer has.
+// The expiry says which one is newer, the same way it says it for the
+// store.
+func (m *Manager) newerToken(cur *oauth.Token, refused string, held *oauth.Token) *oauth.Token {
+	if held == nil || held.Refresh == "" {
+		return nil
+	}
+	if held.Refresh == refused {
+		return nil
+	}
+	if !held.Expires.IsZero() && !cur.Expires.IsZero() && held.Expires.Before(cur.Expires) {
+		return nil
+	}
+	return held
+}
+
+// saveToken writes an account's token to the store.
+//
+// The token is written only when it is newer than the one the store
+// holds. The chain advances on its own, so two renewals can answer
+// with two different tokens, and the older one can arrive second: the
+// older token's refresh has been spent already — the newer one was
+// bought with it — and writing it down would leave the store with a
+// refresh token the site refuses, which signs the account out at the
+// next renewal.
+//
+// The expiry says which token is newer: the site hands out access
+// tokens that live an hour, so the token of the later renewal ends
+// later. Two tokens that end at the same time are the same step of the
+// chain, and the one in the store is kept: writing the other one down
+// buys nothing and risks a refresh token that is spent already.
+func (m *Manager) saveToken(ctx context.Context, accountID string, tok *oauth.Token) error {
+	stored, err := m.Store.GetToken(ctx, accountID)
+	if err == nil && !stored.ExpiresAt.Before(tok.Expires) {
+		// The store already holds a token that is at least as new.
+		return nil
+	}
+	// A token that could not be read is written over: the store is
+	// the only place the token lives, and a renewal that is not
+	// written down is a renewal that is lost.
+	return m.Store.SaveToken(ctx, store.Token{
 		AccountID: accountID,
 		Access:    tok.Access,
 		Refresh:   tok.Refresh,
 		ExpiresAt: tok.Expires,
 		Subject:   tok.Subject,
 		UpdatedAt: time.Now(),
-	}); err != nil {
-		return nil, err
-	}
-	return tok, nil
+	})
 }
 
 // ForceRenew renews an account's token without waiting for it to be
@@ -1111,11 +1619,14 @@ func (m *Manager) Renew(ctx context.Context, accountID string, cur *oauth.Token)
 //
 // It is what the gateway does when the site answers 401.
 //
-// The renewer is not told to forget the account. The token it holds
-// may be newer than the one in the store -- a renewal that worked but
-// whose writing failed leaves the store behind -- and it is the only
-// way out of that: the refresh token in the store is spent, and a spent
-// refresh token must not be sent again.
+// The renewer is not told to forget the account, and it is not told to
+// reset the chain either. The token it holds may be newer than the one
+// in the store -- a renewal that worked but whose writing failed leaves
+// the store behind -- and it is the only way out of that: the refresh
+// token in the store is spent, and a spent refresh token must not be
+// sent again. A reset would drop the token that is the only way out, and
+// a forget would drop the record of the tokens already spent, so that
+// one of them would be sent again.
 func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Token, error) {
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err != nil {
@@ -1124,14 +1635,7 @@ func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Toke
 	if stored.Access == "" && stored.Refresh == "" {
 		return nil, fmt.Errorf("account %s is signed out", accountID)
 	}
-	cur := &oauth.Token{
-		AccountID: accountID,
-		Access:    stored.Access,
-		Refresh:   stored.Refresh,
-		Expires:   stored.ExpiresAt,
-		Subject:   stored.Subject,
-	}
-	return m.Renew(ctx, accountID, cur)
+	return m.Renew(ctx, accountID, tokenFromStore(stored))
 }
 
 // markSignedOut records that an account's sign-in is gone.
@@ -1164,9 +1668,61 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) e
 	}
 	// The renewer forgets the account too: a signed-out account must
 	// not be able to renew, and a token of the old sign-in must not be
-	// waiting when the account signs in again.
+	// waiting when the account signs in again. This is the one place
+	// where forgetting is right: the account is signed out for good,
+	// so nothing of the old chain is of use any more.
 	m.Renewer.Forget(accountID)
 	return nil
+}
+
+// markError writes an account's last error down, without signing it
+// out.
+//
+// An account whose refresh answer was lost is not a signed-out
+// account: the site never said the sign-in is no good, and the access
+// token may work until it ends. The error is written down all the same
+// and the account is put in the error state, so that the WebUI shows
+// that this account is in trouble instead of showing it as a normal
+// one.
+//
+// The renewer is not told anything: it has to keep the record of the
+// token whose outcome is not known, because that token must not be sent
+// again.
+func (m *Manager) markError(ctx context.Context, accountID, reason string) error {
+	a, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	a.Status = store.StatusError
+	a.LastError = reason
+	a.UpdatedAt = time.Now()
+	return m.Store.UpdateAccount(ctx, a)
+}
+
+// spentRefresh remembers the refresh token that really went to the
+// site.
+//
+// The renewer walks the chain, so the token that is spent is not always
+// the one the caller asked about. The renewal runs in a goroutine of
+// its own and the caller may stop waiting for it, so the remembering
+// has to be safe.
+type spentRefresh struct {
+	mu  sync.Mutex
+	tok string
+}
+
+// set remembers the refresh token that was sent.
+func (s *spentRefresh) set(tok string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tok = tok
+}
+
+// get gives the refresh token that was sent.
+func (s *spentRefresh) get() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tok
 }
 
 // accFor gives the account API client an account's calls go out with.
