@@ -30,17 +30,18 @@ type Model struct {
 	Efforts []string
 }
 
-// FallbackModels is the list used when the live one can't be had.
+// fallbackModels is the list used when the live one can't be had.
 //
-// It is read-only: a caller that wants to change it copies it with
-// CloneModels, which copies the slices inside each model too.
+// It is package-private on purpose: a caller that gets a copy can
+// change its copy, and there is no way to reach this one and change
+// it for everybody.
 //
 // The context and output limits are the ones the endpoint really allows,
 // not the ones MiniMax Code declares. Its model config says 512K/128K for
 // the M3 family, but the endpoint accepts 1,048,576 input tokens and
 // 524,288 output tokens for every one of them. An agent that believed the
 // advertised ones would compact its history about half way too early.
-var FallbackModels = []Model{
+var fallbackModels = []Model{
 	{
 		ID: "MiniMax-M3.1-Flash-Preview", Name: "M3.1-Flash-Preview",
 		Context: 1048576, Output: 524288,
@@ -68,6 +69,12 @@ var FallbackModels = []Model{
 		Thinking: ThinkingOn,
 	},
 }
+
+// FallbackModels gives the built-in model list.
+//
+// The caller gets its own copy: the models and the slices inside them.
+// Changing what it got back changes nothing for anybody else.
+func FallbackModels() []Model { return CloneModels(fallbackModels) }
 
 // Clone copies the model, including the slices inside it, so a caller
 // can change it without touching the original.

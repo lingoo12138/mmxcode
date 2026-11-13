@@ -17,6 +17,11 @@ import (
 )
 
 // Duration is a time.Duration written in YAML as "5m", "120s", "1h30m".
+//
+// It is never zero. Every place that reads one treats "not positive" as
+// "no limit at all" or "fall back to the default", so a zero would be
+// read as something the writer did not mean. Zero is refused where the
+// configuration is read.
 type Duration time.Duration
 
 // UnmarshalYAML reads a duration from a string.
@@ -60,17 +65,21 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // parseDuration reads a duration, refusing the impossible ones.
 //
-// A negative duration is refused here, at the last gate before the
-// configuration is used: everywhere a timeout is read, "not positive"
-// means "no timeout at all", so a stray minus sign would quietly turn
-// into a request that never comes back.
+// Zero and negative are refused here, at the last gate before the
+// configuration is used. Everywhere a timeout is read, "not positive"
+// means either "no timeout at all" — a request that never comes back —
+// or "fall back to the default" — a schedule that quietly runs at a
+// time nobody asked for. Both are worse than refusing to start.
+//
+// There is no legitimate zero to protect: the defaults are all
+// positive, so a zero in a file can only be a mistake.
 func parseDuration(s string) (time.Duration, error) {
 	v, err := time.ParseDuration(s)
 	if err != nil {
 		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 	}
-	if v < 0 {
-		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	if v <= 0 {
+		return 0, fmt.Errorf("invalid duration %q: must be positive", s)
 	}
 	return v, nil
 }
@@ -83,8 +92,8 @@ func (d Duration) Duration() time.Duration { return time.Duration(d) }
 
 // Server holds the listener and the keys the gateway accepts.
 type Server struct {
-	Listen  string   `yaml:"listen"`
-	APIKeys []string `yaml:"api_keys"`
+	Listen  string   `yaml:"listen" json:"listen"`
+	APIKeys []string `yaml:"api_keys" json:"api_keys"`
 }
 
 // Proxy holds the global proxy and the named egress groups.
@@ -92,39 +101,39 @@ type Server struct {
 // The groups are the names an account can be pointed at; the addresses
 // live here, so moving a group moves every account that uses it.
 type Proxy struct {
-	Default string            `yaml:"default"`
-	Groups  map[string]string `yaml:"groups"`
+	Default string            `yaml:"default" json:"default"`
+	Groups  map[string]string `yaml:"groups" json:"groups"`
 }
 
 // Upstream holds the upstream site's settings.
 type Upstream struct {
-	Timeout Duration `yaml:"timeout"`
-	Site    string   `yaml:"site"`
+	Timeout Duration `yaml:"timeout" json:"timeout"`
+	Site    string   `yaml:"site" json:"site"`
 }
 
 // Rotation holds how accounts are picked and when one is given up on.
 type Rotation struct {
-	Strategy          string   `yaml:"strategy"`
-	MaxAttempts       int      `yaml:"max_attempts"`
-	ExhaustedCooldown Duration `yaml:"exhausted_cooldown"`
+	Strategy          string   `yaml:"strategy" json:"strategy"`
+	MaxAttempts       int      `yaml:"max_attempts" json:"max_attempts"`
+	ExhaustedCooldown Duration `yaml:"exhausted_cooldown" json:"exhausted_cooldown"`
 }
 
 // Schedule holds the timers.
 type Schedule struct {
-	CheckinAt    string   `yaml:"checkin_at"`
-	UsageRefresh Duration `yaml:"usage_refresh"`
-	TokenRefresh Duration `yaml:"token_refresh"`
-	EgressHealth Duration `yaml:"egress_health"`
+	CheckinAt    string   `yaml:"checkin_at" json:"checkin_at"`
+	UsageRefresh Duration `yaml:"usage_refresh" json:"usage_refresh"`
+	TokenRefresh Duration `yaml:"token_refresh" json:"token_refresh"`
+	EgressHealth Duration `yaml:"egress_health" json:"egress_health"`
 }
 
 // Config is the whole configuration.
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Proxy    Proxy    `yaml:"proxy"`
-	Upstream Upstream `yaml:"upstream"`
-	Rotation Rotation `yaml:"rotation"`
-	Schedule Schedule `yaml:"schedule"`
-	DB       string   `yaml:"db"`
+	Server   Server   `yaml:"server" json:"server"`
+	Proxy    Proxy    `yaml:"proxy" json:"proxy"`
+	Upstream Upstream `yaml:"upstream" json:"upstream"`
+	Rotation Rotation `yaml:"rotation" json:"rotation"`
+	Schedule Schedule `yaml:"schedule" json:"schedule"`
+	DB       string   `yaml:"db" json:"db"`
 }
 
 // Default is the configuration a file starts from.
@@ -150,10 +159,12 @@ func Default() Config {
 // when it runs without a config file.
 //
 // On an error the configuration returned is the zero value: a half-read
-// configuration is worse than none.
+// configuration is worse than none, and the zero value must not be
+// used. Whoever wants the defaults on an error has Default().
 //
-// The groups map is shared with the returned configuration. It is
-// read-only: whoever wants to change a group copies it first.
+// The groups map belongs to the configuration it was read into, but a
+// copy of the configuration shares it: whoever wants to change a group
+// copies the map first (maps.Clone).
 func Load(path string) (Config, error) {
 	c := Default()
 	if path == "" {
@@ -163,6 +174,9 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
+	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里，报错会指向
+	// 一个根本不存在的字段。
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
 	//
@@ -172,7 +186,7 @@ func Load(path string) (Config, error) {
 	dec.KnownFields(true)
 	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
 	if err := dec.Decode(&c); err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return c, nil
 		}
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
@@ -189,19 +203,33 @@ func Load(path string) (Config, error) {
 }
 
 // oneDocument makes sure the file holds exactly one document.
+//
+// It reads every document there is, not just the second one: a file
+// with "doc1 --- (empty) --- doc3" would slip past a check that only
+// looked once, and doc3 — with its syntax errors and all — would go
+// missing without a word.
 func oneDocument(dec *yaml.Decoder) error {
-	var extra yaml.Node
-	switch err := dec.Decode(&extra); err {
-	case nil:
-		if !nullDocument(&extra) {
-			return errors.New("more than one YAML document")
+	for {
+		var extra yaml.Node
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		return nil
-	case io.EOF:
-		return nil
-	default:
-		return err
+		if err != nil {
+			return err
+		}
+		if !nullDocument(&extra) {
+			return fmt.Errorf("more than one YAML document, at line %d", documentLine(&extra))
+		}
 	}
+}
+
+// documentLine is the line a document starts on, for the error message.
+func documentLine(n *yaml.Node) int {
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0].Line
+	}
+	return n.Line
 }
 
 // nullDocument is true for an empty document, which is what a file
@@ -209,6 +237,9 @@ func oneDocument(dec *yaml.Decoder) error {
 func nullDocument(n *yaml.Node) bool {
 	if n.Kind == yaml.DocumentNode {
 		if len(n.Content) == 0 {
+			return true
+		}
+		if n.Content[0] == nil {
 			return true
 		}
 		return n.Content[0].Tag == "!!null"

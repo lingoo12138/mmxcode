@@ -11,17 +11,19 @@ func TestFallbackModelsLimits(t *testing.T) {
 		name     string
 		inputs   []string
 		thinking Thinking
+		efforts  []string
 	}
 	wants := map[string]want{
-		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn},
-		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable},
-		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn},
-		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn},
+		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
+		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, []string{"none", "high"}},
+		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn, nil},
+		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn, nil},
 	}
-	if len(FallbackModels) != len(wants) {
-		t.Fatalf("got %d models, want %d", len(FallbackModels), len(wants))
+	models := FallbackModels()
+	if len(models) != len(wants) {
+		t.Fatalf("got %d models, want %d", len(models), len(wants))
 	}
-	for _, m := range FallbackModels {
+	for _, m := range models {
 		w, ok := wants[m.ID]
 		if !ok {
 			t.Fatalf("unexpected model %q", m.ID)
@@ -38,6 +40,9 @@ func TestFallbackModelsLimits(t *testing.T) {
 		if m.Thinking != w.thinking {
 			t.Fatalf("%s thinking = %q, want %q", m.ID, m.Thinking, w.thinking)
 		}
+		if strings.Join(m.Efforts, ",") != strings.Join(w.efforts, ",") {
+			t.Fatalf("%s efforts = %v, want %v", m.ID, m.Efforts, w.efforts)
+		}
 	}
 }
 
@@ -48,22 +53,21 @@ func TestFallbackModelsLimits(t *testing.T) {
 // to one model's inputs would change the original's, with nothing in
 // the log to point at it.
 func TestCloneModelsIsIndependent(t *testing.T) {
-	c := CloneModels(FallbackModels)
+	c := FallbackModels()
 	c[0].Inputs[0] = "audio"
-	c[0].Efforts = append(c[0].Efforts, "extra")
-	if FallbackModels[0].Inputs[0] != "text" {
-		t.Fatalf("the original's inputs changed to %q", FallbackModels[0].Inputs[0])
+	c[0].Efforts[0] = "changed"
+	original := FallbackModels()
+	if original[0].Inputs[0] != "text" {
+		t.Fatalf("the original's inputs changed to %q", original[0].Inputs[0])
 	}
-	for _, e := range FallbackModels[0].Efforts {
-		if e == "extra" {
-			t.Fatal("the original's efforts changed")
-		}
+	if original[0].Efforts[0] == "changed" {
+		t.Fatal("the original's efforts changed")
 	}
 }
 
 func TestM3ThinkingVariants(t *testing.T) {
 	var m Model
-	for _, x := range FallbackModels {
+	for _, x := range FallbackModels() {
 		if x.ID == "MiniMax-M3" {
 			m = x
 		}

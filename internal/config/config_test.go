@@ -130,7 +130,7 @@ func TestDurationYAML(t *testing.T) {
 	if !strings.Contains(string(b), "1h30m0s") {
 		t.Fatalf("marshalled = %q", b)
 	}
-	// 写出来要能读回来
+	// 写出来要能读回去
 	var back Duration
 	if err := yaml.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
@@ -282,6 +282,82 @@ func TestDurationRejectsNegative(t *testing.T) {
 	var d Duration
 	if err := yaml.Unmarshal([]byte(`"-5s"`), &d); err == nil {
 		t.Fatal("expected an error for the negative duration")
+	}
+}
+
+func TestDurationRejectsZero(t *testing.T) {
+	// 零在下游是"不设超时"或者"默默用默认值"，两个都不好。
+	// 默认值全都不是零，所以文件里出现零一定是人写的。
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"0s"`), &d); err == nil {
+		t.Fatal("expected an error for the zero duration")
+	}
+}
+
+func TestLoadStripsBOM(t *testing.T) {
+	// Windows 上的编辑器爱写 BOM，它会混进第一个键名里。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "\ufeff" + "server:\n  listen: \":9090\"\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.Listen != ":9090" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadRejectsDocumentAfterAnEmptyOne(t *testing.T) {
+	// 文档1、空文档、文档3：只看一次的话，文档3 会被悄悄丢掉，
+	// 连它的语法错都不报。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server:\n  listen: \":1\"\n---\nnull\n---\nserver:\n  listen: \":3\"\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the third document")
+	}
+}
+
+func TestLoadRejectsDocumentAfterAnEmptyOneWithBadSyntax(t *testing.T) {
+	// 第三份文档的语法错也不能被吞掉。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server:\n  listen: \":1\"\n---\nnull\n---\nbogus: [\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the third document")
+	}
+}
+
+func TestConfigJSONUsesTheSameNames(t *testing.T) {
+	// WebUI 读配置用 JSON，字段名要和 YAML 里的一样。
+	c := Default()
+	c.Server.Listen = ":9090"
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"server", "proxy", "upstream", "rotation", "schedule", "db"} {
+		if _, ok := m[key]; !ok {
+			t.Fatalf("json has no %q: %s", key, b)
+		}
+	}
+	srv, ok := m["server"].(map[string]any)
+	if !ok {
+		t.Fatalf("server is not an object: %s", b)
+	}
+	if srv["listen"] != ":9090" {
+		t.Fatalf("server.listen = %v", srv["listen"])
 	}
 }
 

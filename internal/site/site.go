@@ -83,7 +83,7 @@ const (
 //
 // It is the only endpoint with a query of its own, so it lives here
 // rather than being spelled out at the call site.
-const ModelsQuery = "region=en&buildEnv=prod"
+const ModelsQuery = "region=" + Region + "&buildEnv=prod"
 
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
