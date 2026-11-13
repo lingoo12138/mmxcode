@@ -9,11 +9,14 @@ package checkin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/site"
+	"mmxcode/internal/upstream"
 )
 
 // The outcomes.
@@ -47,9 +50,12 @@ func New(acc *account.Client) *Client { return &Client{acc: acc} }
 
 // Run reads the panel and claims today's credits.
 //
-// A 401 is answered the way MiniMax Code answers it: the sign-in is
-// renewed and the check-in is asked once more. The renewal is the
-// caller's job, so Run asks through the renewer it is given.
+// The sign-in is the caller's business: the caller renews the token
+// before it calls, and Run neither renews nor tries again. What Run
+// does with a refused sign-in — an HTTP 401 or 403, or MiniMax's own
+// refusal code in the body of a 200 — is to answer OutcomeFailed
+// instead of an error: a refused sign-in is one event, however it
+// arrives.
 func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error) {
 	if userID == "" {
 		id, err := c.acc.Identity(ctx, access, "")
@@ -63,14 +69,14 @@ func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error
 		return out, nil
 	}
 	var refused *account.RefusedError
-	if !asRefused(err, &refused) {
-		return Outcome{}, err
+	if errors.As(err, &refused) || errors.Is(err, upstream.ErrSignInRefused) {
+		return Outcome{Outcome: OutcomeFailed, Message: err.Error()}, nil
 	}
-	return Outcome{Outcome: OutcomeFailed, Message: err.Error()}, nil
+	return Outcome{}, err
 }
 
 func (c *Client) run(ctx context.Context, access, userID string) (Outcome, error) {
-	raw, err := c.acc.Call(ctx, access, userID, http.MethodGet, "/minimax-cloud/api/v1/signin/status", nil, checkinQuery())
+	raw, err := c.acc.Call(ctx, access, userID, http.MethodGet, site.SigninStatusPath, nil, account.CheckinQuery())
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -92,38 +98,68 @@ func (c *Client) run(ctx context.Context, access, userID string) (Outcome, error
 	case 4:
 		return Outcome{Outcome: OutcomeIneligible}, nil
 	case 2:
-		claimRaw, err := c.acc.Call(ctx, access, userID, http.MethodPost, "/minimax-cloud/api/v1/signin/claim", []byte("{}"), checkinQuery())
+		claimRaw, err := c.acc.Call(ctx, access, userID, http.MethodPost, site.SigninClaimPath, []byte("{}"), account.CheckinQuery())
 		if err != nil {
 			return Outcome{}, err
 		}
 		var env struct {
 			Data struct {
-				ClaimResult *int     `json:"claim_result"`
-				Points      *float64 `json:"points"`
+				ClaimResult json.RawMessage `json:"claim_result"`
+				Points      *float64        `json:"points"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(claimRaw, &env); err != nil {
-			return Outcome{}, fmt.Errorf("check-in: not JSON")
+			return Outcome{}, fmt.Errorf("check-in: not JSON: %w", err)
 		}
 		out := Outcome{Outcome: OutcomeDone}
-		if env.Data.Points != nil {
+		if env.Data.Points != nil && *env.Data.Points > 0 {
 			out.Credit = *env.Data.Points
 		}
-		if env.Data.ClaimResult != nil {
-			switch *env.Data.ClaimResult {
-			case 1:
-				out.Outcome = OutcomeClaimed
-				out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
-			case 2:
-				out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
-			default:
-				return Outcome{}, fmt.Errorf("check-in: unknown claim_result %d", *env.Data.ClaimResult)
-			}
+		// The claim answers 1 when it claimed now and 2 when the day
+		// was already claimed. Anything else is not a claim: the
+		// reference throws for it, and so does this. A check-in that
+		// is not known is not a check-in that was done.
+		result, ok := claimResult(env.Data.ClaimResult)
+		if !ok {
+			return Outcome{}, fmt.Errorf("check-in: unknown claim_result %s", claimText(env.Data.ClaimResult))
+		}
+		switch result {
+		case 1:
+			out.Outcome = OutcomeClaimed
+			out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
+		case 2:
+			out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
+		default:
+			return Outcome{}, fmt.Errorf("check-in: unknown claim_result %v", result)
 		}
 		return out, nil
 	default:
 		return Outcome{Outcome: OutcomeInactive}, nil
 	}
+}
+
+// claimResult reads the claim's answer as the reference reads it: a
+// number above zero, and nothing else.
+func claimResult(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) != nil {
+		return 0, false
+	}
+	if f <= 0 {
+		return 0, false
+	}
+	return f, true
+}
+
+// claimText is what the answer said, for the error's text.
+func claimText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "undefined"
+	}
+	return string(raw)
 }
 
 // day is one day of the panel.
@@ -142,7 +178,7 @@ func parsePanel(raw []byte) ([]day, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("check-in: not JSON")
+		return nil, fmt.Errorf("check-in: not JSON: %w", err)
 	}
 	days := env.Data.Days
 	if len(days) == 0 {
@@ -185,29 +221,4 @@ func streakFrom(days []day, i int) int {
 		n++
 	}
 	return n
-}
-
-// checkinQuery is the query MiniMax Code's own check-in sends.
-func checkinQuery() []account.QueryKV {
-	return []account.QueryKV{
-		{K: "device_platform", V: "web"},
-		{K: "is_desktop", V: "1"},
-		{K: "desktop_version", V: "0.6.12"},
-	}
-}
-
-// asRefused unwraps an error into a refusal.
-func asRefused(err error, target **account.RefusedError) bool {
-	for err != nil {
-		if re, ok := err.(*account.RefusedError); ok {
-			*target = re
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }

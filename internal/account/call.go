@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -20,13 +21,18 @@ type QueryKV = sign.KV
 // Call sends one signed account API request.
 //
 // The body is "{}" for a POST and nil for a GET, as MiniMax Code sends
-// it. The answer's business codes are checked before it is handed back.
+// it. What is signed is exactly what goes on the wire: a POST whose
+// body was not given sends "{}" and signs "{}". The answer's business
+// codes are checked before it is handed back.
 func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []QueryKV) ([]byte, error) {
 	now := c.now()
+	// The reference signs the bytes it sends: a POST's body, or "{}"
+	// when it has none. A signature over anything else is refused.
+	wire := wireBody(method, body)
 	signed := sign.Sign(c.base, path, sign.Options{
 		Access:   access,
 		UserID:   userID,
-		Body:     body,
+		Body:     wire,
 		Query:    query,
 		Now:      now.UnixMilli(),
 		TZOffset: c.tzOffset,
@@ -36,7 +42,7 @@ func (c *Client) Call(ctx context.Context, access, userID, method, path string, 
 	var req *http.Request
 	var err error
 	if method == http.MethodPost {
-		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(body)))
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(wire)))
 	} else {
 		req, err = http.NewRequestWithContext(ctx, method, signed.URL, nil)
 	}
@@ -68,8 +74,24 @@ func (c *Client) Call(ctx context.Context, access, userID, method, path string, 
 	return raw, nil
 }
 
+// wireBody is the body that goes on the wire and into the signature.
+//
+// The reference's signing sends a GET without a body and a POST with
+// the body it is given, an empty one as "{}". The two have to be the
+// same bytes: a signature made over something else is refused.
+func wireBody(method string, body []byte) []byte {
+	if method != http.MethodPost {
+		return nil
+	}
+	if len(body) == 0 {
+		return []byte("{}")
+	}
+	return body
+}
+
 // RefusedError is a refusal of the sign-in.
 type RefusedError struct {
+	// Status is the HTTP status the refusal came with.
 	Status int
 }
 
@@ -78,34 +100,25 @@ func (e *RefusedError) Error() string {
 	return fmt.Sprintf("the sign-in was refused (HTTP %d)", e.Status)
 }
 
+// Is says whether the error is the upstream's refusal of the sign-in.
+//
+// A refused sign-in is one event, whatever shape it arrives in: an
+// HTTP 401 or 403, or MiniMax's own code 1000048 in the body of a
+// 200. errors.Is(err, upstream.ErrSignInRefused) tells it apart from
+// every other error.
+func (e *RefusedError) Is(target error) bool {
+	return target == upstream.ErrSignInRefused
+}
+
 // isNotFound says an error is a 404.
 func isNotFound(err error) bool {
-	var re *statusError
-	return asStatus(err, &re) && re.status == http.StatusNotFound
+	var se *statusError
+	return errors.As(err, &se) && se.status == http.StatusNotFound
 }
 
 type statusError struct{ status int }
 
 func (e *statusError) Error() string { return "HTTP " + strconv.Itoa(e.status) }
-
-// asStatus unwraps an error into a status error.
-//
-// The call helper returns a plain fmt.Errorf for a bad status, so the
-// status is carried in a typed error instead of a formatted string.
-func asStatus(err error, target **statusError) bool {
-	for err != nil {
-		if se, ok := err.(*statusError); ok {
-			*target = se
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
-}
 
 // parsePlanWindows reads the console's answer as windows.
 func parsePlanWindows(raw []byte) ([]Window, error) {
@@ -135,10 +148,16 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("no plan in the reply")
+		return nil, fmt.Errorf("no plan in the reply: %w", err)
 	}
 	if env.BaseResp != nil && env.BaseResp.StatusCode != 0 {
-		return nil, fmt.Errorf("%s", env.BaseResp.StatusMsg)
+		// The reference names the status code when the answer has no
+		// message of its own: an error with an empty text says nothing.
+		msg := strings.TrimSpace(env.BaseResp.StatusMsg)
+		if msg == "" {
+			msg = fmt.Sprintf("MiniMax said %d", env.BaseResp.StatusCode)
+		}
+		return nil, errors.New(msg)
 	}
 	var out []Window
 	for _, m := range env.ModelRemains {
@@ -203,7 +222,9 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			// The site counts the items a window has. A count that is
 			// not there is zero, the way the reference reads it, so a
 			// window with a limit and no count yet is "0 of 150" and
-			// not "unknown".
+			// not "unknown". A count that is negative is not a count
+			// at all: the reference wants the count to be at least
+			// zero, or the window has no limit to show.
 			items, of := 0.0, 0.0
 			if x.usedCnt != nil {
 				items = *x.usedCnt
@@ -211,7 +232,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			if x.totalCnt != nil {
 				of = *x.totalCnt
 			}
-			if of > 0 && items <= of {
+			if items >= 0 && of > 0 && items <= of {
 				w.Amount = items
 				if status == 2 {
 					// A spent window counts its whole limit.

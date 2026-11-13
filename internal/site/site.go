@@ -85,6 +85,33 @@ const (
 // rather than being spelled out at the call site.
 const ModelsQuery = "region=" + Region + "&buildEnv=prod"
 
+// KV is one query parameter.
+//
+// It is the site's own type, so that a package that builds a query does
+// not have to know about the signing package to say what a parameter
+// is. The signing package has one of its own, and the two are the same
+// shape.
+type KV struct {
+	// K is the parameter's name.
+	K string
+	// V is the parameter's value.
+	V string
+}
+
+// CheckinQuery is the query MiniMax Code's own check-in sends.
+//
+// The check-in comes from the desktop client, so it says so: the
+// device_platform is "web", the desktop version is MiniMax Code's, and
+// the account's own user id is in the query.
+//
+// It is kept here, once: the check-in and the credits ledger ask the
+// same way, and the reference has one copy of it too.
+var CheckinQuery = []KV{
+	{K: "device_platform", V: "web"},
+	{K: "is_desktop", V: "1"},
+	{K: "desktop_version", V: "0.6.12"},
+}
+
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
 

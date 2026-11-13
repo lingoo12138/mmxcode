@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,5 +202,71 @@ func TestNoPanel(t *testing.T) {
 	c := New(testAccountClient(t, srv))
 	if _, err := c.Run(context.Background(), "tok", "1234567890"); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// TestRefusedByHTTP says a 401 is a failed check-in, not an error.
+//
+// 401 是“签到被拒”，是一个结果，不是一个意外。
+func TestRefusedByHTTP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid access token"}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", out.Outcome, OutcomeFailed)
+	}
+}
+
+// TestRefusedByBusinessCode says MiniMax's own refusal is the same event.
+//
+// 200 的回答里带 1000048，和 401 是一件事：签到被拒。
+func TestRefusedByBusinessCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", out.Outcome, OutcomeFailed)
+	}
+}
+
+// TestUnknownClaimResult says a claim that says nothing is not a claim.
+//
+// 回答里没有 claim_result 时，不能当成“已经签到过了”——那会把一次
+// 没有发生的签到记成完成了。
+func TestUnknownClaimResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(panel(2, true)))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{}}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err == nil {
+		t.Fatalf("outcome = %+v, want an error", out)
+	}
+	if !strings.Contains(err.Error(), "claim_result") {
+		t.Fatalf("error = %q", err.Error())
 	}
 }

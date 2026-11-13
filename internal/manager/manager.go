@@ -11,6 +11,7 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -183,6 +184,13 @@ func (m *Manager) Client(ctx context.Context, accountID string) (*http.Client, s
 }
 
 // RefreshUsage reads an account's credits and windows and saves them.
+//
+// The membership comes first: it names the group the plan's windows
+// are under, and the console asks for the windows of that group.
+//
+// A refused sign-in is not a missing reading: the account is marked
+// signed out, so that a plan that could not be read is not mistaken
+// for a plan without windows.
 func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
 	a, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
@@ -198,6 +206,18 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 	if err != nil {
 		return store.UsageSnapshot{}, err
 	}
+
+	// The membership is read before the plan, because it names the
+	// group the plan's windows are under.
+	group := ""
+	if mem, err := acc.Membership(ctx, tok.Access, a.UserID); err == nil {
+		snap.Balance = mem.Balance
+		snap.PlanUntil = mem.ExpiresAt
+		group = mem.GroupID
+	} else if isRefusal(err) {
+		m.markSignedOut(ctx, accountID, err.Error())
+	}
+
 	batches, err := acc.Ledger(ctx, tok.Access, a.UserID)
 	if err != nil {
 		return store.UsageSnapshot{}, err
@@ -205,24 +225,36 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 	now := time.Now()
 	var granted, consumed, remaining float64
 	have := false
+	unknown := false
 	var soonest time.Time
 	for _, b := range batches {
 		if b.CreditType != 1 && b.CreditType != 2 {
+			// A bucket the plan does not count.
 			continue
 		}
-		if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
+		if !b.HasExpiresAt {
+			// The credits cannot be read: the batch does not say
+			// when it runs out, so a live batch cannot be told
+			// from a spent one, and the balance would be wrong.
+			unknown = true
+			break
+		}
+		if !b.ExpiresAt.After(now) {
+			// Expired.
 			continue
 		}
 		granted += b.Granted
 		consumed += b.Consumed
 		remaining += b.Remaining
 		have = true
-		if b.ExpiresAt.IsZero() {
-			continue
-		}
 		if soonest.IsZero() || b.ExpiresAt.Before(soonest) {
 			soonest = b.ExpiresAt
 		}
+	}
+	if unknown {
+		// A part of the ledger would tell a wrong share, so no
+		// share is told at all.
+		have = false
 	}
 	if have {
 		snap.HasAmounts = true
@@ -232,17 +264,19 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		snap.ExpiresAt = soonest
 	}
 
-	if ws, err := acc.PlanWindows(ctx, tok.Access, ""); err == nil && len(ws) > 0 {
-		if b, err := json.Marshal(ws); err == nil {
-			snap.WindowsJSON = string(b)
+	if ws, err := acc.PlanWindows(ctx, tok.Access, group); err == nil {
+		if len(ws) > 0 {
+			if b, err := json.Marshal(ws); err == nil {
+				snap.WindowsJSON = string(b)
+			}
 		}
+	} else if isRefusal(err) {
+		m.markSignedOut(ctx, accountID, err.Error())
 	}
-	if title, err := acc.PlanTitle(ctx, tok.Access, ""); err == nil {
+	if title, err := acc.PlanTitle(ctx, tok.Access, group); err == nil {
 		snap.Plan = title
-	}
-	if mem, err := acc.Membership(ctx, tok.Access, a.UserID); err == nil {
-		snap.Balance = mem.Balance
-		snap.PlanUntil = mem.ExpiresAt
+	} else if isRefusal(err) {
+		m.markSignedOut(ctx, accountID, err.Error())
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
@@ -303,18 +337,19 @@ func (m *Manager) LatestWindows(ctx context.Context, accountID string) ([]accoun
 
 // asOAuthError unwraps an error into an OAuth error.
 func asOAuthError(err error, target **oauth.Error) bool {
-	for err != nil {
-		if oe, ok := err.(*oauth.Error); ok {
-			*target = oe
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
+	return errors.As(err, target)
+}
+
+// isRefusal says an error is a refusal of the sign-in.
+//
+// A refused sign-in is one event, however it arrives: an HTTP 401 or
+// 403, or MiniMax's own code 1000048 in the body of a 200.
+func isRefusal(err error) bool {
+	if err == nil {
+		return false
 	}
-	return false
+	var refused *account.RefusedError
+	return errors.As(err, &refused) || errors.Is(err, upstream.ErrSignInRefused)
 }
 
 // WindowGroup says which plan window a model spends from.

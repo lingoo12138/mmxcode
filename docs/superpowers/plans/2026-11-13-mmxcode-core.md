@@ -5178,12 +5178,20 @@ package account
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"mmxcode/internal/upstream"
 )
+
+func testClient(t *testing.T) *upstream.Client {
+	t.Helper()
+	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
+}
 
 func TestIdentity(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5228,8 +5236,10 @@ func TestIdentityNoUserIDInAnswer(t *testing.T) {
 }
 
 func TestLedgerPaging(t *testing.T) {
+	var pages []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		page := r.URL.Query().Get("page_number")
+		pages = append(pages, page)
 		if page == "1" {
 			w.Write([]byte(`{"total_count":3,"details":[
 				{"credit_type":1,"granted_amount":"1,200.5","consumed_amount":"100","remaining_amount":"1100.5","granted_at_ms":1763000000000,"expire_at_ms":1900000000000},
@@ -5254,6 +5264,96 @@ func TestLedgerPaging(t *testing.T) {
 	}
 	if batches[0].Granted != 1200.5 || batches[0].Remaining != 1100.5 {
 		t.Fatalf("batch = %+v", batches[0])
+	}
+	// 页面要一页一页地问，跳过第 2 页的 bug 不能混过去
+	if len(pages) != 2 || pages[0] != "1" || pages[1] != "2" {
+		t.Fatalf("pages = %v, want [1 2]", pages)
+	}
+}
+
+// TestLedgerUnreadableAmount says the credits cannot be read.
+//
+// The reference does not answer a part of the ledger: a batch whose
+// amount is not a number would tell a wrong share.
+func TestLedgerUnreadableAmount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":1,"details":[
+			{"credit_type":1,"granted_amount":"abc","consumed_amount":"0","remaining_amount":"1100.5","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches != nil {
+		t.Fatalf("batches = %+v, want none", batches)
+	}
+}
+
+// TestLedgerMissingExpiry says the time a batch runs out is not there.
+//
+// It is not the same as a batch that ran out: the credits of such a
+// batch cannot be read, and the batch must not be called expired.
+func TestLedgerMissingExpiry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":1,"details":[
+			{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("got %d batches", len(batches))
+	}
+	b := batches[0]
+	if b.HasExpiresAt {
+		t.Fatalf("batch = %+v, want no expiry", b)
+	}
+	if !b.ExpiresAt.IsZero() {
+		t.Fatalf("expires at = %v, want the zero time", b.ExpiresAt)
+	}
+	if b.Granted != 600 || b.Remaining != 500 {
+		t.Fatalf("batch = %+v", b)
+	}
+}
+
+// TestLedgerExpireAtZero says a batch that expires at zero has expired.
+//
+// The time is there, and it is in the past: that is a spent batch, not
+// an unreadable one.
+func TestLedgerExpireAtZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":1,"details":[
+			{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","expire_at_ms":0}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	batches, err := c.Ledger(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("got %d batches", len(batches))
+	}
+	b := batches[0]
+	if !b.HasExpiresAt {
+		t.Fatalf("batch = %+v, want an expiry", b)
+	}
+	if b.ExpiresAt.IsZero() {
+		t.Fatalf("expires at = %v, want the epoch", b.ExpiresAt)
 	}
 }
 
@@ -5369,6 +5469,230 @@ func TestModelsFallback(t *testing.T) {
 		t.Fatal("expected the fallback models")
 	}
 }
+
+// TestMembership says the plan is read from the answer's data.
+//
+// 真的答案把字段放在 data 下面，只读顶层的话一个真的套餐会被说成没有。
+func TestMembership(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/matrix/api/v1/commerce/get_membership_info" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"data":{"has_token_plan":true,"token_plan_tier":"TokenPlanMax","op_group_id":"grp-1","op_credit_summary":{"total_remaining_amount":"1234.5"}}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	m, err := c.Membership(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Known {
+		t.Fatal("the plan is unknown")
+	}
+	if !m.HasTokenPlan {
+		t.Fatalf("membership = %+v, want a plan", m)
+	}
+	if m.Tier != "TokenPlanMax" {
+		t.Fatalf("tier = %q", m.Tier)
+	}
+	if m.GroupID != "grp-1" {
+		t.Fatalf("group = %q", m.GroupID)
+	}
+	if m.Balance != "1234.5" {
+		t.Fatalf("balance = %q", m.Balance)
+	}
+}
+
+// TestMembershipTopLevelWins says the top level wins over the data.
+//
+// 顶层的字段优先，data 里的同名字段只在顶层没有的时候用。
+func TestMembershipTopLevelWins(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"has_token_plan":false,"token_plan_tier":"Top","op_group_id":"grp-top","data":{"has_token_plan":true,"token_plan_tier":"Under","op_group_id":"grp-under"}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	m, err := c.Membership(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.HasTokenPlan {
+		t.Fatalf("membership = %+v, want no plan", m)
+	}
+	if m.Tier != "Top" || m.GroupID != "grp-top" {
+		t.Fatalf("membership = %+v", m)
+	}
+}
+
+// TestMembershipOpcreditBalance says the balance is the account's own.
+//
+// 没有 op_credit_summary 时用 opcredit_balance，字符串和数字都认。
+func TestMembershipOpcreditBalance(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":{"has_token_plan":true,"opcredit_balance":" 42.5 "}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	m, err := c.Membership(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Balance != "42.5" {
+		t.Fatalf("balance = %q, want 42.5", m.Balance)
+	}
+}
+
+// TestMembershipNotFound says the plan is unknown, not that there is none.
+//
+// 国际站对会员接口回 404，那是“不知道”，不是“没有”。
+func TestMembershipNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`404 page not found`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	m, err := c.Membership(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Known {
+		t.Fatalf("membership = %+v, want an unknown plan", m)
+	}
+	if m.HasTokenPlan {
+		t.Fatalf("membership = %+v, want no plan", m)
+	}
+}
+
+// TestPlanWindowsNegativeCount says a negative count is not a count.
+//
+// 负数的已用次数不是次数，不能拿它当金额。
+func TestPlanWindowsNegativeCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+			{"model_name":"general","current_interval_status":1,"current_interval_remaining_percent":90,
+			 "current_interval_total_percent":100,"current_interval_total_count":10,"current_interval_used_count":-5,
+			 "start_time":1763000000000,"end_time":1763010000000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 1 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if ws[0].Amount != 0 || ws[0].Limit != 0 {
+		t.Fatalf("window = %+v, want no count", ws[0])
+	}
+}
+
+// TestPlanWindowsEmptyStatusMsg says the error names the status code.
+//
+// 回答没有 status_msg 时，错误里至少要有一个状态码，不能是空字符串。
+func TestPlanWindowsEmptyStatusMsg(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"base_resp":{"status_code":1001,"status_msg":""}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	_, err := c.PlanWindows(context.Background(), "tok", "")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if err.Error() == "" {
+		t.Fatalf("error = %q, want a text", err.Error())
+	}
+	if !strings.Contains(err.Error(), "1001") {
+		t.Fatalf("error = %q, want the status code", err.Error())
+	}
+}
+
+// TestCallPostNilBody says the body on the wire is what is signed.
+//
+// 签名算的是 "{}"，发出去的也得是 "{}"，不然上游会拒。
+func TestCallPostNilBody(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	if _, err := c.Call(context.Background(), "tok", "1234567890", http.MethodPost, "/v1/whatever", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got != "{}" {
+		t.Fatalf("body = %q, want {}", got)
+	}
+}
+
+// TestCallGetHasNoBody says a GET signs and sends nothing.
+func TestCallGetHasNoBody(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	if _, err := c.Call(context.Background(), "tok", "1234567890", http.MethodGet, "/v1/whatever", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("body = %q, want nothing", got)
+	}
+}
+
+// TestModelsLive says the live list is asked for with the token.
+func TestModelsLive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mavis/api/v1/models" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("authorization = %q", got)
+		}
+		w.Write([]byte(`{"providers":[{"providerId":"minimax","config":{"models":{"MiniMax-M3.1":{"name":"M3.1","limit":{"context":1048576,"output":524288},"modalities":{"input":["text","image"]},"reasoning":true,"thinking":{"effortOptions":["low","high","none"]}}},"model_order":["MiniMax-M3.1"]}}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ms := c.Models("tok")
+	if len(ms) != 1 {
+		t.Fatalf("got %d models: %+v", len(ms), ms)
+	}
+	if ms[0].ID != "MiniMax-M3.1" || ms[0].Name != "M3.1" {
+		t.Fatalf("model = %+v", ms[0])
+	}
+	if ms[0].Context != 1048576 || ms[0].Output != 524288 {
+		t.Fatalf("model = %+v", ms[0])
+	}
+	if len(ms[0].Efforts) != 2 {
+		t.Fatalf("efforts = %v, want two", ms[0].Efforts)
+	}
+}
 ```
 
 测试文件的 import 补上 `"mmxcode/internal/upstream"`，并加助手：
@@ -5402,6 +5726,7 @@ Expected: FAIL —— `undefined: New`
 package account
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -5415,6 +5740,12 @@ import (
 	"mmxcode/internal/site"
 	"mmxcode/internal/upstream"
 )
+
+// modelsTimeout is how long the live model list is waited for.
+//
+// The reference gives the call ten seconds; the console's endpoints are
+// not documented, so a stalled one gets little of that.
+const modelsTimeout = 10 * time.Second
 
 // Identity is who the account is.
 type Identity struct {
@@ -5454,6 +5785,14 @@ type Batch struct {
 	GrantedAt time.Time `json:"-"`
 	// ExpiresAt is when it runs out.
 	ExpiresAt time.Time `json:"-"`
+	// HasGrantedAt says the answer carried the time the batch was
+	// given. A batch without one has no GrantedAt, not one in 1970.
+	HasGrantedAt bool `json:"-"`
+	// HasExpiresAt says the answer carried the time the batch runs
+	// out. A batch without one cannot be read: the credits of a batch
+	// that never expires cannot be told from those of a spent one, and
+	// a wrong share is worse than none.
+	HasExpiresAt bool `json:"-"`
 }
 
 // Window is one plan window: the five hours, the seven days, or a
@@ -5570,18 +5909,22 @@ func (c *Client) SetClock(now func() time.Time, tzOffset int) {
 	c.tzOffset = tzOffset
 }
 
-// checkinQuery is the query MiniMax Code's own check-in sends.
+// CheckinQuery is the query MiniMax Code's own check-in sends.
 //
-// The check-in comes from the desktop client, so it says so.
-var checkinQuery = []signKV{
-	{K: "device_platform", V: "web"},
-	{K: "is_desktop", V: "1"},
-	{K: "desktop_version", V: "0.6.12"},
+// It is the site's one, in the shape the signing package takes. The
+// check-in and the credits ledger ask the same way, and the copy is
+// kept in one place: the site's.
+func CheckinQuery() []QueryKV {
+	out := make([]QueryKV, 0, len(site.CheckinQuery))
+	for _, kv := range site.CheckinQuery {
+		out = append(out, QueryKV{K: kv.K, V: kv.V})
+	}
+	return out
 }
 
 // Identity reads who the account is.
 func (c *Client) Identity(ctx context.Context, access, userID string) (Identity, error) {
-	body, err := c.call(ctx, access, userID, http.MethodGet, site.IdentityPath, nil, nil)
+	body, err := c.Call(ctx, access, userID, http.MethodGet, site.IdentityPath, nil, nil)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -5604,7 +5947,7 @@ func (c *Client) Identity(ctx context.Context, access, userID string) (Identity,
 		} `json:"userInfo"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
-		return Identity{}, fmt.Errorf("account: not JSON")
+		return Identity{}, fmt.Errorf("account: not JSON: %w", err)
 	}
 	id := firstNonEmpty(env.Data.UserInfo.RealUserID, env.Data.UserInfo.RealUserID2)
 	if id == "" {
@@ -5621,91 +5964,221 @@ func (c *Client) Identity(ctx context.Context, access, userID string) (Identity,
 //
 // The international site answers the membership API with 404, which
 // means the plan is unknown, not that there is none.
+//
+// The answer's fields are read from the top level first and from the
+// object under "data" second, the way the reference reads them: a
+// field at the top level wins, and one that is only under "data" is
+// used when the top level does not carry it. The real answer nests
+// them under "data", so a plan that is only there is a plan.
 func (c *Client) Membership(ctx context.Context, access, userID string) (Membership, error) {
-	m, err := c.membershipOnce(ctx, access, userID, "")
+	m, err := c.membershipOnce(ctx, access, userID)
 	if err == nil {
 		return m, nil
 	}
-	if !isNotFound(err) {
-		return Membership{}, err
-	}
-	m2, err2 := c.membershipOnce(ctx, access, userID, "")
-	if err2 == nil {
-		return m2, nil
-	}
-	if isNotFound(err2) {
+	if isNotFound(err) {
 		return Membership{Known: false}, nil
 	}
-	return Membership{}, err2
+	return Membership{}, err
 }
 
-func (c *Client) membershipOnce(ctx context.Context, access, userID, groupID string) (Membership, error) {
-	body, err := c.call(ctx, access, userID, http.MethodPost,
+func (c *Client) membershipOnce(ctx context.Context, access, userID string) (Membership, error) {
+	body, err := c.Call(ctx, access, userID, http.MethodPost,
 		site.MembershipPath, []byte("{}"), nil)
 	if err != nil {
 		return Membership{}, err
 	}
-	var env struct {
-		HasTokenPlan     *bool       `json:"has_token_plan"`
-		TokenPlanTier    string      `json:"token_plan_tier"`
-		TokenPlanExpires json.Number `json:"token_plan_expires_at"`
-		OpGroupID        string      `json:"op_group_id"`
-		OpCreditSummary  *struct {
-			TotalRemainingAmount string `json:"total_remaining_amount"`
-		} `json:"op_credit_summary"`
-		OpCreditBalance json.RawMessage            `json:"opcredit_balance"`
-		Data            map[string]json.RawMessage `json:"data"`
-	}
+	var env map[string]json.RawMessage
 	if err := json.Unmarshal(body, &env); err != nil {
-		return Membership{}, fmt.Errorf("membership: not JSON")
+		return Membership{}, fmt.Errorf("membership: not JSON: %w", err)
 	}
-	m := Membership{Known: true, Tier: env.TokenPlanTier, GroupID: env.OpGroupID}
-	if env.HasTokenPlan != nil {
-		m.HasTokenPlan = *env.HasTokenPlan
+	// The fields are sometimes at the top level and sometimes under
+	// "data". A "data" that is not an object carries no fields.
+	var data map[string]json.RawMessage
+	if raw, ok := env["data"]; ok {
+		_ = json.Unmarshal(raw, &data)
 	}
-	if env.OpCreditSummary != nil {
-		m.Balance = env.OpCreditSummary.TotalRemainingAmount
+	pick := func(k string) json.RawMessage {
+		if v, ok := env[k]; ok && !isJSONNull(v) {
+			return v
+		}
+		if v, ok := data[k]; ok && !isJSONNull(v) {
+			return v
+		}
+		return nil
 	}
-	if env.TokenPlanExpires != "" {
-		if f, err := env.TokenPlanExpires.Float64(); err == nil && f > 0 {
-			ms := int64(f)
-			if ms < 1e12 {
-				ms *= 1000
-			}
-			m.ExpiresAt = time.UnixMilli(ms)
+	m := Membership{Known: true}
+	if raw := pick("has_token_plan"); raw != nil {
+		var has bool
+		if json.Unmarshal(raw, &has) == nil {
+			m.HasTokenPlan = has
 		}
 	}
+	m.Tier = jsonString(pick("token_plan_tier"))
+	m.GroupID = jsonString(pick("op_group_id"))
+	if f, ok := jsonNumber(pick("token_plan_expires_at")); ok && f > 0 {
+		ms := int64(f)
+		if ms < 1e12 {
+			ms *= 1000
+		}
+		m.ExpiresAt = time.UnixMilli(ms)
+	}
+	m.Balance = membershipBalance(env, data, pick)
 	return m, nil
+}
+
+// membershipBalance is the credits left, as the site writes them.
+//
+// The summary's total is the balance. When there is no total, the
+// account's own opcredit_balance is it: as a string, trimmed, or as a
+// number.
+func membershipBalance(env, data map[string]json.RawMessage, pick func(string) json.RawMessage) string {
+	sum := jsonObject(env["op_credit_summary"])
+	if sum == nil {
+		sum = jsonObject(data["op_credit_summary"])
+	}
+	if sum != nil {
+		if v := jsonString(sum["total_remaining_amount"]); v != "" {
+			return v
+		}
+	}
+	return jsonBalance(pick("opcredit_balance"))
+}
+
+// isJSONNull says a value is the JSON null.
+func isJSONNull(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	return v == nil
+}
+
+// jsonObject is a value as an object, or nothing when it is not one.
+func jsonObject(raw json.RawMessage) map[string]json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+// jsonString is a value as a trimmed string, or nothing when it is not
+// a string or is empty.
+func jsonString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// jsonBalance is a balance the site wrote as a string or as a number.
+func jsonBalance(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) == nil {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return ""
+}
+
+// jsonNumber is a number the site wrote as a number or as a string.
+func jsonNumber(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) == nil {
+		return f, true
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return 0, false
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// ledgerBatch is a batch as the site writes it.
+//
+// The times are pointers, so that a batch without one is told from a
+// batch with a zero one. The site writes the time the credits run out
+// in, and a batch without it cannot be read.
+type ledgerBatch struct {
+	Batch
+	GrantedAtMS *int64 `json:"granted_at_ms"`
+	ExpiresAtMS *int64 `json:"expire_at_ms"`
+}
+
+// batch turns the answer's batch into the one the callers see.
+//
+// A time the answer did not carry stays unset: it is not the epoch,
+// and saying so would make an unreadable batch look like a spent one.
+func (l ledgerBatch) batch() Batch {
+	b := l.Batch
+	if l.GrantedAtMS != nil {
+		b.GrantedAtMS = *l.GrantedAtMS
+		b.HasGrantedAt = true
+		b.GrantedAt = time.UnixMilli(*l.GrantedAtMS)
+	}
+	if l.ExpiresAtMS != nil {
+		b.ExpiresAtMS = *l.ExpiresAtMS
+		b.HasExpiresAt = true
+		b.ExpiresAt = time.UnixMilli(*l.ExpiresAtMS)
+	}
+	return b
 }
 
 // Ledger reads every batch of credits.
 //
 // A page that can't be read whole gives nil: a part of the ledger
-// would tell a wrong share.
+// would tell a wrong share. So does a batch whose amounts cannot be
+// read: the credits cannot be told apart then, and none is better
+// than a wrong share.
 func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, error) {
 	const pageSize = 20
 	const maxPages = 10
 	var out []Batch
 	for page := 1; page <= maxPages; page++ {
-		query := append(append([]signKV{}, checkinQuery...),
-			signKV{K: "page_number", V: strconv.Itoa(page)},
-			signKV{K: "page_size", V: strconv.Itoa(pageSize)},
-			signKV{K: "include_expired", V: "true"},
+		query := append(append([]QueryKV{}, CheckinQuery()...),
+			QueryKV{K: "page_number", V: strconv.Itoa(page)},
+			QueryKV{K: "page_size", V: strconv.Itoa(pageSize)},
+			QueryKV{K: "include_expired", V: "true"},
 		)
-		body, err := c.call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
+		body, err := c.Call(ctx, access, userID, http.MethodGet, site.CreditPath, nil, query)
 		if err != nil {
 			return nil, err
 		}
 		var env struct {
-			Details    []Batch `json:"details"`
-			TotalCount *int    `json:"total_count"`
+			Details    []ledgerBatch `json:"details"`
+			TotalCount *int          `json:"total_count"`
 			Data       *struct {
-				Details    []Batch `json:"details"`
-				TotalCount *int    `json:"total_count"`
+				Details    []ledgerBatch `json:"details"`
+				TotalCount *int          `json:"total_count"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &env); err != nil {
-			return nil, fmt.Errorf("credits: not JSON")
+			return nil, fmt.Errorf("credits: not JSON: %w", err)
 		}
 		details, total := env.Details, env.TotalCount
 		if len(details) == 0 && env.Data != nil {
@@ -5714,20 +6187,24 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 		if total == nil {
 			return nil, nil
 		}
-		for i := range details {
-			b := &details[i]
-			granted, ok1 := ParseAmount(b.GrantedAmount, false)
-			remaining, ok2 := ParseAmount(b.RemainingAmount, true)
-			if !ok1 || !ok2 {
-				continue
+		for _, lb := range details {
+			b := lb.batch()
+			if b.CreditType == 1 || b.CreditType == 2 {
+				granted, ok1 := ParseAmount(b.GrantedAmount, false)
+				remaining, ok2 := ParseAmount(b.RemainingAmount, true)
+				if !ok1 || !ok2 {
+					// The amounts cannot be read: the credits of
+					// this batch cannot be told from the ones of
+					// a spent batch, and the ledger as a whole
+					// cannot be read.
+					return nil, nil
+				}
+				b.Granted = granted
+				b.Remaining = math.Min(remaining, granted)
+				b.Consumed = granted - b.Remaining
 			}
-			b.Granted = granted
-			b.Remaining = math.Min(remaining, granted)
-			b.Consumed = granted - b.Remaining
-			b.GrantedAt = time.UnixMilli(b.GrantedAtMS)
-			b.ExpiresAt = time.UnixMilli(b.ExpiresAtMS)
+			out = append(out, b)
 		}
-		out = append(out, details...)
 		if len(out) >= *total || len(details) == 0 {
 			if len(out) < *total {
 				return nil, nil
@@ -5773,6 +6250,9 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, &RefusedError{Status: resp.StatusCode}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
 	}
@@ -5780,6 +6260,11 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 }
 
 // PlanTitle reads the plan's name as the console says it.
+//
+// The reference gives up quietly when the name cannot be read and the
+// usage card names the tier instead. This keeps the error, so that a
+// caller can tell a plan without a name from a plan that could not be
+// read; the manager treats a failure as no name, as the reference does.
 func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string, error) {
 	path := c.platform + site.PlanTitlePath + "?biz_line=2&cycle_type=1&resource_package_type=7"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
@@ -5800,6 +6285,9 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 	if err != nil {
 		return "", err
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", &RefusedError{Status: resp.StatusCode}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
 	}
@@ -5809,7 +6297,7 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 		} `json:"current_subscribe"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
-		return "", fmt.Errorf("M Plan: not JSON")
+		return "", fmt.Errorf("M Plan: not JSON: %w", err)
 	}
 	if env.CurrentSubscribe == nil {
 		return "", nil
@@ -5819,11 +6307,260 @@ func (c *Client) PlanTitle(ctx context.Context, access, groupID string) (string,
 
 // Models gives the site's models.
 //
-// The built-in list is what the site is known to have. The live list
-// is asked for by whoever needs it — the gateway's /v1/models — so
-// that a fallback and a live read are not confused with each other.
+// The live list is asked for with the account's own token, the way the
+// reference asks for it: the site's own answer, the list without a
+// token when the account's one is refused, and the built-in list when
+// the live one cannot be read. The built-in list is what the site is
+// known to have, so a fallback and a live read are not confused with
+// each other.
 func (c *Client) Models(access string) []site.Model {
-	return site.FallbackModels()
+	if c.up == nil {
+		return site.FallbackModels()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), modelsTimeout)
+	defer cancel()
+	body, status, ok := c.modelsOnce(ctx, access)
+	if !ok && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+		// The account's own token was turned away: the site's list is
+		// asked for without one.
+		body, _, ok = c.modelsOnce(ctx, "")
+	}
+	if !ok {
+		return site.FallbackModels()
+	}
+	ms := parseModels(body)
+	if len(ms) == 0 {
+		return site.FallbackModels()
+	}
+	return ms
+}
+
+// modelsOnce asks the site for its model list.
+//
+// The model list is on the chat host, which is the account host today:
+// the two are the same host, and the path is the chat's.
+func (c *Client) modelsOnce(ctx context.Context, access string) ([]byte, int, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+site.ModelsPath+"?"+site.ModelsQuery, nil)
+	if err != nil {
+		return nil, 0, false
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "identity")
+	if access != "" {
+		req.Header.Set("Authorization", "Bearer "+access)
+	}
+	resp, err := c.up.Do(req)
+	if err != nil {
+		return nil, 0, false
+	}
+	body, err := upstream.ReadBody(resp)
+	if err != nil {
+		return nil, resp.StatusCode, false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, resp.StatusCode, false
+	}
+	return body, resp.StatusCode, true
+}
+
+// modelProvider is one provider of the model config.
+type modelProvider struct {
+	ProviderID string          `json:"providerId"`
+	Config     json.RawMessage `json:"config"`
+}
+
+// modelConfig is the models of one provider.
+//
+// The models are kept as they were written: Go's maps have no order,
+// and the answer's order is the order the site's models are listed in.
+type modelConfig struct {
+	Models     json.RawMessage `json:"models"`
+	ModelOrder []string        `json:"model_order"`
+}
+
+// modelEntry is one model of the config.
+type modelEntry struct {
+	Name       string `json:"name"`
+	Reasoning  *bool  `json:"reasoning"`
+	Attachment *bool  `json:"attachment"`
+	Limit      struct {
+		Context json.Number `json:"context"`
+		Output  json.Number `json:"output"`
+	} `json:"limit"`
+	Modalities struct {
+		Input []string `json:"input"`
+	} `json:"modalities"`
+	ThinkingConfig struct {
+		Mode string `json:"mode"`
+	} `json:"thinking_config"`
+	Thinking *struct {
+		EffortOptions    []string `json:"effortOptions"`
+		EffortOptionsAlt []string `json:"effort_options"`
+	} `json:"thinking"`
+	EffortOptions []string `json:"effort_options"`
+}
+
+// parseModels reads MiniMax Code's model config as models.
+//
+// The answer is {providers:[{providerId:"minimax",config:{models:{<id>:{…}},
+// model_order?}}]}. The models come in the order model_order gives
+// them, the rest in the order the answer wrote them.
+func parseModels(body []byte) []site.Model {
+	var env struct {
+		Providers []modelProvider `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil
+	}
+	var cfg *modelConfig
+	for i := range env.Providers {
+		if env.Providers[i].ProviderID != "minimax" {
+			continue
+		}
+		var c modelConfig
+		if err := json.Unmarshal(env.Providers[i].Config, &c); err != nil {
+			continue
+		}
+		cfg = &c
+		break
+	}
+	if cfg == nil || len(cfg.Models) == 0 {
+		return nil
+	}
+	models := map[string]json.RawMessage{}
+	if json.Unmarshal(cfg.Models, &models) != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(models))
+	seen := map[string]bool{}
+	for _, id := range cfg.ModelOrder {
+		if _, ok := models[id]; ok && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range jsonKeys(cfg.Models) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	out := make([]site.Model, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		var e modelEntry
+		if err := json.Unmarshal(models[id], &e); err != nil {
+			continue
+		}
+		m := site.Model{ID: id, Name: id}
+		if name := strings.TrimSpace(e.Name); name != "" {
+			m.Name = name
+		}
+		if f, err := e.Limit.Context.Float64(); err == nil && f > 0 {
+			m.Context = int(f)
+		}
+		if f, err := e.Limit.Output.Float64(); err == nil && f > 0 {
+			m.Output = int(f)
+		}
+		inputs := []string{"text"}
+		for _, k := range e.Modalities.Input {
+			k = strings.ToLower(k)
+			if k == "" || k == "text" {
+				continue
+			}
+			inputs = append(inputs, k)
+		}
+		// A model said to take attachments takes images, as before #985.
+		if e.Attachment != nil && *e.Attachment && !hasInput(inputs, "image") {
+			inputs = append(inputs, "image")
+		}
+		m.Inputs = inputs
+		m.Thinking = modelThinking(e)
+		m.Efforts = modelEfforts(e)
+		out = append(out, m)
+	}
+	return out
+}
+
+// modelThinking says how a model handles thinking.
+func modelThinking(e modelEntry) site.Thinking {
+	switch strings.TrimSpace(e.ThinkingConfig.Mode) {
+	case "switchable":
+		return site.ThinkingSwitchable
+	case "forced_off":
+		return site.ThinkingOff
+	case "forced_on":
+		return site.ThinkingForcedOn
+	}
+	if e.Reasoning != nil && !*e.Reasoning {
+		return site.ThinkingOff
+	}
+	return site.ThinkingOn
+}
+
+// modelEfforts are the reasoning levels the model takes.
+func modelEfforts(e modelEntry) []string {
+	var all []string
+	if e.Thinking != nil {
+		if len(e.Thinking.EffortOptions) > 0 {
+			all = e.Thinking.EffortOptions
+		} else {
+			all = e.Thinking.EffortOptionsAlt
+		}
+	}
+	if len(all) == 0 {
+		all = e.EffortOptions
+	}
+	out := []string{}
+	for _, v := range all {
+		v = strings.TrimSpace(v)
+		if v == "" || v == "default" || v == "none" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// hasInput says the kinds of input already name one.
+func hasInput(inputs []string, k string) bool {
+	for _, in := range inputs {
+		if in == k {
+			return true
+		}
+	}
+	return false
+}
+
+// jsonKeys gives an object's keys in the order the answer wrote them.
+//
+// Go's maps have no order, and the answer's order is the order the
+// site's models are listed in.
+func jsonKeys(raw json.RawMessage) []string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	var keys []string
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return keys
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return keys
+		}
+		keys = append(keys, key)
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return keys
+		}
+	}
+	return keys
 }
 
 // ParseAmount reads a ledger amount.
@@ -5889,6 +6626,7 @@ package account
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -5900,19 +6638,24 @@ import (
 	"mmxcode/internal/upstream"
 )
 
-// signKV is one query parameter for a signed call.
-type signKV = sign.KV
+// QueryKV is one query parameter for a signed call.
+type QueryKV = sign.KV
 
-// call sends one signed account API request.
+// Call sends one signed account API request.
 //
 // The body is "{}" for a POST and nil for a GET, as MiniMax Code sends
-// it. The answer's business codes are checked before it is handed back.
-func (c *Client) call(ctx context.Context, access, userID, method, path string, body []byte, query []signKV) ([]byte, error) {
+// it. What is signed is exactly what goes on the wire: a POST whose
+// body was not given sends "{}" and signs "{}". The answer's business
+// codes are checked before it is handed back.
+func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []QueryKV) ([]byte, error) {
 	now := c.now()
+	// The reference signs the bytes it sends: a POST's body, or "{}"
+	// when it has none. A signature over anything else is refused.
+	wire := wireBody(method, body)
 	signed := sign.Sign(c.base, path, sign.Options{
 		Access:   access,
 		UserID:   userID,
-		Body:     body,
+		Body:     wire,
 		Query:    query,
 		Now:      now.UnixMilli(),
 		TZOffset: c.tzOffset,
@@ -5922,7 +6665,7 @@ func (c *Client) call(ctx context.Context, access, userID, method, path string, 
 	var req *http.Request
 	var err error
 	if method == http.MethodPost {
-		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(body)))
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(wire)))
 	} else {
 		req, err = http.NewRequestWithContext(ctx, method, signed.URL, nil)
 	}
@@ -5946,7 +6689,7 @@ func (c *Client) call(ctx context.Context, access, userID, method, path string, 
 		return nil, &RefusedError{Status: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, &statusError{status: resp.StatusCode}
 	}
 	if err := upstream.CheckEnvelope("account", raw); err != nil {
 		return nil, err
@@ -5954,8 +6697,24 @@ func (c *Client) call(ctx context.Context, access, userID, method, path string, 
 	return raw, nil
 }
 
+// wireBody is the body that goes on the wire and into the signature.
+//
+// The reference's signing sends a GET without a body and a POST with
+// the body it is given, an empty one as "{}". The two have to be the
+// same bytes: a signature made over something else is refused.
+func wireBody(method string, body []byte) []byte {
+	if method != http.MethodPost {
+		return nil
+	}
+	if len(body) == 0 {
+		return []byte("{}")
+	}
+	return body
+}
+
 // RefusedError is a refusal of the sign-in.
 type RefusedError struct {
+	// Status is the HTTP status the refusal came with.
 	Status int
 }
 
@@ -5964,34 +6723,25 @@ func (e *RefusedError) Error() string {
 	return fmt.Sprintf("the sign-in was refused (HTTP %d)", e.Status)
 }
 
+// Is says whether the error is the upstream's refusal of the sign-in.
+//
+// A refused sign-in is one event, whatever shape it arrives in: an
+// HTTP 401 or 403, or MiniMax's own code 1000048 in the body of a
+// 200. errors.Is(err, upstream.ErrSignInRefused) tells it apart from
+// every other error.
+func (e *RefusedError) Is(target error) bool {
+	return target == upstream.ErrSignInRefused
+}
+
 // isNotFound says an error is a 404.
 func isNotFound(err error) bool {
-	var re *statusError
-	return asStatus(err, &re) && re.status == http.StatusNotFound
+	var se *statusError
+	return errors.As(err, &se) && se.status == http.StatusNotFound
 }
 
 type statusError struct{ status int }
 
 func (e *statusError) Error() string { return "HTTP " + strconv.Itoa(e.status) }
-
-// asStatus unwraps an error into a status error.
-//
-// The call helper returns a plain fmt.Errorf for a bad status, so the
-// status is carried in a typed error instead of a formatted string.
-func asStatus(err error, target **statusError) bool {
-	for err != nil {
-		if se, ok := err.(*statusError); ok {
-			*target = se
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
-}
 
 // parsePlanWindows reads the console's answer as windows.
 func parsePlanWindows(raw []byte) ([]Window, error) {
@@ -6021,10 +6771,16 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("no plan in the reply")
+		return nil, fmt.Errorf("no plan in the reply: %w", err)
 	}
 	if env.BaseResp != nil && env.BaseResp.StatusCode != 0 {
-		return nil, fmt.Errorf("%s", env.BaseResp.StatusMsg)
+		// The reference names the status code when the answer has no
+		// message of its own: an error with an empty text says nothing.
+		msg := strings.TrimSpace(env.BaseResp.StatusMsg)
+		if msg == "" {
+			msg = fmt.Sprintf("MiniMax said %d", env.BaseResp.StatusCode)
+		}
+		return nil, errors.New(msg)
 	}
 	var out []Window
 	for _, m := range env.ModelRemains {
@@ -6089,7 +6845,9 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			// The site counts the items a window has. A count that is
 			// not there is zero, the way the reference reads it, so a
 			// window with a limit and no count yet is "0 of 150" and
-			// not "unknown".
+			// not "unknown". A count that is negative is not a count
+			// at all: the reference wants the count to be at least
+			// zero, or the window has no limit to show.
 			items, of := 0.0, 0.0
 			if x.usedCnt != nil {
 				items = *x.usedCnt
@@ -6097,7 +6855,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			if x.totalCnt != nil {
 				of = *x.totalCnt
 			}
-			if of > 0 && items <= of {
+			if items >= 0 && of > 0 && items <= of {
 				w.Amount = items
 				if status == 2 {
 					// A spent window counts its whole limit.
@@ -6204,8 +6962,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/upstream"
 )
 
 // panel makes a seven-day panel, with the given day's status.
@@ -6260,6 +7022,14 @@ func boolstr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func testAccountClient(t *testing.T, srv *httptest.Server) *account.Client {
+	t.Helper()
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	c := account.New(up)
+	c.SetBase(srv.URL, srv.URL)
+	return c
 }
 
 func TestAlreadyCheckedIn(t *testing.T) {
@@ -6392,6 +7162,72 @@ func TestNoPanel(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// TestRefusedByHTTP says a 401 is a failed check-in, not an error.
+//
+// 401 是“签到被拒”，是一个结果，不是一个意外。
+func TestRefusedByHTTP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid access token"}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", out.Outcome, OutcomeFailed)
+	}
+}
+
+// TestRefusedByBusinessCode says MiniMax's own refusal is the same event.
+//
+// 200 的回答里带 1000048，和 401 是一件事：签到被拒。
+func TestRefusedByBusinessCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", out.Outcome, OutcomeFailed)
+	}
+}
+
+// TestUnknownClaimResult says a claim that says nothing is not a claim.
+//
+// 回答里没有 claim_result 时，不能当成“已经签到过了”——那会把一次
+// 没有发生的签到记成完成了。
+func TestUnknownClaimResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(panel(2, true)))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{}}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err == nil {
+		t.Fatalf("outcome = %+v, want an error", out)
+	}
+	if !strings.Contains(err.Error(), "claim_result") {
+		t.Fatalf("error = %q", err.Error())
+	}
+}
 ```
 
 测试文件的 import 补上 `"mmxcode/internal/account"` 与 `"mmxcode/internal/upstream"`，并加助手：
@@ -6444,11 +7280,14 @@ package checkin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/site"
+	"mmxcode/internal/upstream"
 )
 
 // The outcomes.
@@ -6482,9 +7321,12 @@ func New(acc *account.Client) *Client { return &Client{acc: acc} }
 
 // Run reads the panel and claims today's credits.
 //
-// A 401 is answered the way MiniMax Code answers it: the sign-in is
-// renewed and the check-in is asked once more. The renewal is the
-// caller's job, so Run asks through the renewer it is given.
+// The sign-in is the caller's business: the caller renews the token
+// before it calls, and Run neither renews nor tries again. What Run
+// does with a refused sign-in — an HTTP 401 or 403, or MiniMax's own
+// refusal code in the body of a 200 — is to answer OutcomeFailed
+// instead of an error: a refused sign-in is one event, however it
+// arrives.
 func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error) {
 	if userID == "" {
 		id, err := c.acc.Identity(ctx, access, "")
@@ -6498,14 +7340,14 @@ func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error
 		return out, nil
 	}
 	var refused *account.RefusedError
-	if !asRefused(err, &refused) {
-		return Outcome{}, err
+	if errors.As(err, &refused) || errors.Is(err, upstream.ErrSignInRefused) {
+		return Outcome{Outcome: OutcomeFailed, Message: err.Error()}, nil
 	}
-	return Outcome{Outcome: OutcomeFailed, Message: err.Error()}, nil
+	return Outcome{}, err
 }
 
 func (c *Client) run(ctx context.Context, access, userID string) (Outcome, error) {
-	raw, err := c.acc.Call(ctx, access, userID, http.MethodGet, "/minimax-cloud/api/v1/signin/status", nil, checkinQuery())
+	raw, err := c.acc.Call(ctx, access, userID, http.MethodGet, site.SigninStatusPath, nil, account.CheckinQuery())
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -6527,38 +7369,68 @@ func (c *Client) run(ctx context.Context, access, userID string) (Outcome, error
 	case 4:
 		return Outcome{Outcome: OutcomeIneligible}, nil
 	case 2:
-		claimRaw, err := c.acc.Call(ctx, access, userID, http.MethodPost, "/minimax-cloud/api/v1/signin/claim", []byte("{}"), checkinQuery())
+		claimRaw, err := c.acc.Call(ctx, access, userID, http.MethodPost, site.SigninClaimPath, []byte("{}"), account.CheckinQuery())
 		if err != nil {
 			return Outcome{}, err
 		}
 		var env struct {
 			Data struct {
-				ClaimResult *int     `json:"claim_result"`
-				Points      *float64 `json:"points"`
+				ClaimResult json.RawMessage `json:"claim_result"`
+				Points      *float64        `json:"points"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(claimRaw, &env); err != nil {
-			return Outcome{}, fmt.Errorf("check-in: not JSON")
+			return Outcome{}, fmt.Errorf("check-in: not JSON: %w", err)
 		}
 		out := Outcome{Outcome: OutcomeDone}
-		if env.Data.Points != nil {
+		if env.Data.Points != nil && *env.Data.Points > 0 {
 			out.Credit = *env.Data.Points
 		}
-		if env.Data.ClaimResult != nil {
-			switch *env.Data.ClaimResult {
-			case 1:
-				out.Outcome = OutcomeClaimed
-				out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
-			case 2:
-				out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
-			default:
-				return Outcome{}, fmt.Errorf("check-in: unknown claim_result %d", *env.Data.ClaimResult)
-			}
+		// The claim answers 1 when it claimed now and 2 when the day
+		// was already claimed. Anything else is not a claim: the
+		// reference throws for it, and so does this. A check-in that
+		// is not known is not a check-in that was done.
+		result, ok := claimResult(env.Data.ClaimResult)
+		if !ok {
+			return Outcome{}, fmt.Errorf("check-in: unknown claim_result %s", claimText(env.Data.ClaimResult))
+		}
+		switch result {
+		case 1:
+			out.Outcome = OutcomeClaimed
+			out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
+		case 2:
+			out.Streak = streakFrom(days, indexOf(days, today)-1) + 1
+		default:
+			return Outcome{}, fmt.Errorf("check-in: unknown claim_result %v", result)
 		}
 		return out, nil
 	default:
 		return Outcome{Outcome: OutcomeInactive}, nil
 	}
+}
+
+// claimResult reads the claim's answer as the reference reads it: a
+// number above zero, and nothing else.
+func claimResult(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) != nil {
+		return 0, false
+	}
+	if f <= 0 {
+		return 0, false
+	}
+	return f, true
+}
+
+// claimText is what the answer said, for the error's text.
+func claimText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "undefined"
+	}
+	return string(raw)
 }
 
 // day is one day of the panel.
@@ -6577,7 +7449,7 @@ func parsePanel(raw []byte) ([]day, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("check-in: not JSON")
+		return nil, fmt.Errorf("check-in: not JSON: %w", err)
 	}
 	days := env.Data.Days
 	if len(days) == 0 {
@@ -6620,31 +7492,6 @@ func streakFrom(days []day, i int) int {
 		n++
 	}
 	return n
-}
-
-// checkinQuery is the query MiniMax Code's own check-in sends.
-func checkinQuery() []account.QueryKV {
-	return []account.QueryKV{
-		{K: "device_platform", V: "web"},
-		{K: "is_desktop", V: "1"},
-		{K: "desktop_version", V: "0.6.12"},
-	}
-}
-
-// asRefused unwraps an error into a refusal.
-func asRefused(err error, target **account.RefusedError) bool {
-	for err != nil {
-		if re, ok := err.(*account.RefusedError); ok {
-			*target = re
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }
 ```
 
