@@ -3368,7 +3368,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			Path:      upPath,
 			Access:    tok.Access,
 			SessionID: mavisSession,
-			TZOffset:  -time.Now().Zone() * 3600,
+			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
+			// 和 Go 的 Offset() 是同一个值。
+			TZOffset:  int(time.Now().Offset()),
 			Body:      upBody,
 			Stream:    stream,
 			Anthropic: upPath == site.MessagesPath,

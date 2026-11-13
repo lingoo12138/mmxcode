@@ -4813,7 +4813,9 @@ func New(up *upstream.Client) *Client {
 	return &Client{
 		up:       up,
 		now:      time.Now,
-		tzOffset: -time.Now().Zone() * 3600,
+		// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
+		// 和 Go 的 Offset() 是同一个值。
+		tzOffset: int(time.Now().Offset()),
 		osName:   runtime.GOOS,
 	}
 }
