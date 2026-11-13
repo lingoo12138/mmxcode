@@ -3410,6 +3410,106 @@ func TestPollDeviceSuccess(t *testing.T) {
 	}
 }
 
+func TestPollKeepsWaitingWhilePending(t *testing.T) {
+	// 用户还没点授权：token 端点用 400 加 authorization_pending 回答。
+	// 这是正常状态，接着等就是了 —— 当成失败的话，每一次登录都死在
+	// 第一轮轮询上。
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"authorization_pending"}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "acc-token",
+			"refresh_token": "ref-token",
+			"expires_in":    3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv)
+	d := &Device{
+		userCode: "ABCD", verifier: "v",
+		pollField: "device_code", pollValue: "dev-1",
+		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
+	}
+	tok, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("polled %d times, want 3", calls)
+	}
+	if tok.Access != "acc-token" {
+		t.Fatalf("token = %+v", tok)
+	}
+}
+
+func TestPollKeepsWaitingByStatus(t *testing.T) {
+	// 另一种写法：200 加 status=pending。
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 2 {
+			json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "acc-token",
+			"refresh_token": "ref-token",
+			"expires_in":    3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv)
+	d := &Device{
+		userCode: "ABCD", verifier: "v",
+		pollField: "device_code", pollValue: "dev-1",
+		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
+	}
+	if _, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("polled %d times, want 2", calls)
+	}
+}
+
+func TestPollSlowDown(t *testing.T) {
+	// slow_down 是让我们等久一点，不是失败。
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 2 {
+			json.NewEncoder(w).Encode(map[string]any{"error": "slow_down"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "acc-token",
+			"refresh_token": "ref-token",
+			"expires_in":    3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv)
+	d := &Device{
+		userCode: "ABCD", verifier: "v",
+		pollField: "device_code", pollValue: "dev-1",
+		deadline: time.Now().Add(time.Minute), interval: time.Millisecond,
+	}
+	if _, err := d.Poll(context.Background(), c, srv.URL+"/oauth2/token"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("polled %d times, want 2", calls)
+	}
+}
+
 func TestPollDeviceDenied(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"error": "access_denied"})
@@ -3716,13 +3816,24 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		if err := json.Unmarshal(body, &b); err != nil {
 			return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode}
 		}
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		httpOK := resp.StatusCode >= 200 && resp.StatusCode <= 299
+		code := strings.ToLower(b.Error)
+		status := strings.ToLower(b.Status)
+
+		// 用户还没点授权是正常状态，不是错误。RFC 8628 就是这么说的：
+		// token 端点用 400 加 authorization_pending 回答。这不能当失败，
+		// 得接着等 —— 当成失败的话，每一次登录都死在第一轮轮询上。
+		if code == "authorization_pending" {
+			continue
+		}
+		if code == "slow_down" {
+			wait += 5 * time.Second
+			continue
+		}
+		if !httpOK {
 			return nil, oauthError(resp.StatusCode, body)
 		}
-		if b.Error != "" && b.Error != "authorization_pending" && b.Error != "slow_down" {
-			return nil, oauthError(resp.StatusCode, body)
-		}
-		switch strings.ToLower(b.Status) {
+		switch status {
 		case "pending":
 			continue
 		case "slow_down":
@@ -3732,6 +3843,9 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 			return nil, &Error{Code: "access_denied"}
 		case "expired", "expired_token":
 			return nil, &Error{Code: "expired_token"}
+		}
+		if b.Error != "" {
+			return nil, oauthError(resp.StatusCode, body)
 		}
 		if b.AccessToken == "" || b.ExpiresIn <= 0 {
 			return nil, &Error{Code: "invalid_token_response", HTTPStatus: resp.StatusCode}
