@@ -118,9 +118,16 @@ func Load(path string) (Config, error) {
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
+	//
+	// 注意这只管结构体的字段。map 的键名管不了：出口组的名字是配置
+	// 自己定的，加载器没有一份已知的名单可比。组名写错由设置出口组的
+	// 地方挡（CLI 与 WebUI 都查配置里有没有这个组）。
 	dec.KnownFields(true)
 	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
-	if err := dec.Decode(&c); err != nil && err != io.EOF {
+	if err := dec.Decode(&c); err != nil {
+		if err == io.EOF {
+			return c, nil
+		}
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {

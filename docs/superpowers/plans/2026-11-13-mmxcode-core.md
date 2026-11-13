@@ -283,8 +283,7 @@ func TestDurationYAML(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Go 的 Duration.String() 总是带秒：90 分钟是 1h30m0s，不是 1h30m
-	if string(b) != "1h30m0s
-" {
+	if string(b) != "1h30m0s\n" {
 		t.Fatalf("marshalled = %q", b)
 	}
 	// 写出来要能读回去
@@ -330,8 +329,7 @@ func TestLoadEmptyFile(t *testing.T) {
 
 func TestLoadCommentOnlyFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := writeFile(path, "# 只有注释
-"); err != nil {
+	if err := writeFile(path, "# 只有注释\n"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err != nil {
@@ -348,9 +346,7 @@ func TestLoadMissingFile(t *testing.T) {
 func TestLoadRejectsUnknownKey(t *testing.T) {
 	// 键名写错时必须报错。拼错一个出口组名，静默走全局默认是很坏的失败方式。
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := writeFile(path, "server:
-  listenn: \":9090\"
-"); err != nil {
+	if err := writeFile(path, "server:\n  listenn: \":9090\"\n"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil {
