@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,17 +125,18 @@ func TestDurationYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Go 把 90 分钟写成 "1h30m0s"，yaml 也就不必加引号。
-	if string(b) != "1h30m0s\n" {
+	// 写出来的形状由标准库决定（Duration.String() 总是带秒），
+	// 要守的是"写出来能读回去"。
+	if !strings.Contains(string(b), "1h30m0s") {
 		t.Fatalf("marshalled = %q", b)
 	}
-	// 写出去的东西要能读回来。
+	// 写出来要能读回来
 	var back Duration
 	if err := yaml.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
 	}
 	if back.Duration() != 90*time.Minute {
-		t.Fatalf("round trip = %v, want 90m", back.Duration())
+		t.Fatalf("round trip = %v", back.Duration())
 	}
 }
 
@@ -154,25 +157,7 @@ func TestLoadEmptyPath(t *testing.T) {
 	}
 }
 
-func TestLoadMissingFile(t *testing.T) {
-	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
-		t.Fatal("expected an error")
-	}
-}
-
-func TestLoadRejectsUnknownKey(t *testing.T) {
-	// 键名写错时必须报错。拼错一个出口组名，静默走全局默认是很坏的失败方式。
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := writeFile(path, "server:\n  listenn: \":9090\"\n"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("expected an error for the unknown key")
-	}
-}
-
 func TestLoadEmptyFile(t *testing.T) {
-	// 空文件不是错误：默认值就是完整配置。
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := writeFile(path, ""); err != nil {
 		t.Fatal(err)
@@ -182,7 +167,7 @@ func TestLoadEmptyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.Server.Listen != ":8080" {
-		t.Fatalf("listen = %q, want :8080", c.Server.Listen)
+		t.Fatalf("listen = %q", c.Server.Listen)
 	}
 }
 
@@ -191,12 +176,130 @@ func TestLoadCommentOnlyFile(t *testing.T) {
 	if err := writeFile(path, "# 只有注释\n"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadMissingFile(t *testing.T) {
+	if _, err := Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestLoadRejectsUnknownKey(t *testing.T) {
+	// 结构体的字段名写错时必须报错。出口组的名字不在这里查，见
+	// config.go 里关于 KnownFields 的说明。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  listenn: \":9090\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the unknown key")
+	} else if !strings.Contains(err.Error(), "listenn") {
+		t.Fatalf("error %q does not name the bad key", err)
+	}
+}
+
+func TestLoadRejectsTwoDocuments(t *testing.T) {
+	// 一个文件里只该有一份配置。Decode 一次只读一个文档，第二个会被
+	// 悄悄丢掉 —— 配置的一半就没了。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  listen: \":1\"\n---\nserver:\n  listen: \":2\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for the second document")
+	}
+}
+
+func TestLoadAllowsTrailingSeparator(t *testing.T) {
+	// 结尾一个裸的 "---" 是空文档，不是第二份配置。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "server:\n  listen: \":1\"\n---\n"); err != nil {
+		t.Fatal(err)
+	}
 	c, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Server.Listen != ":8080" {
-		t.Fatalf("listen = %q, want :8080", c.Server.Listen)
+	if c.Server.Listen != ":1" {
+		t.Fatalf("listen = %q", c.Server.Listen)
+	}
+}
+
+func TestLoadNullGroupsBecomesEmptyMap(t *testing.T) {
+	// WebUI 要遍历出口组，nil map 会让它炸。
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, "proxy:\n  groups:\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Proxy.Groups == nil {
+		t.Fatal("groups is nil")
+	}
+	if len(c.Proxy.Groups) != 0 {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
+	}
+}
+
+func TestConfigYAMLRoundTrip(t *testing.T) {
+	// CLI 与 WebUI 都要把配置写回文件，写出来要能读回来。
+	c := Default()
+	c.Proxy.Groups["warp"] = "socks5h://warp:4000"
+	c.Server.APIKeys = []string{"sk-a"}
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, string(b)); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Upstream.Timeout.Duration() != c.Upstream.Timeout.Duration() {
+		t.Fatalf("timeout = %v, want %v", back.Upstream.Timeout.Duration(), c.Upstream.Timeout.Duration())
+	}
+	if back.Proxy.Groups["warp"] != c.Proxy.Groups["warp"] {
+		t.Fatalf("groups = %v", back.Proxy.Groups)
+	}
+	if back.Schedule.CheckinAt != c.Schedule.CheckinAt || back.DB != c.DB {
+		t.Fatalf("round trip lost data: %+v", back)
+	}
+	if len(back.Server.APIKeys) != 1 || back.Server.APIKeys[0] != "sk-a" {
+		t.Fatalf("api keys = %v", back.Server.APIKeys)
+	}
+}
+
+func TestDurationRejectsNegative(t *testing.T) {
+	// 负的时长到用的时候就是"没有超时"，请求会一直挂着。
+	var d Duration
+	if err := yaml.Unmarshal([]byte(`"-5s"`), &d); err == nil {
+		t.Fatal("expected an error for the negative duration")
+	}
+}
+
+func TestDurationJSON(t *testing.T) {
+	// WebUI 读配置用 JSON，时长要写成字符串，不是纳秒数。
+	b, err := json.Marshal(Duration(90 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `"1h30m0s"` {
+		t.Fatalf("marshalled = %s", b)
+	}
+	var d Duration
+	if err := json.Unmarshal(b, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Duration() != 90*time.Minute {
+		t.Fatalf("d = %v", d.Duration())
 	}
 }
 

@@ -16,7 +16,7 @@ func TestPathsAreBare(t *testing.T) {
 		DeviceCodePath, TokenPath,
 		ModelsPath, MessagesPath, ChatCompletionsPath, ResponsesPath,
 		IdentityPath, WorkspacePath, MembershipPath, CreditPath,
-		SigninStatus, SigninClaim,
+		SigninStatusPath, SigninClaimPath,
 		PlanRemainsPath, CodingPlanPath, PlanTitlePath,
 	}
 	for _, p := range paths {
@@ -25,6 +25,9 @@ func TestPathsAreBare(t *testing.T) {
 		}
 		if strings.Contains(p, "://") {
 			t.Errorf("path %q carries a host", p)
+		}
+		if strings.ContainsAny(p, "?#") {
+			t.Errorf("path %q carries a query or a fragment", p)
 		}
 	}
 }
@@ -39,6 +42,9 @@ func TestURLHelpers(t *testing.T) {
 	}
 	if got := PlatformURL(PlanRemainsPath); got != PlatformHost+"/backend/account/token_plan/remains_percent" {
 		t.Errorf("PlatformURL = %q", got)
+	}
+	if got := AgentURL(SigninStatusPath); got != AgentHost+"/minimax-cloud/api/v1/signin/status" {
+		t.Errorf("AgentURL = %q", got)
 	}
 }
 

@@ -37,8 +37,11 @@ const (
 	// PlaceholderKey is the key MiniMax Code gives its SDK; the account
 	// itself goes in Authorization.
 	PlaceholderKey = "sk-xxx"
-	// UserAgent is what MiniMax Code calls itself.
+	// UserAgent is what MiniMax Code calls itself when it chats.
 	UserAgent = "MiniMaxAgent"
+	// AccountUserAgent is what MiniMax Code calls itself when it signs
+	// an account API request.
+	AccountUserAgent = "MiniMaxCode"
 	// AgentID is MiniMax Code's agent id.
 	AgentID = "main"
 )
@@ -63,12 +66,12 @@ const (
 	ResponsesPath       = "/mavis/api/v1/llm/v1/responses"
 
 	// The account API's endpoints, on AgentHost.
-	IdentityPath   = "/v1/api/user/info"
-	WorkspacePath  = "/matrix/api/v1/user/get_user_extra_info"
-	MembershipPath = "/matrix/api/v1/commerce/get_membership_info"
-	CreditPath     = "/minimax-cloud/api/v1/credit/details"
-	SigninStatus   = "/minimax-cloud/api/v1/signin/status"
-	SigninClaim    = "/minimax-cloud/api/v1/signin/claim"
+	IdentityPath     = "/v1/api/user/info"
+	WorkspacePath    = "/matrix/api/v1/user/get_user_extra_info"
+	MembershipPath   = "/matrix/api/v1/commerce/get_membership_info"
+	CreditPath       = "/minimax-cloud/api/v1/credit/details"
+	SigninStatusPath = "/minimax-cloud/api/v1/signin/status"
+	SigninClaimPath  = "/minimax-cloud/api/v1/signin/claim"
 
 	// The plan console's endpoints, on PlatformHost.
 	PlanRemainsPath = "/backend/account/token_plan/remains_percent"
@@ -76,8 +79,21 @@ const (
 	PlanTitlePath   = "/v1/api/openplatform/charge/combo/cycle_audio_resource_package"
 )
 
+// ModelsQuery is the query the model list endpoint needs.
+//
+// It is the only endpoint with a query of its own, so it lives here
+// rather than being spelled out at the call site.
+const ModelsQuery = "region=en&buildEnv=prod"
+
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
+
+// AgentURL gives an account API endpoint's full URL.
+//
+// AgentHost and LLMHost are the same host today. That is exactly why
+// this helper is worth having: a call site that picks the wrong one
+// would not notice.
+func AgentURL(path string) string { return AgentHost + path }
 
 // LLMURL gives a chat endpoint's full URL.
 func LLMURL(path string) string { return LLMHost + path }

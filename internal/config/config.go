@@ -6,6 +6,8 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,9 +25,9 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&s); err != nil {
 		return err
 	}
-	v, err := time.ParseDuration(s)
+	v, err := parseDuration(s)
 	if err != nil {
-		return fmt.Errorf("duration %q: %w", s, err)
+		return err
 	}
 	*d = Duration(v)
 	return nil
@@ -33,6 +35,45 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 
 // MarshalYAML writes the duration back as a string.
 func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+
+// MarshalJSON writes the duration as a string.
+//
+// Not as a number of nanoseconds: the WebUI reads the configuration as
+// JSON, and 120000000000 means nothing to it.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// UnmarshalJSON reads a duration from a string.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := parseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(v)
+	return nil
+}
+
+// parseDuration reads a duration, refusing the impossible ones.
+//
+// A negative duration is refused here, at the last gate before the
+// configuration is used: everywhere a timeout is read, "not positive"
+// means "no timeout at all", so a stray minus sign would quietly turn
+// into a request that never comes back.
+func parseDuration(s string) (time.Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	}
+	return v, nil
+}
 
 // String is the duration's own text.
 func (d Duration) String() string { return time.Duration(d).String() }
@@ -107,6 +148,12 @@ func Default() Config {
 //
 // An empty path gives the defaults alone, which is what the CLI wants
 // when it runs without a config file.
+//
+// On an error the configuration returned is the zero value: a half-read
+// configuration is worse than none.
+//
+// The groups map is shared with the returned configuration. It is
+// read-only: whoever wants to change a group copies it first.
 func Load(path string) (Config, error) {
 	c := Default()
 	if path == "" {
@@ -114,7 +161,7 @@ func Load(path string) (Config, error) {
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return c, fmt.Errorf("read config: %w", err)
+		return Config{}, fmt.Errorf("read config: %w", err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
@@ -128,10 +175,43 @@ func Load(path string) (Config, error) {
 		if err == io.EOF {
 			return c, nil
 		}
-		return c, fmt.Errorf("parse config %s: %w", path, err)
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// 一个文件里只该有一份配置。Decode 一次只读一个文档，第二个会被
+	// 悄悄丢掉 —— 配置的一半就没了，连语法错都不报。宁可报错。
+	if err := oneDocument(dec); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.Proxy.Groups == nil {
 		c.Proxy.Groups = map[string]string{}
 	}
 	return c, nil
+}
+
+// oneDocument makes sure the file holds exactly one document.
+func oneDocument(dec *yaml.Decoder) error {
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); err {
+	case nil:
+		if !nullDocument(&extra) {
+			return errors.New("more than one YAML document")
+		}
+		return nil
+	case io.EOF:
+		return nil
+	default:
+		return err
+	}
+}
+
+// nullDocument is true for an empty document, which is what a file
+// ending in a bare "---" holds.
+func nullDocument(n *yaml.Node) bool {
+	if n.Kind == yaml.DocumentNode {
+		if len(n.Content) == 0 {
+			return true
+		}
+		return n.Content[0].Tag == "!!null"
+	}
+	return n.Tag == "!!null"
 }
