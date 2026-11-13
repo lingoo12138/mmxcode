@@ -767,10 +767,11 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 		// not the chat that was asked for. GetBody is what reads it a
 		// second time; without it the body cannot be replayed, so the
 		// answer is handed back as it came.
-		method, body := current.Method, current.Body
+		method, body, length := current.Method, current.Body, current.ContentLength
+		replay := false
 		if resp.StatusCode != 307 && resp.StatusCode != 308 {
 			if method != http.MethodGet && method != http.MethodHead {
-				method, body = http.MethodGet, nil
+				method, body, length = http.MethodGet, nil, 0
 			}
 		} else if body != nil {
 			if current.GetBody == nil {
@@ -781,6 +782,7 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 				return resp, nil
 			}
 			body = fresh
+			replay = true
 		}
 		resp.Body.Close()
 		nextReq, err := http.NewRequestWithContext(current.Context(), method, next.String(), body)
@@ -788,9 +790,19 @@ func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, err
 			return nil, err
 		}
 		nextReq.Header = current.Header.Clone()
-		// The body is a reader now, so the next hop would not know how
-		// to read it again. Keep the way to do it.
-		nextReq.GetBody = current.GetBody
+		if replay {
+			// The body came out of GetBody, which hands out a plain
+			// reader, and http.NewRequest only recognises bytes and
+			// strings readers. Without the length the replay would go
+			// out with no Content-Length at all, chunked instead of
+			// what the first request had.
+			if length != 0 {
+				nextReq.ContentLength = length
+			}
+			// The body is a reader now, so the next hop would not know
+			// how to read it again. Keep the way to do it.
+			nextReq.GetBody = current.GetBody
+		}
 		current = nextReq
 	}
 }
@@ -1122,6 +1134,7 @@ package rotator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -1344,38 +1357,62 @@ func TestWindowKey(t *testing.T) {
 在同一个文件末尾追加：
 
 ```go
-func TestSessionKeyFromHeaders(t *testing.T) {
+func TestSessionFromHeaders(t *testing.T) {
 	h := map[string][]string{
 		"X-Session-Id":      {"abc"},
 		"X-Conversation-Id": {"def"},
 	}
-	if got := SessionKey(h, "sys", "hello"); got != "abc" {
-		t.Fatalf("key = %q", got)
+	s := SessionOf(h, "sys", "hello")
+	if s.UpstreamID != "abc" {
+		t.Fatalf("upstream id = %q", s.UpstreamID)
 	}
 	h2 := map[string][]string{"X-Conversation-Id": {"def"}}
-	if got := SessionKey(h2, "sys", "hello"); got != "def" {
-		t.Fatalf("key = %q", got)
+	if got := SessionOf(h2, "sys", "hello"); got.UpstreamID != "def" {
+		t.Fatalf("upstream id = %q", got.UpstreamID)
 	}
 }
 
-func TestSessionKeyFromHash(t *testing.T) {
-	a := SessionKey(nil, "sys", "hello")
-	b := SessionKey(nil, "sys", "hello")
-	if a == "" {
-		t.Fatal("expected a key")
+func TestSessionKeyIsHashed(t *testing.T) {
+	// 客户端自己那串字符串不进数据库键
+	h := map[string][]string{"X-Session-Id": {"abc"}}
+	s := SessionOf(h, "sys", "hello")
+	if s.Key == "" {
+		t.Fatal("no key")
 	}
-	if a != b {
+	if strings.Contains(s.Key, "abc") {
+		t.Fatalf("key = %q, it holds the client's own string", s.Key)
+	}
+	if SessionOf(h, "sys", "hello").Key != s.Key {
 		t.Fatal("the same conversation gave two keys")
 	}
-	c := SessionKey(nil, "sys", "other")
-	if a == c {
+	other := SessionOf(map[string][]string{"X-Session-Id": {"def"}}, "sys", "hello")
+	if other.Key == s.Key {
 		t.Fatal("two conversations gave the same key")
 	}
 }
 
-func TestSessionKeyEmpty(t *testing.T) {
-	if got := SessionKey(nil, "", ""); got != "" {
-		t.Fatalf("key = %q", got)
+func TestSessionFromHash(t *testing.T) {
+	a := SessionOf(nil, "sys", "hello")
+	b := SessionOf(nil, "sys", "hello")
+	if a.Key == "" {
+		t.Fatal("expected a key")
+	}
+	if a.Key != b.Key {
+		t.Fatal("the same conversation gave two keys")
+	}
+	c := SessionOf(nil, "sys", "other")
+	if a.Key == c.Key {
+		t.Fatal("two conversations gave the same key")
+	}
+	if a.UpstreamID == "" {
+		t.Fatal("expected an upstream session id")
+	}
+}
+
+func TestSessionEmpty(t *testing.T) {
+	s := SessionOf(nil, "", "")
+	if s.Key != "" || s.UpstreamID != "" {
+		t.Fatalf("session = %+v", s)
 	}
 }
 
@@ -1434,30 +1471,54 @@ var sessionHeaders = []string{
 	"Session-Id",
 }
 
-// SessionKey gives the key a request's account is bound by.
+// Session is what a request's session is made of.
+//
+// The two things it holds are different on purpose. The key says which
+// account the conversation belongs to, and it is ours alone. The
+// upstream id says which conversation it is, and MiniMax sees it.
+type Session struct {
+	// Key is the account affinity key. Always a hash.
+	Key string
+	// UpstreamID is the session id sent to MiniMax.
+	UpstreamID string
+}
+
+// SessionOf reads the session out of a request.
 //
 // The client's own session id is used when it has one. Otherwise the
-// key is a hash of the system prompt and the first user message: the
-// first message of a conversation does not change while the
+// session is a hash of the system prompt and the first user message:
+// the first message of a conversation does not change while the
 // conversation goes on, so the hash holds the conversation to one
 // account.
 //
-// The hash is computed here and never sent anywhere. When there is
-// neither a header nor a message to hash, the key is empty and the
-// request is handled by round robin.
-func SessionKey(headers map[string][]string, system, firstUser string) string {
+// The key is a hash either way. A client's own string is not ours to
+// keep, and it has no business becoming a database key as it came.
+//
+// The upstream id is the client's own when it sent one: it names the
+// conversation, not the account, so it stays the same when the
+// conversation moves to another account.
+//
+// When there is neither a header nor a message to hash, the session is
+// empty and the request is handled by round robin.
+func SessionOf(headers map[string][]string, system, firstUser string) Session {
 	for _, h := range sessionHeaders {
 		for _, v := range headers[h] {
 			if s := strings.TrimSpace(v); s != "" {
-				return "hdr:" + s
+				return Session{Key: "h:" + digest("hdr:"+s), UpstreamID: s}
 			}
 		}
 	}
 	if strings.TrimSpace(system) == "" && strings.TrimSpace(firstUser) == "" {
-		return ""
+		return Session{}
 	}
-	sum := sha256.Sum256([]byte(system + "\x00" + firstUser))
-	return "h:" + hex.EncodeToString(sum[:])[:32]
+	d := digest(system + "\x00" + firstUser)
+	return Session{Key: "m:" + d, UpstreamID: d}
+}
+
+// digest is the short hash a session key is made of.
+func digest(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:32]
 }
 ```
 
@@ -1630,8 +1691,6 @@ type Plan struct {
 	AccountID string
 	// WindowKey is the plan window the request spends.
 	WindowKey string
-	// SessionID is the session id sent upstream.
-	SessionID string
 	// Rebound says the session was moved to another account.
 	Rebound bool
 }
@@ -1739,7 +1798,6 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 				return Plan{
 					AccountID: id,
 					WindowKey: window,
-					SessionID: SessionID(sessionKey),
 				}, nil
 			}
 		}
@@ -1756,7 +1814,6 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 		return Plan{
 			AccountID: a.ID,
 			WindowKey: window,
-			SessionID: SessionID(sessionKey),
 			Rebound:   true,
 		}, nil
 	}
@@ -1767,7 +1824,6 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	return Plan{
 		AccountID: a.ID,
 		WindowKey: window,
-		SessionID: SessionID(sessionKey),
 	}, nil
 }
 
@@ -1867,20 +1923,6 @@ func (r *Rotator) isExhausted(exhausted []store.Exhausted, accountID, windowKey 
 		}
 	}
 	return false
-}
-
-// SessionID gives the session id sent upstream.
-//
-// It identifies the conversation, not the account, so it stays the same
-// when the conversation moves to another account.
-func SessionID(sessionKey string) string {
-	if sessionKey == "" {
-		return ""
-	}
-	if strings.HasPrefix(sessionKey, "hdr:") {
-		return strings.TrimPrefix(sessionKey, "hdr:")
-	}
-	return sessionKey
 }
 ```
 
@@ -3330,8 +3372,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	}
 	model := modelOf(body)
 	stream := isStream(body)
-	sessionKey := rotator.SessionKey(r.Header, systemOf(body), firstUserOf(body))
-	mavisSession := rotator.SessionID(sessionKey)
+	sess := rotator.SessionOf(r.Header, systemOf(body), firstUserOf(body))
 
 	used := map[string]bool{}
 	var lastErr error
@@ -3340,7 +3381,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		attempts = 3
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		plan, err := s.Rot.Pick(ctx, sessionKey, model, used)
+		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
 			if lastErr != nil {
 				writeError(w, http.StatusTooManyRequests, lastErr.Error())
@@ -3367,7 +3408,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			BaseURL:   s.UpstreamBase,
 			Path:      upPath,
 			Access:    tok.Access,
-			SessionID: mavisSession,
+			SessionID: sess.UpstreamID,
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
 			// 和 Go 的 Offset() 是同一个值。
 			TZOffset:  int(time.Now().Offset()),
@@ -3852,7 +3893,9 @@ func textOf(raw json.RawMessage) string {
 }
 ```
 
-`rotator.SessionID` 已在 Task 3 里导出，gateway 直接用。
+`rotator.SessionOf` 已在 Task 3 里导出，gateway 直接用。它给出两个东西：
+亲和键（永远是哈希，客户端自己那串字符串不会变成数据库键）和发给上游的
+会话 id（客户端带了就用客户端的，换号时不变）。
 
 - [ ] **Step 6: 运行测试确认通过**
 

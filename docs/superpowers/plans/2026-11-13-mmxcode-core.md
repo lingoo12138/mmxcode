@@ -2565,7 +2565,7 @@ func TestFollowsSameHostRedirect(t *testing.T) {
 	defer srv.Close()
 
 	c := New(Options{Timeout: 5 * time.Second})
-	resp, err := c.Get(ctx, srv.URL+"/start")
+	resp, err := c.Get(context.Background(), srv.URL+"/start")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2625,7 +2625,7 @@ func TestRefusesCrossHostRedirect(t *testing.T) {
 	defer srv.Close()
 
 	c := New(Options{Timeout: 5 * time.Second})
-	_, err := c.Get(ctx, srv.URL+"/start")
+	_, err := c.Get(context.Background(), srv.URL+"/start")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -2938,10 +2938,11 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		// http.NewRequest prepares it for bytes.Reader and
 		// strings.Reader. Without it the body cannot be replayed, so the
 		// answer is handed back as it came.
-		method, body := current.Method, current.Body
+		method, body, length := current.Method, current.Body, current.ContentLength
+		replay := false
 		if resp.StatusCode != 307 && resp.StatusCode != 308 {
 			if method != http.MethodGet && method != http.MethodHead {
-				method, body = http.MethodGet, nil
+				method, body, length = http.MethodGet, nil, 0
 			}
 		} else if body != nil {
 			if current.GetBody == nil {
@@ -2952,6 +2953,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				return resp, nil
 			}
 			body = fresh
+			replay = true
 		}
 		resp.Body.Close()
 		nextReq, err := http.NewRequestWithContext(current.Context(), method, next.String(), body)
@@ -2959,9 +2961,19 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 		nextReq.Header = current.Header.Clone()
-		// The body is a reader now, so the next hop would not know how
-		// to read it again. Keep the way to do it.
-		nextReq.GetBody = current.GetBody
+		if replay {
+			// The body came out of GetBody, which hands out a plain
+			// reader, and http.NewRequest only recognises bytes and
+			// strings readers. Without the length the replay would go
+			// out with no Content-Length at all, chunked instead of
+			// what the first request had.
+			if length != 0 {
+				nextReq.ContentLength = length
+			}
+			// The body is a reader now, so the next hop would not know
+			// how to read it again. Keep the way to do it.
+			nextReq.GetBody = current.GetBody
+		}
 		current = nextReq
 	}
 }
