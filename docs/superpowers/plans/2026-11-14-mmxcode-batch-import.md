@@ -3663,6 +3663,33 @@ func TestAnAccountWithoutATokenIsTakenBackOut(t *testing.T) {
 		t.Fatalf("the broken account was left behind: %v", st.accounts)
 	}
 }
+
+func TestAFailedIdentityLookupKeepsTheEmailOfTheList(t *testing.T) {
+	// 站点那边问不出身份的时候，邮箱得从清单里兜底：邮箱空着的账号
+	// 以后落线了是登不回来的——有密码也不知道该登谁。
+	st := &fakeStore{}
+	c := aChain(st)
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{}, errors.New("the account API answered 503")
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 || st.accounts[0] != "acc_1:a@example.com" {
+		t.Fatalf("accounts = %v", st.accounts)
+	}
+	if !strings.Contains(res.Message, "身份") {
+		t.Fatalf("message = %q, want it to say the identity was not confirmed", res.Message)
+	}
+	if strings.Contains(res.Message, "hunter2") {
+		t.Fatalf("message = %q, want no password in it", res.Message)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -3686,6 +3713,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"mmxcode/internal/account"
@@ -3813,17 +3841,27 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	}
 
 	id := account.Identity{}
+	var notes []string
 	if c.Identity != nil {
 		got, err := c.Identity(ctx, tok.Access, tok.Subject)
 		if err == nil {
 			id = got
+		} else {
+			// 身份没问出来，账号还是在的，只是不知道站点那边是不是就认
+			// 这一份。这件事得说出来：不然人以为每一条都对，而邮箱要是
+			// 也空了，这个号以后就再也登不回来了。
+			notes = append(notes, "没能确认账号身份："+err.Error())
 		}
 	}
 	now := c.now()
-	name := id.Email
-	if name == "" {
-		name = email
+	// 邮箱从清单里兜底：站点那边一时问不出来身份，账号的邮箱也不能
+	// 就这么空着。没有邮箱的账号落线以后是登不回来的——手里有密码
+	// 也用不上，因为不知道该拿它去登谁。
+	mail := id.Email
+	if mail == "" {
+		mail = email
 	}
+	name := mail
 	userID := id.RealUserID
 	if userID == "" {
 		userID = tok.Subject
@@ -3832,7 +3870,7 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		ID:        c.newID(),
 		Name:      name,
 		UserID:    userID,
-		Email:     id.Email,
+		Email:     mail,
 		Status:    store.StatusActive,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -3858,15 +3896,17 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		if err != nil {
 			// The account is in; only the password is lost. Say so,
 			// but do not call the import a failure.
+			notes = append(notes, "密码没能加密存下："+err.Error())
 			return Result{Email: email, OK: true, AccountID: acc.ID,
-				Stage: StageStore, Message: "密码没能加密存下：" + err.Error()}, nil
+				Stage: StageStore, Message: strings.Join(notes, "；")}, nil
 		}
 		if err := c.Store.SetPassword(ctx, acc.ID, cipher, now); err != nil {
+			notes = append(notes, "密码没能存下："+err.Error())
 			return Result{Email: email, OK: true, AccountID: acc.ID,
-				Stage: StageStore, Message: "密码没能存下：" + err.Error()}, nil
+				Stage: StageStore, Message: strings.Join(notes, "；")}, nil
 		}
 	}
-	return Result{Email: email, OK: true, AccountID: acc.ID}, nil
+	return Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}, nil
 }
 
 // deleter is a store that can take an account back out.

@@ -260,3 +260,30 @@ func TestAnAccountWithoutATokenIsTakenBackOut(t *testing.T) {
 		t.Fatalf("the broken account was left behind: %v", st.accounts)
 	}
 }
+
+func TestAFailedIdentityLookupKeepsTheEmailOfTheList(t *testing.T) {
+	// 站点那边问不出身份的时候，邮箱得从清单里兜底：邮箱空着的账号
+	// 以后落线了是登不回来的——有密码也不知道该登谁。
+	st := &fakeStore{}
+	c := aChain(st)
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{}, errors.New("the account API answered 503")
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 || st.accounts[0] != "acc_1:a@example.com" {
+		t.Fatalf("accounts = %v", st.accounts)
+	}
+	if !strings.Contains(res.Message, "身份") {
+		t.Fatalf("message = %q, want it to say the identity was not confirmed", res.Message)
+	}
+	if strings.Contains(res.Message, "hunter2") {
+		t.Fatalf("message = %q, want no password in it", res.Message)
+	}
+}
