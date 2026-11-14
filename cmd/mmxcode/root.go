@@ -19,6 +19,7 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -40,6 +41,10 @@ type env struct {
 	egr   *egress.Resolver
 	acc   *account.Client
 	mgr   *manager.Manager
+
+	// makeRunner makes the batch driver. It is a field so that a test
+	// can run a batch without a network.
+	makeRunner func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner
 }
 
 func newRoot() *cobra.Command {
@@ -97,6 +102,7 @@ func newRoot() *cobra.Command {
 	}
 
 	root.AddCommand(newLoginCmd(e))
+	root.AddCommand(newImportCmd(e))
 	root.AddCommand(newAccountsCmd(e))
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
