@@ -501,6 +501,10 @@ docker compose exec mmxcode mmxcode import --file /data/accounts.txt
 4. 大陆出口下 `account.minimax.io` 是否也被 307 到 `.cn`（笔记里只记了 `agent.minimax.io`）
 5. Akamai 的 `_abck` / `bm_sz` 在批量登录时会不会真的拦（笔记里的实测是单账号直连通过）
 6. 批量到多少个号会触发风控
+7. **抓一个真的网页请求存成金标准**：整条 URL 加 `yy` 加 `x-signature`。命令行那边的六个向量是照着参考实现重算出来的，网页这一边目前只是照着笔记里的散文推的——两边只有一边有金标准，这个不对称才是最大的风险。抓包笔记里已经有 `x-signature` 的那半个向量（`abd7da0095474425f28458b7b56a6626` 能用 `md5(秒 + 密钥 + body)` 复现），`yy` 那一半缺的是完整 URL
+8. `op_ticket` 到底在不在：抓包笔记 §4 的公共 query 里没有它，是设计文档从 js/204 里读出来的。它在 query 里就改了签名的字节
+9. `uuid` 出现两次的时候，站点读的是哪一个。网页那边公共的那一份在前、自己那份在后，常见的解析器取第一个（`url.Values.Get`、`URLSearchParams.get`、Java 的 `getParameter`）——但这是猜的
+10. 同一个账号导两次会不会在库里留下两行。`Chain.Import` 每回都新建一行，库里没有按邮箱找账号的法子
 
 ## 15. 与外部资料核对过的部分
 
