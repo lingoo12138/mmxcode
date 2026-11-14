@@ -174,10 +174,17 @@ GET 时 `bodyJSON` 是字面量 `"{}"`。我们 `internal/sign` 里的算法与�
 
 ### 3.2 网页那套公共 query（键序也是签名的一部分）
 
-网页的 axios 拦截器把公共 query 拼在**调用方 query 之后**（JS 的 `{...params, ...common}`：调用方的键在前，后来的只改值不改位置），然后最后加 `client`：
+网页的公共 query 是一整块，**排在前面**；调用方自己那份 query **追加在后面**。
+真抓包里那条设备注册的请求就是这么排的：
 
 ```
-[调用方的 query]                              ← 设备注册时是 uuid
+POST /v1/api/user/device/register?device_platform=web&biz_id=3&...&uuid=<uuid4>&uuid=<uuid4>
+                                                            ↑公共块里的  ↑调用方自己的
+```
+
+（`uuid` 出现两次：公共块里有一份，调用方自己那份又追加了一份。）
+
+```
 device_platform=web
 biz_id=3
 app_id=3001
@@ -201,10 +208,10 @@ screen_height=800
 client=web
 ```
 
-设备注册：
+设备注册（公共块在前，自己那份 uuid 在后）：
 
 ```
-POST https://account.minimax.io/v1/api/user/device/register?uuid=<uuid4>
+POST https://account.minimax.io/v1/api/user/device/register?<公共 query>&uuid=<uuid4>
 body: {"uuid":"<uuid4>"}
 -> 200 {"data":{"deviceIDStr":"574786429807779842"}}
 ```
@@ -215,11 +222,17 @@ body: {"uuid":"<uuid4>"}
 
 现在 `internal/sign.Sign` 把 mcode 那套默认值写死了（`device_platform=mcode`、`browser_name=mcode`、`client=mcode`，调用方的 query 插在中间）。网页这套不一样：
 
-- 调用方的 query 在**最前**（mcode 是在中间）
+- 调用方的 query 排在公共块的**后面**（mcode 是在中间）
 - `device_platform` / `browser_name` / `client` 的值不同
 - 多出 `uuid` / `device_id` / `screen_width` / `screen_height` / `device_memory` / `cpu_core_num` / `browser_language` / `browser_platform` / `op_ticket`
 
 改法：`sign.Options` 加一个 `Flavor` 字段（`sign.FlavorMCode` / `sign.FlavorWeb`），每个 flavor 各自一份默认 query 与插入位置。**默认仍是 mcode**，现有的调用方一行不用改。
+
+网页这套是拿一个 `URLSearchParams` 填的：公共块先填，调用方自己那份后填。所以
+两半里都有的键，query 里会出现两次，而站点用的那几种解析器
+（`url.Values.Get`、`URLSearchParams.get`、Java 的 `getParameter`）取的都是**第一
+个**——网页这边算数的是公共块里那个值。CLI 那套是对象字面量，两半对重复键的
+处理不一样，各是各的。
 
 ## 4. 密码的存法
 
@@ -500,3 +513,39 @@ docker compose exec mmxcode mmxcode import --file /data/accounts.txt
   - `js/809` 模块 375：`loginType` 枚举
   - `app/oauth-authorize/page-*.js`：`GET` / `POST /oauth2/device/authorize` 的体与 `login_required` 的处理
 - **用户自己的抓包笔记**（`C:/Users/lishihua/Downloads/README.md`，2026-11-05~06）：登录时序、cookie 清单、错误码表、以及「同一个产品并行维护两套 OAuth 客户端」的结论
+
+## 16. 做完了什么样
+
+整个功能做完了：清单能导、密码加密存库、账号掉了能自己登回去；命令行和页面上
+两套前端共用同一批任务。下面记的是实现时跟上面这份设计不一样的地方。
+
+**网页那半边的 query 顺序反过来了。** §3.2 原先写的是「调用方的 query 在最前」
+（那是照网页前端 `{...参数, ...公共参数}` 的写法推的）。真抓包里那条设备注册
+的请求是**公共块在前、调用方自己那份在后**，`uuid` 因此出现两次。代码按抓包改
+了，`internal/sign` 里两套 flavor 各自的注释也跟着改了。签名用就是这个顺序，
+所以 `yy` 的字节跟着变了。
+
+**`browser_language` 是 `en-US`。** 站点自己的值就是 `en-US`；换成 `zh-CN`
+签名就对不上。
+
+**上传的那份清单不许落盘。** §8.4 说清单读进内存、不写盘。但 Go 的
+`ParseMultipartForm` 给多少内存就往内存里放多少，放不下的会写临时文件去——
+明文密码就落盘了。所以实现改成：用 `http.MaxBytesReader` 把请求体卡在 8 MB，
+给解析器 16 MB 内存，超出的那部分先被卡住，临时文件这条路走不到。
+
+**重登页只列登得回去的账号。** 签出而且还存着密码的才列。没有密码的账号登不
+回去，列出来配一个按不动的按钮比不列更糟。
+
+**重登成功了就把旧的那条链扔掉。** 走一遍 `Renewer.Forget(accountID)`：旧的
+refresh token 到此为止，不会被花掉。
+
+**设计 §7 里有两样，原先的计划漏了，一并做了。** `import --timeout`（整趟导入
+的时限）和 `mmxcode relogin` 命令。
+
+**`.env.example` 里添了一行。** 这个文件本来就有（compose 读的那几个变量都在
+里面），这一步加的是 `MMXCODE_PASSWORD_KEY`，compose 的 `environment` 里也加了
+对应的一行。
+
+**待实测的项从 6 条长到 10 条。** 多出来的四条在计划文件的末尾：抓一个真的网页
+请求存成金标准、`op_ticket` 到底在不在 query 里、`uuid` 出现两次时站点读的是哪
+一个、同一个账号导两次会不会在库里留下两行。

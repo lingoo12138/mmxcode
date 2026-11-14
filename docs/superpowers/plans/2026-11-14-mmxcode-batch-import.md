@@ -5756,15 +5756,16 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `config.example.yaml`
 - Modify: `config.docker.yaml`
 - Modify: `docker-compose.yml`
-- Create: `.env.example`
+- Modify: `.env.example`
 
 （`internal/config/config.go` 里的 `Batch` 一节已经在 Task 8 加了——调
 度器要读它，那一步没有它编不过。这一步只管那些 yaml 文件。）
 
 - [ ] **Step 1: 看看现在是什么样**
 
-Run: `cat config.example.yaml config.docker.yaml docker-compose.yml`
-Expected: 看得见现在的样子。仓库里还没有 `.env.example`，这一步把它建出来。
+Run: `cat config.example.yaml config.docker.yaml docker-compose.yml .env.example`
+Expected: 看得见现在的样子。`.env.example` 已经有了，compose 读的那几个变量都在
+里面——这一步是往里加一行，不是新建一个文件。
 
 - [ ] **Step 2: 写实现**
 
@@ -5864,17 +5865,29 @@ batch:
 
 - [ ] **Step 3: 把计划跟代码对起来**
 
-改过代码之后，计划的整文件代码块要跟仓库里的文件逐字节相同。用：
+改过代码之后，计划的代码块要跟仓库里的代码对得上。用：
 
 ```bash
-python -I docs/superpowers/tools/sync_plan.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md internal/webauth/webauth.go internal/webauth/rsa.go internal/provision/provision.go internal/provision/chain.go internal/secret/secret.go internal/sign/sign.go internal/store/store.go cmd/mmxcode/import.go
+python -I docs/superpowers/tools/refresh_plan_blocks.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md .
+python -I docs/superpowers/tools/sync_plan.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md internal/sign/sign.go internal/sign/sign_test.go internal/secret/secret.go internal/secret/secret_test.go internal/webauth/webauth.go internal/webauth/rsa.go internal/webauth/webauth_test.go internal/provision/provision.go internal/provision/provision_test.go internal/provision/chain.go internal/provision/chain_test.go cmd/mmxcode/import.go cmd/mmxcode/import_test.go
 python -I docs/superpowers/tools/check_plan_files.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md .
+python -I docs/superpowers/tools/check_plan_fences.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md
 ```
 
-第一个脚本把仓库里的文件填回计划里带着它们的那几个整文件代码块——靠顶层
-声明认哪个块是哪个文件，所以只动整文件的块。第二个脚本查两件事：整文件
-的代码块是不是都还能过 `gofmt`，以及计划里带的那些文件是不是逐字节相同
-（不相同会列出来）。
+四个脚本各管一件事：
+
+- `refresh_plan_blocks.py` 把**片段**里的每个声明按它落地时的样子改过来
+  （仓库里有另一个版本，就换成那个版本）。
+- `sync_plan.py` 把**整文件**的代码块按字节换成仓库里的文件。
+- `check_plan_files.py` 查两件事：整文件的块是不是都还能过 `gofmt`，以及计划里
+  的每个声明是不是都在仓库里原样存在（片段也查）。
+- `check_plan_fences.py` 查代码块里有没有混进中文散文——那种块编不过，错的
+  提示又看不出是哪来的。
+
+这个功能**自己写的**那几个文件（`sign`、`secret`、`webauth`、`provision`、
+`import` 及其测试）在计划里是整文件带过来的，逐字节相同；只是改过的那些
+（`store`、`webui`、`serve`、`config`、`manager`）在计划里是**改的那一部分**，
+一个声明一个声明地对。
 
 工具在 `docs/superpowers/tools/` 里，是这个项目用来对计划的脚本。
 

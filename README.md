@@ -59,6 +59,8 @@ mmxcode serve                     # 起 HTTP 服务、WebUI 与定时任务
 mmxcode login                    # 登录一个账号
 mmxcode accounts list            # 列出账号
 mmxcode accounts proxy <id> --group warp
+mmxcode import --file accounts.txt  # 批量导入账号
+mmxcode relogin --all             # 把签出的账号登回去
 mmxcode checkin                  # 给所有账号签到
 mmxcode usage                    # 积分汇总
 mmxcode models                   # 模型列表
@@ -72,6 +74,70 @@ mmxcode models                   # 模型列表
 `serve` 自己没有别的开关：监听地址、key、轮转参数都在配置文件里。
 
 其余子命令的开关：`login --name`（账号标签）、`accounts proxy --group/--url`（出口组名 / 单独的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）。
+
+### 批量导入
+
+一份清单就能把一堆账号登进来。每行一个账号，写成 `邮箱|密码`，`#` 开头是注释，空行跳过：
+
+```bash
+# 清单每行一个账号：邮箱|密码，# 开头是注释
+mmxcode import --file accounts.txt
+
+# 每个账号走哪个出口组，每个账号之间隔多久
+mmxcode import --file accounts.txt --group clash --interval 5s
+
+# 整趟导入最多跑多久
+mmxcode import --file accounts.txt --timeout 30m
+
+# 登录成功就丢密码，不入库
+mmxcode import --file accounts.txt --no-store-password
+```
+
+导入走的是网页登录那一路（设备码 → 密码登录 → 批准 → 换令牌），所以只需要
+账号的邮箱和密码，不需要人点浏览器。
+
+**密码存不存。** 登录成功以后密码会加密存进库里（AES-256-GCM），密钥从环境
+变量 `MMXCODE_PASSWORD_KEY` 来（base64 的 32 字节）：
+
+```bash
+export MMXCODE_PASSWORD_KEY=$(head -c 32 /dev/urandom | base64)
+```
+
+不设这个变量，密码登录一次就丢：账号掉线了就得自己再登一次。设了，
+掉线的账号可以自己登回去。
+
+**掉线的账号自己登回去。** 默认是关的 —— 要开就在配置文件里写：
+
+```yaml
+batch:
+  relogin:
+    enabled: true
+```
+
+调度器会定期看那些签出（signed_out）而且还存着密码的账号，用存的密码重新
+登一遍。也可以手动来一次：
+
+```bash
+mmxcode relogin --all              # 所有签出且有密码的账号
+mmxcode relogin --account acc_123  # 只登这一个
+```
+
+**页面上也能导。** WebUI 里有一页「导入」，上传同一个格式的清单就行；旁边
+还有一页「重登」，列出签出的账号，一键登回去。
+
+上传这一页**只在没配 `server.api_keys` 的时候开放**：配了 key 就说明别的机器
+能连进来，明文密码不该从那儿过。配了 key 的时候页面上没有上传入口，用命令
+行导。
+
+### 批量导入的配置
+
+| 键 | 默认值 | 作用 |
+|---|---|---|
+| `batch.interval` | `3s` | 批量导入时两个账号之间的间隔 |
+| `batch.group` | 空 | 批量导入走哪个出口组。空 = 全局默认出口 |
+| `batch.relogin.enabled` | `false` | 账号掉线了自动用存着的密码登回去 |
+| `batch.relogin.cooldown` | `1h` | 调度器两趟重登之间隔多久 |
+| `batch.relogin.max_accounts` | `20` | 一趟重登最多处理多少个账号 |
 
 ## 对外接口
 
@@ -99,6 +165,9 @@ mmxcode models                   # 模型列表
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
 | `/api/events` | GET | SSE，每 30 秒一个心跳 |
 | `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
+| `/api/import` | POST | 批量导入（上传清单；配了 key 就关着） |
+| `/api/import/{id}` | GET | 某一次批量导入走到哪儿了 |
+| `/api/relogin` | POST | 把签出的账号登回去 |
 
 WebUI 页面：
 
@@ -108,6 +177,8 @@ WebUI 页面：
 | `/login` | 登录 |
 | `/egress` | 出口 |
 | `/usage` | 用量 |
+| `/import` | 批量导入（没配 key 时才开） |
+| `/relogin` | 重登 |
 | `/signin` | 交 key 的登录页 |
 | `/static/app.js` | 页面上的脚本 |
 
@@ -188,7 +259,7 @@ compose 做的事：
 - 挂配置文件：默认挂仓库里的 `config.docker.yaml` 到 `/app/config.yaml`（只读）。要用自己的副本就设 `MMXCODE_CONFIG_FILE=./config.yaml`。
 - 挂数据目录：默认是 Docker 命名卷 `mmxcode-data`，容器里是 `/data`，数据库落在 `/data/mmxcode.db`。
 - 容器以非 root 用户 `mmxcode`（uid 10001）运行，`/data` 归它所有。
-- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）。
+- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）、`MMXCODE_PASSWORD_KEY`（批量导入的密码加密密钥；不设就不存密码）。
 
 数据目录：
 
