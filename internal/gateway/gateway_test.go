@@ -1009,3 +1009,191 @@ func TestAnEmptyKeySignsNobodyIn(t *testing.T) {
 		}
 	}
 }
+
+// sessionRecorder keeps the session ids the upstream was told about.
+//
+// 记下发给上游的会话 id：这一节要看的就是它。
+type sessionRecorder struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *sessionRecorder) record(r *http.Request) {
+	s.mu.Lock()
+	s.ids = append(s.ids, r.Header.Get("X-Mavis-Session-Id"))
+	s.mu.Unlock()
+}
+
+func (s *sessionRecorder) seen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ids...)
+}
+
+// plainPool is a pool that cannot supply an upstream id.
+//
+// 没有 UpstreamID 方法的池子：rotator 退回自己算出来的那个 id。
+type plainPool struct {
+	accounts []store.Account
+	sessions map[string]string
+}
+
+func (p *plainPool) Accounts(context.Context) ([]store.Account, error) { return p.accounts, nil }
+
+func (p *plainPool) Exhausted(context.Context) ([]store.Exhausted, error) { return nil, nil }
+
+func (p *plainPool) BindSession(_ context.Context, key, accountID string) error {
+	if p.sessions == nil {
+		p.sessions = map[string]string{}
+	}
+	p.sessions[key] = accountID
+	return nil
+}
+
+func (p *plainPool) SessionAccount(_ context.Context, key string) (string, bool, error) {
+	id, ok := p.sessions[key]
+	return id, ok, nil
+}
+
+func (p *plainPool) MarkExhausted(context.Context, string, string, time.Time, string) error {
+	return nil
+}
+
+func (p *plainPool) Remaining(context.Context, string) (float64, bool) { return 0, false }
+
+// chat sends one chat request and gives the answer back.
+func chat(t *testing.T, h *harness, sessionID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	if sessionID != "" {
+		req.Header.Set("X-Session-Id", sessionID)
+	}
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	return w
+}
+
+// TestTheUpstreamIDIsTheOneTheStoreKept says the upstream is told the
+// id the database keeps, and not the client's own string.
+//
+// 上游看到的是数据库里存着的那个 id。客户端自己那串字符串不外发。
+func TestTheUpstreamIDIsTheOneTheStoreKept(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	chat(t, h, "client-1", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+
+	seen := rec.seen()
+	if len(seen) != 1 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "client-1" {
+		t.Fatal("the client's own session id went upstream")
+	}
+	key := rotator.SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "", "").Key
+	want, err := h.store.UpstreamID(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen[0] != want {
+		t.Fatalf("upstream id = %q, want the one the store keeps %q", seen[0], want)
+	}
+}
+
+// TestOneConversationKeepsOneUpstreamID says the two requests of one
+// conversation go upstream with the same id.
+//
+// 一段对话的两次请求，上游看到的是同一个会话 id：重启之后也是这个。
+func TestOneConversationKeepsOneUpstreamID(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-1", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "" {
+		t.Fatal("no upstream id was sent")
+	}
+	if seen[0] != seen[1] {
+		t.Fatalf("the two requests got %q and %q", seen[0], seen[1])
+	}
+}
+
+// TestTwoConversationsGetDifferentUpstreamIDs says two conversations do
+// not share the id the upstream is told about.
+//
+// 两段对话拿到两个不同的上游 id。
+func TestTwoConversationsGetDifferentUpstreamIDs(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-2", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "" || seen[1] == "" {
+		t.Fatalf("upstream ids = %q and %q", seen[0], seen[1])
+	}
+	if seen[0] == seen[1] {
+		t.Fatalf("the two conversations got the same upstream id %q", seen[0])
+	}
+}
+
+// TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne says a pool that
+// cannot supply an id leaves the derived one in place, and that it is
+// stable.
+//
+// 给不出上游 id 的池子：退回请求自己算出来的那个，两次请求是同一个。
+func TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	// 换成一个给不出上游 id 的池子。
+	h.gw.Rot = rotator.New(&plainPool{accounts: []store.Account{{
+		ID: "acc_01", Name: "a", Status: store.StatusActive,
+	}}}, rotator.Options{MaxAttempts: 3, WindowGroup: manager.WindowGroup})
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-1", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	// 退回的规则没有变：客户端带了 id，就是客户端自己那串。
+	if seen[0] != "client-1" {
+		t.Fatalf("upstream id = %q, want the client's own", seen[0])
+	}
+	if seen[0] != seen[1] {
+		t.Fatalf("the two requests got %q and %q", seen[0], seen[1])
+	}
+
+	// 客户端没带 id：退回的是第一条消息的哈希。
+	chat(t, h, "", body)
+	seen = rec.seen()
+	want := rotator.SessionOf(nil, "", "hi").UpstreamID
+	if seen[len(seen)-1] != want {
+		t.Fatalf("upstream id = %q, want the hash %q", seen[len(seen)-1], want)
+	}
+}

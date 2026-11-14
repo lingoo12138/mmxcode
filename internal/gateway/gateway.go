@@ -4,6 +4,20 @@
 // there. When the account is spent, another is tried and the request
 // is replayed — but only while nothing has been written to the client
 // yet.
+//
+// The session id the upstream is told about is the one the database
+// keeps: an opaque id, made once and kept, so the upstream sees one
+// conversation and the mapping from the session to the upstream's
+// conversation survives a restart. The client's own session id does not
+// go upstream, and neither does a hash of the request's words.
+//
+// What that does not fix: two conversations whose system prompt and
+// first user message are the same, sent by a client that sends no
+// session id of its own, are one session by the session key's own
+// definition. They share one upstream id, and one upstream
+// conversation, however random that id is, and no server can tell them
+// apart: there is nothing in the request that does. The fix for that
+// case is the client sending X-Session-Id.
 package gateway
 
 import (
@@ -91,6 +105,7 @@ type poolStore interface {
 	ListExhausted(ctx context.Context) ([]store.Exhausted, error)
 	BindSession(ctx context.Context, sessionKey, accountID string) error
 	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
 	LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error)
 }
@@ -112,6 +127,15 @@ func (p poolAdapter) BindSession(ctx context.Context, key, accountID string) err
 
 func (p poolAdapter) SessionAccount(ctx context.Context, key string) (string, bool, error) {
 	return p.s.SessionAccount(ctx, key)
+}
+
+// UpstreamID gives the upstream id of a session.
+//
+// The id is the one the database keeps: an opaque id, made once and
+// kept, so the upstream sees one conversation and the mapping survives
+// a restart. The client's own session id does not go upstream.
+func (p poolAdapter) UpstreamID(ctx context.Context, key string) (string, error) {
+	return p.s.UpstreamID(ctx, key)
 }
 
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
@@ -238,6 +262,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	model := modelOf(body)
 	stream := isStream(body)
 	sess := rotator.SessionOf(r.Header, systemOf(body), firstUserOf(body))
+	// 发给上游的会话 id 是数据库里存着的那个：不重算，也不把客户端
+	// 自己那串字符串发出去。取不到就是取不到，不能拿别的顶上：顶上来的
+	// 那个上游没见过，会把这段对话当成新的一段。
+	upstreamID, err := s.Rot.UpstreamID(ctx, sess)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 
 	used := map[string]bool{}
 	var lastErr error
@@ -278,7 +310,7 @@ accountLoop:
 			BaseURL:   s.UpstreamBase,
 			Path:      upPath,
 			Access:    tok.Access,
-			SessionID: sess.UpstreamID,
+			SessionID: upstreamID,
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
 			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
 			// 方法，Zone() 的第二个返回值就是它。

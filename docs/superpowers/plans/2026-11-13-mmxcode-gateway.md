@@ -3662,6 +3662,7 @@ func TestTheStrategyIsChecked(t *testing.T) {
 
 
 
+
 - [ ] **Step 2: 写会话键与判定的测试**
 
 在同一个文件末尾追加：
@@ -3950,6 +3951,7 @@ func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 
 
 
+
 - [ ] **Step 3: 运行测试确认失败**
 
 ```bash
@@ -4049,6 +4051,7 @@ func digest(s string) string {
 	return hex.EncodeToString(sum[:])[:32]
 }
 ```
+
 
 
 
@@ -4300,6 +4303,7 @@ func isQuotaMessage(message string) bool {
 	return upstream.IsQuotaRefusal([]byte(message))
 }
 ```
+
 
 
 
@@ -4918,6 +4922,7 @@ func (r *Rotator) isExhausted(exhausted []store.Exhausted, accountID, windowKey 
 	return false
 }
 ```
+
 
 
 
@@ -6814,6 +6819,194 @@ func TestAnEmptyKeySignsNobodyIn(t *testing.T) {
 		}
 	}
 }
+
+// sessionRecorder keeps the session ids the upstream was told about.
+//
+// 记下发给上游的会话 id：这一节要看的就是它。
+type sessionRecorder struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *sessionRecorder) record(r *http.Request) {
+	s.mu.Lock()
+	s.ids = append(s.ids, r.Header.Get("X-Mavis-Session-Id"))
+	s.mu.Unlock()
+}
+
+func (s *sessionRecorder) seen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ids...)
+}
+
+// plainPool is a pool that cannot supply an upstream id.
+//
+// 没有 UpstreamID 方法的池子：rotator 退回自己算出来的那个 id。
+type plainPool struct {
+	accounts []store.Account
+	sessions map[string]string
+}
+
+func (p *plainPool) Accounts(context.Context) ([]store.Account, error) { return p.accounts, nil }
+
+func (p *plainPool) Exhausted(context.Context) ([]store.Exhausted, error) { return nil, nil }
+
+func (p *plainPool) BindSession(_ context.Context, key, accountID string) error {
+	if p.sessions == nil {
+		p.sessions = map[string]string{}
+	}
+	p.sessions[key] = accountID
+	return nil
+}
+
+func (p *plainPool) SessionAccount(_ context.Context, key string) (string, bool, error) {
+	id, ok := p.sessions[key]
+	return id, ok, nil
+}
+
+func (p *plainPool) MarkExhausted(context.Context, string, string, time.Time, string) error {
+	return nil
+}
+
+func (p *plainPool) Remaining(context.Context, string) (float64, bool) { return 0, false }
+
+// chat sends one chat request and gives the answer back.
+func chat(t *testing.T, h *harness, sessionID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	if sessionID != "" {
+		req.Header.Set("X-Session-Id", sessionID)
+	}
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	return w
+}
+
+// TestTheUpstreamIDIsTheOneTheStoreKept says the upstream is told the
+// id the database keeps, and not the client's own string.
+//
+// 上游看到的是数据库里存着的那个 id。客户端自己那串字符串不外发。
+func TestTheUpstreamIDIsTheOneTheStoreKept(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	chat(t, h, "client-1", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+
+	seen := rec.seen()
+	if len(seen) != 1 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "client-1" {
+		t.Fatal("the client's own session id went upstream")
+	}
+	key := rotator.SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "", "").Key
+	want, err := h.store.UpstreamID(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen[0] != want {
+		t.Fatalf("upstream id = %q, want the one the store keeps %q", seen[0], want)
+	}
+}
+
+// TestOneConversationKeepsOneUpstreamID says the two requests of one
+// conversation go upstream with the same id.
+//
+// 一段对话的两次请求，上游看到的是同一个会话 id：重启之后也是这个。
+func TestOneConversationKeepsOneUpstreamID(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-1", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "" {
+		t.Fatal("no upstream id was sent")
+	}
+	if seen[0] != seen[1] {
+		t.Fatalf("the two requests got %q and %q", seen[0], seen[1])
+	}
+}
+
+// TestTwoConversationsGetDifferentUpstreamIDs says two conversations do
+// not share the id the upstream is told about.
+//
+// 两段对话拿到两个不同的上游 id。
+func TestTwoConversationsGetDifferentUpstreamIDs(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-2", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	if seen[0] == "" || seen[1] == "" {
+		t.Fatalf("upstream ids = %q and %q", seen[0], seen[1])
+	}
+	if seen[0] == seen[1] {
+		t.Fatalf("the two conversations got the same upstream id %q", seen[0])
+	}
+}
+
+// TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne says a pool that
+// cannot supply an id leaves the derived one in place, and that it is
+// stable.
+//
+// 给不出上游 id 的池子：退回请求自己算出来的那个，两次请求是同一个。
+func TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
+	rec := &sessionRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	// 换成一个给不出上游 id 的池子。
+	h.gw.Rot = rotator.New(&plainPool{accounts: []store.Account{{
+		ID: "acc_01", Name: "a", Status: store.StatusActive,
+	}}}, rotator.Options{MaxAttempts: 3, WindowGroup: manager.WindowGroup})
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	chat(t, h, "client-1", body)
+	chat(t, h, "client-1", body)
+
+	seen := rec.seen()
+	if len(seen) != 2 {
+		t.Fatalf("the upstream was asked %d times", len(seen))
+	}
+	// 退回的规则没有变：客户端带了 id，就是客户端自己那串。
+	if seen[0] != "client-1" {
+		t.Fatalf("upstream id = %q, want the client's own", seen[0])
+	}
+	if seen[0] != seen[1] {
+		t.Fatalf("the two requests got %q and %q", seen[0], seen[1])
+	}
+
+	// 客户端没带 id：退回的是第一条消息的哈希。
+	chat(t, h, "", body)
+	seen = rec.seen()
+	want := rotator.SessionOf(nil, "", "hi").UpstreamID
+	if seen[len(seen)-1] != want {
+		t.Fatalf("upstream id = %q, want the hash %q", seen[len(seen)-1], want)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -7144,6 +7337,20 @@ func writeRateLimit(w http.ResponseWriter, message string) {
 // there. When the account is spent, another is tried and the request
 // is replayed — but only while nothing has been written to the client
 // yet.
+//
+// The session id the upstream is told about is the one the database
+// keeps: an opaque id, made once and kept, so the upstream sees one
+// conversation and the mapping from the session to the upstream's
+// conversation survives a restart. The client's own session id does not
+// go upstream, and neither does a hash of the request's words.
+//
+// What that does not fix: two conversations whose system prompt and
+// first user message are the same, sent by a client that sends no
+// session id of its own, are one session by the session key's own
+// definition. They share one upstream id, and one upstream
+// conversation, however random that id is, and no server can tell them
+// apart: there is nothing in the request that does. The fix for that
+// case is the client sending X-Session-Id.
 package gateway
 
 import (
@@ -7231,6 +7438,7 @@ type poolStore interface {
 	ListExhausted(ctx context.Context) ([]store.Exhausted, error)
 	BindSession(ctx context.Context, sessionKey, accountID string) error
 	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
 	LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error)
 }
@@ -7252,6 +7460,15 @@ func (p poolAdapter) BindSession(ctx context.Context, key, accountID string) err
 
 func (p poolAdapter) SessionAccount(ctx context.Context, key string) (string, bool, error) {
 	return p.s.SessionAccount(ctx, key)
+}
+
+// UpstreamID gives the upstream id of a session.
+//
+// The id is the one the database keeps: an opaque id, made once and
+// kept, so the upstream sees one conversation and the mapping survives
+// a restart. The client's own session id does not go upstream.
+func (p poolAdapter) UpstreamID(ctx context.Context, key string) (string, error) {
+	return p.s.UpstreamID(ctx, key)
 }
 
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
@@ -7378,6 +7595,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	model := modelOf(body)
 	stream := isStream(body)
 	sess := rotator.SessionOf(r.Header, systemOf(body), firstUserOf(body))
+	// 发给上游的会话 id 是数据库里存着的那个：不重算，也不把客户端
+	// 自己那串字符串发出去。取不到就是取不到，不能拿别的顶上：顶上来的
+	// 那个上游没见过，会把这段对话当成新的一段。
+	upstreamID, err := s.Rot.UpstreamID(ctx, sess)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 
 	used := map[string]bool{}
 	var lastErr error
@@ -7418,7 +7643,7 @@ accountLoop:
 			BaseURL:   s.UpstreamBase,
 			Path:      upPath,
 			Access:    tok.Access,
-			SessionID: sess.UpstreamID,
+			SessionID: upstreamID,
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
 			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
 			// 方法，Zone() 的第二个返回值就是它。
@@ -8064,8 +8289,17 @@ func textOf(raw json.RawMessage) string {
 ```
 
 `rotator.SessionOf` 已在 Task 3 里导出，gateway 直接用。它给出两个东西：
-亲和键（永远是哈希，客户端自己那串字符串不会变成数据库键）和发给上游的
-会话 id（客户端带了就用客户端的，换号时不变）。
+亲和键（永远是哈希，客户端自己那串字符串不会变成数据库键）和推导出来的
+上游会话 id（客户端带了就用客户端的，换号时不变）。
+
+发给上游的会话 id 不是这个推导出来的，而是 `rotator.Rotator.UpstreamID` 给的：
+池子（网关这边是 `store.UpstreamID`）存着的那个随机 id，一个会话一个，存下来
+不变，重启之后还是它。池子给不出的时候（测试里的替身）才退回推导出来的那个。
+
+这个改不了两段一样的开场白：system prompt 和第一条 user 消息都一样、客户端又不
+带会话 id 的两段对话，按会话键的定义本来就是同一个会话，于是共用一个上游 id
+和一个上游会话。服务器分不出来 —— 请求里没有能分开它们的东西，要分开只能让
+客户端带上 `X-Session-Id`。
 
 - [ ] **Step 6: 运行测试确认通过**
 
