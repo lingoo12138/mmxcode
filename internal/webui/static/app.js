@@ -1,10 +1,76 @@
 // mmxcode 的 WebUI 脚本。
 //
-// 只做三件事：改账号的出口、触发签到、测出口。
+// 做几件事：改账号的出口、触发签到、测出口、登录。
 // 页面本身是服务端渲染的，这里不重新渲染。
 //
 // 这里不用带 API key：浏览器同源的 fetch 会自己带上 mmxcode_session
 // 那张票，页面的按钮因此不会 401。
+//
+// 上游答上来的东西（验证码、地址、错误）一律当字看：它们进页面的时候
+// 只走 textContent 和 URL，不拼 HTML。
+
+// readAnswer 读一个回答。
+//
+// 回答不一定是 JSON：网关拒绝了一把 key 的时候给的是登录页，那是
+// HTML。所以回答先当字读下来，再看它是什么。
+async function readAnswer(res) {
+  const text = await res.text();
+  const type = (res.headers.get('Content-Type') || '').toLowerCase();
+  let json = null;
+  if (type.indexOf('json') >= 0) {
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      json = null;
+    }
+  }
+  return { ok: res.ok, status: res.status, json: json, text: text };
+}
+
+// messageOf 说一个回答说了什么。
+//
+// JSON 的错误在 error.message 里，登录页的那句话在 .bad 里。两样都读，
+// 人看到的都是一句话，不是一段 HTML。
+function messageOf(answer) {
+  if (answer.json) {
+    const e = answer.json.error;
+    if (typeof e === 'string' && e) return e;
+    if (e && e.message) return e.message;
+    if (answer.json.message) return answer.json.message;
+  }
+  const page = pageMessage(answer.text);
+  if (page) return page;
+  return answer.text.trim() || ('HTTP ' + answer.status);
+}
+
+// pageMessage 读登录页上那句话。
+//
+// 页面是 HTML，所以它被解析成文档，只取 .bad 那一行的字。它从来不
+// 被写回页面里去。
+function pageMessage(html) {
+  if (!html) return '';
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const bad = doc.querySelector('.bad');
+    return bad ? bad.textContent.trim() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// safeURL 给一个能点的地址，或者不给。
+//
+// 地址是上游答上来的，javascript: 那种点一下就跑。只有 http 和 https
+// 才是链接，其余的不是链接。
+function safeURL(raw) {
+  try {
+    const u = new URL(String(raw));
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href;
+  } catch (e) {
+    return null;
+  }
+}
 
 async function post(url, body) {
   const res = await fetch(url, {
@@ -12,9 +78,10 @@ async function post(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(text || res.statusText);
-  return text ? JSON.parse(text) : null;
+  const answer = await readAnswer(res);
+  if (answer.status === 401) askForKey();
+  if (!answer.ok) throw new Error(messageOf(answer));
+  return answer.json;
 }
 
 async function patch(url, body) {
@@ -23,7 +90,60 @@ async function patch(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  const answer = await readAnswer(res);
+  if (answer.status === 401) askForKey();
+  if (!answer.ok) throw new Error(messageOf(answer));
+}
+
+// signIn 拿一张票。
+//
+// 回答可能是登录页（HTML），也可能是 JSON：网关现在给的是前者。两样
+// 都读，人看到的是同一句话。
+async function signIn(key) {
+  const res = await fetch('/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: key }),
+  });
+  const answer = await readAnswer(res);
+  if (!answer.ok) throw new Error(messageOf(answer));
+  return answer;
+}
+
+// askForKey 要一把 key。
+//
+// 会话没了的时候，页面上的按钮都答 401。这里问一次 key，交给网关换
+// 一张票，换到了就把页面重新加载。
+let keyBox = null;
+function askForKey() {
+  if (keyBox) return;
+  keyBox = document.createElement('div');
+  keyBox.className = 'card';
+  const label = document.createElement('p');
+  label.textContent = '这个网关要一把 API key。填进去就能继续。';
+  const form = document.createElement('form');
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.placeholder = 'API key';
+  input.autocomplete = 'current-password';
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.textContent = '进入';
+  const msg = document.createElement('p');
+  form.append(input, button);
+  keyBox.append(label, form, msg);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    button.disabled = true;
+    try {
+      await signIn(input.value);
+      location.reload();
+    } catch (e) {
+      msg.textContent = e.message;
+      button.disabled = false;
+    }
+  });
+  document.body.appendChild(keyBox);
 }
 
 document.addEventListener('click', async (ev) => {
@@ -63,9 +183,18 @@ document.addEventListener('click', async (ev) => {
     box.textContent = '请稍候……';
     try {
       const out = await post('/api/accounts');
-      box.innerHTML =
-        `把验证码 <strong>${out.user_code}</strong> 填到 ` +
-        `<a href="${out.verification_url}" target="_blank">这个页面</a>。`;
+      // 验证码和地址是上游给的：它们只作为字和地址进页面，不作为
+      // 标记。地址还得是 http 或者 https 才配当链接。
+      box.textContent = '';
+      const code = document.createElement('strong');
+      code.textContent = out.user_code;
+      const link = document.createElement('a');
+      link.textContent = '这个页面';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      const href = safeURL(out.verification_url);
+      if (href) link.href = href;
+      box.append('把验证码 ', code, ' 填到 ', link, '。');
       poll(out.id);
     } catch (e) {
       box.textContent = '失败：' + e.message;
@@ -90,13 +219,14 @@ function poll(id) {
   const timer = setInterval(async () => {
     try {
       const out = await post(`/api/accounts/poll`, { id });
+      const box = document.getElementById('poll-result');
       if (out.done) {
         clearInterval(timer);
-        document.getElementById('poll-result').textContent = '登录成功，正在刷新……';
+        if (box) box.textContent = '登录成功，正在刷新……';
         location.reload();
       } else if (out.error) {
         clearInterval(timer);
-        document.getElementById('poll-result').textContent = '失败：' + out.error;
+        if (box) box.textContent = '失败：' + out.error;
       }
     } catch (e) {
       /* 继续等 */

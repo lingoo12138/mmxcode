@@ -6,16 +6,20 @@ package webui
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"mmxcode/internal/account"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
@@ -38,8 +42,26 @@ type pendingLogin struct {
 	URL       string
 	Device    *oauth.Device
 	CreatedAt time.Time
-	Err       string
+	// Err says why the sign-in did not work. It is empty while the
+	// sign-in is still going on.
+	//
+	// It is written and read under the WebUI's lock. A string is two
+	// words, and reading one of them while the other one is being
+	// written gives a string that is half of one thing and half of
+	// another: a pointer to nowhere with a length that is not there.
+	Err string
+	// FailedAt is when the sign-in failed. It is zero while the sign-in
+	// is still going on.
+	FailedAt time.Time
 }
+
+// defaultPendingTTL is how long a sign-in that has ended is kept.
+//
+// A sign-in that failed has to be kept long enough for the browser to
+// be told why: the page asks about it every few seconds. After that it
+// goes, so that a server that is up for a long time does not keep every
+// sign-in it ever had.
+const defaultPendingTTL = 10 * time.Minute
 
 // WebUI serves the pages and the API.
 type WebUI struct {
@@ -53,6 +75,9 @@ type WebUI struct {
 	tmpl    *template.Template
 	mu      sync.Mutex
 	pending map[string]*pendingLogin
+	// pendingTTL is how long a sign-in that has ended is kept. It is a
+	// field so that a test can make it short.
+	pendingTTL time.Duration
 }
 
 // New makes the WebUI.
@@ -62,11 +87,12 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 	// last page's content, so every page would render the last one.
 	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
-		Mgr:     mgr,
-		Cfg:     cfg,
-		Store:   s,
-		tmpl:    tmpl,
-		pending: map[string]*pendingLogin{},
+		Mgr:        mgr,
+		Cfg:        cfg,
+		Store:      s,
+		tmpl:       tmpl,
+		pending:    map[string]*pendingLogin{},
+		pendingTTL: defaultPendingTTL,
 	}
 }
 
@@ -301,6 +327,12 @@ func (w *WebUI) loginData(ctx context.Context) (map[string]any, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, p := range w.pending {
+		// A sign-in that failed is not waiting for anybody any more. It
+		// is kept a while so that the page can say why it failed, and
+		// it must not be shown as one that is still going on.
+		if p.Err != "" {
+			continue
+		}
 		return map[string]any{"Pending": map[string]any{
 			"UserCode": p.UserCode, "URL": p.URL,
 		}}, nil
@@ -353,36 +385,109 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	tok, err := d.Poll(ctx, w.Mgr.Up, site.AccountURL(site.TokenPath))
-	w.mu.Lock()
-	p := w.pending[id]
-	w.mu.Unlock()
 	if err != nil {
-		w.mu.Lock()
-		if p != nil {
-			p.Err = err.Error()
-		}
-		w.mu.Unlock()
+		w.failLogin(id, err.Error())
 		return
 	}
 	now := time.Now()
 	acc := store.Account{
-		ID:        fmt.Sprintf("acc_%d", now.UnixMilli()),
-		Name:      tok.Subject,
-		UserID:    tok.Subject,
+		ID:        newAccountID(),
 		Status:    store.StatusActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	// 账户是谁，要问站点本人：令牌里的那个 sub 是猜的，签到和积分
+	// 明细要的是真的那个 user id。命令行就是这么做的，这里也一样。
+	who, ierr := w.identity(ctx, tok)
+	if ierr != nil {
+		// 登录成功了，只是读不到账户信息：账号还是建起来，用令牌
+		// 自己带着的东西填。
+		fmt.Fprintf(os.Stderr, "webui: signed in, but the account's identity could not be read: %v\n", ierr)
+	}
+	acc.Name = firstNonEmpty(who.Email, who.RealUserID, tok.Subject)
+	acc.UserID = firstNonEmpty(who.RealUserID, tok.Subject)
+	acc.Email = who.Email
 	if err := w.Store.CreateAccount(ctx, acc); err != nil {
+		// 建账号失败要说出来：不然这一次登录就悄悄没了，人只看到
+		// 页面在转圈。
+		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
-	_ = w.Store.SaveToken(ctx, store.Token{
+	if err := w.Store.SaveToken(ctx, store.Token{
 		AccountID: acc.ID, Access: tok.Access, Refresh: tok.Refresh,
 		ExpiresAt: tok.Expires, Subject: tok.Subject, UpdatedAt: now,
-	})
+	}); err != nil {
+		w.failLogin(id, "the token could not be written down: "+err.Error())
+		return
+	}
 	w.mu.Lock()
 	delete(w.pending, id)
 	w.mu.Unlock()
+}
+
+// identity reads who the account is.
+//
+// The token's own claims are guesses, so the site is asked. A failure
+// is not fatal: the sign-in worked, and the caller falls back to what
+// the token carries.
+func (w *WebUI) identity(ctx context.Context, tok *oauth.Token) (account.Identity, error) {
+	if w.Mgr == nil || w.Mgr.Acc == nil {
+		return account.Identity{}, errors.New("no account client")
+	}
+	return w.Mgr.Acc.Identity(ctx, tok.Access, tok.Subject)
+}
+
+// failLogin says the sign-in did not work.
+//
+// The reason is kept on the entry, so that the page can be told why.
+// The entry itself goes away after a while: a server that is up for a
+// long time must not keep every sign-in it ever had.
+//
+// The entry is not taken away at once, because the browser has to be
+// able to read the reason. The page asks every few seconds, and it
+// stops asking once it has the answer.
+func (w *WebUI) failLogin(id string, reason string) {
+	w.mu.Lock()
+	p := w.pending[id]
+	if p != nil {
+		p.Err = reason
+		p.FailedAt = time.Now()
+	}
+	ttl := w.pendingTTL
+	w.mu.Unlock()
+	if p == nil {
+		return
+	}
+	time.AfterFunc(ttl, func() {
+		w.mu.Lock()
+		delete(w.pending, id)
+		w.mu.Unlock()
+	})
+}
+
+// newAccountID makes an id for a new account.
+//
+// The time alone is not enough: two sign-ins that end in the same
+// millisecond get the same id, and the second one is refused by the
+// primary key. So the id has a random part too.
+func newAccountID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// 没有随机数的时候只能用时间：撞车的机会很小，撞上了也
+		// 只是这一次登录白做。
+		return fmt.Sprintf("acc_%d", time.Now().UnixMilli())
+	}
+	return "acc_" + hex.EncodeToString(b)
+}
+
+// firstNonEmpty gives the first value that is not empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // apiPoll says how a sign-in is going.
@@ -391,15 +496,22 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 		ID string `json:"id"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
+	// The reason is read under the lock and copied out of it. It is
+	// written under the same lock, and reading it outside would read
+	// half of one string and half of another.
 	w.mu.Lock()
 	p := w.pending[body.ID]
+	reason := ""
+	if p != nil {
+		reason = p.Err
+	}
 	w.mu.Unlock()
-	if p == nil {
-		writeJSON(rw, map[string]any{"done": true})
+	if reason != "" {
+		writeJSON(rw, map[string]any{"error": reason})
 		return
 	}
-	if p.Err != "" {
-		writeJSON(rw, map[string]any{"error": p.Err})
+	if p == nil {
+		writeJSON(rw, map[string]any{"done": true})
 		return
 	}
 	writeJSON(rw, map[string]any{"done": false})

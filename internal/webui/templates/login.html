@@ -3,9 +3,11 @@
 {{if .Pending}}
 <p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
    <a href="{{.Pending.URL}}" target="_blank">这个页面</a>。</p>
-<p id="poll-result" class="muted">正在等……</p>
 {{else}}
 <button id="start-login">开始登录</button>
-<div id="login-result"></div>
 {{end}}
+{{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，
+     失败的话也得让人看见那句话。 */}}
+<div id="login-result"></div>
+<p id="poll-result" class="muted">{{if .Pending}}正在等……{{end}}</p>
 {{end}}
