@@ -211,9 +211,22 @@ WARP 是额外的出口选项，跟按账号单独指定的代理并列。
 
 上游行为对齐社区插件 [`@magpie-community/opencode-minimax-auth`](https://github.com/magpie-community/plugins/tree/main/packages/minimax) 的 `packages/minimax/index.mjs`：端点、请求签名、刷新语义、签到语义、配额拒绝的判定，都以它为准。
 
+### 上游只认 Anthropic 那条路
+
+参考插件只会打 Anthropic 的 `/messages`（它接的是 `@ai-sdk/anthropic`），它从来没走过 OpenAI 的 `/chat/completions`，也没走过 Codex 的 `/responses`。所以这两种客户端协议都备着本地转换：
+
+- **OpenAI**：先按原样发给上游的 `/chat/completions`；上游回 404（就是没有这个接口）时，改成本地转成 Anthropic 的 `/messages` 再发一次，回来的答案转回 OpenAI 的形状。这个判断只做一次，之后都走本地转换。
+- **Codex**：同样的办法，先试 `/responses`，404 就转成 Anthropic 再发。
+
+转换出来的形状是客户端真的能用的：Codex 的非流式回答里，工具调用是 `function_call` 条目（`call_id`、`name`、`arguments` 都在），不是一段空文本。
+
 ## 计划
 
 两个计划都已实现：
 
 - 计划 A：核心库与 CLI（`docs/superpowers/plans/2026-11-13-mmxcode-core.md`）
 - 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署（`docs/superpowers/plans/2026-11-13-mmxcode-gateway.md`）
+
+### 不做的
+
+图片生成、视频生成、语音、web search 这些**不做**。参考插件通过 MiniMax 的 Matrix 连接器（`/minimax-cloud/api/v1/connectors/*`）用得上它们，但那些是另一个量级的工作量，要做的时候单开一个计划 —— 设计文档 §1.5 记着调研到的东西。
