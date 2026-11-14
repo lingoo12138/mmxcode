@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1997,5 +1998,57 @@ func TestAFailedReloginKeepsTheTokenThatIsThere(t *testing.T) {
 	}
 	if !strings.Contains(acc.LastError, "refused the password") {
 		t.Fatalf("last error = %q, want the reason", acc.LastError)
+	}
+}
+
+func TestTwoReloginsOfOneAccountAreOneSignIn(t *testing.T) {
+	// 调度器的一轮和命令行里的那一次可能撞上。同一个账号只能登一次：
+	// 登两次就是站点那边两个设备码、两个会话。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	var calls int32
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		atomic.AddInt32(&calls, 1)
+		// 慢一点，让另一个那一次挤在锁上。
+		time.Sleep(50 * time.Millisecond)
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: "acc_1", Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			_ = m.Relogin(ctx, "acc_1")
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("signed in %d times, want 1", got)
+	}
+	tok, err := m.Store.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new-access" {
+		t.Fatalf("token = %+v", tok)
 	}
 }

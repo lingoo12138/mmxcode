@@ -93,6 +93,35 @@ type Manager struct {
 	// ReloginFn signs an account in again. It is a field so that a
 	// test can stand in for the network.
 	ReloginFn ReloginFunc
+	// reloginLocks serialises the relogin of one account.
+	reloginLocks reloginLocks
+}
+
+// reloginLocks serialises the relogin of one account.
+//
+// 调度器的一轮和人在命令行里的那一次可能撞上。同一个账号被登两次，
+// 站点那边就是两个设备码、两个会话、两条新链；后失败的那一次还会把
+// 先成功那一次存好的令牌抹掉。
+type reloginLocks struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+// lock takes the lock of one account and gives back the way to let it
+// go.
+func (l *reloginLocks) lock(id string) func() {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sync.Mutex{}
+	}
+	mu, ok := l.m[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		l.m[id] = mu
+	}
+	l.mu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // New makes a manager.
@@ -546,6 +575,19 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	if acc.Status != store.StatusSignedOut {
 		return ErrNotSignedOut
 	}
+	// 同一个账号的重登要一个一个来：调度器的一轮和命令行里的那一次
+	// 可能撞上，两个都登的话，站点那边就是两个设备码、两个会话。
+	unlock := m.reloginLocks.lock(accountID)
+	defer unlock()
+	// 等锁的时候别人可能已经把这个账号登回去了。再登一次是白登，
+	// 而且会把刚换好的令牌再换一次。
+	acc, err = m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if acc.Status != store.StatusSignedOut {
+		return ErrNotSignedOut
+	}
 	cipher, err := m.Store.Password(ctx, accountID)
 	if err != nil {
 		return err
@@ -606,6 +648,10 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int)
 			continue
 		}
 		if err := m.Relogin(ctx, acc.ID); err != nil {
+			if errors.Is(err, ErrNotSignedOut) {
+				// 别人刚把它登回去了：这不算失败。
+				continue
+			}
 			failed++
 			continue
 		}
