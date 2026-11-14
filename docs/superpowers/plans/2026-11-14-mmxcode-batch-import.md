@@ -4812,6 +4812,12 @@ batch:
 并在文件里加类型与两个方法：
 
 ```go
+// ErrNotSignedOut says the account is not signed out.
+//
+// 重登是给签出的账号准备的。状态不是签出的账号，替它登录没有意义：
+// 它手里那条链还能用，重登一次只会把还能用的令牌换掉。
+var ErrNotSignedOut = errors.New("这个账号不是签出状态，不用重登")
+
 // ReloginFunc signs an account in again with the password it was
 // brought in with.
 type ReloginFunc func(ctx context.Context, acc store.Account, password string) error
@@ -4822,10 +4828,17 @@ type ReloginFunc func(ctx context.Context, acc store.Account, password string) e
 // An account without a password cannot be signed in again: there is
 // nothing to sign in with. That is an error, not a silent skip — the
 // person who asked wants to know.
+//
+// Only a signed-out account is signed in again. An account that is
+// still active has a token that works, and signing it in again would
+// replace that token with a new one for no reason.
 func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	acc, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
 		return err
+	}
+	if acc.Status != store.StatusSignedOut {
+		return ErrNotSignedOut
 	}
 	cipher, err := m.Store.Password(ctx, accountID)
 	if err != nil {
@@ -4847,8 +4860,11 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 		return errors.New("没有地方能重新登录")
 	}
 	if err := m.ReloginFn(ctx, acc, password); err != nil {
-		if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
-			return errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
+		// 登不回去说的是这次登录失败，不是手里那条链的事。所以令牌
+		// 不动：清空它只能毁掉一个还能用的凭据，什么也救不回来。
+		// 这里写下的只是失败的原因，账号还是签出的。
+		if mErr := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, err.Error(), time.Now()); mErr != nil {
+			return errors.Join(err, fmt.Errorf("the failure could not be saved: %w", mErr))
 		}
 		return err
 	}

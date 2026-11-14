@@ -1890,3 +1890,112 @@ func TestTheReloginDropsTheOldChain(t *testing.T) {
 		t.Fatal("the old chain is still there: its refresh token could be sent again")
 	}
 }
+
+func TestAReloginOfAnActiveAccountIsRefused(t *testing.T) {
+	// 还能用的账号不需要重登：替它登一次只会把还能用的令牌换掉。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_1", Access: "good-access", Refresh: "good-refresh",
+		ExpiresAt: now.Add(50 * time.Minute), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	signedIn := false
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		signedIn = true
+		return errors.New("the site refused the password")
+	}
+	err = m.Relogin(ctx, "acc_1")
+	if err == nil {
+		t.Fatal("no error for an account that is not signed out")
+	}
+	if !errors.Is(err, ErrNotSignedOut) {
+		t.Fatalf("error = %q, want it to say the account is not signed out", err)
+	}
+	if signedIn {
+		t.Fatal("an active account was signed in again")
+	}
+	// 令牌还在，状态也还在：一个还能用的账号不能因为一次重登而掉出去。
+	tok, err := m.Store.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "good-access" || tok.Refresh != "good-refresh" {
+		t.Fatalf("token = %+v, want the one that was there", tok)
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusActive {
+		t.Fatalf("status = %q, want active", acc.Status)
+	}
+}
+
+func TestAFailedReloginKeepsTheTokenThatIsThere(t *testing.T) {
+	// 这次重登失败，什么都没说手里那条链的事：令牌不能动。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_1", Access: "good-access", Refresh: "good-refresh",
+		ExpiresAt: now.Add(50 * time.Minute), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return errors.New("the site refused the password")
+	}
+	if err := m.Relogin(ctx, "acc_1"); err == nil {
+		t.Fatal("no error for a failed sign-in")
+	}
+	tok, err := m.Store.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "good-access" || tok.Refresh != "good-refresh" {
+		t.Fatalf("token = %+v, want the one that was there", tok)
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want signed out", acc.Status)
+	}
+	if !strings.Contains(acc.LastError, "refused the password") {
+		t.Fatalf("last error = %q, want the reason", acc.LastError)
+	}
+}
