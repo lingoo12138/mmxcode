@@ -30,9 +30,6 @@ type ChatRequest struct {
 	Body []byte
 	// Stream says the answer is a stream.
 	Stream bool
-	// Anthropic says the Anthropic protocol is in use, so the version
-	// header is filled in when the client did not send one.
-	Anthropic bool
 	// Extra holds headers the client set, copied over.
 	Extra map[string]string
 }
@@ -60,7 +57,10 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 	if req.SessionID != "" {
 		httpReq.Header.Set("X-Mavis-Session-Id", req.SessionID)
 	}
-	if req.Anthropic && httpReq.Header.Get("anthropic-version") == "" {
+	// MiniMax Code's own requests all carry the version header, so
+	// every request here carries it too — the site reads the request
+	// as MiniMax Code wrote it, not as the client's protocol wrote it.
+	if httpReq.Header.Get("anthropic-version") == "" {
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
 	}
 	// 必须：不带压缩时 MiniMax 才会一个事件一个事件地吐

@@ -62,6 +62,33 @@ func TestToAnthropicStringInput(t *testing.T) {
 	}
 }
 
+// TestAnEmptyTextBlockStillHasItsText says a text block keeps its
+// text field even when the text is empty.
+//
+// Anthropic wants the field: a block that says only "type":"text" is
+// refused. And a block that carries a field it does not know is
+// refused too, so the text block carries nothing else.
+func TestAnEmptyTextBlockStillHasItsText(t *testing.T) {
+	out, err := ToAnthropic([]byte(`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	block := m["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if _, ok := block["text"]; !ok {
+		t.Fatalf("block = %v, want a text field", block)
+	}
+	if block["text"] != "" {
+		t.Fatalf("block = %v, want an empty text", block)
+	}
+	if len(block) != 2 {
+		t.Fatalf("block = %v, want only the type and the text", block)
+	}
+}
+
 func TestToAnthropicToolCalls(t *testing.T) {
 	in := []byte(`{
 		"model":"m",

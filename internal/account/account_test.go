@@ -356,6 +356,81 @@ func TestPlanWindowsEmpty(t *testing.T) {
 	}
 }
 
+// TestTheWindowEndIsReadInSecondsToo says a window's end is read the
+// way its length is read.
+//
+// 站点写时间不说是秒还是毫秒：一万亿以下是秒。窗口的结束时间要是按
+// 毫秒读，一个秒的时间就变成了 1970 年 —— 窗口早就"回来了"，于是
+// 用完的账号一次又一次被挑中。
+func TestTheWindowEndIsReadInSecondsToo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+			{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+			 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+			 "start_time":1763000000,"end_time":1763010800,
+			 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+			 "current_weekly_total_percent":100,"weekly_start_time":1762800000,"weekly_end_time":1763400000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if got := ws[0].ResetsAt.UnixMilli(); got != 1763010800000 {
+		t.Fatalf("the window resets at %d, want 1763010800000", got)
+	}
+	// 长度也一样：三个小时（秒写和毫秒写都是三个小时）
+	if ws[0].Name != "3 hours" {
+		t.Fatalf("window = %+v, want the three hour window", ws[0])
+	}
+}
+
+// TestPlanWindowsKeepsTheConsoleAnswerWhenItsListIsNotEmpty says a
+// list that is not empty is the console's answer, even when every entry
+// in it is a bucket the plan does not have.
+//
+// 参考实现看的是回答里有没有那个列表，不是我们能从列表里做出几个
+// 窗口。列表在，答案就在：这时这个套餐就是没有窗口，那是答案，不是
+// 再问一次的理由。
+func TestPlanWindowsKeepsTheConsoleAnswerWhenItsListIsNotEmpty(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			// 一个套餐没有的桶：两个窗口都是无限的、两个都没有计数。
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,"current_weekly_status":3,
+				 "current_interval_total_count":0,"current_weekly_total_count":0}
+			]}`))
+		default:
+			t.Errorf("the open platform was asked: %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 0 {
+		t.Fatalf("got %+v, want no windows", ws)
+	}
+	if len(asked) != 1 || asked[0] != site.PlanRemainsPath {
+		t.Fatalf("asked %v, want only the console", asked)
+	}
+}
+
 // TestWindowName says a window is named after its own length.
 //
 // 窗口的名字是它自己的长度：三小时的窗口叫 "3 hours"，不是写死的

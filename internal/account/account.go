@@ -523,32 +523,36 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 // The console's own answer comes first; the open platform's is the
 // fallback.
 //
-// The console's answer is used only when it has windows in it. The
-// reference uses it only when the answer is a list that is not empty,
-// and asks the open platform otherwise: the international site's
+// The console's answer is used only when it has a list of windows in
+// it. The reference uses it only when the answer is a list that is not
+// empty, and asks the open platform otherwise: the international site's
 // remains_percent answers 200 with an empty list, and the windows are
 // at the other endpoint.
+//
+// A list that is not empty is the console's answer even when every
+// entry in it is a bucket the plan does not have: then the plan has no
+// windows, and that is an answer, not a reason to ask again.
 //
 // An answer the console could not give is not thrown away when the
 // open platform has the windows: the two endpoints are two ways of
 // asking the same question, and the one that answered is the one that
 // counts.
 func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Window, error) {
-	ws, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
-	if err == nil && len(ws) > 0 {
+	ws, listed, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
+	if err == nil && listed {
 		return ws, nil
 	}
-	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
+	ws2, _, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
 	if err2 != nil {
 		return nil, err2
 	}
 	return ws2, nil
 }
 
-func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, error) {
+func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.platform+path, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+access)
@@ -558,17 +562,17 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 	}
 	resp, err := c.up.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	body, err := upstream.ReadBody(resp)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, &RefusedError{Status: resp.StatusCode}
+		return nil, false, &RefusedError{Status: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
 	}
 	return parsePlanWindows(body)
 }

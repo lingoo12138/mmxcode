@@ -362,11 +362,10 @@ accountLoop:
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
 			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
 			// 方法，Zone() 的第二个返回值就是它。
-			TZOffset:  nowOffset(),
-			Body:      upBody,
-			Stream:    stream,
-			Anthropic: upPath == site.MessagesPath,
-			Extra:     clientHeaders(r),
+			TZOffset: nowOffset(),
+			Body:     upBody,
+			Stream:   stream,
+			Extra:    clientHeaders(r),
 		}
 
 		// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
@@ -401,7 +400,6 @@ accountLoop:
 					upBody, upPath, convertBack = fb, fp, fback
 					chatReq.Body = upBody
 					chatReq.Path = upPath
-					chatReq.Anthropic = upPath == site.MessagesPath
 					resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
 					if err != nil {
 						var oe *upstream.OtherSiteError
@@ -559,23 +557,17 @@ func upstreamMessage(raw []byte) string {
 
 // action says what to do about the answer.
 //
-// The rotator owns the rule. The one thing it cannot know is that the
-// site refuses a sign-in with a 403 as well as with a 401 — the account
-// package reads both that way — so the gateway says the sign-in was
-// refused.
+// The rotator owns the rule, and on the chat path the rule is the
+// site's own: a 401 means the token was turned away before its end, so
+// the token is renewed and the same account is asked again. A 403 is
+// the site's refusal to answer and not a stale token — renewing on it
+// would spend a refresh token (which MiniMax gives only once) on
+// every refusal.
 //
-// It says it only when the rotator did not read the answer as a
-// refusal to spend: an answer that names the credits is about the
-// credits, and spending the window is the right answer for it.
+// The account API is a different story: there the site refuses a
+// sign-in with a 403 as well as with a 401, and the account package
+// reads both that way.
 func (s *Server) action(failure rotator.Failure) rotator.Action {
-	action := rotator.Decide(failure)
-	if action == rotator.ActionFailover {
-		return action
-	}
-	if failure.Status != http.StatusUnauthorized && failure.Status != http.StatusForbidden {
-		return action
-	}
-	failure.Refused = true
 	return rotator.Decide(failure)
 }
 

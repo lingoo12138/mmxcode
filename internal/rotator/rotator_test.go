@@ -861,6 +861,15 @@ func TestDecideReadsTheQuotaWordsFromTheNestedMessage(t *testing.T) {
 	}
 }
 
+func TestDecideReadsTheQuotaWordsFromAPlainErrorField(t *testing.T) {
+	// 站点也会这样答：error 是一个字符串，不是对象。那句话就是
+	// 上游说的拒绝，配额的话要认。
+	f := Failure{Status: 403, Body: []byte(`{"error":"insufficient_balance"}`)}
+	if got := Decide(f); got != ActionFailover {
+		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
+	}
+}
+
 func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 	f := Failure{Status: 429, Message: "insufficient balance"}
 	if got := Decide(f); got != ActionFailover {

@@ -591,32 +591,25 @@ func TestUnauthorizedRenewsTheToken(t *testing.T) {
 	}
 }
 
-// TestForbiddenRenewsTheToken says a 403 renews the token too.
+// TestForbiddenDoesNotRenewTheToken says a 403 does not renew the
+// token.
 //
-// 站点用 403 拒签到，账号这一边也是这么读的：令牌旧了，续签。
-func TestForbiddenRenewsTheToken(t *testing.T) {
-	// 次数是本地的一份：handler 是先给的，那时 h还不存在。
-	hits := 0
+// 聊天这条路只有 401 才续签：403 是站点自己不答，不是令牌旧了。
+// 续签一次就是花掉一个只能用一次的 refresh token，不该花在每个
+// 403 上。
+func TestForbiddenDoesNotRenewTheToken(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits == 1 {
-			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"message":"forbidden"}`))
-			return
-		}
-		w.Write([]byte(`{"type":"message","content":[]}`))
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
 	w := httptest.NewRecorder()
 	h.gw.ServeHTTP(w, req)
-	if w.Code != 200 {
+	if h.renewals != 0 {
+		t.Fatalf("the token was renewed %d times, want 0", h.renewals)
+	}
+	if w.Code != http.StatusForbidden {
 		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
-	}
-	if h.renewals != 1 {
-		t.Fatalf("the token was renewed %d times, want 1", h.renewals)
-	}
-	if len(h.tokens) < 2 || h.tokens[0] == h.tokens[1] {
-		t.Fatalf("the account was asked again with the same token: %v", h.tokens)
 	}
 }
 

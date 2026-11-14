@@ -343,8 +343,18 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	}
 	d.deadline = deadline
 
+	// The wait between two polls. The site's own variant says the
+	// interval in milliseconds and the ordinary one in seconds, and
+	// the reference reads each one in its own unit: 3000 is three
+	// seconds on one path and three thousand milliseconds on the
+	// other.
 	interval := 5 * time.Second
-	if b.Interval > 0 {
+	switch {
+	case b.Interval <= 0:
+		// 没有这个字段（或者是零）：五秒一轮。
+	case byUser:
+		interval = time.Duration(b.Interval) * time.Millisecond
+	default:
 		interval = pollInterval(b.Interval)
 	}
 	d.interval = interval

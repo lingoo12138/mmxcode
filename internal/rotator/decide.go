@@ -180,8 +180,10 @@ func parseBusiness(body []byte) (code int, message string, refused bool) {
 // MiniMax's own shape.
 //
 // The message is looked for at the top level and inside an error
-// object, which are the shapes the site uses. A field that is not a
-// string says nothing.
+// object, which are the shapes the site uses. An error field that is a
+// string and not an object is the message itself: the site answers
+// with a plain error that way. A field that is not a string says
+// nothing.
 func plainMessage(body []byte) string {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(body, &obj) != nil {
@@ -194,6 +196,9 @@ func plainMessage(body []byte) string {
 		raw, ok := obj[key]
 		if !ok {
 			continue
+		}
+		if s := rawString(raw); s != "" {
+			return s
 		}
 		var sub map[string]json.RawMessage
 		if json.Unmarshal(raw, &sub) != nil {

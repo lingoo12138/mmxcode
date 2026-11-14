@@ -122,7 +122,12 @@ type statusError struct{ status int }
 func (e *statusError) Error() string { return "HTTP " + strconv.Itoa(e.status) }
 
 // parsePlanWindows reads the console's answer as windows.
-func parsePlanWindows(raw []byte) ([]Window, error) {
+//
+// listed says the answer had a list of windows in it. The reference
+// decides on that list and not on the windows it can make of it: an
+// answer with a list is the console's answer, even when every entry in
+// it is a bucket the plan does not have.
+func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 	var env struct {
 		BaseResp *struct {
 			StatusCode int    `json:"status_code"`
@@ -149,7 +154,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("no plan in the reply: %w", err)
+		return nil, false, fmt.Errorf("no plan in the reply: %w", err)
 	}
 	if env.BaseResp != nil && env.BaseResp.StatusCode != 0 {
 		// The reference names the status code when the answer has no
@@ -158,7 +163,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		if msg == "" {
 			msg = fmt.Sprintf("MiniMax said %d", env.BaseResp.StatusCode)
 		}
-		return nil, errors.New(msg)
+		return nil, false, errors.New(msg)
 	}
 	var out []Window
 	for _, m := range env.ModelRemains {
@@ -224,7 +229,13 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			}
 			w := Window{Name: own, ModelName: name, Used: used}
 			if x.end > 0 {
-				w.ResetsAt = time.UnixMilli(x.end)
+				// The end of the window is a time the site wrote, and
+				// the site does not say in which unit: a number
+				// below a trillion is seconds. The reference reads it
+				// the same way, and the window's own length is read
+				// that way too — so the two agree on how long the
+				// window is.
+				w.ResetsAt = time.UnixMilli(planMS(x.end))
 			}
 			// The site counts the items a window has. A count that is
 			// not there is zero, the way the reference reads it, so a
@@ -257,7 +268,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			out = append(out, w)
 		}
 	}
-	return out, nil
+	return out, len(env.ModelRemains) > 0, nil
 }
 
 // isThree says whether a number is 3.

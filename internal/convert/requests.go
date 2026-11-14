@@ -82,6 +82,40 @@ type anthropicBlock struct {
 	Content   string          `json:"content,omitempty"`
 }
 
+// MarshalJSON writes the block the way Anthropic wants it.
+//
+// Anthropic wants the field every block has, even when the field is
+// empty: a text block without a "text" is refused. And a block that
+// carries a field it does not know is refused too, so each kind writes
+// only its own fields — a text block never carries an id.
+func (b anthropicBlock) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case "tool_use":
+		input := b.Input
+		if len(input) == 0 {
+			// Anthropic wants an object here, not nothing.
+			input = json.RawMessage("{}")
+		}
+		return json.Marshal(struct {
+			Type  string          `json:"type"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}{b.Type, b.ID, b.Name, input})
+	case "tool_result":
+		return json.Marshal(struct {
+			Type      string `json:"type"`
+			ToolUseID string `json:"tool_use_id"`
+			Content   string `json:"content"`
+		}{b.Type, b.ToolUseID, b.Content})
+	default:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{b.Type, b.Text})
+	}
+}
+
 // anthropicTool is one tool of an Anthropic request.
 type anthropicTool struct {
 	Name        string          `json:"name"`

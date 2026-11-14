@@ -30,7 +30,6 @@ func TestChatSendsTheRightHeaders(t *testing.T) {
 		TZOffset:  -480,
 		Body:      []byte(`{"model":"MiniMax-M3"}`),
 		Stream:    false,
-		Anthropic: true,
 	}
 	resp, err := c.Chat(context.Background(), req, nil)
 	if err != nil {
@@ -79,7 +78,7 @@ func TestChatKeepsTheClientAnthropicVersion(t *testing.T) {
 	c := New(Options{Timeout: 5 * time.Second})
 	req := ChatRequest{
 		BaseURL: srv.URL, Path: "/mavis/api/v1/llm/v1/messages",
-		Access: "a", Body: []byte(`{}`), Anthropic: true,
+		Access: "a", Body: []byte(`{}`),
 		Extra: map[string]string{"anthropic-version": "2099-01-01"},
 	}
 	resp, err := c.Chat(context.Background(), req, nil)

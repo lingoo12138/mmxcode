@@ -106,6 +106,28 @@ func TestStartDeviceUserCodeVariant(t *testing.T) {
 	}
 }
 
+func TestStartDeviceUserCodeIntervalIsInMilliseconds(t *testing.T) {
+	// 站点自己那套里的间隔是毫秒：500 是半秒，不是八分多钟。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       time.Now().Add(10 * time.Minute).UnixMilli(),
+			"interval":         500,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.interval != 500*time.Millisecond {
+		t.Fatalf("interval = %v, want 500ms", d.interval)
+	}
+}
+
 func TestStartDeviceExpiredInSeconds(t *testing.T) {
 	// expired_in 小于 1e12 时是"还剩多少秒"，不是绝对时间。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
