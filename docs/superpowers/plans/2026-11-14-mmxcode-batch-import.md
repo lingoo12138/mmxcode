@@ -1789,26 +1789,75 @@ func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, err
 //
 // 没有这一行是 ErrNotFound。
 func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, error) {
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
-	}
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
-			last_error, created_at, updated_at
-		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
-		ORDER BY created_at, id LIMIT 1`, email)
-	a, err := scanAccount(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Account{}, fmt.Errorf("get the account by email %s: %w", email, ErrNotFound)
-	}
-	if err != nil {
-		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
-	}
-	return a, nil
+	return s.accountByEmail(ctx, s.db, email)
 }
 
 ```
+
+还要一个写事务：按邮箱找一行、没有就建一行，这种「查了再做」的事要
+在一个事务里做完，不然两个并发的导入会各建一行（同一个站点账号两行都
+是活的）。数据源名字里已经有 `_txlock=immediate`：事务一开始就拿着写
+锁，第二个进来的那个看见的是第一个建好的那一行。不改表的结构，也不加
+索引。
+
+```go
+// Tx is what one transaction can do.
+//
+// It is the same set of writes the store has, but inside one
+// transaction: they all land, or none of them does.
+type Tx interface {
+	// AccountByEmail gives the account with that email, when there is
+	// one. It says ErrNotFound when there is none.
+	AccountByEmail(ctx context.Context, email string) (Account, error)
+	// CreateAccount inserts an account.
+	CreateAccount(ctx context.Context, a Account) error
+	// SaveToken writes an account's token.
+	SaveToken(ctx context.Context, t Token) error
+	// SetAccountName writes the account's name.
+	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
+	// SetAccountProxy writes the account's outlet.
+	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
+}
+
+// Tx runs fn inside one write transaction.
+//
+// The write lock is taken when the transaction starts (the data source
+// name says _txlock=immediate), so "look the email up, and make a row
+// when there is none" cannot be done by two imports at the same time.
+// Without that, two concurrent imports of one email leave two live rows
+// of one site account: both of them are in the rotation pool, the page
+// lists the account twice, and the token of one of them is bound to be
+// thrown away by the other one's re-login.
+//
+// An error from fn rolls the transaction back: a reader never sees a
+// row whose token was not written.
+//
+// The rollback does not need the caller's context: the caller may have
+// been cut short, and the half of the transaction that did land has to
+// go back all the same.
+func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin a transaction: %w", err)
+	}
+	if err := fn(&sqlTx{s: s, tx: tx}); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("commit the transaction: %w", err)
+	}
+	return nil
+}
+
+```
+
+（事务里跑的语句和事务外的是同一批：能跑语句的就连接池和事务两样，
+所以语句只写一遍，`*sql.DB` 和 `*sql.Tx` 都当同一个接口使。）
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
@@ -3548,6 +3597,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3558,7 +3608,12 @@ import (
 )
 
 // fakeStore keeps what it is given.
+//
+// 它也照着真库的样子来：事务期间别人进不来（真库是一开始就把写锁拿
+// 着），写错了要退回去。
 type fakeStore struct {
+	// mu is the write lock.
+	mu       sync.Mutex
 	accounts []string
 	tokens   []string
 	password []string
@@ -3570,26 +3625,165 @@ type fakeStore struct {
 	names []string
 	// statuses are the states that were written.
 	statuses []string
+	// groups are the outlets that were written.
+	groups []string
+	// make is where the rows are made, when the test wants two imports
+	// to meet there.
+	make *barrier
 }
 
-func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
+// barrier lets a fixed number of callers meet.
+//
+// 真库里两个并发的导入是排队的：等不到对方就放行，这里就是这个意思。
+type barrier struct {
+	mu   sync.Mutex
+	n    int
+	want int
+	ch   chan struct{}
+}
+
+func newBarrier(want int) *barrier {
+	return &barrier{want: want, ch: make(chan struct{})}
+}
+
+// wait blocks until the wanted number of callers have arrived, or until
+// the wait is over.
+//
+// 等不到也要放行：真库里的事务是排队的，不是卡死的。
+func (b *barrier) wait() {
+	b.mu.Lock()
+	b.n++
+	if b.n >= b.want {
+		select {
+		case <-b.ch:
+		default:
+			close(b.ch)
+		}
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.ch:
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// snapshot is what the fake holds right now.
+type snapshot struct {
+	accounts []string
+	tokens   []string
+	password []string
+	rows     []store.Account
+	names    []string
+	statuses []string
+	groups   []string
+}
+
+// snapshot takes what the fake holds, so that it can be put back.
+func (s *fakeStore) snapshot() snapshot {
+	return snapshot{
+		accounts: append([]string(nil), s.accounts...),
+		tokens:   append([]string(nil), s.tokens...),
+		password: append([]string(nil), s.password...),
+		rows:     append([]store.Account(nil), s.rows...),
+		names:    append([]string(nil), s.names...),
+		statuses: append([]string(nil), s.statuses...),
+		groups:   append([]string(nil), s.groups...),
+	}
+}
+
+// restore puts back what the fake held before.
+//
+// 事务里写下去的东西，一眼吞掉就要退回去。
+func (s *fakeStore) restore(before snapshot) {
+	s.accounts = before.accounts
+	s.tokens = before.tokens
+	s.password = before.password
+	s.rows = before.rows
+	s.names = before.names
+	s.statuses = before.statuses
+	s.groups = before.groups
+}
+
+// Tx runs fn inside a transaction.
+//
+// 真库的事务一开始就把写锁拿着：两个并发的导入是排队进来的，不是同时
+// 进来的。写错了就退回去。
+func (s *fakeStore) Tx(ctx context.Context, fn func(store.Tx) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := s.snapshot()
+	if err := fn(fakeTx{s}); err != nil {
+		s.restore(before)
+		return err
+	}
+	return nil
+}
+
+// fakeTx is one transaction of the fake store.
+type fakeTx struct {
+	s *fakeStore
+}
+
+func (t fakeTx) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	return t.s.lookup(email)
+}
+
+func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
+	t.s.waitMake()
+	return t.s.createAccount(a)
+}
+
+func (t fakeTx) SaveToken(ctx context.Context, tok store.Token) error {
+	return t.s.saveToken(tok)
+}
+
+func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	return t.s.setAccountName(id, name)
+}
+
+func (t fakeTx) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	return t.s.setAccountProxy(id, group, url)
+}
+
+func (t fakeTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return t.s.updateAccountStatus(id, status)
+}
+
+// waitMake lets two imports meet before they make a row.
+//
+// 两个并发的导入都要按邮箱找这一行，都找到没有，都要建一行——这就是要
+// 防的那件事。让它们在门口碰头，这事就一定会发生，而不是碰运气。
+//
+// 等的时候不拿着锁：不然另一个导入连看都看不了，就成了排队，不是并发。
+func (s *fakeStore) waitMake() {
+	if s.make != nil {
+		s.make.wait()
+	}
+}
+
+// createAccount makes a row.
+func (s *fakeStore) createAccount(a store.Account) error {
 	s.accounts = append(s.accounts, a.ID+":"+a.Email)
 	s.rows = append(s.rows, a)
 	return nil
 }
 
-// AccountByEmail gives the account with that email.
-func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
-	for _, r := range s.rows {
-		if strings.EqualFold(r.Email, email) {
-			return r, nil
-		}
+// saveToken writes a token.
+func (s *fakeStore) saveToken(tok store.Token) error {
+	if s.failToken {
+		return errors.New("the disk is full")
 	}
-	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+	s.tokens = append(s.tokens, tok.AccountID+":"+tok.Refresh)
+	return nil
 }
 
-// SetAccountName writes the account's name.
-func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+// setAccountName writes a name.
+func (s *fakeStore) setAccountName(id, name string) error {
 	s.names = append(s.names, id+":"+name)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
@@ -3599,19 +3793,9 @@ func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updated
 	return nil
 }
 
-// UpdateAccountStatus writes the account's state.
-func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
-	s.statuses = append(s.statuses, id+":"+status)
-	for i := range s.rows {
-		if s.rows[i].ID == id {
-			s.rows[i].Status = status
-		}
-	}
-	return nil
-}
-
-// SetAccountProxy writes the account's outlet.
-func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+// setAccountProxy writes an outlet.
+func (s *fakeStore) setAccountProxy(id, group, url string) error {
+	s.groups = append(s.groups, id+":"+group)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
 			s.rows[i].ProxyGroup = group
@@ -3621,15 +3805,71 @@ func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, 
 	return nil
 }
 
-func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
-	if s.failToken {
-		return errors.New("the disk is full")
+// updateAccountStatus writes a state.
+func (s *fakeStore) updateAccountStatus(id, status string) error {
+	s.statuses = append(s.statuses, id+":"+status)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Status = status
+		}
 	}
-	s.tokens = append(s.tokens, t.AccountID+":"+t.Refresh)
 	return nil
 }
 
+// lookup gives the account with that email.
+func (s *fakeStore) lookup(email string) (store.Account, error) {
+	for _, r := range s.rows {
+		if strings.EqualFold(r.Email, email) {
+			return r, nil
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
+	s.waitMake()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createAccount(a)
+}
+
+// AccountByEmail gives the account with that email.
+func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lookup(email)
+}
+
+// SetAccountName writes the account's name.
+func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setAccountName(id, name)
+}
+
+// UpdateAccountStatus writes the account's state.
+func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateAccountStatus(id, status)
+}
+
+// SetAccountProxy writes the account's outlet.
+func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setAccountProxy(id, group, url)
+}
+
+func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveToken(t)
+}
+
 func (s *fakeStore) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.password = append(s.password, id+":"+cipher)
 	return nil
 }
@@ -3643,6 +3883,8 @@ func (s *fakeStore) DeleteAccount(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i, a := range s.accounts {
 		if strings.HasPrefix(a, id+":") {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
@@ -4088,6 +4330,53 @@ func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
 	}
 }
 
+// TestTwoConcurrentImportsOfOneEmailAreOneRow says two imports of one
+// email do not make two rows.
+//
+// 两个并发的导入（网页上传两趟，或者两个进程各跑一趟）：都要按邮箱找
+// 这一行，都找到没有，都建一行——同一个站点账号两行都是活的，页面把
+// 它列两遍，其中一个的令牌迟早被另一个的重登作废。
+//
+// 找和建要在一个事务里：事务一开始就把写锁拿着，第二个进来的那个看见
+// 的是第一个建好的那一行。
+func TestTwoConcurrentImportsOfOneEmailAreOneRow(t *testing.T) {
+	st := &fakeStore{make: newBarrier(2)}
+	c := aChain(st)
+	// 两次导入给两个不同的号：两行就看得出来是两行。
+	var mu sync.Mutex
+	n := 0
+	c.NewID = func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return fmt.Sprintf("acc_%d", n)
+	}
+
+	var wg sync.WaitGroup
+	results := make([]Result, 2)
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = c.Import(context.Background(), "a@example.com", "hunter2")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("import %d: %v", i, err)
+		}
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want one row", st.accounts)
+	}
+	if results[0].AccountID != results[1].AccountID {
+		t.Fatalf("account ids = %q and %q, want the same row",
+			results[0].AccountID, results[1].AccountID)
+	}
+}
+
 func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
 	// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的应该是
 	// 同一个账号从同一个地方来，而不是两个地方。
@@ -4168,20 +4457,21 @@ import (
 )
 
 // Store is where an imported account goes.
+//
+// 找和建要在一个事务里：不然两个并发的导入会各自看见「还没有」这一
+// 行，然后各建一行——同一个站点账号两行都是活的。
 type Store interface {
-	CreateAccount(ctx context.Context, a store.Account) error
-	SaveToken(ctx context.Context, t store.Token) error
+	// Tx runs fn inside one write transaction.
+	Tx(ctx context.Context, fn func(store.Tx) error) error
+	// SetPassword writes an account's encrypted password.
 	SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error
-	// AccountByEmail gives the account with that email, when there is
-	// one. It says store.ErrNotFound when there is none.
-	AccountByEmail(ctx context.Context, email string) (store.Account, error)
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
 	// SetAccountProxy writes the account's outlet.
 	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
-	// UpdateAccountStatus writes the account's state and its last
-	// error.
-	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 }
 
 // Web is the part of the account site the chain talks to.
@@ -4332,96 +4622,87 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	// 失败了，重来一遍是补救的办法。库里已经有这一行的时候再建一行，
 	// 同一个站点账号就有两个活着的行——两个都在轮转池里，页面把它列
 	// 两遍，而且其中一个的令牌迟早被另一个的重登作废。
-	existing, err := c.find(ctx, mail, email)
+	//
+	// 找和写在一个事务里：查了再做的事，两个并发的导入一起做就会做两
+	// 遍（网页上传两趟，或者两个进程各跑一趟）。令牌跟这一行一起写：
+	// 读者不会看见一行没有令牌的账号。
+	var existed bool
+	var row store.Account
+	err = c.Store.Tx(ctx, func(tx store.Tx) error {
+		existing, err := findIn(ctx, tx, mail, email)
+		if err != nil {
+			return err
+		}
+		if existing.ID != "" {
+			existed = true
+			row = existing
+			return tx.SaveToken(ctx, store.Token{
+				AccountID: row.ID,
+				Access:    tok.Access,
+				Refresh:   tok.Refresh,
+				ExpiresAt: tok.Expires,
+				Subject:   tok.Subject,
+				UpdatedAt: now,
+			})
+		}
+		acc := store.Account{
+			ID:         c.newID(),
+			Name:       mail,
+			UserID:     userID,
+			Email:      mail,
+			Status:     store.StatusActive,
+			ProxyGroup: c.ProxyGroup,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		if err := tx.CreateAccount(ctx, acc); err != nil {
+			return err
+		}
+		if err := tx.SaveToken(ctx, store.Token{
+			AccountID: acc.ID,
+			Access:    tok.Access,
+			Refresh:   tok.Refresh,
+			ExpiresAt: tok.Expires,
+			Subject:   tok.Subject,
+			UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		row = acc
+		return nil
+	})
 	if err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	if existing.ID != "" {
-		return c.update(ctx, email, password, existing, tok, id.Email, now, notes)
+		msg := err.Error()
+		if existed {
+			// 原来那一行没动过：它还带着一条能用的链，报错就是，不用
+			// 把这一行删掉——删掉就是毁掉一个还能用的账号。
+			msg = "令牌没能存下，库里原来那一行没动：" + msg
+		}
+		return Result{Email: email}, &Error{Stage: StageStore, Message: msg}
 	}
 
-	acc := store.Account{
-		ID:         c.newID(),
-		Name:       mail,
-		UserID:     userID,
-		Email:      mail,
-		Status:     store.StatusActive,
-		ProxyGroup: c.ProxyGroup,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+	if existed {
+		notes = c.refresh(ctx, row, id.Email, now, notes)
+		notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
 	}
-	if err := c.Store.CreateAccount(ctx, acc); err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	if err := c.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID,
-		Access:    tok.Access,
-		Refresh:   tok.Refresh,
-		ExpiresAt: tok.Expires,
-		Subject:   tok.Subject,
-		UpdatedAt: now,
-	}); err != nil {
-		// 账号的行已经写进去了，令牌却没有：这样的账号是残的，
-		// 把它拿掉，导入才能干净地再来一次。
-		c.undo(ctx, acc.ID)
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
-	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
+	notes, stored := c.keep(ctx, row.ID, password, now, notes)
+	res := Result{Email: email, OK: true, AccountID: row.ID, Message: strings.Join(notes, "；")}
 	if !stored {
 		res.Stage = StageStore
 	}
 	return res, nil
 }
 
-// find gives the account row with that email, when there is one.
+// refresh puts the new sign-in on the row that is already there.
 //
-// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
-// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+// 状态、名字、出口组这三样在事务外写：它们各写各的列，写不进去不
+// 影响别的——令牌已经是新的了，只是状态还没跟上，这种事要说出来，不
+// 是导入失败。
 //
-// 找不到不是错：那就是一个新账号。
-func (c *Chain) find(ctx context.Context, mail, email string) (store.Account, error) {
-	acc, err := c.Store.AccountByEmail(ctx, mail)
-	if err == nil {
-		return acc, nil
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, err
-	}
-	if mail == email {
-		return store.Account{}, nil
-	}
-	acc, err = c.Store.AccountByEmail(ctx, email)
-	if errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, nil
-	}
-	if err != nil {
-		return store.Account{}, err
-	}
-	return acc, nil
-}
-
-// update signs the account in again and puts the new sign-in on the row
-// that is already there.
-//
-// 令牌先写：写失败的时候库里那一行没动过，它原来那条链还是好的，报错
-// 就是，不用把这一行删掉——删掉就是毁掉一个还能用的账号。
-//
-// 名字只在真的问出身份的时候才改：问不出来的时候手里没有真名字，
-// 拿清单上的邮箱把原来的名字盖掉，是把知道的东西换成不知道的。
-func (c *Chain) update(ctx context.Context, email, password string, acc store.Account,
-	tok *oauth.Token, knownName string, now time.Time, notes []string) (Result, error) {
-	if err := c.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID,
-		Access:    tok.Access,
-		Refresh:   tok.Refresh,
-		ExpiresAt: tok.Expires,
-		Subject:   tok.Subject,
-		UpdatedAt: now,
-	}); err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore,
-			Message: "令牌没能存下，库里原来那一行没动：" + err.Error()}
-	}
+// 名字只在真的问出身份的时候才改：问不出来的时候手里没有真名字，拿
+// 清单上的邮箱把原来的名字盖掉，是把知道的东西换成不知道的。
+func (c *Chain) refresh(ctx context.Context, acc store.Account,
+	knownName string, now time.Time, notes []string) []string {
 	// 它刚刚登进去了：状态回到 active。这笔写不进去不是导入失败——
 	// 令牌已经是新的了，只是状态还没跟上，要说出来。
 	if err := c.Store.UpdateAccountStatus(ctx, acc.ID, store.StatusActive, "", now); err != nil {
@@ -4439,13 +4720,34 @@ func (c *Chain) update(ctx context.Context, email, password string, acc store.Ac
 			notes = append(notes, "出口组没能更新："+err.Error())
 		}
 	}
-	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
-	notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
-	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
-	if !stored {
-		res.Stage = StageStore
+	return notes
+}
+
+// findIn gives the account row with that email, when there is one.
+//
+// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
+// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+//
+// 找不到不是错：那就是一个新账号。
+func findIn(ctx context.Context, tx store.Tx, mail, email string) (store.Account, error) {
+	acc, err := tx.AccountByEmail(ctx, mail)
+	if err == nil {
+		return acc, nil
 	}
-	return res, nil
+	if !errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, err
+	}
+	if mail == email {
+		return store.Account{}, nil
+	}
+	acc, err = tx.AccountByEmail(ctx, email)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, nil
+	}
+	if err != nil {
+		return store.Account{}, err
+	}
+	return acc, nil
 }
 
 // keep encrypts the password and writes it down, when there is a
@@ -4465,33 +4767,6 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 		return append(notes, "密码没能存下："+err.Error()), false
 	}
 	return notes, true
-}
-
-// deleter is a store that can take an account back out.
-//
-// It is not part of the Store interface: taking the row back out is
-// only possible with a store that has DeleteAccount, and the chain
-// works without it.
-type deleter interface {
-	DeleteAccount(ctx context.Context, id string) error
-}
-
-// undo takes the account row back out.
-//
-// A store that cannot take the row out is left alone: the row stays
-// where it is, broken but visible, and the message says what happened
-// to it.
-//
-// The delete does not use the caller's context: the caller may have
-// been cut short (a deadline, a cancel), and then the delete would be
-// refused too, leaving a half-made account behind — one without a
-// token. The row has to go even when the run that made it is over.
-func (c *Chain) undo(ctx context.Context, id string) {
-	d, ok := c.Store.(deleter)
-	if !ok {
-		return
-	}
-	_ = d.DeleteAccount(context.WithoutCancel(ctx), id)
 }
 
 // webError turns what the site said into what the runner needs to

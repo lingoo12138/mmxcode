@@ -43,6 +43,137 @@ func makeAccount(t *testing.T, s *Store, id string) {
 	}
 }
 
+// TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow says a lookup
+// and an insert inside one transaction are one thing to everybody.
+//
+// 两个并发的导入：都按邮箱找，都没有就建一行。真库的事务一开始就把
+// 写锁拿着，所以第二个进来的那个看见的是第一个建好的那一行——不然同
+// 一个站点账号会有两行都是活的。
+func TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	var wg sync.WaitGroup
+	ids := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			err := s.Tx(ctx, func(tx Tx) error {
+				acc, err := tx.AccountByEmail(ctx, "a@example.com")
+				if errors.Is(err, ErrNotFound) {
+					acc = Account{
+						ID: fmt.Sprintf("acc_%d", i), Name: "a@example.com",
+						Email: "a@example.com", Status: StatusActive,
+						CreatedAt: now, UpdatedAt: now,
+					}
+					if err := tx.CreateAccount(ctx, acc); err != nil {
+						return err
+					}
+					if err := tx.SaveToken(ctx, Token{
+						AccountID: acc.ID, Access: "tok", Refresh: "ref",
+						ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+					}); err != nil {
+						return err
+					}
+					ids[i] = acc.ID
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				ids[i] = acc.ID
+				return nil
+			})
+			if err != nil {
+				t.Errorf("transaction %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %d, want one row", len(rows))
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("ids = %q and %q, want the same row", ids[0], ids[1])
+	}
+}
+
+// TestATransactionThatFailsLeavesNothingBehind says a transaction that
+// fails takes its writes back.
+//
+// 写失败的时候不能留半截子：读者会看见一行没有令牌的账号，那个账号
+// 以后就登不回来了。
+func TestATransactionThatFailsLeavesNothingBehind(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	err := s.Tx(ctx, func(tx Tx) error {
+		if err := tx.CreateAccount(ctx, Account{
+			ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+			Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return errors.New("the disk is full")
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("accounts = %d, want none", len(rows))
+	}
+}
+
+// TestATransactionThatIsCutShortHalfWayLeavesNothingBehind says a
+// transaction that is cut short half way takes its writes back.
+//
+// 导入被掐断的时候，行写下去了、令牌没写下去：这样的半截子留在库里，
+// 读者看见的是一个没有令牌的账号——那个账号以后就登不回来了。
+//
+// 回滚不用调用方的上下文：那时候它已经没了。
+func TestATransactionThatIsCutShortHalfWayLeavesNothingBehind(t *testing.T) {
+	s := openTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now()
+
+	err := s.Tx(ctx, func(tx Tx) error {
+		if err := tx.CreateAccount(ctx, Account{
+			ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+			Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		// 这一趟导入被掐断了：下一笔写不进去了。
+		cancel()
+		return tx.SaveToken(ctx, Token{
+			AccountID: "acc_1", Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	rows, err := s.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("accounts = %d, want none", len(rows))
+	}
+}
+
 func TestAccountRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,7 +18,12 @@ import (
 )
 
 // fakeStore keeps what it is given.
+//
+// 它也照着真库的样子来：事务期间别人进不来（真库是一开始就把写锁拿
+// 着），写错了要退回去。
 type fakeStore struct {
+	// mu is the write lock.
+	mu       sync.Mutex
 	accounts []string
 	tokens   []string
 	password []string
@@ -29,26 +35,165 @@ type fakeStore struct {
 	names []string
 	// statuses are the states that were written.
 	statuses []string
+	// groups are the outlets that were written.
+	groups []string
+	// make is where the rows are made, when the test wants two imports
+	// to meet there.
+	make *barrier
 }
 
-func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
+// barrier lets a fixed number of callers meet.
+//
+// 真库里两个并发的导入是排队的：等不到对方就放行，这里就是这个意思。
+type barrier struct {
+	mu   sync.Mutex
+	n    int
+	want int
+	ch   chan struct{}
+}
+
+func newBarrier(want int) *barrier {
+	return &barrier{want: want, ch: make(chan struct{})}
+}
+
+// wait blocks until the wanted number of callers have arrived, or until
+// the wait is over.
+//
+// 等不到也要放行：真库里的事务是排队的，不是卡死的。
+func (b *barrier) wait() {
+	b.mu.Lock()
+	b.n++
+	if b.n >= b.want {
+		select {
+		case <-b.ch:
+		default:
+			close(b.ch)
+		}
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.ch:
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// snapshot is what the fake holds right now.
+type snapshot struct {
+	accounts []string
+	tokens   []string
+	password []string
+	rows     []store.Account
+	names    []string
+	statuses []string
+	groups   []string
+}
+
+// snapshot takes what the fake holds, so that it can be put back.
+func (s *fakeStore) snapshot() snapshot {
+	return snapshot{
+		accounts: append([]string(nil), s.accounts...),
+		tokens:   append([]string(nil), s.tokens...),
+		password: append([]string(nil), s.password...),
+		rows:     append([]store.Account(nil), s.rows...),
+		names:    append([]string(nil), s.names...),
+		statuses: append([]string(nil), s.statuses...),
+		groups:   append([]string(nil), s.groups...),
+	}
+}
+
+// restore puts back what the fake held before.
+//
+// 事务里写下去的东西，一眼吞掉就要退回去。
+func (s *fakeStore) restore(before snapshot) {
+	s.accounts = before.accounts
+	s.tokens = before.tokens
+	s.password = before.password
+	s.rows = before.rows
+	s.names = before.names
+	s.statuses = before.statuses
+	s.groups = before.groups
+}
+
+// Tx runs fn inside a transaction.
+//
+// 真库的事务一开始就把写锁拿着：两个并发的导入是排队进来的，不是同时
+// 进来的。写错了就退回去。
+func (s *fakeStore) Tx(ctx context.Context, fn func(store.Tx) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := s.snapshot()
+	if err := fn(fakeTx{s}); err != nil {
+		s.restore(before)
+		return err
+	}
+	return nil
+}
+
+// fakeTx is one transaction of the fake store.
+type fakeTx struct {
+	s *fakeStore
+}
+
+func (t fakeTx) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	return t.s.lookup(email)
+}
+
+func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
+	t.s.waitMake()
+	return t.s.createAccount(a)
+}
+
+func (t fakeTx) SaveToken(ctx context.Context, tok store.Token) error {
+	return t.s.saveToken(tok)
+}
+
+func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	return t.s.setAccountName(id, name)
+}
+
+func (t fakeTx) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	return t.s.setAccountProxy(id, group, url)
+}
+
+func (t fakeTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return t.s.updateAccountStatus(id, status)
+}
+
+// waitMake lets two imports meet before they make a row.
+//
+// 两个并发的导入都要按邮箱找这一行，都找到没有，都要建一行——这就是要
+// 防的那件事。让它们在门口碰头，这事就一定会发生，而不是碰运气。
+//
+// 等的时候不拿着锁：不然另一个导入连看都看不了，就成了排队，不是并发。
+func (s *fakeStore) waitMake() {
+	if s.make != nil {
+		s.make.wait()
+	}
+}
+
+// createAccount makes a row.
+func (s *fakeStore) createAccount(a store.Account) error {
 	s.accounts = append(s.accounts, a.ID+":"+a.Email)
 	s.rows = append(s.rows, a)
 	return nil
 }
 
-// AccountByEmail gives the account with that email.
-func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
-	for _, r := range s.rows {
-		if strings.EqualFold(r.Email, email) {
-			return r, nil
-		}
+// saveToken writes a token.
+func (s *fakeStore) saveToken(tok store.Token) error {
+	if s.failToken {
+		return errors.New("the disk is full")
 	}
-	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+	s.tokens = append(s.tokens, tok.AccountID+":"+tok.Refresh)
+	return nil
 }
 
-// SetAccountName writes the account's name.
-func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+// setAccountName writes a name.
+func (s *fakeStore) setAccountName(id, name string) error {
 	s.names = append(s.names, id+":"+name)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
@@ -58,19 +203,9 @@ func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updated
 	return nil
 }
 
-// UpdateAccountStatus writes the account's state.
-func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
-	s.statuses = append(s.statuses, id+":"+status)
-	for i := range s.rows {
-		if s.rows[i].ID == id {
-			s.rows[i].Status = status
-		}
-	}
-	return nil
-}
-
-// SetAccountProxy writes the account's outlet.
-func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+// setAccountProxy writes an outlet.
+func (s *fakeStore) setAccountProxy(id, group, url string) error {
+	s.groups = append(s.groups, id+":"+group)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
 			s.rows[i].ProxyGroup = group
@@ -80,15 +215,71 @@ func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, 
 	return nil
 }
 
-func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
-	if s.failToken {
-		return errors.New("the disk is full")
+// updateAccountStatus writes a state.
+func (s *fakeStore) updateAccountStatus(id, status string) error {
+	s.statuses = append(s.statuses, id+":"+status)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Status = status
+		}
 	}
-	s.tokens = append(s.tokens, t.AccountID+":"+t.Refresh)
 	return nil
 }
 
+// lookup gives the account with that email.
+func (s *fakeStore) lookup(email string) (store.Account, error) {
+	for _, r := range s.rows {
+		if strings.EqualFold(r.Email, email) {
+			return r, nil
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
+	s.waitMake()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createAccount(a)
+}
+
+// AccountByEmail gives the account with that email.
+func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lookup(email)
+}
+
+// SetAccountName writes the account's name.
+func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setAccountName(id, name)
+}
+
+// UpdateAccountStatus writes the account's state.
+func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateAccountStatus(id, status)
+}
+
+// SetAccountProxy writes the account's outlet.
+func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setAccountProxy(id, group, url)
+}
+
+func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveToken(t)
+}
+
 func (s *fakeStore) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.password = append(s.password, id+":"+cipher)
 	return nil
 }
@@ -102,6 +293,8 @@ func (s *fakeStore) DeleteAccount(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i, a := range s.accounts {
 		if strings.HasPrefix(a, id+":") {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
@@ -544,6 +737,53 @@ func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
 	}
 	if len(st.accounts) != 1 {
 		t.Fatalf("accounts = %v, want the row still there", st.accounts)
+	}
+}
+
+// TestTwoConcurrentImportsOfOneEmailAreOneRow says two imports of one
+// email do not make two rows.
+//
+// 两个并发的导入（网页上传两趟，或者两个进程各跑一趟）：都要按邮箱找
+// 这一行，都找到没有，都建一行——同一个站点账号两行都是活的，页面把
+// 它列两遍，其中一个的令牌迟早被另一个的重登作废。
+//
+// 找和建要在一个事务里：事务一开始就把写锁拿着，第二个进来的那个看见
+// 的是第一个建好的那一行。
+func TestTwoConcurrentImportsOfOneEmailAreOneRow(t *testing.T) {
+	st := &fakeStore{make: newBarrier(2)}
+	c := aChain(st)
+	// 两次导入给两个不同的号：两行就看得出来是两行。
+	var mu sync.Mutex
+	n := 0
+	c.NewID = func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		return fmt.Sprintf("acc_%d", n)
+	}
+
+	var wg sync.WaitGroup
+	results := make([]Result, 2)
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = c.Import(context.Background(), "a@example.com", "hunter2")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("import %d: %v", i, err)
+		}
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want one row", st.accounts)
+	}
+	if results[0].AccountID != results[1].AccountID {
+		t.Fatalf("account ids = %q and %q, want the same row",
+			results[0].AccountID, results[1].AccountID)
 	}
 }
 

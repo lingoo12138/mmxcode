@@ -19,20 +19,21 @@ import (
 )
 
 // Store is where an imported account goes.
+//
+// 找和建要在一个事务里：不然两个并发的导入会各自看见「还没有」这一
+// 行，然后各建一行——同一个站点账号两行都是活的。
 type Store interface {
-	CreateAccount(ctx context.Context, a store.Account) error
-	SaveToken(ctx context.Context, t store.Token) error
+	// Tx runs fn inside one write transaction.
+	Tx(ctx context.Context, fn func(store.Tx) error) error
+	// SetPassword writes an account's encrypted password.
 	SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error
-	// AccountByEmail gives the account with that email, when there is
-	// one. It says store.ErrNotFound when there is none.
-	AccountByEmail(ctx context.Context, email string) (store.Account, error)
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
 	// SetAccountProxy writes the account's outlet.
 	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
-	// UpdateAccountStatus writes the account's state and its last
-	// error.
-	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 }
 
 // Web is the part of the account site the chain talks to.
@@ -183,96 +184,87 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	// 失败了，重来一遍是补救的办法。库里已经有这一行的时候再建一行，
 	// 同一个站点账号就有两个活着的行——两个都在轮转池里，页面把它列
 	// 两遍，而且其中一个的令牌迟早被另一个的重登作废。
-	existing, err := c.find(ctx, mail, email)
+	//
+	// 找和写在一个事务里：查了再做的事，两个并发的导入一起做就会做两
+	// 遍（网页上传两趟，或者两个进程各跑一趟）。令牌跟这一行一起写：
+	// 读者不会看见一行没有令牌的账号。
+	var existed bool
+	var row store.Account
+	err = c.Store.Tx(ctx, func(tx store.Tx) error {
+		existing, err := findIn(ctx, tx, mail, email)
+		if err != nil {
+			return err
+		}
+		if existing.ID != "" {
+			existed = true
+			row = existing
+			return tx.SaveToken(ctx, store.Token{
+				AccountID: row.ID,
+				Access:    tok.Access,
+				Refresh:   tok.Refresh,
+				ExpiresAt: tok.Expires,
+				Subject:   tok.Subject,
+				UpdatedAt: now,
+			})
+		}
+		acc := store.Account{
+			ID:         c.newID(),
+			Name:       mail,
+			UserID:     userID,
+			Email:      mail,
+			Status:     store.StatusActive,
+			ProxyGroup: c.ProxyGroup,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		if err := tx.CreateAccount(ctx, acc); err != nil {
+			return err
+		}
+		if err := tx.SaveToken(ctx, store.Token{
+			AccountID: acc.ID,
+			Access:    tok.Access,
+			Refresh:   tok.Refresh,
+			ExpiresAt: tok.Expires,
+			Subject:   tok.Subject,
+			UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		row = acc
+		return nil
+	})
 	if err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	if existing.ID != "" {
-		return c.update(ctx, email, password, existing, tok, id.Email, now, notes)
+		msg := err.Error()
+		if existed {
+			// 原来那一行没动过：它还带着一条能用的链，报错就是，不用
+			// 把这一行删掉——删掉就是毁掉一个还能用的账号。
+			msg = "令牌没能存下，库里原来那一行没动：" + msg
+		}
+		return Result{Email: email}, &Error{Stage: StageStore, Message: msg}
 	}
 
-	acc := store.Account{
-		ID:         c.newID(),
-		Name:       mail,
-		UserID:     userID,
-		Email:      mail,
-		Status:     store.StatusActive,
-		ProxyGroup: c.ProxyGroup,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+	if existed {
+		notes = c.refresh(ctx, row, id.Email, now, notes)
+		notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
 	}
-	if err := c.Store.CreateAccount(ctx, acc); err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	if err := c.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID,
-		Access:    tok.Access,
-		Refresh:   tok.Refresh,
-		ExpiresAt: tok.Expires,
-		Subject:   tok.Subject,
-		UpdatedAt: now,
-	}); err != nil {
-		// 账号的行已经写进去了，令牌却没有：这样的账号是残的，
-		// 把它拿掉，导入才能干净地再来一次。
-		c.undo(ctx, acc.ID)
-		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
-	}
-	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
-	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
+	notes, stored := c.keep(ctx, row.ID, password, now, notes)
+	res := Result{Email: email, OK: true, AccountID: row.ID, Message: strings.Join(notes, "；")}
 	if !stored {
 		res.Stage = StageStore
 	}
 	return res, nil
 }
 
-// find gives the account row with that email, when there is one.
+// refresh puts the new sign-in on the row that is already there.
 //
-// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
-// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+// 状态、名字、出口组这三样在事务外写：它们各写各的列，写不进去不
+// 影响别的——令牌已经是新的了，只是状态还没跟上，这种事要说出来，不
+// 是导入失败。
 //
-// 找不到不是错：那就是一个新账号。
-func (c *Chain) find(ctx context.Context, mail, email string) (store.Account, error) {
-	acc, err := c.Store.AccountByEmail(ctx, mail)
-	if err == nil {
-		return acc, nil
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, err
-	}
-	if mail == email {
-		return store.Account{}, nil
-	}
-	acc, err = c.Store.AccountByEmail(ctx, email)
-	if errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, nil
-	}
-	if err != nil {
-		return store.Account{}, err
-	}
-	return acc, nil
-}
-
-// update signs the account in again and puts the new sign-in on the row
-// that is already there.
-//
-// 令牌先写：写失败的时候库里那一行没动过，它原来那条链还是好的，报错
-// 就是，不用把这一行删掉——删掉就是毁掉一个还能用的账号。
-//
-// 名字只在真的问出身份的时候才改：问不出来的时候手里没有真名字，
-// 拿清单上的邮箱把原来的名字盖掉，是把知道的东西换成不知道的。
-func (c *Chain) update(ctx context.Context, email, password string, acc store.Account,
-	tok *oauth.Token, knownName string, now time.Time, notes []string) (Result, error) {
-	if err := c.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID,
-		Access:    tok.Access,
-		Refresh:   tok.Refresh,
-		ExpiresAt: tok.Expires,
-		Subject:   tok.Subject,
-		UpdatedAt: now,
-	}); err != nil {
-		return Result{Email: email}, &Error{Stage: StageStore,
-			Message: "令牌没能存下，库里原来那一行没动：" + err.Error()}
-	}
+// 名字只在真的问出身份的时候才改：问不出来的时候手里没有真名字，拿
+// 清单上的邮箱把原来的名字盖掉，是把知道的东西换成不知道的。
+func (c *Chain) refresh(ctx context.Context, acc store.Account,
+	knownName string, now time.Time, notes []string) []string {
 	// 它刚刚登进去了：状态回到 active。这笔写不进去不是导入失败——
 	// 令牌已经是新的了，只是状态还没跟上，要说出来。
 	if err := c.Store.UpdateAccountStatus(ctx, acc.ID, store.StatusActive, "", now); err != nil {
@@ -290,13 +282,34 @@ func (c *Chain) update(ctx context.Context, email, password string, acc store.Ac
 			notes = append(notes, "出口组没能更新："+err.Error())
 		}
 	}
-	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
-	notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
-	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
-	if !stored {
-		res.Stage = StageStore
+	return notes
+}
+
+// findIn gives the account row with that email, when there is one.
+//
+// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
+// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+//
+// 找不到不是错：那就是一个新账号。
+func findIn(ctx context.Context, tx store.Tx, mail, email string) (store.Account, error) {
+	acc, err := tx.AccountByEmail(ctx, mail)
+	if err == nil {
+		return acc, nil
 	}
-	return res, nil
+	if !errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, err
+	}
+	if mail == email {
+		return store.Account{}, nil
+	}
+	acc, err = tx.AccountByEmail(ctx, email)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, nil
+	}
+	if err != nil {
+		return store.Account{}, err
+	}
+	return acc, nil
 }
 
 // keep encrypts the password and writes it down, when there is a
@@ -316,33 +329,6 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 		return append(notes, "密码没能存下："+err.Error()), false
 	}
 	return notes, true
-}
-
-// deleter is a store that can take an account back out.
-//
-// It is not part of the Store interface: taking the row back out is
-// only possible with a store that has DeleteAccount, and the chain
-// works without it.
-type deleter interface {
-	DeleteAccount(ctx context.Context, id string) error
-}
-
-// undo takes the account row back out.
-//
-// A store that cannot take the row out is left alone: the row stays
-// where it is, broken but visible, and the message says what happened
-// to it.
-//
-// The delete does not use the caller's context: the caller may have
-// been cut short (a deadline, a cancel), and then the delete would be
-// refused too, leaving a half-made account behind — one without a
-// token. The row has to go even when the run that made it is over.
-func (c *Chain) undo(ctx context.Context, id string) {
-	d, ok := c.Store.(deleter)
-	if !ok {
-		return
-	}
-	_ = d.DeleteAccount(context.WithoutCancel(ctx), id)
 }
 
 // webError turns what the site said into what the runner needs to

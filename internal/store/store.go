@@ -690,10 +690,19 @@ func fromMS(v int64) time.Time {
 
 // CreateAccount inserts an account.
 func (s *Store) CreateAccount(ctx context.Context, a Account) error {
+	return s.createAccount(ctx, s.db, a)
+}
+
+// createAccount inserts an account, on the pool or inside a
+// transaction.
+//
+// 同一句语句在事务里和事务外都要用：能跑语句的就这三样，所以语句只
+// 写一遍。
+func (s *Store) createAccount(ctx context.Context, db execer, a Account) error {
 	if err := checkStatus(a.Status); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO accounts (id, name, user_id, email, status, proxy_group, proxy_url,
 			last_error, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
@@ -738,10 +747,14 @@ func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
 // have to read the account first, and a change that touches the state
 // cannot lose a change that touched something else.
 func (s *Store) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return s.updateAccountStatus(ctx, s.db, id, status, lastError, updatedAt)
+}
+
+func (s *Store) updateAccountStatus(ctx context.Context, db execer, id, status, lastError string, updatedAt time.Time) error {
 	if err := checkStatus(status); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=?`,
 		status, lastError, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -759,7 +772,11 @@ func (s *Store) UpdateAccountStatus(ctx context.Context, id, status, lastError s
 // are the only things it writes, so a caller that changes the outlet
 // does not have to read the account first.
 func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	return s.setAccountProxy(ctx, s.db, id, group, url, updatedAt)
+}
+
+func (s *Store) setAccountProxy(ctx context.Context, db execer, id, group, url string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET proxy_group=?, proxy_url=?, updated_at=? WHERE id=?`,
 		group, url, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -777,7 +794,11 @@ func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, upda
 // writes, so a caller that renames an account does not have to read
 // the account first, and cannot lose a change another writer made.
 func (s *Store) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	return s.setAccountName(ctx, s.db, id, name, updatedAt)
+}
+
+func (s *Store) setAccountName(ctx context.Context, db execer, id, name string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET name=?, updated_at=? WHERE id=?`,
 		name, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -963,6 +984,101 @@ func checkStatus(status string) error {
 		status, StatusActive, StatusSignedOut, StatusError)
 }
 
+// execer is what can run a statement.
+//
+// 事务里和事务外跑的是同一批语句：连接池和事务都做得到，所以语句只
+// 写一遍，事务里跑的也是同一句。
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// Tx is what one transaction can do.
+//
+// It is the same set of writes the store has, but inside one
+// transaction: they all land, or none of them does.
+type Tx interface {
+	// AccountByEmail gives the account with that email, when there is
+	// one. It says ErrNotFound when there is none.
+	AccountByEmail(ctx context.Context, email string) (Account, error)
+	// CreateAccount inserts an account.
+	CreateAccount(ctx context.Context, a Account) error
+	// SaveToken writes an account's token.
+	SaveToken(ctx context.Context, t Token) error
+	// SetAccountName writes the account's name.
+	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
+	// SetAccountProxy writes the account's outlet.
+	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
+}
+
+// Tx runs fn inside one write transaction.
+//
+// The write lock is taken when the transaction starts (the data source
+// name says _txlock=immediate), so "look the email up, and make a row
+// when there is none" cannot be done by two imports at the same time.
+// Without that, two concurrent imports of one email leave two live rows
+// of one site account: both of them are in the rotation pool, the page
+// lists the account twice, and the token of one of them is bound to be
+// thrown away by the other one's re-login.
+//
+// An error from fn rolls the transaction back: a reader never sees a
+// row whose token was not written.
+//
+// The rollback does not need the caller's context: the caller may have
+// been cut short, and the half of the transaction that did land has to
+// go back all the same.
+func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin a transaction: %w", err)
+	}
+	if err := fn(&sqlTx{s: s, tx: tx}); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("commit the transaction: %w", err)
+	}
+	return nil
+}
+
+// sqlTx is one transaction of the store.
+//
+// 它拿着库，是为了那几样要盖时间戳的语句：时间戳是库自己的时钟盖的
+// （东八区），不是调用方的。
+type sqlTx struct {
+	s  *Store
+	tx *sql.Tx
+}
+
+func (t *sqlTx) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	return t.s.accountByEmail(ctx, t.tx, email)
+}
+
+func (t *sqlTx) CreateAccount(ctx context.Context, a Account) error {
+	return t.s.createAccount(ctx, t.tx, a)
+}
+
+func (t *sqlTx) SaveToken(ctx context.Context, tok Token) error {
+	return t.s.saveToken(ctx, t.tx, tok)
+}
+
+func (t *sqlTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	return t.s.setAccountName(ctx, t.tx, id, name, updatedAt)
+}
+
+func (t *sqlTx) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	return t.s.setAccountProxy(ctx, t.tx, id, group, url, updatedAt)
+}
+
+func (t *sqlTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return t.s.updateAccountStatus(ctx, t.tx, id, status, lastError, updatedAt)
+}
+
 // DeleteAccount removes an account and everything under it.
 //
 // The children are taken away by the database: the tables say what
@@ -1037,11 +1153,15 @@ func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 //
 // 没有这一行是 ErrNotFound。
 func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	return s.accountByEmail(ctx, s.db, email)
+}
+
+func (s *Store) accountByEmail(ctx context.Context, db execer, email string) (Account, error) {
 	email = strings.TrimSpace(email)
 	if email == "" {
 		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := db.QueryRowContext(ctx, `
 		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
 			last_error, created_at, updated_at
 		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
@@ -1081,7 +1201,11 @@ func scanAccount(sc scanner) (Account, error) {
 
 // SaveToken writes an account's token.
 func (s *Store) SaveToken(ctx context.Context, t Token) error {
-	_, err := s.db.ExecContext(ctx, `
+	return s.saveToken(ctx, s.db, t)
+}
+
+func (s *Store) saveToken(ctx context.Context, db execer, t Token) error {
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO tokens (account_id, access, refresh, expires_at, subject, updated_at)
 		VALUES (?,?,?,?,?,?)
 		ON CONFLICT(account_id) DO UPDATE SET
