@@ -3124,6 +3124,197 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestTheNameIsWrittenOnItsOwn says the name setter writes the name
+// and nothing else.
+//
+// 改名只写名字，别的列不碰。
+func TestTheNameIsWrittenOnItsOwn(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	// 状态那一列一被写就报错，所以改名字的时候它一定没被写。
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TRIGGER no_status_write BEFORE UPDATE OF status ON accounts
+		BEGIN SELECT RAISE(ABORT, 'the status was written'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetAccountName(ctx, "acc_01", "renamed", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Name != "renamed" {
+		t.Fatalf("the name is %q", a.Name)
+	}
+	if a.Status != StatusActive {
+		t.Fatalf("the status is %q", a.Status)
+	}
+
+	// 没有的账号是找不到，不是改成功。
+	err = s.SetAccountName(ctx, "nope", "x", time.Now())
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want a not-found", err)
+	}
+}
+
+// TestTheLastErrorIsWrittenOnItsOwn says the last-error setter writes
+// the error and neither the status nor anything else.
+//
+// 记一条错误只写错误，不改状态。
+func TestTheLastErrorIsWrittenOnItsOwn(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TRIGGER no_status_write BEFORE UPDATE OF status ON accounts
+		BEGIN SELECT RAISE(ABORT, 'the status was written'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetAccountLastError(ctx, "acc_01", "the site said no", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.LastError != "the site said no" {
+		t.Fatalf("the last error is %q", a.LastError)
+	}
+	if a.Status != StatusActive {
+		t.Fatalf("the status is %q", a.Status)
+	}
+
+	err = s.SetAccountLastError(ctx, "nope", "x", time.Now())
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want a not-found", err)
+	}
+}
+
+// TestThePlanErrorIsKept says the plan's error is written down with
+// the reading, so a plan whose title could not be read is not a plan
+// without a title.
+//
+// 套餐名读不出来，要记下来。
+func TestThePlanErrorIsKept(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01",
+		Granted:   100, Consumed: 10, Remaining: 90,
+		HasAmounts: true,
+		PlanError:  "the plan title could not be read",
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("got %d readings", len(snaps))
+	}
+	if snaps[0].PlanError != "the plan title could not be read" {
+		t.Fatalf("the plan error is %q", snaps[0].PlanError)
+	}
+
+	// 没有错的读数，读回来也是空的，不是上一条留下的。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01",
+		Granted:   100, Consumed: 20, Remaining: 80,
+		HasAmounts: true,
+		CreatedAt:  time.Now().Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snaps, err = s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 || snaps[0].PlanError != "" {
+		t.Fatalf("got %+v", snaps)
+	}
+}
+
+// TestTheFileAtVersionTwoGetsThePlanErrorColumn says a file that was
+// made before the plan error column is brought forward by the third
+// step.
+//
+// 版本二的库要补上这一列，行还在。
+func TestTheFileAtVersionTwoGetsThePlanErrorColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v2.db")
+
+	// 先做一个新库，再把那一列去掉、把版本写回二，就像上一个版本存下的那样。
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	makeAccount(t, s, "acc_01")
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", Granted: 600, Consumed: 100, Remaining: 500,
+		HasAmounts: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE usage_snapshots DROP COLUMN plan_error"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再打开就该被补上。
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := s2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("the file is at version %d, want %d", version, schemaVersion)
+	}
+	cols, err := columnsOf(ctx, s2.db, "usage_snapshots")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cols["plan_error"]; !ok {
+		t.Fatal("usage_snapshots has no column plan_error")
+	}
+	// 行还在，读数还是那一条。
+	snaps, err := s2.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 || snaps[0].Remaining != 500 {
+		t.Fatalf("got %+v", snaps)
+	}
+	if snaps[0].PlanError != "" {
+		t.Fatalf("the plan error is %q", snaps[0].PlanError)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3308,6 +3499,7 @@ var tables = []table{
   balance     TEXT,
   membership_error TEXT,
   windows_error TEXT,
+  plan_error TEXT,
   created_at  INTEGER NOT NULL
 )`,
 		copy: []copyColumn{
@@ -3323,6 +3515,7 @@ var tables = []table{
 			nullable("balance"),
 			nullable("membership_error"),
 			nullable("windows_error"),
+			nullable("plan_error"),
 			notNull("created_at", "0"),
 		},
 	},
@@ -3518,7 +3711,13 @@ type UsageSnapshot struct {
 	// It is kept, because a plan whose windows could not be read is
 	// not a plan without windows.
 	WindowsError string
-	CreatedAt    time.Time
+	// PlanError says the plan's title could not be read.
+	//
+	// It is kept, because a plan whose title could not be read is not
+	// a plan without a title: the field below would say "" and read
+	// as "this account has no plan".
+	PlanError string
+	CreatedAt time.Time
 }
 
 // Exhausted is one account's spent window.
@@ -3708,7 +3907,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // migrations are the steps, in order.
 //
@@ -3716,6 +3915,7 @@ const schemaVersion = 2
 var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateMake,
 	migrateConform,
+	migratePlanError,
 }
 
 // migrateMake makes the tables that are not there.
@@ -3773,6 +3973,30 @@ func migrateConform(ctx context.Context, conn *sql.Conn) error {
 			if _, err := tx.ExecContext(ctx, q); err != nil {
 				return fmt.Errorf("migrate: take away the rows of %s without an account: %w",
 					c.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// migratePlanError gives the usage readings the plan error column.
+//
+// The column was added after the table was first made, so a file that
+// was made before it does not have it. The table is rebuilt when the
+// column is not there, and left alone when it is: a file that already
+// has it must not have its readings copied about for nothing.
+func migratePlanError(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 3, func(tx *sql.Tx) error {
+		cols, err := columnsOf(ctx, tx, "usage_snapshots")
+		if err != nil {
+			return err
+		}
+		if _, ok := cols["plan_error"]; ok {
+			return nil
+		}
+		for _, t := range tables {
+			if t.name == "usage_snapshots" {
+				return rebuildTable(ctx, tx, t)
 			}
 		}
 		return nil
@@ -4051,6 +4275,43 @@ func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, upda
 	return nil
 }
 
+// SetAccountName writes the account's name.
+//
+// It is narrow like SetAccountProxy: the name is the only thing it
+// writes, so a caller that renames an account does not have to read
+// the account first, and cannot lose a change another writer made.
+func (s *Store) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET name=?, updated_at=? WHERE id=?`,
+		name, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the name of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the name of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// SetAccountLastError writes the account's last error.
+//
+// It writes the error and nothing else. It does not write the status
+// either: an account that is healthy and an account whose last reading
+// failed are two different things, and writing the status here would
+// mean reading it first and writing back a value that could be stale.
+func (s *Store) SetAccountLastError(ctx context.Context, id, lastError string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET last_error=?, updated_at=? WHERE id=?`,
+		lastError, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the last error of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the last error of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // checkStatus says whether a status is one of ours.
 //
 // The rotator looks for the active accounts, so an account with a
@@ -4279,11 +4540,11 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO usage_snapshots (account_id, granted, consumed, remaining,
 			expires_at, plan, plan_until, windows_json, balance,
-			membership_error, windows_error, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			membership_error, windows_error, plan_error, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		u.AccountID, granted, consumed, remaining, ms(u.ExpiresAt),
 		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance,
-		u.MembershipError, u.WindowsError, ms(s.stamp(u.CreatedAt)))
+		u.MembershipError, u.WindowsError, u.PlanError, ms(s.stamp(u.CreatedAt)))
 	if err != nil {
 		return fmt.Errorf("save usage snapshot: %w", err)
 	}
@@ -4299,7 +4560,7 @@ func usageSnapshotColumns(prefix string) string {
 	cols := []string{
 		"id", "account_id", "granted", "consumed", "remaining", "expires_at",
 		"plan", "plan_until", "windows_json", "balance",
-		"membership_error", "windows_error", "created_at",
+		"membership_error", "windows_error", "plan_error", "created_at",
 	}
 	if prefix != "" {
 		for i := range cols {
@@ -4370,12 +4631,13 @@ func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
 		expiresAt                    sql.NullInt64
 		plan, windowsJSON, balance   sql.NullString
 		membershipErr, windowsErr    sql.NullString
+		planErr                      sql.NullString
 		planUntil                    sql.NullInt64
 		createdAt                    int64
 	)
 	if err := sc.Scan(&u.ID, &u.AccountID, &granted, &consumed, &remaining, &expiresAt,
 		&plan, &planUntil, &windowsJSON, &balance, &membershipErr, &windowsErr,
-		&createdAt); err != nil {
+		&planErr, &createdAt); err != nil {
 		return UsageSnapshot{}, err
 	}
 	u.Granted = granted.Float64
@@ -4389,6 +4651,7 @@ func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
 	u.Balance = balance.String
 	u.MembershipError = membershipErr.String
 	u.WindowsError = windowsErr.String
+	u.PlanError = planErr.String
 	u.CreatedAt = fromMS(createdAt)
 	return u, nil
 }

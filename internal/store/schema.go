@@ -167,6 +167,7 @@ var tables = []table{
   balance     TEXT,
   membership_error TEXT,
   windows_error TEXT,
+  plan_error TEXT,
   created_at  INTEGER NOT NULL
 )`,
 		copy: []copyColumn{
@@ -182,6 +183,7 @@ var tables = []table{
 			nullable("balance"),
 			nullable("membership_error"),
 			nullable("windows_error"),
+			nullable("plan_error"),
 			notNull("created_at", "0"),
 		},
 	},
