@@ -28,7 +28,7 @@
 - Modify: `internal/sign/sign.go`
 - Modify: `internal/sign/sign_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `internal/sign/sign_test.go` 末尾加：
 
@@ -698,12 +698,12 @@ func TestParamsGetOfAMissingKey(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/sign/ -count=1 -run "WebFlavour|MCodeFlavour"`
 Expected: FAIL（`FlavorWeb` 还没有，编译就过不去）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `internal/sign/sign.go` 里加：
 
@@ -1231,17 +1231,17 @@ func md5Hex(s string) string {
 }
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/sign/ -count=1`
 Expected: PASS（全部，包括原有的向量测试）
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿，`gofmt -l` 没有输出
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add internal/sign
@@ -1262,7 +1262,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `internal/secret/secret.go`
 - Create: `internal/secret/secret_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `internal/secret/secret_test.go`：
 
@@ -1342,12 +1342,12 @@ func TestFromEnvWithAShortKey(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/secret/ -count=1`
 Expected: FAIL（包还不存在）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 创建 `internal/secret/secret.go`：
 
@@ -1455,12 +1455,12 @@ func (k Key) Open(text string) (string, error) {
 
 （`strings` 已经在 import 里了。）
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/secret/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add internal/secret
@@ -1481,7 +1481,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `internal/store/store.go`
 - Modify: `internal/store/store_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `internal/store/store_test.go` 末尾加：
 
@@ -1578,12 +1578,12 @@ func TestAnImportRunCanBeAskedForByItsName(t *testing.T) {
 
 （`newTestStore` 是这个包里现成的helper；名字不一样的话看 `store_test.go` 里已有的建库函数叫什么，用那个。）
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/store/ -count=1 -run "Password|ImportRun"`
 Expected: FAIL（`SetPassword` / `ImportRun` 还没有）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `internal/store/schema.go` 的 `accounts` 表里加一列：
 
@@ -1859,17 +1859,17 @@ func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
 （事务里跑的语句和事务外的是同一批：能跑语句的就连接池和事务两样，
 所以语句只写一遍，`*sql.DB` 和 `*sql.Tx` 都当同一个接口使。）
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/store/ -count=1`
 Expected: PASS（全部，包括迁移的测试）
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add internal/store
@@ -1889,7 +1889,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `internal/webauth/webauth.go`
 - Create: `internal/webauth/webauth_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `internal/webauth/webauth_test.go`：
 
@@ -2261,12 +2261,12 @@ func TestEachClientHasItsOwnSession(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/webauth/ -count=1`
 Expected: FAIL（包还不存在）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 创建 `internal/webauth/webauth.go`：
 
@@ -2847,17 +2847,17 @@ func encryptPassword(password string) (string, error) {
 	return base64.StdEncoding.EncodeToString(cipher), nil
 }
 ```
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/webauth/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add internal/webauth
@@ -2877,7 +2877,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `internal/provision/provision.go`
 - Create: `internal/provision/provision_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `internal/provision/provision_test.go`：
 
@@ -3195,12 +3195,12 @@ func TestTheResultsAreAnArrayEvenWhenThereAreNone(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/provision/ -count=1`
 Expected: FAIL（包还不存在）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 创建 `internal/provision/provision.go`：
 
@@ -3557,12 +3557,12 @@ func ResultsJSON(results []Result) string {
 
 （`Parse` 收的是 `io.Reader`，读全部用 `io.ReadAll`。`Runner.Now` 这个字段计划里写了但用不上，去掉。）
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/provision/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add internal/provision
@@ -3581,7 +3581,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `internal/provision/chain.go`
 - Create: `internal/provision/chain_test.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `internal/provision/chain_test.go`：
 
@@ -4527,12 +4527,12 @@ func TestTheBrokenAccountIsTakenBackOutWhenTheRunWasCutShort(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/provision/ -count=1 -run "Chain"`
 Expected: FAIL（`Chain` 还没有）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 创建 `internal/provision/chain.go`：
 
@@ -4994,12 +4994,12 @@ func (c *Chain) newID() string {
 }
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/provision/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add internal/provision
@@ -5017,7 +5017,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `cmd/mmxcode/import_test.go`
 - Modify: `cmd/mmxcode/root.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `cmd/mmxcode/import_test.go`：
 
@@ -5212,12 +5212,12 @@ func TestTheImportGivesTheAccountTheGroupItUsed(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./cmd/mmxcode/ -count=1 -run Import`
 Expected: FAIL
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `cmd/mmxcode/root.go` 的 `env` 结构里加一个口子，让测试不用真的上网：
 
@@ -5603,17 +5603,17 @@ func randomHex(n int) string {
 }
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./cmd/mmxcode/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add cmd/mmxcode
@@ -5634,7 +5634,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `cmd/mmxcode/import.go`
 - Modify: `cmd/mmxcode/root.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `internal/manager/manager_test.go` 末尾加（并 import `"bytes"` 与 `"mmxcode/internal/secret"`）：
 
@@ -5798,12 +5798,12 @@ func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
 
 ```
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/manager/ ./internal/scheduler/ -count=1 -run Relogin`
 Expected: FAIL
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 先在 `internal/config/config.go` 里加一节 `Batch`——调度器要读它，没有
 这一节这一步编不过。（Task 10 只剩那些 yaml 文件了。）
@@ -6295,17 +6295,17 @@ func (e *env) reloginFn(group string) manager.ReloginFunc {
 	root.AddCommand(newReloginCmd(e))
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/manager/ ./internal/scheduler/ ./cmd/mmxcode/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add internal/manager internal/scheduler cmd/mmxcode
@@ -6330,7 +6330,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `internal/webui/static/app.js`
 - Modify: `cmd/mmxcode/serve.go`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `internal/webui/webui_test.go` 里加一个能换配置的 helper（把现有的 `newTestWebUI` 改成调它），并加测试：
 
@@ -6484,12 +6484,12 @@ func TestTheReloginIsAskedFor(t *testing.T) {
 
 （`bytes`、`mime/multipart` 要 import。）
 
-- [ ] **Step 2: 跑测试，确认它失败**
+- [x] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/webui/ -count=1 -run "Import|Relogin"`
 Expected: FAIL
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 在 `internal/webui/webui.go` 里：
 
@@ -6998,12 +6998,12 @@ func passwordNote(keeper func(string) (string, error), keeperErr error) string {
 
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/webui/ ./cmd/mmxcode/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add internal/webui cmd/mmxcode
@@ -7051,13 +7051,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 （`internal/config/config.go` 里的 `Batch` 一节已经在 Task 8 加了——调
 度器要读它，那一步没有它编不过。这一步只管那些 yaml 文件。）
 
-- [ ] **Step 1: 看看现在是什么样**
+- [x] **Step 1: 看看现在是什么样**
 
 Run: `cat config.example.yaml config.docker.yaml docker-compose.yml .env.example`
 Expected: 看得见现在的样子。`.env.example` 已经有了，compose 读的那几个变量都在
 里面——这一步是往里加一行，不是新建一个文件。
 
-- [ ] **Step 2: 写实现**
+- [x] **Step 2: 写实现**
 
 （`internal/config/config.go` 里的 `Batch` 与 `Relogin` 已经在 Task 8 加好了，
 调度器要读它，那一步没有它编不过。这一步不碰 Go 代码，只管 yaml 和部署。）
@@ -7094,17 +7094,17 @@ batch:
 MMXCODE_PASSWORD_KEY=
 ```
 
-- [ ] **Step 4: 跑测试，确认它过了**
+- [x] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/config/ -count=1`
 Expected: PASS
 
-- [ ] **Step 5: 跑整个测试套件**
+- [x] **Step 5: 跑整个测试套件**
 
 Run: `go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1`
 Expected: 全绿
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add internal/config config.example.yaml config.docker.yaml docker-compose.yml .env.example
@@ -7122,7 +7122,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `docs/superpowers/specs/2026-11-14-mmxcode-batch-import-design.md`
 - Modify: `docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md`
 
-- [ ] **Step 1: README 补上这一节**
+- [x] **Step 1: README 补上这一节**
 
 在 README 的「命令」一节里加上：
 
@@ -7149,11 +7149,11 @@ batch:
 ```
 ```
 
-- [ ] **Step 2: spec 补上「做完了什么样」**
+- [x] **Step 2: spec 补上「做完了什么样」**
 
 在设计文档的末尾加一节，记下实现时和设计不一样的地方（如果有）。没有就不加。
 
-- [ ] **Step 3: 把计划跟代码对起来**
+- [x] **Step 3: 把计划跟代码对起来**
 
 改过代码之后，计划的代码块要跟仓库里的代码对得上。用：
 
@@ -7181,7 +7181,7 @@ python -I docs/superpowers/tools/check_plan_fences.py docs/superpowers/plans/202
 
 工具在 `docs/superpowers/tools/` 里，是这个项目用来对计划的脚本。
 
-- [ ] **Step 4: 最后的检查**
+- [x] **Step 4: 最后的检查**
 
 ```bash
 go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1
@@ -7189,7 +7189,7 @@ go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1
 
 全绿，`gofmt -l` 没有输出。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add README.md docs/
