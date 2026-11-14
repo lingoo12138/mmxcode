@@ -1772,6 +1772,44 @@ func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, err
 
 （`s.exec` 是这个包里现成的写库helper；名字不一样就看 `store.go` 里别的 setter 怎么写的，照着来。`sql.ErrNoRows` 需要 `"database/sql"` 这个 import。）
 
+另外还要一个按邮箱找账号的方法：重跑一次导入的时候，靠它把原来那一
+行找出来更新，而不是给同一个站点账号再来一行。不改表的结构，也不加
+索引——表才几百行。
+
+```go
+// AccountByEmail gives the account with that email.
+//
+// 邮箱是站点那边认的东西：同一个邮箱只该有一行。重跑一次导入是常事
+// （上一批有一部分失败了，重来一遍是补救的办法），再来一行就是同一个
+// 站点账号有两个活着的行，两个都在轮转池里，页面把它列两遍。
+//
+// 表不大——几百行——一次全表扫就够了，不值得为它改表的结构或者加个
+// 索引。邮箱比的时候两边都折成小写：清单上写的是哪个样子，库里存的
+// 是哪个样子，人看着是同一个就是同一个。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
+			last_error, created_at, updated_at
+		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
+		ORDER BY created_at, id LIMIT 1`, email)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
+	}
+	return a, nil
+}
+
+```
+
 - [ ] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/store/ -count=1`
@@ -3406,6 +3444,7 @@ package provision
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -3423,10 +3462,49 @@ type fakeStore struct {
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
+	// rows are the accounts themselves.
+	rows []store.Account
+	// names are the names that were written.
+	names []string
+	// statuses are the states that were written.
+	statuses []string
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
 	s.accounts = append(s.accounts, a.ID+":"+a.Email)
+	s.rows = append(s.rows, a)
+	return nil
+}
+
+// AccountByEmail gives the account with that email.
+func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	for _, r := range s.rows {
+		if strings.EqualFold(r.Email, email) {
+			return r, nil
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+// SetAccountName writes the account's name.
+func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	s.names = append(s.names, id+":"+name)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Name = name
+		}
+	}
+	return nil
+}
+
+// UpdateAccountStatus writes the account's state.
+func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	s.statuses = append(s.statuses, id+":"+status)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Status = status
+		}
+	}
 	return nil
 }
 
@@ -3690,6 +3768,61 @@ func TestAFailedIdentityLookupKeepsTheEmailOfTheList(t *testing.T) {
 		t.Fatalf("message = %q, want no password in it", res.Message)
 	}
 }
+
+func TestTheSameAccountTwiceIsOneRow(t *testing.T) {
+	// 重跑一次导入是常事：同一个站点账号只能有一行活着。
+	st := &fakeStore{}
+	c := aChain(st)
+
+	first, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want one row", st.accounts)
+	}
+	if second.AccountID != first.AccountID {
+		t.Fatalf("account id = %q, want %q", second.AccountID, first.AccountID)
+	}
+	if !second.OK {
+		t.Fatalf("res = %+v", second)
+	}
+	if !strings.Contains(second.Message, "已经在库里") {
+		t.Fatalf("message = %q, want it to say it was an update", second.Message)
+	}
+	// 令牌是换新的：这一行现在用的是刚登进去的那条链。
+	if len(st.tokens) != 2 {
+		t.Fatalf("tokens = %v, want the token written twice", st.tokens)
+	}
+	if len(st.statuses) != 1 || st.statuses[0] != "acc_1:"+store.StatusActive {
+		t.Fatalf("statuses = %v", st.statuses)
+	}
+}
+
+func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
+	// 令牌没写下去的时候，库里原来那一行不能动：它还带着一条能用的
+	// 链，把它删掉就是毁掉一个还能用的账号。
+	st := &fakeStore{}
+	c := aChain(st)
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	st.failToken = true
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err == nil {
+		t.Fatal("no error for a token that could not be saved")
+	}
+	if res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want the row still there", st.accounts)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -3728,6 +3861,14 @@ type Store interface {
 	CreateAccount(ctx context.Context, a store.Account) error
 	SaveToken(ctx context.Context, t store.Token) error
 	SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error
+	// AccountByEmail gives the account with that email, when there is
+	// one. It says store.ErrNotFound when there is none.
+	AccountByEmail(ctx context.Context, email string) (store.Account, error)
+	// SetAccountName writes the account's name.
+	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 }
 
 // Web is the part of the account site the chain talks to.
@@ -3831,6 +3972,9 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 }
 
 // Import signs one account in and puts it in the database.
+//
+// An account that is already in the database is signed in again and its
+// row is updated: one site account must not have two live rows.
 func (c *Chain) Import(ctx context.Context, email, password string) (Result, error) {
 	tok, err := c.SignIn(ctx, email, password)
 	if err != nil {
@@ -3861,14 +4005,26 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	if mail == "" {
 		mail = email
 	}
-	name := mail
 	userID := id.RealUserID
 	if userID == "" {
 		userID = tok.Subject
 	}
+
+	// 这个账号是不是已经在库里了？重跑一次导入是常事：上一批有一部分
+	// 失败了，重来一遍是补救的办法。库里已经有这一行的时候再建一行，
+	// 同一个站点账号就有两个活着的行——两个都在轮转池里，页面把它列
+	// 两遍，而且其中一个的令牌迟早被另一个的重登作废。
+	existing, err := c.find(ctx, mail, email)
+	if err != nil {
+		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
+	}
+	if existing.ID != "" {
+		return c.update(ctx, email, password, existing, tok, id.Email, now, notes)
+	}
+
 	acc := store.Account{
 		ID:        c.newID(),
-		Name:      name,
+		Name:      mail,
 		UserID:    userID,
 		Email:     mail,
 		Status:    store.StatusActive,
@@ -3891,22 +4047,94 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		c.undo(ctx, acc.ID)
 		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
 	}
-	if c.Keeper != nil {
-		cipher, err := c.Keeper(password)
-		if err != nil {
-			// The account is in; only the password is lost. Say so,
-			// but do not call the import a failure.
-			notes = append(notes, "密码没能加密存下："+err.Error())
-			return Result{Email: email, OK: true, AccountID: acc.ID,
-				Stage: StageStore, Message: strings.Join(notes, "；")}, nil
-		}
-		if err := c.Store.SetPassword(ctx, acc.ID, cipher, now); err != nil {
-			notes = append(notes, "密码没能存下："+err.Error())
-			return Result{Email: email, OK: true, AccountID: acc.ID,
-				Stage: StageStore, Message: strings.Join(notes, "；")}, nil
+	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
+	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
+	if !stored {
+		res.Stage = StageStore
+	}
+	return res, nil
+}
+
+// find gives the account row with that email, when there is one.
+//
+// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
+// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+//
+// 找不到不是错：那就是一个新账号。
+func (c *Chain) find(ctx context.Context, mail, email string) (store.Account, error) {
+	acc, err := c.Store.AccountByEmail(ctx, mail)
+	if err == nil {
+		return acc, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, err
+	}
+	if mail == email {
+		return store.Account{}, nil
+	}
+	acc, err = c.Store.AccountByEmail(ctx, email)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Account{}, nil
+	}
+	if err != nil {
+		return store.Account{}, err
+	}
+	return acc, nil
+}
+
+// update signs the account in again and puts the new sign-in on the row
+// that is already there.
+//
+// 令牌先写：写失败的时候库里那一行没动过，它原来那条链还是好的，报错
+// 就是，不用把这一行删掉——删掉就是毁掉一个还能用的账号。
+//
+// 名字只在真的问出身份的时候才改：问不出来的时候手里没有真名字，
+// 拿清单上的邮箱把原来的名字盖掉，是把知道的东西换成不知道的。
+func (c *Chain) update(ctx context.Context, email, password string, acc store.Account,
+	tok *oauth.Token, knownName string, now time.Time, notes []string) (Result, error) {
+	if err := c.Store.SaveToken(ctx, store.Token{
+		AccountID: acc.ID,
+		Access:    tok.Access,
+		Refresh:   tok.Refresh,
+		ExpiresAt: tok.Expires,
+		Subject:   tok.Subject,
+		UpdatedAt: now,
+	}); err != nil {
+		return Result{Email: email}, &Error{Stage: StageStore,
+			Message: "令牌没能存下，库里原来那一行没动：" + err.Error()}
+	}
+	// 它刚刚登进去了：状态回到 active。这笔写不进去不是导入失败——
+	// 令牌已经是新的了，只是状态还没跟上，要说出来。
+	if err := c.Store.UpdateAccountStatus(ctx, acc.ID, store.StatusActive, "", now); err != nil {
+		notes = append(notes, "令牌换新了，但状态没能写成 active："+err.Error())
+	}
+	if knownName != "" && knownName != acc.Name {
+		if err := c.Store.SetAccountName(ctx, acc.ID, knownName, now); err != nil {
+			notes = append(notes, "名字没能更新："+err.Error())
 		}
 	}
+	notes, _ = c.keep(ctx, acc.ID, password, now, notes)
+	notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
 	return Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}, nil
+}
+
+// keep encrypts the password and writes it down, when there is a
+// keeper.
+//
+// It says whether the password made it: an account that is in without a
+// password cannot sign itself back in, and the person has to know.
+func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, notes []string) ([]string, bool) {
+	if c.Keeper == nil {
+		return notes, true
+	}
+	cipher, err := c.Keeper(password)
+	if err != nil {
+		return append(notes, "密码没能加密存下："+err.Error()), false
+	}
+	if err := c.Store.SetPassword(ctx, id, cipher, now); err != nil {
+		return append(notes, "密码没能存下："+err.Error()), false
+	}
+	return notes, true
 }
 
 // deleter is a store that can take an account back out.

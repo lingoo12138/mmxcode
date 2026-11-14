@@ -3,6 +3,7 @@ package provision
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +21,49 @@ type fakeStore struct {
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
+	// rows are the accounts themselves.
+	rows []store.Account
+	// names are the names that were written.
+	names []string
+	// statuses are the states that were written.
+	statuses []string
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
 	s.accounts = append(s.accounts, a.ID+":"+a.Email)
+	s.rows = append(s.rows, a)
+	return nil
+}
+
+// AccountByEmail gives the account with that email.
+func (s *fakeStore) AccountByEmail(ctx context.Context, email string) (store.Account, error) {
+	for _, r := range s.rows {
+		if strings.EqualFold(r.Email, email) {
+			return r, nil
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+// SetAccountName writes the account's name.
+func (s *fakeStore) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	s.names = append(s.names, id+":"+name)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Name = name
+		}
+	}
+	return nil
+}
+
+// UpdateAccountStatus writes the account's state.
+func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	s.statuses = append(s.statuses, id+":"+status)
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Status = status
+		}
+	}
 	return nil
 }
 
@@ -285,5 +325,60 @@ func TestAFailedIdentityLookupKeepsTheEmailOfTheList(t *testing.T) {
 	}
 	if strings.Contains(res.Message, "hunter2") {
 		t.Fatalf("message = %q, want no password in it", res.Message)
+	}
+}
+
+func TestTheSameAccountTwiceIsOneRow(t *testing.T) {
+	// 重跑一次导入是常事：同一个站点账号只能有一行活着。
+	st := &fakeStore{}
+	c := aChain(st)
+
+	first, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want one row", st.accounts)
+	}
+	if second.AccountID != first.AccountID {
+		t.Fatalf("account id = %q, want %q", second.AccountID, first.AccountID)
+	}
+	if !second.OK {
+		t.Fatalf("res = %+v", second)
+	}
+	if !strings.Contains(second.Message, "已经在库里") {
+		t.Fatalf("message = %q, want it to say it was an update", second.Message)
+	}
+	// 令牌是换新的：这一行现在用的是刚登进去的那条链。
+	if len(st.tokens) != 2 {
+		t.Fatalf("tokens = %v, want the token written twice", st.tokens)
+	}
+	if len(st.statuses) != 1 || st.statuses[0] != "acc_1:"+store.StatusActive {
+		t.Fatalf("statuses = %v", st.statuses)
+	}
+}
+
+func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
+	// 令牌没写下去的时候，库里原来那一行不能动：它还带着一条能用的
+	// 链，把它删掉就是毁掉一个还能用的账号。
+	st := &fakeStore{}
+	c := aChain(st)
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	st.failToken = true
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err == nil {
+		t.Fatal("no error for a token that could not be saved")
+	}
+	if res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v, want the row still there", st.accounts)
 	}
 }

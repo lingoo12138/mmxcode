@@ -1025,6 +1025,37 @@ func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 	return a, nil
 }
 
+// AccountByEmail gives the account with that email.
+//
+// 邮箱是站点那边认的东西：同一个邮箱只该有一行。重跑一次导入是常事
+// （上一批有一部分失败了，重来一遍是补救的办法），再来一行就是同一个
+// 站点账号有两个活着的行，两个都在轮转池里，页面把它列两遍。
+//
+// 表不大——几百行——一次全表扫就够了，不值得为它改表的结构或者加个
+// 索引。邮箱比的时候两边都折成小写：清单上写的是哪个样子，库里存的
+// 是哪个样子，人看着是同一个就是同一个。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
+			last_error, created_at, updated_at
+		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
+		ORDER BY created_at, id LIMIT 1`, email)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
+	}
+	return a, nil
+}
+
 type scanner interface{ Scan(dest ...any) error }
 
 func scanAccount(sc scanner) (Account, error) {

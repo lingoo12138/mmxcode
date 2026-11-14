@@ -1613,3 +1613,40 @@ func TestTheOldFileGetsThePasswordColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestAnAccountIsFoundByItsEmail says an account can be found by the
+// email it was brought in with.
+//
+// 同一个邮箱只该有一行：重跑一次导入的时候，靠这个把原来那一行找
+// 出来更新，而不是再来一行。
+func TestAnAccountIsFoundByItsEmail(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByEmail(ctx, "a@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %+v", got)
+	}
+	// 邮箱比大小写：清单上写的是哪个样子，库里存的是哪个样子，人看着
+	// 是同一个就是同一个。
+	got, err = s.AccountByEmail(ctx, "A@Example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %+v", got)
+	}
+	_, err = s.AccountByEmail(ctx, "b@example.com")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("error = %v, want not found", err)
+	}
+}
