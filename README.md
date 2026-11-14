@@ -98,6 +98,7 @@ mmxcode models                   # 模型列表
 | `/api/egress/test` | POST | 立刻测一个出口组 |
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
 | `/api/events` | GET | SSE，每 30 秒一个心跳 |
+| `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
 
 WebUI 页面：
 
@@ -107,6 +108,7 @@ WebUI 页面：
 | `/login` | 登录 |
 | `/egress` | 出口 |
 | `/usage` | 用量 |
+| `/signin` | 交 key 的登录页 |
 | `/static/app.js` | 页面上的脚本 |
 
 ### 鉴权
@@ -118,7 +120,8 @@ WebUI 页面：
   no api key is configured, so the gateway would listen on :8080 for everyone; put api_keys in the config or listen on 127.0.0.1
   ```
 
-- 鉴权对所有路径生效，包括 WebUI 页面本身：配了 key 之后，浏览器直接打开 `/` 也会被 401 挡下。
+- 鉴权对所有路径生效。带 key 的请求（`x-api-key` 头或 `Authorization: Bearer`）一律放行；不带 key 的请求分两种：`/api/` 下的接口回 401，浏览器要开的页面回登录页 `/signin`（200），登录页上填 key 换来的 cookie 之后就能进管理界面。
+- cookie 的值是拿 key 算出来的 HMAC，服务器自己不留东西；`HttpOnly`、`SameSite=Strict`，走 TLS 时才加 `Secure`。
 
 ### 轮转
 
