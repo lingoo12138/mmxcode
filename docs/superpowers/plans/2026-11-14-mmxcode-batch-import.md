@@ -4467,6 +4467,37 @@ func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing
 	}
 }
 
+// TestAnImportWithoutAGroupKeepsTheGroupThatIsThere says an import
+// without a group does not wipe the group the account has.
+//
+// 组是人自己设的：一次没带组的导入不能把它抹掉——抹掉了账号的出口就变
+// 了，而导入的人根本没有说要变。
+func TestAnImportWithoutAGroupKeepsTheGroupThatIsThere(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	c.ProxyGroup = "hk"
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
+	}
+	// 第二趟没带组。
+	c.ProxyGroup = ""
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk: an import without a group must not wipe it",
+			st.rows[0].ProxyGroup)
+	}
+	// 而且出口那一行根本没动过。
+	if len(st.groups) != 0 {
+		t.Fatalf("the outlet was written %d times, want none", len(st.groups))
+	}
+}
+
 func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
