@@ -2758,6 +2758,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2785,7 +2786,6 @@ func TestChatSendsTheRightHeaders(t *testing.T) {
 		TZOffset:  -480,
 		Body:      []byte(`{"model":"MiniMax-M3"}`),
 		Stream:    false,
-		Anthropic: true,
 	}
 	resp, err := c.Chat(context.Background(), req, nil)
 	if err != nil {
@@ -2834,7 +2834,7 @@ func TestChatKeepsTheClientAnthropicVersion(t *testing.T) {
 	c := New(Options{Timeout: 5 * time.Second})
 	req := ChatRequest{
 		BaseURL: srv.URL, Path: "/mavis/api/v1/llm/v1/messages",
-		Access: "a", Body: []byte(`{}`), Anthropic: true,
+		Access: "a", Body: []byte(`{}`),
 		Extra: map[string]string{"anthropic-version": "2099-01-01"},
 	}
 	resp, err := c.Chat(context.Background(), req, nil)
@@ -2957,9 +2957,6 @@ type ChatRequest struct {
 	Body []byte
 	// Stream says the answer is a stream.
 	Stream bool
-	// Anthropic says the Anthropic protocol is in use, so the version
-	// header is filled in when the client did not send one.
-	Anthropic bool
 	// Extra holds headers the client set, copied over.
 	Extra map[string]string
 }
@@ -2987,7 +2984,10 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 	if req.SessionID != "" {
 		httpReq.Header.Set("X-Mavis-Session-Id", req.SessionID)
 	}
-	if req.Anthropic && httpReq.Header.Get("anthropic-version") == "" {
+	// MiniMax Code's own requests all carry the version header, so
+	// every request here carries it too — the site reads the request
+	// as MiniMax Code wrote it, not as the client's protocol wrote it.
+	if httpReq.Header.Get("anthropic-version") == "" {
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
 	}
 	// 必须：不带压缩时 MiniMax 才会一个事件一个事件地吐
@@ -2995,24 +2995,6 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.Round
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 
-	// A nil transport means the client's own: the client was made with
-	// the transport of the account's exit, and falling back to a fresh
-	// default one would quietly drop the proxy.
-	if transport == nil {
-		transport = c.http.Transport
-	}
-	// A nil transport means the client's own: the client was made with
-	// the transport of the account's exit, and falling back to a fresh
-	// default one would quietly drop the proxy.
-	if transport == nil {
-		transport = c.http.Transport
-	}
-	// A nil transport means the client's own: the client was made with
-	// the transport of the account's exit, and falling back to a fresh
-	// default one would quietly drop the proxy.
-	if transport == nil {
-		transport = c.http.Transport
-	}
 	// A nil transport means the client's own: the client was made with
 	// the transport of the account's exit, and falling back to a fresh
 	// default one would quietly drop the proxy.
@@ -3954,6 +3936,15 @@ func TestDecideReadsTheQuotaWordsFromTheNestedMessage(t *testing.T) {
 	}
 }
 
+func TestDecideReadsTheQuotaWordsFromAPlainErrorField(t *testing.T) {
+	// 站点也会这样答：error 是一个字符串，不是对象。那句话就是
+	// 上游说的拒绝，配额的话要认。
+	f := Failure{Status: 403, Body: []byte(`{"error":"insufficient_balance"}`)}
+	if got := Decide(f); got != ActionFailover {
+		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
+	}
+}
+
 func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 	f := Failure{Status: 429, Message: "insufficient balance"}
 	if got := Decide(f); got != ActionFailover {
@@ -4544,8 +4535,10 @@ func parseBusiness(body []byte) (code int, message string, refused bool) {
 // MiniMax's own shape.
 //
 // The message is looked for at the top level and inside an error
-// object, which are the shapes the site uses. A field that is not a
-// string says nothing.
+// object, which are the shapes the site uses. An error field that is a
+// string and not an object is the message itself: the site answers
+// with a plain error that way. A field that is not a string says
+// nothing.
 func plainMessage(body []byte) string {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(body, &obj) != nil {
@@ -4558,6 +4551,9 @@ func plainMessage(body []byte) string {
 		raw, ok := obj[key]
 		if !ok {
 			continue
+		}
+		if s := rawString(raw); s != "" {
+			return s
 		}
 		var sub map[string]json.RawMessage
 		if json.Unmarshal(raw, &sub) != nil {
@@ -5269,6 +5265,8 @@ package convert
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -5324,6 +5322,33 @@ func TestToAnthropicStringInput(t *testing.T) {
 	block := msg["content"].([]any)[0].(map[string]any)
 	if block["text"] != "hello" {
 		t.Fatalf("block = %v", block)
+	}
+}
+
+// TestAnEmptyTextBlockStillHasItsText says a text block keeps its
+// text field even when the text is empty.
+//
+// Anthropic wants the field: a block that says only "type":"text" is
+// refused. And a block that carries a field it does not know is
+// refused too, so the text block carries nothing else.
+func TestAnEmptyTextBlockStillHasItsText(t *testing.T) {
+	out, err := ToAnthropic([]byte(`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	block := m["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if _, ok := block["text"]; !ok {
+		t.Fatalf("block = %v, want a text field", block)
+	}
+	if block["text"] != "" {
+		t.Fatalf("block = %v, want an empty text", block)
+	}
+	if len(block) != 2 {
+		t.Fatalf("block = %v, want only the type and the text", block)
 	}
 }
 
@@ -5398,6 +5423,720 @@ func TestToAnthropicKeepsStream(t *testing.T) {
 func TestToAnthropicRejectsBadJSON(t *testing.T) {
 	if _, err := ToAnthropic([]byte(`not json`)); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// anthropicSSE is a fixed sample of the upstream's stream.
+const anthropicSSE = "event: message_start\n" +
+	`data: {"type":"message_start","message":{"id":"msg_1","model":"MiniMax-M3","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}` + "\n\n" +
+	"event: content_block_start\n" +
+	`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}` + "\n\n" +
+	"event: content_block_stop\n" +
+	`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+	"event: content_block_start\n" +
+	`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}` + "\n\n" +
+	"event: content_block_stop\n" +
+	`data: {"type":"content_block_stop","index":1}` + "\n\n" +
+	"event: message_delta\n" +
+	`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}` + "\n\n" +
+	"event: message_stop\n" +
+	`data: {"type":"message_stop"}` + "\n\n"
+
+func TestStreamProducesResponsesEvents(t *testing.T) {
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(anthropicSSE), &out, "MiniMax-M3"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"response.created",
+		"response.output_item.added",
+		"response.reasoning_summary_text.delta",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.completed",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the stream has no %s:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, `"delta":"Hello"`) {
+		t.Fatalf("the text delta is missing:\n%s", got)
+	}
+	if !strings.Contains(got, `"delta":"let me think"`) {
+		t.Fatalf("the thinking delta is missing:\n%s", got)
+	}
+}
+
+func TestStreamProducesFunctionCallEvents(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"m","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\""}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(in), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+		`"type":"function_call"`,
+		`"name":"get_weather"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the stream has no %s:\n%s", want, got)
+		}
+	}
+}
+
+// TestStreamEmpty: an empty stream is a stream that ended before the
+// answer was done. The client has to be able to tell that from a
+// whole answer, so the conversion fails and no response.completed is
+// written.
+func TestStreamEmpty(t *testing.T) {
+	var out strings.Builder
+	err := StreamResponses(strings.NewReader(""), &out, "m")
+	if err == nil {
+		t.Fatal("expected an error: the stream ended early")
+	}
+	got := out.String()
+	if !strings.Contains(got, "response.created") {
+		t.Fatalf("the stream has no created event:\n%s", got)
+	}
+	if strings.Contains(got, "response.completed") {
+		t.Fatalf("the stream says it completed:\n%s", got)
+	}
+}
+
+// events reads the events out of a Responses stream.
+func events(t *testing.T, s string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, block := range strings.Split(s, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		for _, line := range strings.Split(block, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m); err != nil {
+				t.Fatalf("the event's data is not JSON: %v", err)
+			}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// eventTypes gives the type of every event of a stream.
+func eventTypes(s string) []string {
+	var out []string
+	for _, block := range strings.Split(s, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				var m map[string]any
+				if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) == nil {
+					out = append(out, fmt.Sprint(m["type"]))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// Finding 1: an upstream error must not be swallowed. The client gets
+// a failure event and the conversion gives an error back, so that the
+// gateway's own handling of a stream that ended early fires too.
+func TestStreamUpstreamErrorFails(t *testing.T) {
+	cases := []struct {
+		name string
+		sse  string
+	}{
+		{
+			name: "an error event",
+			sse: "event: error\n" +
+				`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}` + "\n\n",
+		},
+		{
+			name: "an error field",
+			sse: "event: message_start\n" +
+				`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1}}}` + "\n\n" +
+				"event: error\n" +
+				`data: {"type":"error","error":{"message":"the account is not usable"}}` + "\n\n",
+		},
+		{
+			name: "a statusInfo code",
+			sse: "event: message_start\n" +
+				`data: {"type":"message_start","statusInfo":{"code":1004,"message":"account error"}}` + "\n\n",
+		},
+		{
+			name: "a base_resp code",
+			sse: "event: message_start\n" +
+				`data: {"type":"message_start","base_resp":{"status_code":1002,"status_msg":"bad request"}}` + "\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			err := StreamResponses(strings.NewReader(tc.sse), &out, "m")
+			if err == nil {
+				t.Fatal("expected an error: the upstream said the answer failed")
+			}
+			got := out.String()
+			if strings.Contains(got, "response.completed") {
+				t.Fatalf("the stream says it completed:\n%s", got)
+			}
+			if !strings.Contains(got, "response.failed") {
+				t.Fatalf("the stream has no failure event:\n%s", got)
+			}
+			// The message of the upstream has to reach the client.
+			for _, ev := range events(t, got) {
+				if ev["type"] != "response.failed" {
+					continue
+				}
+				resp := ev["response"].(map[string]any)
+				errObj, ok := resp["error"].(map[string]any)
+				if !ok {
+					t.Fatalf("the failure has no error: %v", resp)
+				}
+				if msg := fmt.Sprint(errObj["message"]); msg == "" {
+					t.Fatalf("the failure has no message: %v", errObj)
+				}
+			}
+		})
+	}
+}
+
+// Finding 2: a stream that ends early is not a whole answer.
+func TestStreamTruncatedIsNotComplete(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}` + "\n\n"
+
+	var out strings.Builder
+	err := StreamResponses(strings.NewReader(in), &out, "m")
+	if err == nil {
+		t.Fatal("expected an error: the stream ended before the answer was done")
+	}
+	got := out.String()
+	if strings.Contains(got, "response.completed") {
+		t.Fatalf("the stream says it completed:\n%s", got)
+	}
+	if !strings.Contains(got, "response.failed") {
+		t.Fatalf("the stream has no failure event:\n%s", got)
+	}
+	// The text that did arrive is still there.
+	if !strings.Contains(got, `"delta":"half an ans"`) {
+		t.Fatalf("the text is missing:\n%s", got)
+	}
+}
+
+// Finding 3: the response id belongs to the Responses protocol, is
+// stable inside one response and is not the upstream's message id.
+func TestStreamResponseID(t *testing.T) {
+	run := func() string {
+		var out strings.Builder
+		if err := StreamResponses(strings.NewReader(anthropicSSE), &out, "m"); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	first := run()
+	second := run()
+
+	idOf := func(s string) string {
+		for _, ev := range events(t, s) {
+			if ev["type"] == "response.created" {
+				return fmt.Sprint(ev["response"].(map[string]any)["id"])
+			}
+		}
+		t.Fatalf("the stream has no created event:\n%s", s)
+		return ""
+	}
+	id, other := idOf(first), idOf(second)
+	if !strings.HasPrefix(id, "resp_") {
+		t.Fatalf("the id is not a Responses id: %q", id)
+	}
+	if id == other {
+		t.Fatalf("two responses have the same id: %q", id)
+	}
+	// The upstream's message id must not be used.
+	if strings.Contains(id, "msg_") {
+		t.Fatalf("the id is the upstream's message id: %q", id)
+	}
+	// One response keeps one id.
+	for _, ev := range events(t, first) {
+		resp, ok := ev["response"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if got := fmt.Sprint(resp["id"]); got != id {
+			t.Fatalf("the events of one response have different ids: %q and %q", id, got)
+		}
+	}
+}
+
+// Finding 4: a block the Responses protocol cannot show does not
+// become an empty message, and it leaves no item without an end.
+func TestStreamSkipsUnknownContentBlock(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"image","source":{"type":"base64","data":"xx"}}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":1}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(in), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	// Every item that was added is also done.
+	added := map[string]bool{}
+	done := map[string]bool{}
+	for _, ev := range events(t, got) {
+		switch ev["type"] {
+		case "response.output_item.added":
+			added[fmt.Sprint(ev["item"].(map[string]any)["id"])] = true
+		case "response.output_item.done":
+			done[fmt.Sprint(ev["item"].(map[string]any)["id"])] = true
+		}
+	}
+	if len(added) == 0 {
+		t.Fatalf("the stream has no item:\n%s", got)
+	}
+	for id := range added {
+		if !done[id] {
+			t.Fatalf("the item %s was added but never done:\n%s", id, got)
+		}
+	}
+	// The picture did not become an empty message.
+	for _, ev := range events(t, got) {
+		if ev["type"] != "response.output_text.done" {
+			continue
+		}
+		if fmt.Sprint(ev["text"]) == "" {
+			t.Fatalf("an empty text was written:\n%s", got)
+		}
+	}
+	// The completed answer has only the message.
+	for _, ev := range events(t, got) {
+		if ev["type"] != "response.completed" {
+			continue
+		}
+		out := ev["response"].(map[string]any)["output"].([]any)
+		if len(out) != 1 {
+			t.Fatalf("the answer has %d items: %v", len(out), out)
+		}
+		if fmt.Sprint(out[0].(map[string]any)["type"]) != "message" {
+			t.Fatalf("the item is not a message: %v", out[0])
+		}
+	}
+}
+
+// Finding 5: the tool choice comes across.
+func TestToAnthropicToolChoice(t *testing.T) {
+	cases := []struct {
+		name string
+		give string
+		want string // the Anthropic tool_choice, "" for none
+	}{
+		{name: "auto", give: `"auto"`, want: `{"type":"auto"}`},
+		{name: "none", give: `"none"`, want: `{"type":"none"}`},
+		{name: "required becomes any", give: `"required"`, want: `{"type":"any"}`},
+		{name: "a named function", give: `{"type":"function","name":"get_weather"}`, want: `{"type":"tool","name":"get_weather"}`},
+		{name: "a name that is not known", give: `"maybe"`, want: ""},
+		{name: "a function without a name", give: `{"type":"function"}`, want: ""},
+		{name: "a shape that is not known", give: `{"type":"allowed_tools","mode":"auto"}`, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := []byte(`{"model":"m","input":"hi","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}],"tool_choice":` + tc.give + `}`)
+			out, err := ToAnthropic(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(out, &m); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := m["tool_choice"]
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("the tool choice should have been left out: %v", got)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("the tool choice is missing: %s", out)
+			}
+			b, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The names of the fields are not what matters here, only
+			// what they say.
+			var have, want map[string]any
+			if err := json.Unmarshal(b, &have); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(have, want) {
+				t.Fatalf("tool_choice = %s, want %s", b, tc.want)
+			}
+		})
+	}
+}
+
+// Finding 6, request side: the arguments of a tool call have to be a
+// JSON object on the Anthropic side.
+func TestToAnthropicToolArguments(t *testing.T) {
+	cases := []struct {
+		name    string
+		give    string
+		want    string
+		wantErr bool
+	}{
+		{name: "a JSON object as a string", give: `"{\"city\":\"SF\"}"`, want: `{"city":"SF"}`},
+		{name: "an object", give: `{"city":"SF"}`, want: `{"city":"SF"}`},
+		{name: "no arguments", give: `""`, want: `{}`},
+		{name: "text that is not JSON", give: `"SF"`, wantErr: true},
+		{name: "JSON that is not an object", give: `"[1,2]"`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := []byte(`{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":` + tc.give + `}]}`)
+			out, err := ToAnthropic(in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(out, &m); err != nil {
+				t.Fatal(err)
+			}
+			msgs := m["messages"].([]any)
+			block := msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+			input, ok := block["input"].(map[string]any)
+			if !ok {
+				t.Fatalf("the tool input is not an object: %v", block)
+			}
+			b, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tc.want {
+				t.Fatalf("input = %s, want %s", b, tc.want)
+			}
+		})
+	}
+}
+
+// Finding 6, stream side: the arguments of the finished tool call are
+// one JSON string.
+func TestStreamFunctionCallArgumentsAreOneString(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\""}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":":\"SF\"}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(in), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	var args string
+	for _, ev := range events(t, got) {
+		if ev["type"] != "response.output_item.done" {
+			continue
+		}
+		item := ev["item"].(map[string]any)
+		if fmt.Sprint(item["type"]) != "function_call" {
+			continue
+		}
+		s, ok := item["arguments"].(string)
+		if !ok {
+			t.Fatalf("the arguments are not a string: %v", item)
+		}
+		args = s
+	}
+	if args == "" {
+		t.Fatalf("the finished tool call has no arguments:\n%s", got)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("the arguments are not one JSON string: %q: %v", args, err)
+	}
+	if parsed["city"] != "SF" {
+		t.Fatalf("the arguments are wrong: %q", args)
+	}
+}
+
+// Finding 7: the completed answer carries the items that were sent and
+// uses the names of the Responses protocol.
+func TestStreamCompletedPayload(t *testing.T) {
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(anthropicSSE), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, ev := range events(t, got) {
+		if ev["type"] != "response.completed" {
+			continue
+		}
+		resp := ev["response"].(map[string]any)
+		if _, ok := resp["output"].([]any); !ok {
+			t.Fatalf("the completed answer has no output: %v", resp)
+		}
+		items := resp["output"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("the answer has %d items: %v", len(items), items)
+		}
+		if fmt.Sprint(items[0].(map[string]any)["type"]) != "reasoning" {
+			t.Fatalf("the first item is not a reasoning: %v", items[0])
+		}
+		if fmt.Sprint(items[1].(map[string]any)["type"]) != "message" {
+			t.Fatalf("the second item is not a message: %v", items[1])
+		}
+		if resp["output_text"] != "Hello" {
+			t.Fatalf("output_text = %v", resp["output_text"])
+		}
+		// The names of the Anthropic protocol have no place here.
+		for _, key := range []string{"stop_reason", "content", "role"} {
+			if _, ok := resp[key]; ok {
+				t.Fatalf("the completed answer has the Anthropic field %q: %v", key, resp)
+			}
+		}
+		return
+	}
+	t.Fatalf("the stream has no completed event:\n%s", got)
+}
+
+// Finding 8: every event says where it stands in the stream.
+func TestStreamSequenceNumbers(t *testing.T) {
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(anthropicSSE), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for i, ev := range events(t, got) {
+		seq, ok := ev["sequence_number"].(float64)
+		if !ok {
+			t.Fatalf("the event %d has no sequence_number: %v", i, ev)
+		}
+		if int(seq) != i {
+			t.Fatalf("the event %d has the sequence number %v", i, seq)
+		}
+	}
+}
+
+// Finding 9: a data field may be continued over several lines.
+func TestStreamMultiLineData(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{
+			// The shape the SSE specification asks for: every line
+			// carries the data field, and the lines belong to one
+			// payload.
+			name: "the data field is written again",
+			in: "event: message_start\n" +
+				`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+				"event: content_block_start\n" +
+				`data: {"type":"content_block_start","index":0,` + "\n" +
+				`data: "content_block":{"type":"text","text":""}}` + "\n\n" +
+				"event: content_block_delta\n" +
+				`data: {"type":"content_block_delta","index":0,` + "\n" +
+				`data: "delta":{"type":"text_delta","text":"Hello"}}` + "\n\n" +
+				"event: content_block_stop\n" +
+				`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+				"event: message_stop\n" +
+				`data: {"type":"message_stop"}` + "\n\n",
+		},
+		{
+			// The shape some upstreams send: only the first line of
+			// the payload carries the data field.
+			name: "the payload is spread over the lines",
+			in: "event: message_start\n" +
+				`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+				"event: content_block_start\n" +
+				`data: {"type":"content_block_start","index":0,` + "\n" +
+				`"content_block":{"type":"text","text":""}}` + "\n\n" +
+				"event: content_block_delta\n" +
+				`data: {"type":"content_block_delta","index":0,` + "\n" +
+				`"delta":{"type":"text_delta","text":"Hello"}}` + "\n\n" +
+				"event: content_block_stop\n" +
+				`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+				"event: message_stop\n" +
+				`data: {"type":"message_stop"}` + "\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			if err := StreamResponses(strings.NewReader(tc.in), &out, "m"); err != nil {
+				t.Fatal(err)
+			}
+			got := out.String()
+			if !strings.Contains(got, `"delta":"Hello"`) {
+				t.Fatalf("the text is missing:\n%s", got)
+			}
+			if !strings.Contains(got, "response.completed") {
+				t.Fatalf("the stream did not finish:\n%s", got)
+			}
+		})
+	}
+}
+
+// Finding 9: a piece of the stream that cannot be read must not leave
+// the client with a false "completed".
+func TestStreamMalformedPayloadIsNotComplete(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	var out strings.Builder
+	err := StreamResponses(strings.NewReader(in), &out, "m")
+	if err == nil {
+		t.Fatal("expected an error: a piece of the stream could not be read")
+	}
+	got := out.String()
+	if strings.Contains(got, "response.completed") {
+		t.Fatalf("the stream says it completed:\n%s", got)
+	}
+	if !strings.Contains(got, "response.failed") {
+		t.Fatalf("the stream has no failure event:\n%s", got)
+	}
+}
+
+// Finding 10: a message with no text in it is not an empty answer.
+func TestStreamEmptyTextBlockIsNotAMessage(t *testing.T) {
+	in := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(in), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, ev := range events(t, got) {
+		switch ev["type"] {
+		case "response.output_text.done", "response.content_part.done":
+			if fmt.Sprint(ev["text"]) == "" {
+				t.Fatalf("an empty text was written:\n%s", got)
+			}
+		case "response.output_item.added", "response.output_item.done":
+			item := ev["item"].(map[string]any)
+			if fmt.Sprint(item["type"]) != "message" {
+				continue
+			}
+			content, ok := item["content"].([]any)
+			if !ok {
+				continue
+			}
+			for _, part := range content {
+				if fmt.Sprint(part.(map[string]any)["text"]) == "" {
+					t.Fatalf("an empty message was written:\n%s", got)
+				}
+			}
+		}
+	}
+	// The answer has no item at all: the model said nothing.
+	for _, ev := range events(t, got) {
+		if ev["type"] != "response.completed" {
+			continue
+		}
+		items := ev["response"].(map[string]any)["output"].([]any)
+		if len(items) != 0 {
+			t.Fatalf("the answer has %d items: %v", len(items), items)
+		}
+	}
+}
+
+// The events of a stream keep their order.
+func TestStreamEventOrder(t *testing.T) {
+	var out strings.Builder
+	if err := StreamResponses(strings.NewReader(anthropicSSE), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	got := eventTypes(out.String())
+	want := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_part.done",
+		"response.output_item.done",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("the events are %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("the events are %v, want %v", got, want)
+		}
 	}
 }
 ```
@@ -5586,6 +6325,40 @@ type anthropicBlock struct {
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
+}
+
+// MarshalJSON writes the block the way Anthropic wants it.
+//
+// Anthropic wants the field every block has, even when the field is
+// empty: a text block without a "text" is refused. And a block that
+// carries a field it does not know is refused too, so each kind writes
+// only its own fields — a text block never carries an id.
+func (b anthropicBlock) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case "tool_use":
+		input := b.Input
+		if len(input) == 0 {
+			// Anthropic wants an object here, not nothing.
+			input = json.RawMessage("{}")
+		}
+		return json.Marshal(struct {
+			Type  string          `json:"type"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}{b.Type, b.ID, b.Name, input})
+	case "tool_result":
+		return json.Marshal(struct {
+			Type      string `json:"type"`
+			ToolUseID string `json:"tool_use_id"`
+			Content   string `json:"content"`
+		}{b.Type, b.ToolUseID, b.Content})
+	default:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{b.Type, b.Text})
+	}
 }
 
 // anthropicTool is one tool of an Anthropic request.
@@ -5879,10 +6652,15 @@ package convert
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // anthropicEvent is one event of the upstream's stream.
@@ -5917,13 +6695,26 @@ type anthropicEvent struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+	// Error is the error an error event carries.
+	Error json.RawMessage `json:"error"`
+	// StatusInfo and BaseResp are MiniMax's own ways of saying that
+	// the answer failed inside a 200.
+	StatusInfo *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+	} `json:"statusInfo"`
+	BaseResp *struct {
+		StatusCode int    `json:"status_code"`
+		StatusMsg  string `json:"status_msg"`
+	} `json:"base_resp"`
 }
 
 // blockState is what is known about one upstream content block.
 type blockState struct {
 	// outputIndex is the item's index in the Responses output.
 	outputIndex int
-	// kind is "reasoning", "message" or "function_call".
+	// kind is "message", "reasoning", "function_call" or "skipped".
 	kind string
 	// itemID is the Responses item id.
 	itemID string
@@ -5935,6 +6726,49 @@ type blockState struct {
 	text string
 	// args is the tool arguments so far.
 	args string
+	// input is the tool input the upstream gave with the block, for
+	// the case that it gives the whole arguments at once.
+	input json.RawMessage
+	// started says whether the item's events have gone out. A block
+	// that says nothing gets no item at all: an empty message is
+	// worse than no message.
+	started bool
+	// finished says whether the item's done event has gone out.
+	finished bool
+}
+
+// converter turns the upstream's stream into a Responses stream.
+type converter struct {
+	bw    *bufio.Writer
+	model string
+
+	// responseID is the id of this response. It is made here and not
+	// taken from the upstream: the upstream's message id is not a
+	// response id, and two requests must not get the same one.
+	responseID string
+
+	// seq counts the events, so that every one of them can say where
+	// it stands in the stream.
+	seq int
+
+	// blocks is what is known about each upstream content block.
+	blocks map[int]*blockState
+	// nextIndex is the index the next output item gets.
+	nextIndex int
+	// items holds the finished output items by their index.
+	items map[int]any
+
+	text      strings.Builder
+	reasoning strings.Builder
+
+	inputTokens  int
+	outputTokens int
+
+	// sawStop says the upstream's stream ended the way it should.
+	sawStop bool
+
+	// failed says the answer has already been reported as failed.
+	failed bool
 }
 
 // StreamResponses turns the upstream's Anthropic stream into a
@@ -5942,247 +6776,622 @@ type blockState struct {
 //
 // The events are written as they come, so a client that is waiting for
 // the first token gets it as soon as the upstream sends it.
+//
+// A stream that fails, or that ends before the answer is done, gets a
+// response.failed and no response.completed: the client has to be able
+// to tell a whole answer from a half one.
 func StreamResponses(r io.Reader, w io.Writer, model string) error {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
-	blocks := map[int]*blockState{}
-	nextIndex := 0
-	responseID := "resp_" + model
-	var text strings.Builder
-	var reasoning strings.Builder
-	stopReason := ""
-	inputTokens, outputTokens := 0, 0
-
-	emit := func(event string, payload map[string]any) error {
-		payload["type"] = event
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(bw, "event: %s\ndata: %s\n\n", event, b); err != nil {
-			return err
-		}
-		return bw.Flush()
+	c := &converter{
+		bw:         bw,
+		model:      model,
+		responseID: randomID("resp"),
+		blocks:     map[int]*blockState{},
+		items:      map[int]any{},
 	}
+	return c.run(r)
+}
 
-	// 第一个事件：response.created
-	if err := emit("response.created", map[string]any{
+// run reads the upstream's stream and writes the Responses stream.
+func (c *converter) run(r io.Reader) error {
+	if err := c.emit("response.created", map[string]any{
 		"response": map[string]any{
-			"id": responseID, "object": "response", "model": model,
+			"id": c.responseID, "object": "response", "model": c.model,
 			"status": "in_progress", "output": []any{},
 		},
 	}); err != nil {
 		return err
 	}
 
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	// broken holds the first piece of the stream that could not be
+	// read. The stream goes on, but it does not end as a whole answer
+	// any more.
+	var broken error
+	err := readSSE(r, func(name, payload string) error {
+		payload = strings.TrimSpace(payload)
+		if payload == "" {
+			return nil
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
+		if payload == "[DONE]" {
+			// 有些上游用 [DONE] 收尾，它也是一个像样的结尾。
+			c.sawStop = true
+			return nil
 		}
 		var ev anthropicEvent
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			// 认不出的行跳过，不让一行坏数据掐断整条流
+			if name == "error" {
+				// 上游说了它自己错了，哪怕这一块不是 JSON。
+				return c.fail("upstream_error", payload)
+			}
+			// 认不出的那一块不掐断整条流，但它也不会被当作
+			// 什么都没发生：这一条流不再是完整的答案。
+			if broken == nil {
+				broken = fmt.Errorf("the upstream sent a piece of the stream that could not be read: %w", err)
+			}
+			return nil
+		}
+		if code, msg, bad := upstreamError(name, &ev); bad {
+			return c.fail(code, msg)
+		}
+		if ev.Type == "" && name != "" {
+			// 有些上游在 event: 那一行写了名字，数据里没有写。
+			ev.Type = name
+		}
+		return c.event(&ev)
+	})
+	if err != nil {
+		var fe *failedError
+		if errors.As(err, &fe) {
+			// 已经报过了
+			return err
+		}
+		return c.fail("upstream_error", err.Error())
+	}
+	if broken != nil {
+		return c.fail("upstream_error", broken.Error())
+	}
+	if !c.sawStop {
+		return c.fail("upstream_error", "the upstream's stream ended before the answer was done")
+	}
+	return c.complete()
+}
+
+// event takes one event of the upstream's stream.
+func (c *converter) event(ev *anthropicEvent) error {
+	switch ev.Type {
+	case "message_start":
+		if ev.Message != nil {
+			c.inputTokens = ev.Message.Usage.InputTokens
+		}
+	case "content_block_start":
+		return c.startBlock(ev)
+	case "content_block_delta":
+		return c.blockDelta(ev)
+	case "content_block_stop":
+		return c.stopBlock(ev)
+	case "message_delta":
+		if ev.Usage != nil {
+			c.outputTokens = ev.Usage.OutputTokens
+		}
+	case "message_stop":
+		c.sawStop = true
+	}
+	return nil
+}
+
+// startBlock takes the opening of one upstream content block.
+//
+// The blocks the Responses protocol cannot show are left out. They get
+// no item at all: an empty message in their place would tell the
+// client that the model said nothing, which is not what happened.
+func (c *converter) startBlock(ev *anthropicEvent) error {
+	if ev.ContentBlock == nil {
+		return nil
+	}
+	st := &blockState{input: ev.ContentBlock.Input}
+	switch ev.ContentBlock.Type {
+	case "text":
+		st.kind = "message"
+	case "thinking":
+		st.kind = "reasoning"
+	case "tool_use":
+		st.kind = "function_call"
+		st.callID = ev.ContentBlock.ID
+		st.name = ev.ContentBlock.Name
+	default:
+		// 图片、文档、工具结果之类的块在 Responses 的输出里没有
+		// 对应的形状，跳过：它们不会变成一个空的消息块。
+		st.kind = "skipped"
+		c.blocks[ev.Index] = st
+		return nil
+	}
+	c.blocks[ev.Index] = st
+	switch st.kind {
+	case "function_call":
+		// 一次工具调用本身就是一件事，不用等它的参数。
+		return c.startItem(st)
+	case "message":
+		// 有些上游把第一段话直接放在块的开头。
+		if ev.ContentBlock.Text != "" {
+			return c.addText(st, ev.ContentBlock.Text)
+		}
+	case "reasoning":
+		if ev.ContentBlock.Thinking != "" {
+			return c.addThinking(st, ev.ContentBlock.Thinking)
+		}
+	}
+	return nil
+}
+
+// startItem writes the opening of one output item.
+//
+// The item is only started when the block actually says something: an
+// item with no text in it would be an empty assistant message, and a
+// client cannot tell that from a real one.
+func (c *converter) startItem(st *blockState) error {
+	if st.started || st.kind == "skipped" {
+		return nil
+	}
+	st.started = true
+	st.outputIndex = c.nextIndex
+	c.nextIndex++
+	switch st.kind {
+	case "message":
+		st.itemID = randomID("msg")
+		if err := c.emit("response.output_item.added", map[string]any{
+			"output_index": st.outputIndex,
+			"item": map[string]any{
+				"type": "message", "id": st.itemID, "role": "assistant",
+				"status": "in_progress", "content": []any{},
+			},
+		}); err != nil {
+			return err
+		}
+		return c.emit("response.content_part.added", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+		})
+	case "reasoning":
+		st.itemID = randomID("rs")
+		if err := c.emit("response.output_item.added", map[string]any{
+			"output_index": st.outputIndex,
+			"item": map[string]any{
+				"type": "reasoning", "id": st.itemID, "summary": []any{},
+			},
+		}); err != nil {
+			return err
+		}
+		return c.emit("response.reasoning_summary_part.added", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
+		})
+	case "function_call":
+		st.itemID = randomID("fc")
+		return c.emit("response.output_item.added", map[string]any{
+			"output_index": st.outputIndex,
+			"item": map[string]any{
+				"type": "function_call", "id": st.itemID,
+				"call_id": st.callID, "name": st.name, "arguments": "",
+				"status": "in_progress",
+			},
+		})
+	}
+	return nil
+}
+
+// addText adds a piece of text to a message item.
+func (c *converter) addText(st *blockState, text string) error {
+	if err := c.startItem(st); err != nil {
+		return err
+	}
+	st.text += text
+	c.text.WriteString(text)
+	return c.emit("response.output_text.delta", map[string]any{
+		"item_id": st.itemID, "output_index": st.outputIndex,
+		"content_index": 0, "delta": text,
+	})
+}
+
+// addThinking adds a piece of thinking to a reasoning item.
+func (c *converter) addThinking(st *blockState, thinking string) error {
+	if err := c.startItem(st); err != nil {
+		return err
+	}
+	st.text += thinking
+	c.reasoning.WriteString(thinking)
+	return c.emit("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": st.itemID, "output_index": st.outputIndex,
+		"summary_index": 0, "delta": thinking,
+	})
+}
+
+// blockDelta takes one piece of an upstream content block.
+func (c *converter) blockDelta(ev *anthropicEvent) error {
+	st, ok := c.blocks[ev.Index]
+	if !ok || ev.Delta == nil {
+		return nil
+	}
+	switch ev.Delta.Type {
+	case "text_delta":
+		if st.kind != "message" || ev.Delta.Text == "" {
+			return nil
+		}
+		return c.addText(st, ev.Delta.Text)
+	case "thinking_delta":
+		if st.kind != "reasoning" || ev.Delta.Thinking == "" {
+			return nil
+		}
+		return c.addThinking(st, ev.Delta.Thinking)
+	case "input_json_delta":
+		if st.kind != "function_call" {
+			return nil
+		}
+		if err := c.startItem(st); err != nil {
+			return err
+		}
+		st.args += ev.Delta.PartialJSON
+		return c.emit("response.function_call_arguments.delta", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"delta": ev.Delta.PartialJSON,
+		})
+	}
+	return nil
+}
+
+// stopBlock takes the end of one upstream content block.
+func (c *converter) stopBlock(ev *anthropicEvent) error {
+	st, ok := c.blocks[ev.Index]
+	if !ok {
+		return nil
+	}
+	return c.finishBlock(st, "completed")
+}
+
+// finishBlock writes the end of one output item.
+//
+// A block that was never started has no item and gets no end either:
+// there is nothing to close.
+func (c *converter) finishBlock(st *blockState, status string) error {
+	if st.finished {
+		return nil
+	}
+	st.finished = true
+	if !st.started {
+		return nil
+	}
+	switch st.kind {
+	case "message":
+		if err := c.emit("response.output_text.done", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"content_index": 0, "text": st.text,
+		}); err != nil {
+			return err
+		}
+		if err := c.emit("response.content_part.done", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": st.text, "annotations": []any{}},
+		}); err != nil {
+			return err
+		}
+		item := map[string]any{
+			"type": "message", "id": st.itemID, "role": "assistant",
+			"status": status,
+			"content": []any{map[string]any{
+				"type": "output_text", "text": st.text, "annotations": []any{},
+			}},
+		}
+		if err := c.emit("response.output_item.done", map[string]any{
+			"output_index": st.outputIndex, "item": item,
+		}); err != nil {
+			return err
+		}
+		c.items[st.outputIndex] = item
+	case "function_call":
+		args := st.args
+		if args == "" {
+			// 参数是一次给全的，或者根本没有参数。
+			args = toolArguments(st.input)
+		}
+		if err := c.emit("response.function_call_arguments.done", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"arguments": args,
+		}); err != nil {
+			return err
+		}
+		item := map[string]any{
+			"type": "function_call", "id": st.itemID,
+			"call_id": st.callID, "name": st.name, "arguments": args,
+			"status": status,
+		}
+		if err := c.emit("response.output_item.done", map[string]any{
+			"output_index": st.outputIndex, "item": item,
+		}); err != nil {
+			return err
+		}
+		c.items[st.outputIndex] = item
+	case "reasoning":
+		if err := c.emit("response.reasoning_summary_part.done", map[string]any{
+			"item_id": st.itemID, "output_index": st.outputIndex,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": st.text},
+		}); err != nil {
+			return err
+		}
+		item := map[string]any{
+			"type": "reasoning", "id": st.itemID,
+			"summary": []any{map[string]any{"type": "summary_text", "text": st.text}},
+		}
+		if err := c.emit("response.output_item.done", map[string]any{
+			"output_index": st.outputIndex, "item": item,
+		}); err != nil {
+			return err
+		}
+		c.items[st.outputIndex] = item
+	}
+	return nil
+}
+
+// closeBlocks ends the blocks that were still open.
+//
+// A stream that breaks in the middle leaves items that were started
+// but never ended. They are closed here, so that the client does not
+// wait for a done event that will never come.
+func (c *converter) closeBlocks() error {
+	idx := make([]int, 0, len(c.blocks))
+	for i := range c.blocks {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	for _, i := range idx {
+		if err := c.finishBlock(c.blocks[i], "incomplete"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// output gives the finished items, in the order of the output.
+func (c *converter) output() []any {
+	idx := make([]int, 0, len(c.items))
+	for i := range c.items {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	out := make([]any, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, c.items[i])
+	}
+	return out
+}
+
+// complete writes the end of a whole answer.
+func (c *converter) complete() error {
+	return c.emit("response.completed", map[string]any{
+		"response": map[string]any{
+			"id": c.responseID, "object": "response", "model": c.model,
+			"status":                 "completed",
+			"output":                 c.output(),
+			"output_text":            c.text.String(),
+			"reasoning_summary_text": c.reasoning.String(),
+			"usage": map[string]any{
+				"input_tokens": c.inputTokens, "output_tokens": c.outputTokens,
+				"total_tokens": c.inputTokens + c.outputTokens,
+			},
+		},
+	})
+}
+
+// failedError is the error of a stream that could not be finished.
+type failedError struct {
+	code string
+	msg  string
+}
+
+func (e *failedError) Error() string { return e.msg }
+
+// fail writes the failure of the answer and gives the error back.
+//
+// A failed answer gets a response.failed and no response.completed:
+// the client has to know that the answer is not there.
+func (c *converter) fail(code, msg string) error {
+	if code == "" {
+		code = "upstream_error"
+	}
+	if c.failed {
+		// 答案已经报过一次失败了，不再报第二次。
+		return &failedError{code: code, msg: msg}
+	}
+	c.failed = true
+	if err := c.closeBlocks(); err != nil {
+		return err
+	}
+	if err := c.emit("response.failed", map[string]any{
+		"response": map[string]any{
+			"id": c.responseID, "object": "response", "model": c.model,
+			"status": "failed",
+			"error":  map[string]any{"code": code, "message": msg},
+			"output": c.output(),
+			"usage": map[string]any{
+				"input_tokens": c.inputTokens, "output_tokens": c.outputTokens,
+				"total_tokens": c.inputTokens + c.outputTokens,
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	return &failedError{code: code, msg: msg}
+}
+
+// emit writes one Responses event.
+func (c *converter) emit(event string, payload map[string]any) error {
+	payload["type"] = event
+	payload["sequence_number"] = c.seq
+	c.seq++
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.bw, "event: %s\ndata: %s\n\n", event, b); err != nil {
+		return err
+	}
+	return c.bw.Flush()
+}
+
+// upstreamError says what is wrong with an upstream event, if anything.
+//
+// MiniMax can put a business error inside a 200 answer, and it can be
+// in the stream as well: as an error event, as an error field, or in
+// one of MiniMax's own status fields.
+func upstreamError(name string, ev *anthropicEvent) (code, msg string, bad bool) {
+	if name == "error" || ev.Type == "error" {
+		return "upstream_error", ev.errorMessage("the upstream said the answer failed"), true
+	}
+	if len(ev.Error) > 0 {
+		raw := strings.TrimSpace(string(ev.Error))
+		if raw != "" && raw != "null" && raw != "{}" {
+			return "upstream_error", ev.errorMessage("the upstream said the answer failed"), true
+		}
+	}
+	if si := ev.StatusInfo; si != nil && si.Code != 0 {
+		m := si.Message
+		if m == "" {
+			m = si.Msg
+		}
+		if m == "" {
+			m = fmt.Sprintf("status %d", si.Code)
+		}
+		return fmt.Sprintf("status_%d", si.Code), m, true
+	}
+	if br := ev.BaseResp; br != nil && br.StatusCode != 0 {
+		m := br.StatusMsg
+		if m == "" {
+			m = fmt.Sprintf("status %d", br.StatusCode)
+		}
+		return fmt.Sprintf("status_%d", br.StatusCode), m, true
+	}
+	return "", "", false
+}
+
+// errorMessage reads the message out of an error field.
+func (ev *anthropicEvent) errorMessage(fallback string) string {
+	if len(ev.Error) == 0 {
+		return fallback
+	}
+	var s string
+	if json.Unmarshal(ev.Error, &s) == nil && s != "" {
+		return s
+	}
+	var obj struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+	}
+	if json.Unmarshal(ev.Error, &obj) == nil {
+		if obj.Message != "" {
+			return obj.Message
+		}
+		if obj.Msg != "" {
+			return obj.Msg
+		}
+		if obj.Type != "" {
+			return obj.Type
+		}
+	}
+	return fallback
+}
+
+// toolArguments gives the arguments of a tool call as one JSON string.
+//
+// The Responses protocol carries the arguments as a string, so the
+// pieces the upstream sends add up to one JSON string.
+func toolArguments(input json.RawMessage) string {
+	if len(input) == 0 {
+		return "{}"
+	}
+	s := strings.TrimSpace(string(input))
+	if s == "" || s == "null" {
+		return "{}"
+	}
+	return s
+}
+
+// readSSE reads the upstream's SSE stream and gives each event to fn.
+//
+// A data field may be continued over several lines: the lines belong to
+// the same payload and are joined with a newline. An event ends at the
+// blank line.
+func readSSE(r io.Reader, fn func(name, payload string) error) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var name string
+	var data []string
+	for sc.Scan() {
+		line := strings.TrimSuffix(sc.Text(), "\r")
+		if line == "" {
+			// 事件到这里为止
+			if len(data) > 0 {
+				if err := fn(name, strings.Join(data, "\n")); err != nil {
+					return err
+				}
+			}
+			name = ""
+			data = nil
 			continue
 		}
-		switch ev.Type {
-		case "message_start":
-			if ev.Message != nil {
-				responseID = ev.Message.ID
-				inputTokens = ev.Message.Usage.InputTokens
-			}
-		case "content_block_start":
-			if ev.ContentBlock == nil {
-				continue
-			}
-			st := &blockState{outputIndex: nextIndex}
-			nextIndex++
-			switch ev.ContentBlock.Type {
-			case "thinking":
-				st.kind = "reasoning"
-				st.itemID = fmt.Sprintf("rs_%d", st.outputIndex)
-				if err := emit("response.output_item.added", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "reasoning", "id": st.itemID, "summary": []any{},
-					},
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.reasoning_summary_part.added", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"summary_index": 0,
-					"part":          map[string]any{"type": "summary_text", "text": ""},
-				}); err != nil {
-					return err
-				}
-			case "tool_use":
-				st.kind = "function_call"
-				st.itemID = "fc_" + fmt.Sprint(st.outputIndex)
-				st.callID = ev.ContentBlock.ID
-				st.name = ev.ContentBlock.Name
-				if err := emit("response.output_item.added", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "function_call", "id": st.itemID,
-						"call_id": st.callID, "name": st.name, "arguments": "",
-					},
-				}); err != nil {
-					return err
-				}
-			default:
-				st.kind = "message"
-				st.itemID = "msg_" + fmt.Sprint(st.outputIndex)
-				if err := emit("response.output_item.added", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "message", "id": st.itemID, "role": "assistant",
-						"status": "in_progress", "content": []any{},
-					},
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.content_part.added", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"content_index": 0,
-					"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-				}); err != nil {
-					return err
-				}
-			}
-			blocks[ev.Index] = st
-		case "content_block_delta":
-			st, ok := blocks[ev.Index]
-			if !ok || ev.Delta == nil {
-				continue
-			}
-			switch ev.Delta.Type {
-			case "text_delta":
-				st.text += ev.Delta.Text
-				text.WriteString(ev.Delta.Text)
-				if err := emit("response.output_text.delta", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"content_index": 0, "delta": ev.Delta.Text,
-				}); err != nil {
-					return err
-				}
-			case "thinking_delta":
-				st.text += ev.Delta.Thinking
-				reasoning.WriteString(ev.Delta.Thinking)
-				if err := emit("response.reasoning_summary_text.delta", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"summary_index": 0, "delta": ev.Delta.Thinking,
-				}); err != nil {
-					return err
-				}
-			case "input_json_delta":
-				st.args += ev.Delta.PartialJSON
-				if err := emit("response.function_call_arguments.delta", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"delta": ev.Delta.PartialJSON,
-				}); err != nil {
-					return err
-				}
-			}
-		case "content_block_stop":
-			st, ok := blocks[ev.Index]
-			if !ok {
-				continue
-			}
-			switch st.kind {
-			case "message":
-				if err := emit("response.output_text.done", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"content_index": 0, "text": st.text,
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.content_part.done", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"content_index": 0,
-					"part":          map[string]any{"type": "output_text", "text": st.text, "annotations": []any{}},
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.output_item.done", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "message", "id": st.itemID, "role": "assistant",
-						"status": "completed",
-						"content": []any{map[string]any{
-							"type": "output_text", "text": st.text, "annotations": []any{},
-						}},
-					},
-				}); err != nil {
-					return err
-				}
-			case "function_call":
-				if err := emit("response.function_call_arguments.done", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"arguments": st.args,
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.output_item.done", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "function_call", "id": st.itemID,
-						"call_id": st.callID, "name": st.name, "arguments": st.args,
-					},
-				}); err != nil {
-					return err
-				}
-			case "reasoning":
-				if err := emit("response.reasoning_summary_part.done", map[string]any{
-					"item_id": st.itemID, "output_index": st.outputIndex,
-					"summary_index": 0,
-					"part":          map[string]any{"type": "summary_text", "text": st.text},
-				}); err != nil {
-					return err
-				}
-				if err := emit("response.output_item.done", map[string]any{
-					"output_index": st.outputIndex,
-					"item": map[string]any{
-						"type": "reasoning", "id": st.itemID,
-						"summary": []any{map[string]any{"type": "summary_text", "text": st.text}},
-					},
-				}); err != nil {
-					return err
-				}
-			}
-		case "message_delta":
-			if ev.Delta != nil && ev.Delta.StopReason != "" {
-				stopReason = ev.Delta.StopReason
-			}
-			if ev.Usage != nil {
-				outputTokens = ev.Usage.OutputTokens
-			}
-		case "message_stop":
-			// 收尾在循环外统一做
+		if strings.HasPrefix(line, ":") {
+			// 注释
+			continue
+		}
+		field, value, found := strings.Cut(line, ":")
+		if !found {
+			field, value = line, ""
+		}
+		switch field {
+		case "event":
+			name = strings.TrimPrefix(value, " ")
+			continue
+		case "data":
+			data = append(data, strings.TrimPrefix(value, " "))
+			continue
+		case "id", "retry":
+			// 跟答案没有关系
+			continue
+		}
+		if len(data) > 0 {
+			// 有些上游把一段 JSON 摊在几行上，只有第一行写了
+			// data:。剩下的行是同一段话的后半截。
+			data = append(data, line)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
+	// 最后一块可能没有空行收尾
+	if len(data) > 0 {
+		return fn(name, strings.Join(data, "\n"))
+	}
+	return nil
+}
 
-	return emit("response.completed", map[string]any{
-		"response": map[string]any{
-			"id": responseID, "object": "response", "model": model,
-			"status": "completed", "stop_reason": stopReason,
-			"output_text":            text.String(),
-			"reasoning_summary_text": reasoning.String(),
-			"usage": map[string]any{
-				"input_tokens": inputTokens, "output_tokens": outputTokens,
-			},
-		},
-	})
+// counter stands in for the random numbers if they cannot be had.
+var counter atomic.Uint64
+
+// randomID gives an id that belongs to this answer alone.
+//
+// The ids of the Responses protocol have to be unique: two requests
+// for the same model must not answer with the same id.
+func randomID(prefix string) string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		// 随机数拿不到时也不能给出重复的 id
+		return fmt.Sprintf("%s_%d", prefix, counter.Add(1))
+	}
+	return prefix + "_" + hex.EncodeToString(b)
 }
 ```
 
@@ -6814,32 +8023,25 @@ func TestUnauthorizedRenewsTheToken(t *testing.T) {
 	}
 }
 
-// TestForbiddenRenewsTheToken says a 403 renews the token too.
+// TestForbiddenDoesNotRenewTheToken says a 403 does not renew the
+// token.
 //
-// 站点用 403 拒签到，账号这一边也是这么读的：令牌旧了，续签。
-func TestForbiddenRenewsTheToken(t *testing.T) {
-	// 次数是本地的一份：handler 是先给的，那时 h还不存在。
-	hits := 0
+// 聊天这条路只有 401 才续签：403 是站点自己不答，不是令牌旧了。
+// 续签一次就是花掉一个只能用一次的 refresh token，不该花在每个
+// 403 上。
+func TestForbiddenDoesNotRenewTheToken(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits == 1 {
-			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"message":"forbidden"}`))
-			return
-		}
-		w.Write([]byte(`{"type":"message","content":[]}`))
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
 	w := httptest.NewRecorder()
 	h.gw.ServeHTTP(w, req)
-	if w.Code != 200 {
+	if h.renewals != 0 {
+		t.Fatalf("the token was renewed %d times, want 0", h.renewals)
+	}
+	if w.Code != http.StatusForbidden {
 		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
-	}
-	if h.renewals != 1 {
-		t.Fatalf("the token was renewed %d times, want 1", h.renewals)
-	}
-	if len(h.tokens) < 2 || h.tokens[0] == h.tokens[1] {
-		t.Fatalf("the account was asked again with the same token: %v", h.tokens)
 	}
 }
 
@@ -8299,11 +9501,10 @@ accountLoop:
 			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
 			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
 			// 方法，Zone() 的第二个返回值就是它。
-			TZOffset:  nowOffset(),
-			Body:      upBody,
-			Stream:    stream,
-			Anthropic: upPath == site.MessagesPath,
-			Extra:     clientHeaders(r),
+			TZOffset: nowOffset(),
+			Body:     upBody,
+			Stream:   stream,
+			Extra:    clientHeaders(r),
 		}
 
 		// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
@@ -8338,7 +9539,6 @@ accountLoop:
 					upBody, upPath, convertBack = fb, fp, fback
 					chatReq.Body = upBody
 					chatReq.Path = upPath
-					chatReq.Anthropic = upPath == site.MessagesPath
 					resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
 					if err != nil {
 						var oe *upstream.OtherSiteError
@@ -8496,23 +9696,17 @@ func upstreamMessage(raw []byte) string {
 
 // action says what to do about the answer.
 //
-// The rotator owns the rule. The one thing it cannot know is that the
-// site refuses a sign-in with a 403 as well as with a 401 — the account
-// package reads both that way — so the gateway says the sign-in was
-// refused.
+// The rotator owns the rule, and on the chat path the rule is the
+// site's own: a 401 means the token was turned away before its end, so
+// the token is renewed and the same account is asked again. A 403 is
+// the site's refusal to answer and not a stale token — renewing on it
+// would spend a refresh token (which MiniMax gives only once) on
+// every refusal.
 //
-// It says it only when the rotator did not read the answer as a
-// refusal to spend: an answer that names the credits is about the
-// credits, and spending the window is the right answer for it.
+// The account API is a different story: there the site refuses a
+// sign-in with a 403 as well as with a 401, and the account package
+// reads both that way.
 func (s *Server) action(failure rotator.Failure) rotator.Action {
-	action := rotator.Decide(failure)
-	if action == rotator.ActionFailover {
-		return action
-	}
-	if failure.Status != http.StatusUnauthorized && failure.Status != http.StatusForbidden {
-		return action
-	}
-	failure.Refused = true
 	return rotator.Decide(failure)
 }
 
@@ -9785,11 +10979,13 @@ document.addEventListener('click', async (ev) => {
 {{if .Pending}}
 <p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
    <a href="{{.Pending.URL}}" target="_blank">这个页面</a>。</p>
-<p id="poll-result" class="muted">正在等……</p>
 {{else}}
 <button id="start-login">开始登录</button>
-<div id="login-result"></div>
 {{end}}
+{{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，
+     失败的话也得让人看见那句话。 */}}
+<div id="login-result"></div>
+<p id="poll-result" class="muted">{{if .Pending}}正在等……{{end}}</p>
 {{end}}
 ```
 
@@ -9800,11 +10996,78 @@ document.addEventListener('click', async (ev) => {
 ```javascript
 // mmxcode 的 WebUI 脚本。
 //
-// 只做三件事：改账号的出口、触发签到、测出口。
+// 做几件事：改账号的出口、触发签到、测出口、登录。
 // 页面本身是服务端渲染的，这里不重新渲染。
 //
 // 这里不用带 API key：浏览器同源的 fetch 会自己带上 mmxcode_session
 // 那张票，页面的按钮因此不会 401。
+//
+// 上游答上来的东西（验证码、地址、错误）一律当字看：它们进页面的时候
+// 只走 textContent 和 URL，不拼 HTML。
+
+// readAnswer 读一个回答。
+//
+// 回答不一定是 JSON：网关拒绝了一把 key 的时候给的是登录页，那是
+// HTML。所以回答先当字读下来，再看它是什么。
+async function readAnswer(res) {
+  const text = await res.text();
+  const type = (res.headers.get('Content-Type') || '').toLowerCase();
+  let json = null;
+  // 没有 Content-Type 的回答也试一下：中间的一层代理可能把它拿掉了。
+  if (type.indexOf('json') >= 0 || type === '') {
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      json = null;
+    }
+  }
+  return { ok: res.ok, status: res.status, json: json, text: text };
+}
+
+// messageOf 说一个回答说了什么。
+//
+// JSON 的错误在 error.message 里，登录页的那句话在 .bad 里。两样都读，
+// 人看到的都是一句话，不是一段 HTML。
+function messageOf(answer) {
+  if (answer.json) {
+    const e = answer.json.error;
+    if (typeof e === 'string' && e) return e;
+    if (e && e.message) return e.message;
+    if (answer.json.message) return answer.json.message;
+  }
+  const page = pageMessage(answer.text);
+  if (page) return page;
+  return answer.text.trim() || ('HTTP ' + answer.status);
+}
+
+// pageMessage 读登录页上那句话。
+//
+// 页面是 HTML，所以它被解析成文档，只取 .bad 那一行的字。它从来不
+// 被写回页面里去。
+function pageMessage(html) {
+  if (!html) return '';
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const bad = doc.querySelector('.bad');
+    return bad ? bad.textContent.trim() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// safeURL 给一个能点的地址，或者不给。
+//
+// 地址是上游答上来的，javascript: 那种点一下就跑。只有 http 和 https
+// 才是链接，其余的不是链接。
+function safeURL(raw) {
+  try {
+    const u = new URL(String(raw));
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href;
+  } catch (e) {
+    return null;
+  }
+}
 
 async function post(url, body) {
   const res = await fetch(url, {
@@ -9812,9 +11075,10 @@ async function post(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(text || res.statusText);
-  return text ? JSON.parse(text) : null;
+  const answer = await readAnswer(res);
+  if (answer.status === 401) askForKey();
+  if (!answer.ok) throw new Error(messageOf(answer));
+  return answer.json;
 }
 
 async function patch(url, body) {
@@ -9823,7 +11087,60 @@ async function patch(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  const answer = await readAnswer(res);
+  if (answer.status === 401) askForKey();
+  if (!answer.ok) throw new Error(messageOf(answer));
+}
+
+// signIn 拿一张票。
+//
+// 回答可能是登录页（HTML），也可能是 JSON：网关现在给的是前者。两样
+// 都读，人看到的是同一句话。
+async function signIn(key) {
+  const res = await fetch('/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: key }),
+  });
+  const answer = await readAnswer(res);
+  if (!answer.ok) throw new Error(messageOf(answer));
+  return answer;
+}
+
+// askForKey 要一把 key。
+//
+// 会话没了的时候，页面上的按钮都答 401。这里问一次 key，交给网关换
+// 一张票，换到了就把页面重新加载。
+let keyBox = null;
+function askForKey() {
+  if (keyBox) return;
+  keyBox = document.createElement('div');
+  keyBox.className = 'card';
+  const label = document.createElement('p');
+  label.textContent = '这个网关要一把 API key。填进去就能继续。';
+  const form = document.createElement('form');
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.placeholder = 'API key';
+  input.autocomplete = 'current-password';
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.textContent = '进入';
+  const msg = document.createElement('p');
+  form.append(input, button);
+  keyBox.append(label, form, msg);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    button.disabled = true;
+    try {
+      await signIn(input.value);
+      location.reload();
+    } catch (e) {
+      msg.textContent = e.message;
+      button.disabled = false;
+    }
+  });
+  document.body.appendChild(keyBox);
 }
 
 document.addEventListener('click', async (ev) => {
@@ -9863,9 +11180,18 @@ document.addEventListener('click', async (ev) => {
     box.textContent = '请稍候……';
     try {
       const out = await post('/api/accounts');
-      box.innerHTML =
-        `把验证码 <strong>${out.user_code}</strong> 填到 ` +
-        `<a href="${out.verification_url}" target="_blank">这个页面</a>。`;
+      // 验证码和地址是上游给的：它们只作为字和地址进页面，不作为
+      // 标记。地址还得是 http 或者 https 才配当链接。
+      box.textContent = '';
+      const code = document.createElement('strong');
+      code.textContent = out.user_code;
+      const link = document.createElement('a');
+      link.textContent = '这个页面';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      const href = safeURL(out.verification_url);
+      if (href) link.href = href;
+      box.append('把验证码 ', code, ' 填到 ', link, '。');
       poll(out.id);
     } catch (e) {
       box.textContent = '失败：' + e.message;
@@ -9890,13 +11216,14 @@ function poll(id) {
   const timer = setInterval(async () => {
     try {
       const out = await post(`/api/accounts/poll`, { id });
+      const box = document.getElementById('poll-result');
       if (out.done) {
         clearInterval(timer);
-        document.getElementById('poll-result').textContent = '登录成功，正在刷新……';
+        if (box) box.textContent = '登录成功，正在刷新……';
         location.reload();
       } else if (out.error) {
         clearInterval(timer);
-        document.getElementById('poll-result').textContent = '失败：' + out.error;
+        if (box) box.textContent = '失败：' + out.error;
       }
     } catch (e) {
       /* 继续等 */
@@ -11272,12 +12599,15 @@ func newServeCmd(e *env) *cobra.Command {
 }
 
 // isLoopback says a listen address is only on this machine.
+//
+// ":8080" and "0.0.0.0:8080" are not: they mean every interface of the
+// machine, so anyone who can reach it can use the accounts.
 func isLoopback(listen string) bool {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
 		host = listen
 	}
-	if host == "" || host == "localhost" {
+	if host == "localhost" {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -11791,6 +13121,2324 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
+
+### Task 11: 实现期新增的文件
+
+计划里原来没有这些文件，实现的时候加上了。
+
+上游只认 Anthropic 那一条路：参考实现只打过 `/messages`，OpenAI 的
+`/chat/completions` 和 Codex 的 `/responses` 是我们本地转出来的。
+`internal/convert/openai.go` 与 `internal/convert/responses.go` 就是
+这两个转换，其余是给它们的测试，以及网关的失败形状和 WebUI 登录页
+的测试。
+
+**Files:**
+- Create: `internal/convert/openai.go`
+- Create: `internal/convert/responses.go`
+- Create: `internal/convert/openai_test.go`
+- Create: `internal/gateway/failures_test.go`
+- Create: `internal/gateway/openai_test.go`
+- Create: `internal/webui/login_test.go`
+
+- [ ] **Step 1: 写转换与测试**
+
+创建 `internal/convert/openai.go`：
+
+```go
+package convert
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+)
+
+// This file is the OpenAI side of the conversion skeleton.
+//
+// The reference plugin only ever calls the Anthropic endpoint. When the
+// site does not serve /chat/completions, an OpenAI request is turned
+// into an Anthropic one here, and the Anthropic answer is turned back
+// into the OpenAI shape — the same skeleton the Codex path rides on,
+// with another shape at each end.
+
+// chatRequest is the part of an OpenAI chat request that is read.
+type chatRequest struct {
+	Model               string          `json:"model"`
+	Messages            []chatMessage   `json:"messages"`
+	MaxTokens           int             `json:"max_tokens"`
+	MaxCompletionTokens int             `json:"max_completion_tokens"`
+	Stream              bool            `json:"stream"`
+	Tools               []chatTool      `json:"tools"`
+	ToolChoice          json.RawMessage `json:"tool_choice"`
+	Stop                json.RawMessage `json:"stop"`
+}
+
+// chatMessage is one message of an OpenAI request.
+type chatMessage struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  []chatToolCall  `json:"tool_calls"`
+	ToolCallID string          `json:"tool_call_id"`
+}
+
+// chatToolCall is one tool call of an assistant message.
+type chatToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// chatTool is one tool of an OpenAI request.
+type chatTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
+// ToAnthropicOpenAI turns an OpenAI chat request into an Anthropic
+// Messages request.
+//
+// The model, the messages, the tools, the tool choice and the
+// streaming flag all come across. The OpenAI tool calls and tool
+// results become Anthropic's tool_use and tool_result blocks.
+//
+// The system prompt is put in Anthropic's own place: an OpenAI request
+// carries it as a message of its own, and Anthropic has a field for
+// it.
+func ToAnthropicOpenAI(body []byte) ([]byte, error) {
+	var in chatRequest
+	if err := json.Unmarshal(body, &in); err != nil {
+		return nil, fmt.Errorf("chat: %w", err)
+	}
+	out := anthropicRequest{
+		Model:     in.Model,
+		Stream:    in.Stream,
+		MaxTokens: in.MaxTokens,
+	}
+	if out.MaxTokens == 0 {
+		out.MaxTokens = in.MaxCompletionTokens
+	}
+	if out.MaxTokens == 0 {
+		out.MaxTokens = 4096
+	}
+	var system []string
+	for _, m := range in.Messages {
+		switch m.Role {
+		case "system", "developer":
+			// Anthropic's system prompt is its own field: the same
+			// words in a different place.
+			if t := chatText(m.Content); t != "" {
+				system = append(system, t)
+			}
+			continue
+		case "user":
+			out.Messages = append(out.Messages, anthropicMessage{
+				Role: "user", Content: chatTextBlocks(m.Content),
+			})
+		case "assistant":
+			blocks := chatBlocks(m.Content)
+			for _, tc := range m.ToolCalls {
+				input, err := toolInput(json.RawMessage(tc.Function.Arguments))
+				if err != nil {
+					return nil, err
+				}
+				blocks = append(blocks, anthropicBlock{
+					Type: "tool_use", ID: tc.ID,
+					Name: tc.Function.Name, Input: input,
+				})
+			}
+			if len(blocks) == 0 {
+				// 一条什么也没有的助手消息在 Anthropic 那边不成立。
+				blocks = []anthropicBlock{{Type: "text", Text: ""}}
+			}
+			out.Messages = append(out.Messages, anthropicMessage{
+				Role: "assistant", Content: blocks,
+			})
+		case "tool", "function":
+			// Anthropic puts the result of a tool in a user message.
+			out.Messages = append(out.Messages, anthropicMessage{
+				Role: "user", Content: []anthropicBlock{{
+					Type: "tool_result", ToolUseID: m.ToolCallID,
+					Content: chatText(m.Content),
+				}},
+			})
+		default:
+			// 别的角色不认，跳过。
+		}
+	}
+	out.System = strings.Join(system, "\n\n")
+	if len(out.Messages) == 0 {
+		out.Messages = []anthropicMessage{{
+			Role: "user", Content: []anthropicBlock{{Type: "text", Text: ""}},
+		}}
+	}
+	for _, t := range in.Tools {
+		if t.Type != "" && t.Type != "function" {
+			continue
+		}
+		schema := t.Function.Parameters
+		if len(schema) == 0 {
+			schema = json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		out.Tools = append(out.Tools, anthropicTool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			InputSchema: schema,
+		})
+	}
+	out.ToolChoice = openAIToolChoice(in.ToolChoice)
+	out.StopSequences = chatStop(in.Stop)
+	return json.Marshal(out)
+}
+
+// openAIToolChoice turns the OpenAI tool_choice into Anthropic's.
+//
+// The same words as the Responses protocol: "required" is Anthropic's
+// "any", and a named function is a named tool.
+func openAIToolChoice(raw json.RawMessage) *anthropicToolChoice {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		switch s {
+		case "auto":
+			return &anthropicToolChoice{Type: "auto"}
+		case "none":
+			return &anthropicToolChoice{Type: "none"}
+		case "required":
+			return &anthropicToolChoice{Type: "any"}
+		}
+		return nil
+	}
+	var obj struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	if obj.Type == "function" && obj.Function.Name != "" {
+		return &anthropicToolChoice{Type: "tool", Name: obj.Function.Name}
+	}
+	return nil
+}
+
+// chatStop reads the stop sequences out of an OpenAI request.
+//
+// The field is a string or a list of strings; both are read.
+func chatStop(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil
+	}
+	return list
+}
+
+// chatText reads the text out of an OpenAI message's content.
+func chatText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Type == "text" || p.Type == "" {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
+// chatBlocks turns an OpenAI message's content into Anthropic blocks.
+//
+// The parts that carry text come across; the pictures and the files do
+// not: their shapes differ, and a picture turned into a piece of text
+// would be a lie.
+func chatBlocks(raw json.RawMessage) []anthropicBlock {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return nil
+		}
+		return []anthropicBlock{{Type: "text", Text: s}}
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
+	}
+	out := make([]anthropicBlock, 0, len(parts))
+	for _, p := range parts {
+		if p.Type == "text" || p.Type == "" {
+			out = append(out, anthropicBlock{Type: "text", Text: p.Text})
+		}
+	}
+	return out
+}
+
+// chatTextBlocks is the blocks of a message that has to say something.
+//
+// Anthropic 的消息不能是空的：一条没有内容的消息不成立，所以这里
+// 补一个空的文字块。
+func chatTextBlocks(raw json.RawMessage) []anthropicBlock {
+	blocks := chatBlocks(raw)
+	if len(blocks) == 0 {
+		return []anthropicBlock{{Type: "text", Text: ""}}
+	}
+	return blocks
+}
+
+// ToChatCompletion turns an Anthropic answer into an OpenAI chat
+// completion.
+//
+// A tool_use block becomes a tool_calls entry and the reason for the
+// end becomes "tool_calls": a client that is told "stop" while the
+// answer holds a tool call waits for nothing.
+func ToChatCompletion(body []byte, model string) ([]byte, error) {
+	var msg anthropicAnswer
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return nil, fmt.Errorf("chat: the upstream's answer could not be read")
+	}
+	if model == "" {
+		model = msg.Model
+	}
+	id := msg.ID
+	if id == "" {
+		id = randomID("chatcmpl")
+	}
+	var content strings.Builder
+	var toolCalls []any
+	for _, c := range msg.Content {
+		switch c.Type {
+		case "text":
+			content.WriteString(c.Text)
+		case "tool_use":
+			toolCalls = append(toolCalls, map[string]any{
+				"id": c.ID, "type": "function",
+				"function": map[string]any{
+					"name": c.Name, "arguments": toolArguments(c.Input),
+				},
+			})
+		}
+	}
+	finish := finishReason(msg.StopReason)
+	if len(toolCalls) > 0 {
+		finish = "tool_calls"
+	}
+	message := map[string]any{
+		"role": "assistant", "content": content.String(),
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+	out := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index": 0, "message": message, "finish_reason": finish,
+		}},
+	}
+	if msg.Usage != nil {
+		out["usage"] = map[string]any{
+			"prompt_tokens":     msg.Usage.InputTokens,
+			"completion_tokens": msg.Usage.OutputTokens,
+			"total_tokens":      msg.Usage.InputTokens + msg.Usage.OutputTokens,
+		}
+	}
+	return json.Marshal(out)
+}
+
+// chatBlock is what is known about one upstream content block.
+type chatBlock struct {
+	// kind is "text" or "tool".
+	kind string
+	// index is the tool call's index in the chunk's tool_calls.
+	index int
+	// id is the tool call's id.
+	id string
+	// name is the tool's name.
+	name string
+	// args are the tool's arguments so far.
+	args string
+	// input is the whole input the upstream gave with the block.
+	input json.RawMessage
+}
+
+// chatConverter turns the upstream's Anthropic stream into an OpenAI
+// chat completion stream.
+type chatConverter struct {
+	bw    *bufio.Writer
+	model string
+	// id is the id of this completion. It is made here and not taken
+	// from the upstream: two requests must not answer with the same
+	// one.
+	id string
+	// created is when the answer was made.
+	created int64
+
+	blocks map[int]*chatBlock
+	// nextIndex is the index the next tool call gets.
+	nextIndex int
+	// toolCalls says whether the answer holds a tool call.
+	toolCalls bool
+
+	// stopReason is why the answer ended.
+	stopReason string
+	// sawStop says the upstream's stream ended the way it should.
+	sawStop bool
+}
+
+// StreamChatCompletions turns the upstream's Anthropic stream into an
+// OpenAI chat completion stream.
+//
+// The pieces go out as they come, so a client that is waiting for the
+// first token gets it as soon as the upstream sends it. The stream
+// ends with a chunk that carries the reason for the end and with
+// "[DONE]", which is how an OpenAI client knows the answer is whole.
+func StreamChatCompletions(r io.Reader, w io.Writer, model string) error {
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+	c := &chatConverter{
+		bw:      bw,
+		model:   model,
+		id:      randomID("chatcmpl"),
+		created: time.Now().Unix(),
+		blocks:  map[int]*chatBlock{},
+	}
+	return c.run(r)
+}
+
+// run reads the upstream's stream and writes the OpenAI stream.
+func (c *chatConverter) run(r io.Reader) error {
+	// 第一块带上角色：OpenAI 的客户端从这一块开始读。
+	if err := c.chunk(map[string]any{"role": "assistant", "content": ""}); err != nil {
+		return err
+	}
+	err := readSSE(r, func(name, payload string) error {
+		payload = strings.TrimSpace(payload)
+		if payload == "" {
+			return nil
+		}
+		if payload == "[DONE]" {
+			// 有些上游用 [DONE] 收尾，它也是一个像样的结尾。
+			c.sawStop = true
+			return nil
+		}
+		var ev anthropicEvent
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			if name == "error" {
+				return c.fail(payload)
+			}
+			return nil
+		}
+		if _, msg, bad := upstreamError(name, &ev); bad {
+			return c.fail(msg)
+		}
+		if ev.Type == "" && name != "" {
+			ev.Type = name
+		}
+		return c.event(&ev)
+	})
+	if err != nil {
+		var ce *chatFailedError
+		if errors.As(err, &ce) {
+			// 已经报过了
+			return err
+		}
+		return c.fail(err.Error())
+	}
+	if !c.sawStop {
+		// 断了的流不是一个完整的答案：客户端得知道它没有拿到整个
+		// 答案，而不是以为答案就这样。
+		return c.fail("the upstream's stream ended before the answer was done")
+	}
+	return c.finish()
+}
+
+// event takes one event of the upstream's stream.
+func (c *chatConverter) event(ev *anthropicEvent) error {
+	switch ev.Type {
+	case "message_start":
+		if ev.Message != nil && c.model == "" {
+			c.model = ev.Message.Model
+		}
+	case "content_block_start":
+		return c.startBlock(ev)
+	case "content_block_delta":
+		return c.blockDelta(ev)
+	case "content_block_stop":
+		return c.stopBlock(ev)
+	case "message_delta":
+		if ev.Delta != nil && ev.Delta.StopReason != "" {
+			c.stopReason = ev.Delta.StopReason
+		}
+	case "message_stop":
+		c.sawStop = true
+	}
+	return nil
+}
+
+// startBlock takes the opening of one upstream content block.
+func (c *chatConverter) startBlock(ev *anthropicEvent) error {
+	if ev.ContentBlock == nil {
+		return nil
+	}
+	switch ev.ContentBlock.Type {
+	case "text", "thinking":
+		c.blocks[ev.Index] = &chatBlock{kind: "text"}
+		return nil
+	case "tool_use":
+		st := &chatBlock{
+			kind: "tool", index: c.nextIndex,
+			id: ev.ContentBlock.ID, name: ev.ContentBlock.Name,
+			input: ev.ContentBlock.Input,
+		}
+		c.nextIndex++
+		c.toolCalls = true
+		c.blocks[ev.Index] = st
+		// 一次工具调用本身就是一件事：它的名字和 id 马上就来。
+		return c.toolChunk(map[string]any{
+			"index": st.index, "id": st.id, "type": "function",
+			"function": map[string]any{"name": st.name, "arguments": ""},
+		})
+	default:
+		// 图片、文档之类的块在 OpenAI 的回答里没有形状，跳过。
+		c.blocks[ev.Index] = &chatBlock{kind: "skipped"}
+		return nil
+	}
+}
+
+// blockDelta takes one piece of an upstream content block.
+func (c *chatConverter) blockDelta(ev *anthropicEvent) error {
+	st, ok := c.blocks[ev.Index]
+	if !ok || ev.Delta == nil {
+		return nil
+	}
+	switch ev.Delta.Type {
+	case "text_delta":
+		if st.kind != "text" || ev.Delta.Text == "" {
+			return nil
+		}
+		return c.chunk(map[string]any{"content": ev.Delta.Text})
+	case "input_json_delta":
+		if st.kind != "tool" {
+			return nil
+		}
+		st.args += ev.Delta.PartialJSON
+		return c.toolChunk(map[string]any{
+			"index":    st.index,
+			"function": map[string]any{"arguments": ev.Delta.PartialJSON},
+		})
+	}
+	return nil
+}
+
+// stopBlock takes the end of one upstream content block.
+func (c *chatConverter) stopBlock(ev *anthropicEvent) error {
+	st, ok := c.blocks[ev.Index]
+	if !ok || st.kind != "tool" {
+		return nil
+	}
+	if st.args == "" {
+		// 参数是一次给全的，或者根本没有参数。
+		st.args = toolArguments(st.input)
+		if st.args == "" {
+			st.args = "{}"
+		}
+		return c.toolChunk(map[string]any{
+			"index":    st.index,
+			"function": map[string]any{"arguments": st.args},
+		})
+	}
+	return nil
+}
+
+// finish writes the end of the answer.
+func (c *chatConverter) finish() error {
+	reason := finishReason(c.stopReason)
+	if c.toolCalls {
+		reason = "tool_calls"
+	}
+	if err := c.write(map[string]any{
+		"index": 0, "delta": map[string]any{}, "finish_reason": reason,
+	}); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.bw, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return c.bw.Flush()
+}
+
+// chunk writes one chunk of the OpenAI stream.
+func (c *chatConverter) chunk(delta map[string]any) error {
+	return c.write(map[string]any{
+		"index": 0, "delta": delta, "finish_reason": nil,
+	})
+}
+
+// toolChunk writes one chunk that carries a piece of a tool call.
+func (c *chatConverter) toolChunk(call map[string]any) error {
+	return c.write(map[string]any{
+		"index":         0,
+		"delta":         map[string]any{"tool_calls": []any{call}},
+		"finish_reason": nil,
+	})
+}
+
+// write writes one chunk of the OpenAI stream.
+func (c *chatConverter) write(choice map[string]any) error {
+	b, err := json.Marshal(map[string]any{
+		"id": c.id, "object": "chat.completion.chunk",
+		"created": c.created, "model": c.model,
+		"choices": []any{choice},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.bw, "data: %s\n\n", b); err != nil {
+		return err
+	}
+	return c.bw.Flush()
+}
+
+// chatFailedError is the error of a stream that could not be finished.
+type chatFailedError struct {
+	msg string
+}
+
+func (e *chatFailedError) Error() string { return e.msg }
+
+// fail writes the failure of the answer.
+//
+// An OpenAI client reads the failure out of a chunk like any other
+// one, so that is where it goes.
+func (c *chatConverter) fail(msg string) error {
+	b, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"message": msg, "type": "api_error"},
+	})
+	fmt.Fprintf(c.bw, "data: %s\n\n", b)
+	fmt.Fprintf(c.bw, "data: [DONE]\n\n")
+	c.bw.Flush()
+	return &chatFailedError{msg: msg}
+}
+```
+
+创建 `internal/convert/responses.go`：
+
+```go
+package convert
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// anthropicAnswer is the shape of an Anthropic message.
+//
+// It is the answer of the Anthropic protocol, whole or in pieces: the
+// same fields are in the message of a whole answer and in the
+// content_block of a stream.
+type anthropicAnswer struct {
+	// ID is the message's id.
+	ID string `json:"id"`
+	// Model is the model that answered.
+	Model string `json:"model"`
+	// StopReason says why the answer ended.
+	StopReason string `json:"stop_reason"`
+	// Content is the answer's blocks.
+	Content []anthropicContent `json:"content"`
+	// Usage says how many tokens were used.
+	Usage *anthropicUsage `json:"usage"`
+}
+
+// anthropicContent is one block of an answer.
+type anthropicContent struct {
+	// Type is the block's kind: text, thinking, tool_use.
+	Type string `json:"type"`
+	// Text is the text of a text block.
+	Text string `json:"text"`
+	// Thinking is the text of a thinking block.
+	Thinking string `json:"thinking"`
+	// ID is the id of a tool_use block.
+	ID string `json:"id"`
+	// Name is the tool's name, for a tool_use block.
+	Name string `json:"name"`
+	// Input is the tool's arguments, for a tool_use block.
+	Input json.RawMessage `json:"input"`
+}
+
+// anthropicUsage is what an answer says about its tokens.
+type anthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// ToResponses turns an Anthropic answer into a Responses answer.
+//
+// The items are the ones the streaming converter writes for the very
+// same answer: a text block is a message item, a thinking block is a
+// reasoning item, a tool_use block is a function call item. The two
+// paths have to agree — an answer must not look different depending
+// on whether the client asked for a stream.
+//
+// A block the Responses protocol has no shape for is left out, not
+// faked: it gets no item at all.
+func ToResponses(body []byte, model string) ([]byte, error) {
+	var msg anthropicAnswer
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return nil, fmt.Errorf("responses: the upstream's answer could not be read")
+	}
+	if model == "" {
+		model = msg.Model
+	}
+	items := []any{}
+	var text, reasoning strings.Builder
+	for _, c := range msg.Content {
+		switch c.Type {
+		case "text":
+			text.WriteString(c.Text)
+			items = append(items, map[string]any{
+				"type": "message", "id": randomID("msg"),
+				"role": "assistant", "status": "completed",
+				"content": []any{map[string]any{
+					"type": "output_text", "text": c.Text, "annotations": []any{},
+				}},
+			})
+		case "thinking":
+			reasoning.WriteString(c.Thinking)
+			items = append(items, map[string]any{
+				"type": "reasoning", "id": randomID("rs"),
+				"summary": []any{map[string]any{
+					"type": "summary_text", "text": c.Thinking,
+				}},
+			})
+		case "tool_use":
+			items = append(items, map[string]any{
+				"type": "function_call", "id": randomID("fc"),
+				"call_id": c.ID, "name": c.Name,
+				"arguments": toolArguments(c.Input),
+				"status":    "completed",
+			})
+		}
+	}
+	out := map[string]any{
+		"id":     randomID("resp"),
+		"object": "response",
+		"status": "completed",
+		"model":  model,
+		"output": items,
+		// output_text 是给不读 output 的客户端准备的：它要的只是那段话。
+		"output_text": text.String(),
+	}
+	if reasoning.Len() > 0 {
+		out["reasoning_summary_text"] = reasoning.String()
+	}
+	if msg.Usage != nil {
+		out["usage"] = map[string]any{
+			"input_tokens":  msg.Usage.InputTokens,
+			"output_tokens": msg.Usage.OutputTokens,
+			"total_tokens":  msg.Usage.InputTokens + msg.Usage.OutputTokens,
+		}
+	}
+	return json.Marshal(out)
+}
+
+// finishReason says what an Anthropic stop reason means to a client
+// that only knows the OpenAI wording.
+func finishReason(stopReason string) string {
+	switch stopReason {
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+```
+
+创建 `internal/convert/openai_test.go`：
+
+```go
+package convert
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// TestToResponsesKeepsTheToolCall says the tool call of an Anthropic
+// answer is a function call item in the Responses answer.
+//
+// 回答里的工具调用块在 Responses 里有一个自己的样子。把它丢掉，模型
+// 就永远调不了工具：客户端收到的是一个说完话了的回答。
+func TestToResponsesKeepsTheToolCall(t *testing.T) {
+	answer := []byte(`{"type":"message","id":"msg_1","model":"m","content":[
+		{"type":"text","text":"ok"},
+		{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Beijing"}}
+	]}`)
+	out, err := ToResponses(answer, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Object string `json:"object"`
+		Status string `json:"status"`
+		Model  string `json:"model"`
+		Output []struct {
+			Type      string `json:"type"`
+			ID        string `json:"id"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Status    string `json:"status"`
+			Content   []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		OutputText string `json:"output_text"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Object != "response" || resp.Status != "completed" {
+		t.Fatalf("the answer = %s", out)
+	}
+	if resp.OutputText != "ok" {
+		t.Fatalf("output_text = %q", resp.OutputText)
+	}
+	var call *struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Status    string `json:"status"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	for i := range resp.Output {
+		if resp.Output[i].Type == "function_call" {
+			call = &resp.Output[i]
+		}
+	}
+	if call == nil {
+		t.Fatalf("the tool call was thrown away: %s", out)
+	}
+	if call.CallID != "toolu_1" || call.Name != "get_weather" {
+		t.Fatalf("the tool call = %+v", call)
+	}
+	if call.Arguments != `{"city":"Beijing"}` {
+		t.Fatalf("arguments = %q", call.Arguments)
+	}
+	if call.Status != "completed" {
+		t.Fatalf("status = %q", call.Status)
+	}
+	if call.ID == "" {
+		t.Fatal("the tool call has no id of its own")
+	}
+}
+
+// TestToResponsesHasTheSameItemsAsTheStream says the whole answer and
+// the stream agree on what the items look like.
+//
+// 同一个上游答案，两条路要给客户端看一样的形状。
+func TestToResponsesHasTheSameItemsAsTheStream(t *testing.T) {
+	answer := []byte(`{"type":"message","id":"msg_1","content":[
+		{"type":"text","text":"ok"},
+		{"type":"thinking","thinking":"hmm"},
+		{"type":"tool_use","id":"toolu_1","name":"f","input":{"a":1}}
+	]}`)
+	out, err := ToResponses(answer, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Output []struct {
+			Type    string `json:"type"`
+			Summary []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"summary"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	kinds := []string{}
+	for _, item := range resp.Output {
+		kinds = append(kinds, item.Type)
+	}
+	want := []string{"message", "reasoning", "function_call"}
+	if len(kinds) != len(want) {
+		t.Fatalf("the items are %v, want %v", kinds, want)
+	}
+	for i, k := range kinds {
+		if k != want[i] {
+			t.Fatalf("the items are %v, want %v", kinds, want)
+		}
+	}
+	if len(resp.Output[0].Content) != 1 || resp.Output[0].Content[0].Type != "output_text" {
+		t.Fatalf("the message item = %+v", resp.Output[0])
+	}
+	if len(resp.Output[1].Summary) != 1 || resp.Output[1].Summary[0].Text != "hmm" {
+		t.Fatalf("the reasoning item = %+v", resp.Output[1])
+	}
+}
+
+// TestToResponsesCarriesTheUsage says the upstream's usage comes along.
+func TestToResponsesCarriesTheUsage(t *testing.T) {
+	answer := []byte(`{"type":"message","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+	out, err := ToResponses(answer, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Usage *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Usage == nil {
+		t.Fatalf("the usage was thrown away: %s", out)
+	}
+	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 || resp.Usage.TotalTokens != 15 {
+		t.Fatalf("the usage = %+v", resp.Usage)
+	}
+}
+
+// TestToAnthropicOpenAITurnsAMessage says an OpenAI request becomes an
+// Anthropic one.
+func TestToAnthropicOpenAITurnsAMessage(t *testing.T) {
+	in := []byte(`{
+		"model":"m",
+		"messages":[
+			{"role":"system","content":"you are helpful"},
+			{"role":"user","content":"hi"}
+		],
+		"max_completion_tokens":32
+	}`)
+	out, err := ToAnthropicOpenAI(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		Model     string `json:"model"`
+		System    string `json:"system"`
+		MaxTokens int    `json:"max_tokens"`
+		Messages  []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Model != "m" {
+		t.Fatalf("model = %q", req.Model)
+	}
+	if req.System != "you are helpful" {
+		t.Fatalf("system = %q", req.System)
+	}
+	if req.MaxTokens != 32 {
+		t.Fatalf("max_tokens = %d", req.MaxTokens)
+	}
+	if len(req.Messages) != 1 {
+		t.Fatalf("messages = %+v", req.Messages)
+	}
+	if req.Messages[0].Role != "user" {
+		t.Fatalf("role = %q", req.Messages[0].Role)
+	}
+	if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Text != "hi" {
+		t.Fatalf("content = %+v", req.Messages[0].Content)
+	}
+}
+
+// TestToAnthropicOpenAITurnsTheTools says the tools and the tool
+// choice come across.
+func TestToAnthropicOpenAITurnsTheTools(t *testing.T) {
+	in := []byte(`{
+		"model":"m",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}}],
+		"tool_choice":{"type":"function","function":{"name":"f"}}
+	}`)
+	out, err := ToAnthropicOpenAI(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		Tools []struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			InputSchema json.RawMessage `json:"input_schema"`
+		} `json:"tools"`
+		ToolChoice *struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Tools) != 1 || req.Tools[0].Name != "f" {
+		t.Fatalf("tools = %+v", req.Tools)
+	}
+	if len(req.Tools[0].InputSchema) == 0 {
+		t.Fatalf("the schema was thrown away: %s", out)
+	}
+	if req.ToolChoice == nil || req.ToolChoice.Type != "tool" || req.ToolChoice.Name != "f" {
+		t.Fatalf("tool_choice = %+v", req.ToolChoice)
+	}
+}
+
+// TestToAnthropicOpenAITurnsTheToolCalls says the tool calls of a
+// conversation come across as tool_use blocks.
+func TestToAnthropicOpenAITurnsTheToolCalls(t *testing.T) {
+	in := []byte(`{
+		"model":"m",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"42"}
+		]
+	}`)
+	out, err := ToAnthropicOpenAI(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type      string          `json:"type"`
+				ID        string          `json:"id"`
+				Name      string          `json:"name"`
+				Input     json.RawMessage `json:"input"`
+				ToolUseID string          `json:"tool_use_id"`
+				Content   string          `json:"content"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Messages) != 3 {
+		t.Fatalf("messages = %+v", req.Messages)
+	}
+	assistant := req.Messages[1]
+	if assistant.Role != "assistant" || len(assistant.Content) != 1 {
+		t.Fatalf("the assistant message = %+v", assistant)
+	}
+	block := assistant.Content[0]
+	if block.Type != "tool_use" || block.ID != "call_1" || block.Name != "f" {
+		t.Fatalf("the tool_use block = %+v", block)
+	}
+	if string(block.Input) != `{"a":1}` {
+		t.Fatalf("the tool's input = %s", block.Input)
+	}
+	result := req.Messages[2]
+	if result.Role != "user" || len(result.Content) != 1 {
+		t.Fatalf("the tool result message = %+v", result)
+	}
+	if result.Content[0].Type != "tool_result" || result.Content[0].ToolUseID != "call_1" {
+		t.Fatalf("the tool_result block = %+v", result.Content[0])
+	}
+	if result.Content[0].Content != "42" {
+		t.Fatalf("the result = %q", result.Content[0].Content)
+	}
+}
+
+// TestToChatCompletionSaysWhatWasSaid says an Anthropic answer becomes
+// an OpenAI chat completion.
+func TestToChatCompletionSaysWhatWasSaid(t *testing.T) {
+	answer := []byte(`{"type":"message","id":"msg_1","model":"m","stop_reason":"end_turn","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":2}}`)
+	out, err := ToChatCompletion(answer, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(out, &completion); err != nil {
+		t.Fatal(err)
+	}
+	if completion.Object != "chat.completion" {
+		t.Fatalf("object = %q", completion.Object)
+	}
+	if completion.Created == 0 {
+		t.Fatal("the completion has no time")
+	}
+	if len(completion.Choices) != 1 {
+		t.Fatalf("choices = %+v", completion.Choices)
+	}
+	if completion.Choices[0].Message.Content != "hi" {
+		t.Fatalf("content = %q", completion.Choices[0].Message.Content)
+	}
+	if completion.Choices[0].FinishReason != "stop" {
+		t.Fatalf("finish_reason = %q", completion.Choices[0].FinishReason)
+	}
+	if completion.Usage.PromptTokens != 3 || completion.Usage.CompletionTokens != 2 || completion.Usage.TotalTokens != 5 {
+		t.Fatalf("the usage = %+v", completion.Usage)
+	}
+}
+
+// TestToChatCompletionTurnsTheToolCall says the tool call of an
+// Anthropic answer is an OpenAI tool call.
+func TestToChatCompletionTurnsTheToolCall(t *testing.T) {
+	answer := []byte(`{"type":"message","id":"msg_1","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"f","input":{"a":1}}]}`)
+	out, err := ToChatCompletion(answer, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &completion); err != nil {
+		t.Fatal(err)
+	}
+	calls := completion.Choices[0].Message.ToolCalls
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls = %+v", calls)
+	}
+	if calls[0].ID != "toolu_1" || calls[0].Type != "function" {
+		t.Fatalf("the tool call = %+v", calls[0])
+	}
+	if calls[0].Function.Name != "f" {
+		t.Fatalf("name = %q", calls[0].Function.Name)
+	}
+	if calls[0].Function.Arguments != `{"a":1}` {
+		t.Fatalf("arguments = %q", calls[0].Function.Arguments)
+	}
+	if completion.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q", completion.Choices[0].FinishReason)
+	}
+}
+
+// TestStreamChatCompletionsGivesTheChunks says the Anthropic stream
+// becomes an OpenAI stream.
+func TestStreamChatCompletionsGivesTheChunks(t *testing.T) {
+	up := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"m","usage":{"input_tokens":5}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+		"",
+	}, "\n")
+	var out strings.Builder
+	if err := StreamChatCompletions(strings.NewReader(up), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	stream := out.String()
+	if !strings.HasSuffix(strings.TrimSpace(stream), "data: [DONE]") {
+		t.Fatalf("the stream does not end with [DONE]: %s", stream)
+	}
+	var text strings.Builder
+	var finish string
+	chunks := 0
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Object  string `json:"object"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("a chunk is not JSON: %v (%s)", err, payload)
+		}
+		if chunk.Object != "chat.completion.chunk" {
+			t.Fatalf("object = %q", chunk.Object)
+		}
+		chunks++
+		text.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
+		}
+	}
+	if chunks < 2 {
+		t.Fatalf("the stream has %d chunks: %s", chunks, stream)
+	}
+	if text.String() != "hi" {
+		t.Fatalf("the text = %q", text.String())
+	}
+	if finish != "stop" {
+		t.Fatalf("finish_reason = %q", finish)
+	}
+}
+
+// TestStreamChatCompletionsGivesTheToolCall says the tool call of a
+// stream is an OpenAI tool call.
+func TestStreamChatCompletionsGivesTheToolCall(t *testing.T) {
+	up := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"m"}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"f","input":{}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+		"",
+	}, "\n")
+	var out strings.Builder
+	if err := StreamChatCompletions(strings.NewReader(up), &out, "m"); err != nil {
+		t.Fatal(err)
+	}
+	stream := out.String()
+	var name, args, id string
+	var finish string
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("a chunk is not JSON: %v (%s)", err, payload)
+		}
+		for _, call := range chunk.Choices[0].Delta.ToolCalls {
+			if call.Function.Name != "" {
+				name = call.Function.Name
+			}
+			if call.ID != "" {
+				id = call.ID
+			}
+			args += call.Function.Arguments
+		}
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
+		}
+	}
+	if name != "f" {
+		t.Fatalf("the tool's name = %q", name)
+	}
+	if id != "toolu_1" {
+		t.Fatalf("the tool call's id = %q", id)
+	}
+	if args != `{"a":1}` {
+		t.Fatalf("the arguments = %q", args)
+	}
+	if finish != "tool_calls" {
+		t.Fatalf("finish_reason = %q", finish)
+	}
+}
+```
+
+创建 `internal/gateway/failures_test.go`：
+
+```go
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestAnUpstreamThatIsDownIsNotARateLimit says a 503 from the upstream
+// reaches the client as a 503.
+//
+// 上游说它自己坏了，客户端就该看到上游坏了。把它说成 429，客户端会
+// 当成自己被限流：退避，过一会儿再来，再问一个还是坏了的上游。运维
+// 看到的也是"被限流了"，而不是"上游挂了"。
+func TestAnUpstreamThatIsDownIsNotARateLimit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"message":"the upstream is down"}`))
+	})
+	// 一次就够：这里要看的不是重试，是最后给客户端的那个状态。
+	h.gw.Cfg.Rotation.MaxAttempts = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestAnUpstreamBadRequestIsNotARateLimit says a 400 from the upstream
+// reaches the client as a 400.
+//
+// 400 是上游说"这个请求不对"。说成 429 是骗客户端：它会把这个请求
+// 一直重试下去，而重试一个不对的请求没有用。
+func TestAnUpstreamBadRequestIsNotARateLimit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"the request is not right"}}`))
+	})
+	h.gw.Cfg.Rotation.MaxAttempts = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestAQuotaRefusalIsStillARateLimit says the one refusal that stays a
+// 429 is the one about the credits.
+//
+// 额度用完了就是限流：客户端等一会儿再来是对的，所以这一条还是 429，
+// 而且要带上限流的样子，让客户端知道该等而不是该换账号。
+func TestAQuotaRefusalIsStillARateLimit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if body.Error.Type != "rate_limit_error" {
+		t.Fatalf("the error's type = %q, want rate_limit_error", body.Error.Type)
+	}
+	if !strings.Contains(body.Error.Message, "usage limit reached") {
+		t.Fatalf("the error's message = %q", body.Error.Message)
+	}
+}
+
+// TestATransportErrorIsABadGateway says a request that never got
+// through is the gateway's own problem.
+//
+// 网络没通的时候上游没有给过任何状态。这时候没有上游的话可以转述，
+// 那是网关这一边的事：502。把它说成 429，客户端会以为是自己被限流
+// 了，而真正坏着的是网关到上游那一段路。
+func TestATransportErrorIsABadGateway(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 上游指到一个已经关掉的地方：连都连不上。
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	h.gw.UpstreamBase = deadURL
+	h.gw.Cfg.Rotation.MaxAttempts = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestABodyOverTheLimitIsRefused says a body that is too big is turned
+// away instead of being read into memory.
+//
+// 没有上限的时候，一个请求就能把它这个网关的内存吃光：这里读的是整
+// 个身子，读进来就一直拿着。
+func TestABodyOverTheLimitIsRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	big := strings.Repeat("x", maxBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(big))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413, body = %s", w.Code, w.Body.String())
+	}
+	if h.hits != 0 {
+		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	}
+}
+
+// TestTheModelListDoesNotAskTheUpstream says the model list is the
+// built-in one and that asking for it costs nothing.
+//
+// 站点的模型接口给的是 provider config 的样子，不是模型列表的样子：
+// 每次去问都问不到东西，白白多一次上游请求，还可能顺手续一次令牌。
+// 现场的模型列表本来就不在这个网关的活儿里。
+func TestTheModelListDoesNotAskTheUpstream(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"whatever"}]}`))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d", w.Code)
+	}
+	if h.hits != 0 {
+		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if body.Object != "list" {
+		t.Fatalf("object = %q", body.Object)
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	for _, m := range body.Data {
+		if m.ID == "whatever" {
+			t.Fatalf("the upstream's answer was used: %s", w.Body.String())
+		}
+	}
+	if !strings.Contains(w.Body.String(), "MiniMax-M3") {
+		t.Fatalf("the built-in list is not in the answer: %s", w.Body.String())
+	}
+}
+
+// TestTheBackoffStopsWhenTheClientIsGone says the wait between two
+// attempts ends when the client goes away.
+//
+// 客户端走了之后再睡上半分钟是白等：上游的次数是白花的，网关的连接
+// 是白占的。退避要看着请求的命。
+func TestTheBackoffStopsWhenTheClientIsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		// 客户端走了：上游还在答，答了也没人听。
+		cancel()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	start := time.Now()
+	h.gw.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+	if h.hits != 1 {
+		t.Fatalf("the upstream was asked %d times, want 1", h.hits)
+	}
+	// 第一次退避是半秒：没有停住的话，这里至少要等半秒。
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("the request took %s: the backoff did not stop", elapsed)
+	}
+}
+```
+
+创建 `internal/gateway/openai_test.go`：
+
+```go
+package gateway
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"mmxcode/internal/site"
+)
+
+// upstreamRecorder keeps what the upstream was asked.
+//
+// 记下发给上游的东西：上游是在自己的 goroutine 里 answering 的，所以
+// 要一把锁。
+type upstreamRecorder struct {
+	mu     sync.Mutex
+	paths  []string
+	bodies [][]byte
+}
+
+func (u *upstreamRecorder) record(r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	u.mu.Lock()
+	u.paths = append(u.paths, r.URL.Path)
+	u.bodies = append(u.bodies, body)
+	u.mu.Unlock()
+}
+
+// seen gives the paths and the bodies the upstream was asked with.
+func (u *upstreamRecorder) seen() ([]string, [][]byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.paths...), append([][]byte(nil), u.bodies...)
+}
+
+// TestTheOpenAIAnswerComesBackInTheOpenAIShape says an OpenAI request
+// that the site cannot answer itself is answered in the OpenAI shape.
+//
+// 参考实现只走 Anthropic 的 /messages，站点多半没有 /chat/completions。
+// 那条路是本地转的：请求转成 Anthropic 的，��答再转回 OpenAI 的样子。
+// 客户端认的是 OpenAI 的形状，不能给它一段 Anthropic 的。
+func TestTheOpenAIAnswerComesBackInTheOpenAIShape(t *testing.T) {
+	rec := &upstreamRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		if r.URL.Path == site.ChatCompletionsPath {
+			// 站点没有这条路
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"message":"no such endpoint"}}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[{"type":"text","text":"hi"}]}`))
+	})
+
+	body := `{"model":"m","max_completion_tokens":32,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// 上游收到的是 Anthropic 的请求
+	paths, bodies := rec.seen()
+	if len(paths) != 2 {
+		t.Fatalf("the upstream was asked %d times: %v", len(paths), paths)
+	}
+	if paths[0] != site.ChatCompletionsPath {
+		t.Fatalf("the first path = %q, want the native one", paths[0])
+	}
+	if paths[1] != site.MessagesPath {
+		t.Fatalf("the second path = %q, want the Anthropic one", paths[1])
+	}
+	var up map[string]any
+	if err := json.Unmarshal(bodies[1], &up); err != nil {
+		t.Fatalf("the upstream's request is not JSON: %v (%s)", err, bodies[1])
+	}
+	if up["max_tokens"] != float64(32) {
+		t.Fatalf("the upstream's request = %s", bodies[1])
+	}
+
+	// 客户端收到的是 OpenAI 的回答
+	var answer struct {
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if answer.Object != "chat.completion" {
+		t.Fatalf("object = %q, want chat.completion", answer.Object)
+	}
+	if len(answer.Choices) != 1 {
+		t.Fatalf("choices = %+v", answer.Choices)
+	}
+	if answer.Choices[0].Message.Role != "assistant" {
+		t.Fatalf("role = %q", answer.Choices[0].Message.Role)
+	}
+	if answer.Choices[0].Message.Content != "hi" {
+		t.Fatalf("content = %q", answer.Choices[0].Message.Content)
+	}
+	if answer.Choices[0].FinishReason != "stop" {
+		t.Fatalf("finish_reason = %q", answer.Choices[0].FinishReason)
+	}
+	// 第一次 404 把这条路关掉了，后面的请求不再去撞它。
+	if h.gw.NativeChatCompletions.Load() {
+		t.Fatal("the native path is still on")
+	}
+}
+
+// TestTheOpenAIToolCallSurvivesTheFallback says a tool call the
+// upstream made comes back as an OpenAI tool call.
+//
+// 模型要调工具，客户端得看得见它调的是哪个工具、拿什么参数去调。
+func TestTheOpenAIToolCallSurvivesTheFallback(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.ChatCompletionsPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","stop_reason":"tool_use","content":[` +
+			`{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Beijing"}}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var answer struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(answer.Choices) != 1 {
+		t.Fatalf("choices = %+v", answer.Choices)
+	}
+	calls := answer.Choices[0].Message.ToolCalls
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls = %+v", calls)
+	}
+	if calls[0].ID != "toolu_1" {
+		t.Fatalf("id = %q, want the tool_use block's id", calls[0].ID)
+	}
+	if calls[0].Type != "function" {
+		t.Fatalf("type = %q", calls[0].Type)
+	}
+	if calls[0].Function.Name != "get_weather" {
+		t.Fatalf("name = %q", calls[0].Function.Name)
+	}
+	if calls[0].Function.Arguments != `{"city":"Beijing"}` {
+		t.Fatalf("arguments = %q", calls[0].Function.Arguments)
+	}
+	if answer.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", answer.Choices[0].FinishReason)
+	}
+}
+
+// TestTheOpenAIRequestIsUntouchedWhenTheSiteHasThePath says the
+// native path is the default: nothing is converted when the site
+// serves /chat/completions.
+//
+// 站点也许真的有这条路。有的时候网关就该原样把请求发过去：转来转去
+// 只会把东西弄丢。
+func TestTheOpenAIRequestIsUntouchedWhenTheSiteHasThePath(t *testing.T) {
+	rec := &upstreamRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","choices":[` +
+			`{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	})
+
+	body := `{"model":"m","max_completion_tokens":32,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	paths, bodies := rec.seen()
+	if len(paths) != 1 || paths[0] != site.ChatCompletionsPath {
+		t.Fatalf("the upstream was asked %v", paths)
+	}
+	if string(bodies[0]) != body {
+		t.Fatalf("the upstream's request = %s, want it unchanged", bodies[0])
+	}
+	// 客户端拿到的就是上游的那一段
+	if !strings.Contains(w.Body.String(), "chatcmpl-1") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if !h.gw.NativeChatCompletions.Load() {
+		t.Fatal("the native path was turned off without a 404")
+	}
+}
+
+// TestTheOpenAIStreamFallbackEndsWithDone says the streaming fallback
+// gives the client an OpenAI stream.
+//
+// OpenAI 的流是一段 data，每一段是一块，最后是 [DONE]。少了最后那一
+// 段，客户端会一直等一个不会来的答案。
+func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.ChatCompletionsPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":{\"input_tokens\":5}}}\n\n"))
+		w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+		w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
+		w.Write([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+		w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n"))
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	})
+
+	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	stream := w.Body.String()
+	if !strings.HasSuffix(strings.TrimSpace(stream), "data: [DONE]") {
+		t.Fatalf("the stream does not end with [DONE]: %s", stream)
+	}
+
+	var text strings.Builder
+	var finish string
+	chunks := 0
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Object  string `json:"object"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("a chunk is not JSON: %v (%s)", err, payload)
+		}
+		if chunk.Object != "chat.completion.chunk" {
+			t.Fatalf("object = %q, want chat.completion.chunk", chunk.Object)
+		}
+		if chunk.Model != "m" {
+			t.Fatalf("model = %q", chunk.Model)
+		}
+		chunks++
+		if len(chunk.Choices) != 1 {
+			t.Fatalf("choices = %+v", chunk.Choices)
+		}
+		text.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
+		}
+	}
+	if chunks < 2 {
+		t.Fatalf("the stream has %d chunks: %s", chunks, stream)
+	}
+	if text.String() != "hi" {
+		t.Fatalf("the text = %q", text.String())
+	}
+	if finish != "stop" {
+		t.Fatalf("finish_reason = %q", finish)
+	}
+}
+```
+
+创建 `internal/webui/login_test.go`：
+
+```go
+package webui
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/oauth"
+	"mmxcode/internal/site"
+	"mmxcode/internal/store"
+	"mmxcode/internal/upstream"
+)
+
+// fakeSite is the site itself, answered here.
+//
+// 一个测试不许碰网络：令牌的端点、账号的 API 都在这里答。没有哪一条
+// 请求能出去。
+type fakeSite struct {
+	mu       sync.Mutex
+	device   string
+	token    string
+	identity string
+	seen     []string
+}
+
+// RoundTrip answers one request.
+func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, r.Method+" "+r.URL.Path)
+	body, status := "", http.StatusOK
+	switch r.URL.Path {
+	case site.DeviceCodePath:
+		body = f.device
+	case site.TokenPath:
+		body = f.token
+	case site.IdentityPath:
+		body = f.identity
+	}
+	if body == "" {
+		status, body = http.StatusNotFound, `{"error":"no such endpoint"}`
+	}
+	return &http.Response{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    r,
+	}, nil
+}
+
+// paths gives the paths that were asked for.
+func (f *fakeSite) paths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.seen...)
+}
+
+// newFakeSiteWebUI makes a WebUI whose site is a stand-in.
+//
+// 账号的 API 和令牌的端点都在 stand-in 后面，所以登录这条路整条都能走
+// 一遍，而没有一条请求出得去。
+func newFakeSiteWebUI(t *testing.T, f *fakeSite) (*WebUI, *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: f})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(map[string]string{}, ""), oauth.NewRenewer())
+	return New(mgr, config.Default(), s), s
+}
+
+// deviceAnswer is what the site answers to a sign-in code.
+const deviceAnswer = `{"device_code":"dc","user_code":"ABCD-EFGH",` +
+	`"verification_uri":"https://account.minimax.io/activate","expires_in":600,"interval":1}`
+
+// tokenWithSubject makes a token that carries a subject claim.
+//
+// 令牌里的 sub 是猜的：这个令牌带一个，好让测试看得见"猜的那个"和
+// "真的那个"不是一回事。
+func tokenWithSubject(sub string) string {
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(fmt.Sprintf(`{"sub":%q}`, sub)))
+	return "header." + payload + ".signature"
+}
+
+// waitForAccounts waits until the store holds n accounts.
+func waitForAccounts(t *testing.T, s *store.Store, n int) []store.Account {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		accs, err := s.ListAccounts(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(accs) >= n {
+			return accs
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("there are not %d accounts yet", n)
+	return nil
+}
+
+// TestTheWebUIAcquiresTheRealUserIDAndEmail says the account the WebUI
+// makes is the account the site knows.
+//
+// 账号是谁要问站点本人：令牌里的那个 sub 是猜的，签到和积分明细要的
+// 是真的那个 user id。猜出来的那个号，签到签不上，积分明细也是空的。
+func TestTheWebUIAcquiresTheRealUserIDAndEmail(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890",` +
+			`"userEmail":"who@example.com"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	accs := waitForAccounts(t, s, 1)
+	acc := accs[0]
+	if acc.UserID != "1234567890" {
+		t.Errorf("user id = %q, want the one the site says", acc.UserID)
+	}
+	if acc.Email != "who@example.com" {
+		t.Errorf("email = %q, want the one the site says", acc.Email)
+	}
+	if acc.Name != "who@example.com" {
+		t.Errorf("name = %q, want the email the site says", acc.Name)
+	}
+	if !strings.HasPrefix(acc.ID, "acc_") {
+		t.Errorf("id = %q, want the acc_ prefix", acc.ID)
+	}
+	// 站点本人被问过了：那个 user id 和邮箱是从它那里来的。
+	asked := false
+	for _, p := range f.paths() {
+		if p == "GET "+site.IdentityPath {
+			asked = true
+		}
+	}
+	if !asked {
+		t.Errorf("the identity API was never asked: %v", f.paths())
+	}
+}
+
+// TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable says a sign-in
+// that worked is not thrown away because the identity could not be read.
+//
+// 登录成功了就是登录成功了：读不到账户信息只是少知道一点，账号照样建
+// 起来，用令牌自己带着的东西填。
+func TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		// 身份读不到：没有回答就是没有回答。
+		identity: "",
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	accs := waitForAccounts(t, s, 1)
+	acc := accs[0]
+	if acc.UserID != "jwt-subject" {
+		t.Errorf("user id = %q, want the one the token carries", acc.UserID)
+	}
+	if acc.Name != "jwt-subject" {
+		t.Errorf("name = %q, want the one the token carries", acc.Name)
+	}
+	if acc.Email != "" {
+		t.Errorf("email = %q, want none", acc.Email)
+	}
+}
+
+// TestTwoSignInsDoNotShareAnAccountID says two sign-ins that end at the
+// same moment do not fight over one id.
+//
+// 账号的 id 是主键：两个登录在同一毫秒里结束，第二个会被数据库挡下
+// 来。挡下来的那一个要是没人说，这一次登录就悄悄没了。
+func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+		if rec.Code != 200 {
+			t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	accs := waitForAccounts(t, s, 3)
+	ids := map[string]bool{}
+	for _, a := range accs {
+		if ids[a.ID] {
+			t.Fatalf("two accounts have the id %q", a.ID)
+		}
+		ids[a.ID] = true
+		if !strings.HasPrefix(a.ID, "acc_") {
+			t.Errorf("id = %q, want the acc_ prefix", a.ID)
+		}
+	}
+}
+
+// TestTheAccountIDIsNotOnlyTheTime says the id is not the time alone.
+//
+// 光是时间不够：同一毫秒里结束的两个登录会拿到同一个 id。
+func TestTheAccountIDIsNotOnlyTheTime(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		id := newAccountID()
+		if !strings.HasPrefix(id, "acc_") {
+			t.Fatalf("id = %q, want the acc_ prefix", id)
+		}
+		if seen[id] {
+			t.Fatalf("the same id twice: %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+// TestARefusedSignInIsToldInTheBrowser says the page is told why the
+// sign-in did not work.
+//
+// 失败要说出来：页面只看到"还在等"，人只当是网慢。
+func TestARefusedSignInIsToldInTheBrowser(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token:  `{"error":"access_denied","error_description":"the user refused"}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var started struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		rec := httptest.NewRecorder()
+		body := strings.NewReader(fmt.Sprintf(`{"id":%q}`, started.ID))
+		w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts/poll", body))
+		var out struct {
+			Error string `json:"error"`
+			Done  bool   `json:"done"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Error != "" {
+			if !strings.Contains(out.Error, "access_denied") {
+				t.Fatalf("the error is %q, want the site's own words", out.Error)
+			}
+			accs, err := s.ListAccounts(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(accs) != 0 {
+				t.Fatalf("the refused sign-in made an account: %+v", accs)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the refusal never came")
+}
+
+// TestAFailedSignInIsForgotten says a sign-in that failed does not stay
+// forever.
+//
+// 说完失败，那次登录就该忘掉：服务器开得久，不能把每一次登录都留着。
+func TestAFailedSignInIsForgotten(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.mu.Lock()
+	w.pendingTTL = 50 * time.Millisecond
+	w.pending["pending_1"] = &pendingLogin{ID: "pending_1"}
+	w.mu.Unlock()
+	w.failLogin("pending_1", "the site refused the sign-in")
+
+	// 页面先问到那句话。
+	rec := httptest.NewRecorder()
+	body := strings.NewReader(`{"id":"pending_1"}`)
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts/poll", body))
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["error"] != "the site refused the sign-in" {
+		t.Fatalf("body = %s, want the reason", rec.Body.String())
+	}
+
+	// 过了一会儿，那次登录不在了。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		n := len(w.pending)
+		w.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the failed sign-in is still there")
+}
+
+// TestThePollDoesNotRaceWithAFailedSignIn says the page can ask about a
+// sign-in while it fails.
+//
+// 页面每隔几秒问一次登录怎么了，登录失败的时候那个失败是写进去的。
+// 读它的时候得拿着锁：字符串是两个词，读到一半就是半个指针加一个
+// 不在那里的长度。
+func TestThePollDoesNotRaceWithAFailedSignIn(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.mu.Lock()
+	w.pending["pending_1"] = &pendingLogin{ID: "pending_1"}
+	w.mu.Unlock()
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	// 登录失败：那个失败是写在锁里的。
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			w.mu.Lock()
+			p := w.pending["pending_1"]
+			if p != nil {
+				p.Err = "the site refused the sign-in"
+			}
+			w.mu.Unlock()
+		}
+	}()
+	// 页面在问。
+	for i := 0; i < 500; i++ {
+		rec := httptest.NewRecorder()
+		body := strings.NewReader(`{"id":"pending_1"}`)
+		w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts/poll", body))
+	}
+	close(done)
+	wg.Wait()
+}
+
+// TestTheDeviceCodeIsNeverMarkup says the code the site gives is never
+// written as markup.
+//
+// 上游答上来的验证码和地址是给人看的，不是给浏览器执行的。Go 这边拼
+// 出来的每一段页面都是模板里的，脚本那边也不许有 innerHTML。
+func TestTheDeviceCodeIsNeverMarkup(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"innerHTML", "template.HTML"} {
+			if strings.Contains(string(b), bad) {
+				t.Errorf("%s has %s in it", name, bad)
+			}
+		}
+	}
+	js, err := os.ReadFile(filepath.Join("static", "app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"innerHTML", `href="${`, "href='${"} {
+		if strings.Contains(string(js), bad) {
+			t.Errorf("static/app.js has %s in it", bad)
+		}
+	}
+}
+
+// TestTheLoginPageEscapesTheDeviceCode says the page shows the code as
+// text, and the address as an address.
+//
+// 验证码是上游给的，地址也是。一个 <script> 进去就是脚本，一个
+// javascript: 的地址进去就是点一下就跑。
+func TestTheLoginPageEscapesTheDeviceCode(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.mu.Lock()
+	w.pending["pending_1"] = &pendingLogin{
+		ID:       "pending_1",
+		UserCode: `<script>alert("x")</script>`,
+		URL:      "javascript:alert(1)",
+	}
+	w.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/login", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<script>alert") {
+		t.Fatalf("the code was written as markup: %s", body)
+	}
+	if strings.Contains(body, "javascript:alert") {
+		t.Fatalf("the address was written as a link: %s", body)
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Fatalf("the code is not escaped: %s", body)
+	}
+}
+```
+
+
+
 
 ## 完成标准
 

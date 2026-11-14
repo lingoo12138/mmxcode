@@ -151,6 +151,8 @@ mmxcode-api/
 
 **MiniMax 变体**：响应里可能没有 `device_code`，而是用 `user_code` 轮询、且 `expired_in` 可能是绝对毫秒时间戳。两 种形式都要支持，由 `expired_in` 是否存在且大于零、`device_code` 是否缺失来判断。参考实现的 `pos()` 只认大于零的值，所以 `expired_in: 0` 等于没有这个字段 —— 一个零的截止时间不是截止时间。
 
+**轮询间隔的单位**：两种形式的 `interval` 单位不一样，参考实现也是分开读的 —— 站点自己那套（`user_code` 轮询）是**毫秒**，普通的（`device_code` 轮询）是**秒**。所以 `interval: 3000` 在前者是三秒，在后者是五十分钟；没有这个字段（或者字段是零）就是五秒一轮。
+
 **轮询语义**：
 - `authorization_pending` / `status=pending` → 继续等
 - `slow_down` / `status=slow_down` → 间隔 +5s
@@ -237,7 +239,9 @@ Codex 回退转换需要产出 `response.output_text.delta`、`response.function
 1. **业务错误码**：HTTP 200 不代表成功。检查 body 的 `statusInfo.code`（`1000048` = 登录被拒）与 `base_resp.status_code`，非 0 视为失败。
 2. **配额拒绝改写**：状态码 402 / 403 / 429 且 body 命中配额正则时，改写为 `429` + `{"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached: <原消息>"}}`，让客户端知道是配额问题、可以换号重试。其他状态码原样透传。
    配额正则：`insufficient|balance|credit|quota|exhaust|limit|余额|积分|额度|不足|用完|上限`（忽略大小写）
+   配额词在上游自己的**消息**里找，不在身体的每个字节里找：消息取 `message` / `msg`，或者 `error` / `err` 里的那个（对象里的 `message` / `msg`，或者它自己就是一个字符串）。身体里别处提到 "limit" 不是拒绝花钱的话，把账号的窗口记成用完就错了 —— 那个错要等到窗口回来才消。
 3. **401**：先刷新 token，同账号重试一次；若刷新判定登出则换号。
+   聊天这条路只有 401 才续签。403 是站点自己不答，不是令牌旧了：续一次就是花掉一个只能用一次的 refresh token。账号 API（签到、积分）是另一回事，那里的 401 和 403 都是签到被拒。
 4. **跨站重定向**：见 8.3，返回 502 + 代理提示，**不当作登录被拒，不消耗 refresh token**。
 
 ## 7. 轮转

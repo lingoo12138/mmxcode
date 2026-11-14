@@ -983,6 +983,33 @@ const (
 // rather than being spelled out at the call site.
 const ModelsQuery = "region=" + Region + "&buildEnv=prod"
 
+// KV is one query parameter.
+//
+// It is the site's own type, so that a package that builds a query does
+// not have to know about the signing package to say what a parameter
+// is. The signing package has one of its own, and the two are the same
+// shape.
+type KV struct {
+	// K is the parameter's name.
+	K string
+	// V is the parameter's value.
+	V string
+}
+
+// CheckinQuery is the query MiniMax Code's own check-in sends.
+//
+// The check-in comes from the desktop client, so it says so: the
+// device_platform is "web", the desktop version is MiniMax Code's, and
+// the account's own user id is in the query.
+//
+// It is kept here, once: the check-in and the credits ledger ask the
+// same way, and the reference has one copy of it too.
+var CheckinQuery = []KV{
+	{K: "device_platform", V: "web"},
+	{K: "is_desktop", V: "1"},
+	{K: "desktop_version", V: "0.6.12"},
+}
+
 // AccountURL gives an account endpoint's full URL.
 func AccountURL(path string) string { return AccountHost + path }
 
@@ -1302,7 +1329,12 @@ node internal/sign/testdata/regen-vectors.mjs
 ```go
 package sign
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"mmxcode/internal/site"
+)
 
 // The vectors were produced by running the reference implementation
 // (magpie-community/plugins, packages/minimax/index.mjs) under Node 24.
@@ -1427,6 +1459,159 @@ func TestSignGoldenVectors(t *testing.T) {
 			if got.Signature != c.wantSig {
 				t.Errorf("signature = %s, want %s", got.Signature, c.wantSig)
 			}
+
+			headers := got.Headers()
+			want := map[string]string{
+				"Authorization": "Bearer " + c.opts.Access,
+				"Accept":        "application/json",
+				"Content-Type":  "application/json",
+				"User-Agent":    site.AccountUserAgent,
+				"yy":            c.wantYY,
+				"x-timestamp":   c.wantTS,
+				"x-signature":   c.wantSig,
+			}
+			for name, value := range want {
+				if headers[name] != value {
+					t.Errorf("header %s = %q, want %q", name, headers[name], value)
+				}
+			}
+		})
+	}
+}
+
+// The query the reference builds for a plain request, so that the cases
+// below can spell out only what they change.
+const plainQuery = "device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+	"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+	"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode"
+
+// The reference resolves the path against the origin and signs the
+// resolved, percent-encoded path, so these all sign something other
+// than what the path looks like.
+func TestSignResolvesThePath(t *testing.T) {
+	cases := []struct {
+		name    string
+		origin  string
+		path    string
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:   "a path without a leading slash",
+			origin: "https://agent.minimax.io",
+			path:   "v1/api/user/info",
+			// The reference resolves it against the origin, so it is
+			// the same request as the golden identity GET.
+			wantURL: "https://agent.minimax.io/v1/api/user/info?" + plainQuery,
+			wantYY:  "40865acf7e929978824a2892b1cc0e7b",
+		},
+		{
+			name:    "a path with a space in it",
+			origin:  "https://agent.minimax.io",
+			path:    "/v1/a b",
+			wantURL: "https://agent.minimax.io/v1/a%20b?" + plainQuery,
+			wantYY:  "5bf73d0b32d9919785be6e1cf3b76a84",
+		},
+		{
+			name:   "a path with a query of its own",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/x?a=1",
+			// The reference assigns the defaults to url.search, which
+			// replaces the path's own query.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "an origin with a path of its own",
+			origin: "https://agent.minimax.io/base/",
+			path:   "/v1/x",
+			// An absolute path replaces the origin's path.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "a path with a percent that is not an escape",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/100%",
+			// JavaScript keeps a "%" that is not an escape as it is,
+			// so the reference signs it as it is too.
+			wantURL: "https://agent.minimax.io/v1/100%?" + plainQuery,
+			wantYY:  "203556ac721d12836c9fa21a52201df3",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign(c.origin, c.path, Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// The reference builds its query as an object literal with the
+// caller's query spread into the middle of it, so a repeated key takes
+// the caller's place but only the leading defaults take the caller's
+// value.
+func TestQueryDefaults(t *testing.T) {
+	cases := []struct {
+		name    string
+		query   []KV
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:  "a leading default is the caller's to override",
+			query: []KV{{"device_platform", "web"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "98e6fa51a036f804c2c65e80295a731b",
+		},
+		{
+			name:  "lang keeps the reference's value",
+			query: []KV{{"lang", "zh"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&lang=en&unix=1763150000000&timezone_offset=-480&sys_language=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d2e7a1e8b377f6fa116a09b1d9825613",
+		},
+		{
+			name:  "client keeps the reference's value",
+			query: []KV{{"client", "x"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&client=mcode&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890",
+			wantYY: "f73c2ba5320fdc2145e65d82d40b14b8",
+		},
+		{
+			name:  "user_id keeps the option's value",
+			query: []KV{{"user_id", "q"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&user_id=1234567890&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&client=mcode",
+			wantYY: "84f842303887f8956faa37fad5226a13",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: c.query,
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
 		})
 	}
 }
@@ -1439,8 +1624,138 @@ func TestQueryOverrideKeepsPosition(t *testing.T) {
 		Query: []KV{{"device_platform", "web"}, {"is_desktop", "1"}},
 	})
 	want := "device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1"
-	if !contains(got.URL, want) {
+	if !strings.Contains(got.URL, want) {
 		t.Fatalf("URL %s does not contain %s", got.URL, want)
+	}
+}
+
+// The options that fall back to a default, and the ones that are
+// trimmed, are all part of the signed query.
+func TestSignOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    Options
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name: "a language of its own",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Lang: "zh",
+			},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=zh&lang=zh" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d6bbe2721fce479b89ca1b7c05de3591",
+		},
+		{
+			name: "no platform name falls back to linux",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480,
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a user id with whitespace around it",
+			opts: Options{
+				Access: "tok_1", UserID: "  1234567890  ",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a query value with a space and a non-ASCII character",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: []KV{{"q", "a b 中文"}},
+			},
+			// URLSearchParams encodes a space as "+" and everything
+			// else as UTF-8 percent escapes.
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&q=a+b+%E4%B8%AD%E6%96%87&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "79bfb3e01c70c286bc75523a8c43a2b2",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", c.opts)
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// An empty body is a GET: the reference has no way to send one, and a
+// POST with an empty body would sign a body the reference never signs.
+func TestSignEmptyBodyIsGet(t *testing.T) {
+	opts := Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: 1763150000000, TZOffset: -480, OSName: "linux",
+	}
+	get := Sign("https://agent.minimax.io", "/p", opts)
+	empty := Sign("https://agent.minimax.io", "/p", Options{
+		Access: opts.Access, UserID: opts.UserID, Body: []byte{},
+		Now: opts.Now, TZOffset: opts.TZOffset, OSName: opts.OSName,
+	})
+	if empty.YY != get.YY {
+		t.Errorf("yy = %s, want the GET one %s", empty.YY, get.YY)
+	}
+	if empty.Signature != get.Signature {
+		t.Errorf("signature = %s, want the GET one %s", empty.Signature, get.Signature)
+	}
+	if want := "cf6860c1fac0feba1367dc97c06cd876"; empty.YY != want {
+		t.Errorf("yy = %s, want %s", empty.YY, want)
+	}
+	if want := "12f7ac9ac565a90bb1d7652ab46ac58c"; empty.Signature != want {
+		t.Errorf("signature = %s, want %s", empty.Signature, want)
+	}
+}
+
+// The reference floors the seconds and Go's division truncates towards
+// zero.
+func TestSignFloorsNegativeSeconds(t *testing.T) {
+	got := Sign("https://agent.minimax.io", "/p", Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: -1500, TZOffset: -480, OSName: "linux",
+	})
+	if got.Timestamp != "-2" {
+		t.Errorf("timestamp = %s, want -2", got.Timestamp)
+	}
+	if want := "f13f639021bd969f8a1dad1c171b5785"; got.YY != want {
+		t.Errorf("yy = %s, want %s", got.YY, want)
+	}
+	if want := "c70bef52e842c40feaa0a33d76040802"; got.Signature != want {
+		t.Errorf("signature = %s, want %s", got.Signature, want)
+	}
+}
+
+// The user id is trimmed the way JavaScript trims a string, which is
+// not quite strings.TrimSpace: JavaScript strips U+FEFF and keeps
+// U+0085, and Go does the opposite.
+func TestJSTrimMatchesJavaScript(t *testing.T) {
+	bom := string(rune(0xFEFF))
+	nel := string(rune(0x0085))
+	cases := map[string]string{
+		"  42  ":     "42",
+		"\t\n42\r\n": "42",
+		bom + "42":   "42",
+		"42" + nel:   "42" + nel,
+	}
+	for in, want := range cases {
+		if got := jsTrim(in); got != want {
+			t.Errorf("jsTrim(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -1476,17 +1791,6 @@ func TestFormEncodeMatchesJS(t *testing.T) {
 			t.Errorf("formEncode(%q) = %q, want %q", in, got, want)
 		}
 	}
-}
-
-func contains(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && (func() bool {
-		for i := 0; i+len(needle) <= len(haystack); i++ {
-			if haystack[i:i+len(needle)] == needle {
-				return true
-			}
-		}
-		return false
-	})()
 }
 ```
 
@@ -5025,9 +5329,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -5093,7 +5399,9 @@ func TestSameHostRedirectKeepsTheBody(t *testing.T) {
 }
 
 func TestRefusesCrossHostRedirect(t *testing.T) {
+	var hits atomic.Int32
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		w.Write([]byte("other"))
 	}))
 	defer other.Close()
@@ -5115,17 +5423,327 @@ func TestRefusesCrossHostRedirect(t *testing.T) {
 	if oe.Status != http.StatusTemporaryRedirect {
 		t.Fatalf("status = %d", oe.Status)
 	}
+	// 另一个服务器一个请求都没有收到：跟随了就收到了。
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("the other server got %d requests, want 0", got)
+	}
+}
+
+func TestRefusesSchemeDowngrade(t *testing.T) {
+	// https 转到同一个 host 的 http：Authorization 就会明文发出去。
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "http://"+r.Host+"/x")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	// The transport speaks plaintext whatever the scheme says, so a
+	// downgrade can be tried without a certificate.
+	base := &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+	c := New(Options{Timeout: 5 * time.Second, Transport: &plainTransport{base: base}})
+	_, err := c.Get(context.Background(), "https://"+srv.Listener.Addr().String()+"/start")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var de *SchemeDowngradeError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v (%T), want SchemeDowngradeError", err, err)
+	}
+	if de.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d", de.Status)
+	}
+	if !strings.Contains(de.Error(), "http") {
+		t.Fatalf("the error does not say the scheme was downgraded: %v", de)
+	}
+	// 只收到了第一个请求：降级后的地址没有被访问过。
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("the server got %d requests, want 1", got)
+	}
+}
+
+// plainTransport talks plaintext whatever the scheme of the request
+// says.
+type plainTransport struct {
+	base *http.Transport
+}
+
+func (t *plainTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	out := r.Clone(r.Context())
+	out.URL.Scheme = "http"
+	return t.base.RoundTrip(out)
+}
+
+func TestRefusesRedirectThatWouldReplayAStaleSignature(t *testing.T) {
+	// 签名是按 path+query 算的。改了 path 还把旧的签名带过去，
+	// 上游会拒签，那看起来就是一个死 token，白白花掉一个刷新令牌。
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "/other")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("yy", "deadbeef")
+	req.Header.Set("x-signature", "cafebabe")
+	_, err = c.Do(req)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var se *StaleSignatureError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v (%T), want StaleSignatureError", err, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("the server got %d requests, want 1", got)
+	}
+}
+
+func TestFollowsRedirectThatKeepsThePathAndTheSignature(t *testing.T) {
+	// path 和 query 都没变，签名还是对的，这种重定向照跟。
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if hits.Load() == 1 {
+			w.Header().Set("Location", "/start?x=1")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/start?x=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("yy", "deadbeef")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("the server got %d requests, want 2", got)
+	}
+}
+
+func TestRefusesRedirectThatChangesTheQueryOfASignedRequest(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if hits.Load() == 1 {
+			w.Header().Set("Location", "/start?other=1")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/start?x=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-signature", "cafebabe")
+	_, err = c.Do(req)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var se *StaleSignatureError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v (%T), want StaleSignatureError", err, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("the server got %d requests, want 1", got)
+	}
+}
+
+func TestTooManyRedirectsIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/loop")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	resp, err := c.Get(context.Background(), srv.URL+"/loop")
+	if err == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDoDoesNotTouchTheCallersRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+
+	// 一个没有 header 的请求不能 panic。
+	bare, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare.Header = nil
+	resp, err := c.Do(bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// 调用方的 header map 里不能被塞进 User-Agent。
+	var got string
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		w.Write([]byte("ok"))
+	}))
+	defer srv2.Close()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv2.URL+"/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got != "MiniMaxCode" {
+		t.Fatalf("the server saw the user-agent %q", got)
+	}
+	if req.Header.Get("User-Agent") != "" {
+		t.Fatalf("the caller's request was changed: %q", req.Header.Get("User-Agent"))
+	}
+}
+
+func TestReadBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ReadBody(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello" {
+		t.Fatalf("body = %q", b)
+	}
+}
+
+func TestReadBodyWithNoResponse(t *testing.T) {
+	if _, err := ReadBody(nil); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestReadBodyRefusesAVeryLongBody(t *testing.T) {
+	// 一个不停往里写的上游不能把内存吃光。
+	body := io.NopCloser(io.LimitReader(filler{}, maxBody+1024))
+	resp := &http.Response{Body: body}
+	if _, err := ReadBody(resp); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+// filler is a reader that never ends.
+type filler struct{}
+
+func (filler) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+func TestTheDefaultTransportIsTunedForManyAccounts(t *testing.T) {
+	tr := defaultTransport()
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("http/2 is not attempted")
+	}
+	if tr.MaxIdleConnsPerHost != 32 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 32", tr.MaxIdleConnsPerHost)
+	}
 }
 
 func TestCheckEnvelopeBusinessError(t *testing.T) {
-	// HTTP 200 but the body says it failed.
-	raw := []byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`)
+	// HTTP 200 but the body says it failed. The message in the body is
+	// not the one the 1000048 case makes up, so the two can be told
+	// apart.
+	raw := []byte(`{"statusInfo":{"code":1000048,"message":"account not found"}}`)
 	err := CheckEnvelope("check-in", raw)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if !strings.Contains(err.Error(), "refused") {
-		t.Fatalf("err = %v", err)
+	if !errors.Is(err, ErrSignInRefused) {
+		t.Fatalf("err = %v, want ErrSignInRefused", err)
+	}
+	var be *BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v (%T), want *BusinessError", err, err)
+	}
+	if be.Code != 1000048 {
+		t.Fatalf("code = %d", be.Code)
+	}
+	if be.What != "check-in" {
+		t.Fatalf("what = %q", be.What)
+	}
+	// The wording is the one the code has always produced.
+	if err.Error() != "check-in: the sign-in was refused" {
+		t.Fatalf("err = %q", err.Error())
+	}
+}
+
+func TestCheckEnvelopeBusinessErrorCarriesTheCode(t *testing.T) {
+	raw := []byte(`{"statusInfo":{"code":1001,"message":"something went wrong"}}`)
+	err := CheckEnvelope("credits", raw)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var be *BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v (%T), want *BusinessError", err, err)
+	}
+	if be.Code != 1001 {
+		t.Fatalf("code = %d", be.Code)
+	}
+	if be.Message != "something went wrong" {
+		t.Fatalf("message = %q", be.Message)
+	}
+	if err.Error() != "credits: something went wrong" {
+		t.Fatalf("err = %q", err.Error())
+	}
+	// 不是签到被拒，就不是 ErrSignInRefused。
+	if errors.Is(err, ErrSignInRefused) {
+		t.Fatalf("err = %v, want not ErrSignInRefused", err)
 	}
 }
 
@@ -5134,6 +5752,13 @@ func TestCheckEnvelopeBaseResp(t *testing.T) {
 	err := CheckEnvelope("credits", raw)
 	if err == nil || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("err = %v", err)
+	}
+	var be *BusinessError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v (%T), want *BusinessError", err, err)
+	}
+	if be.Code != 1001 {
+		t.Fatalf("code = %d", be.Code)
 	}
 }
 
@@ -5152,13 +5777,18 @@ func TestCheckEnvelopeNotJSON(t *testing.T) {
 
 func TestQuotaRefusalDetection(t *testing.T) {
 	cases := map[string]bool{
-		`{"error":{"message":"insufficient balance"}}`: true,
-		`{"message":"额度不足"}`:                           true,
-		`{"message":"积分已用完"}`:                          true,
-		`{"message":"model not available"}`:            false,
-		`{"message":"quota exceeded"}`:                 true,
-		`{"message":"rate limit exceeded"}`:            false,
-		`{"message":"too many requests"}`:              false,
+		`{"error":{"message":"insufficient balance"}}`:   true,
+		`{"message":"额度不足"}`:                             true,
+		`{"message":"积分已用完"}`:                            true,
+		`{"message":"model not available"}`:              false,
+		`{"message":"quota exceeded"}`:                   true,
+		`{"message":"rate limit exceeded"}`:              false,
+		`{"message":"too many requests"}`:                false,
+		`{"message":"rate-limited"}`:                     false,
+		`{"message":"rate limited by upstream"}`:         false,
+		`{"message":"rate_limit exceeded"}`:              false,
+		`{"message":"throttled"}`:                        false,
+		`{"message":"request throttled by the gateway"}`: false,
 	}
 	for body, want := range cases {
 		if got := IsQuotaRefusal([]byte(body)); got != want {
@@ -5565,33 +6195,45 @@ func schemeHost(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// Do sends a request, following a redirect that stays on the host and
-// refusing one that does not.
-//
-// A redirect to another host is an OtherSiteError: the answer says
-// where the request was sent and what to do about it. A redirect that
-// downgrades the scheme is a SchemeDowngradeError, and one that would
-// replay a signature made for another path is a StaleSignatureError.
-// None of them is followed.
+// Do sends a request through the client's own transport.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	// The redirect handling is done here, not by http.Client, so the
-	// cross-host case can be told apart from the same-host one.
+	return doWith(req, c.http.Transport, c.timeout, c.userAgent)
+}
+
+// DoWith sends a request through a given transport.
+//
+// A redirect that stays on the host is followed; one that leaves it is
+// an OtherSiteError, and the request is not sent on.
+//
+// The transport is a parameter because the proxy is a property of the
+// transport: an account with its own exit needs its own client, and
+// the same client is shared by every account that shares an exit.
+//
+// There is no timeout here: a chat streams for as long as it needs,
+// and the caller's context carries the deadline.
+func DoWith(req *http.Request, transport http.RoundTripper) (*http.Response, error) {
+	return doWith(req, transport, 0, "")
+}
+
+// doWith is the redirect loop both of them share.
+//
+// The caller's request is not touched: the User-Agent goes into a
+// copy, and a request with no header map at all is given one, so
+// writing into it cannot panic.
+func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duration, userAgent string) (*http.Response, error) {
+	if transport == nil {
+		transport = defaultTransport()
+	}
 	client := &http.Client{
-		Transport: c.http.Transport,
-		Timeout:   c.timeout,
+		Transport: transport,
+		Timeout:   timeout,
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	// The caller's request is not touched: the User-Agent goes into a
-	// copy, and a request with no header map at all is given one, so
-	// writing into it cannot panic.
 	current := copyRequest(req)
-	// A request that names its own User-Agent keeps it; one that does
-	// not says who it is. Without this the account API calls itself
-	// Go-http-client.
-	if current.Header.Get("User-Agent") == "" {
-		current.Header.Set("User-Agent", c.userAgent)
+	if current.Header.Get("User-Agent") == "" && userAgent != "" {
+		current.Header.Set("User-Agent", userAgent)
 	}
 	for hop := 0; ; hop++ {
 		resp, err := client.Do(current)
@@ -5607,6 +6249,8 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			return resp, nil
 		}
 		if isDowngrade(current.URL, next) && sameAddress(current.URL, next) {
+			// The sign-in would go out in cleartext, so the redirect is
+			// refused and never followed.
 			resp.Body.Close()
 			return nil, &SchemeDowngradeError{
 				From:   schemeHost(current.URL),
@@ -5623,10 +6267,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 		}
 		if signed(current.Header) && !sameRequest(current.URL, next) {
-			// The signature is over the path and the query. Sending the
-			// old one to another path is a request the upstream refuses,
-			// and that refusal reads as a dead token — a false one that
-			// costs a refresh token. The redirect is refused instead.
+			// The signature is made over the path and the query, so the
+			// old one cannot be replayed. Sending it would be refused by
+			// the upstream, and that refusal reads as a dead token.
 			resp.Body.Close()
 			return nil, &StaleSignatureError{
 				From:   schemeHost(current.URL),
@@ -5635,21 +6278,17 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 		}
 		if hop >= 5 {
-			// Too many redirects is an error, not an answer: handing
-			// back the redirect itself would leave the caller with a
-			// body nobody read.
+			// Too many redirects is an error, not an answer: handing back
+			// the redirect itself would leave the caller with a body
+			// nobody read.
 			resp.Body.Close()
 			return nil, fmt.Errorf("too many redirects")
 		}
-		// 307 and 308 keep the method and the body; the others turn a
-		// non-GET into a GET without a body.
-		//
 		// The body has to be read again: http.Request.Body is a reader
 		// the previous request already consumed, so replaying it as it
-		// is would send an empty body — and a signed request with the
-		// wrong body is refused. GetBody is what reads it a second time;
-		// http.NewRequest prepares it for bytes.Reader and
-		// strings.Reader. Without it the body cannot be replayed, so the
+		// is would send an empty body — and a chat with an empty body is
+		// not the chat that was asked for. GetBody is what reads it a
+		// second time; without it the body cannot be replayed, so the
 		// answer is handed back as it came.
 		method, body, length := current.Method, current.Body, current.ContentLength
 		replay := false
@@ -6765,6 +7404,28 @@ func TestStartDeviceUserCodeVariant(t *testing.T) {
 	}
 	if d.interval != 3*time.Second {
 		t.Fatalf("interval = %v, want 3s", d.interval)
+	}
+}
+
+func TestStartDeviceUserCodeIntervalIsInMilliseconds(t *testing.T) {
+	// 站点自己那套里的间隔是毫秒：500 是半秒，不是八分多钟。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       time.Now().Add(10 * time.Minute).UnixMilli(),
+			"interval":         500,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.interval != 500*time.Millisecond {
+		t.Fatalf("interval = %v, want 500ms", d.interval)
 	}
 }
 
@@ -8279,8 +8940,18 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	}
 	d.deadline = deadline
 
+	// The wait between two polls. The site's own variant says the
+	// interval in milliseconds and the ordinary one in seconds, and
+	// the reference reads each one in its own unit: 3000 is three
+	// seconds on one path and three thousand milliseconds on the
+	// other.
 	interval := 5 * time.Second
-	if b.Interval > 0 {
+	switch {
+	case b.Interval <= 0:
+		// 没有这个字段（或者是零）：五秒一轮。
+	case byUser:
+		interval = time.Duration(b.Interval) * time.Millisecond
+	default:
 		interval = pollInterval(b.Interval)
 	}
 	d.interval = interval
@@ -10080,6 +10751,81 @@ func TestPlanWindowsEmpty(t *testing.T) {
 	}
 }
 
+// TestTheWindowEndIsReadInSecondsToo says a window's end is read the
+// way its length is read.
+//
+// 站点写时间不说是秒还是毫秒：一万亿以下是秒。窗口的结束时间要是按
+// 毫秒读，一个秒的时间就变成了 1970 年 —— 窗口早就"回来了"，于是
+// 用完的账号一次又一次被挑中。
+func TestTheWindowEndIsReadInSecondsToo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+			{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+			 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+			 "start_time":1763000000,"end_time":1763010800,
+			 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+			 "current_weekly_total_percent":100,"weekly_start_time":1762800000,"weekly_end_time":1763400000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if got := ws[0].ResetsAt.UnixMilli(); got != 1763010800000 {
+		t.Fatalf("the window resets at %d, want 1763010800000", got)
+	}
+	// 长度也一样：三个小时（秒写和毫秒写都是三个小时）
+	if ws[0].Name != "3 hours" {
+		t.Fatalf("window = %+v, want the three hour window", ws[0])
+	}
+}
+
+// TestPlanWindowsKeepsTheConsoleAnswerWhenItsListIsNotEmpty says a
+// list that is not empty is the console's answer, even when every entry
+// in it is a bucket the plan does not have.
+//
+// 参考实现看的是回答里有没有那个列表，不是我们能从列表里做出几个
+// 窗口。列表在，答案就在：这时这个套餐就是没有窗口，那是答案，不是
+// 再问一次的理由。
+func TestPlanWindowsKeepsTheConsoleAnswerWhenItsListIsNotEmpty(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			// 一个套餐没有的桶：两个窗口都是无限的、两个都没有计数。
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,"current_weekly_status":3,
+				 "current_interval_total_count":0,"current_weekly_total_count":0}
+			]}`))
+		default:
+			t.Errorf("the open platform was asked: %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 0 {
+		t.Fatalf("got %+v, want no windows", ws)
+	}
+	if len(asked) != 1 || asked[0] != site.PlanRemainsPath {
+		t.Fatalf("asked %v, want only the console", asked)
+	}
+}
+
 // TestWindowName says a window is named after its own length.
 //
 // 窗口的名字是它自己的长度：三小时的窗口叫 "3 hours"，不是写死的
@@ -10950,32 +11696,36 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 // The console's own answer comes first; the open platform's is the
 // fallback.
 //
-// The console's answer is used only when it has windows in it. The
-// reference uses it only when the answer is a list that is not empty,
-// and asks the open platform otherwise: the international site's
+// The console's answer is used only when it has a list of windows in
+// it. The reference uses it only when the answer is a list that is not
+// empty, and asks the open platform otherwise: the international site's
 // remains_percent answers 200 with an empty list, and the windows are
 // at the other endpoint.
+//
+// A list that is not empty is the console's answer even when every
+// entry in it is a bucket the plan does not have: then the plan has no
+// windows, and that is an answer, not a reason to ask again.
 //
 // An answer the console could not give is not thrown away when the
 // open platform has the windows: the two endpoints are two ways of
 // asking the same question, and the one that answered is the one that
 // counts.
 func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Window, error) {
-	ws, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
-	if err == nil && len(ws) > 0 {
+	ws, listed, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
+	if err == nil && listed {
 		return ws, nil
 	}
-	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
+	ws2, _, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
 	if err2 != nil {
 		return nil, err2
 	}
 	return ws2, nil
 }
 
-func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, error) {
+func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path string) ([]Window, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.platform+path, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+access)
@@ -10985,17 +11735,17 @@ func (c *Client) planWindowsOnce(ctx context.Context, access, groupID, path stri
 	}
 	resp, err := c.up.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	body, err := upstream.ReadBody(resp)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, &RefusedError{Status: resp.StatusCode}
+		return nil, false, &RefusedError{Status: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("M Plan: HTTP %d", resp.StatusCode)
 	}
 	return parsePlanWindows(body)
 }
@@ -11486,7 +12236,12 @@ type statusError struct{ status int }
 func (e *statusError) Error() string { return "HTTP " + strconv.Itoa(e.status) }
 
 // parsePlanWindows reads the console's answer as windows.
-func parsePlanWindows(raw []byte) ([]Window, error) {
+//
+// listed says the answer had a list of windows in it. The reference
+// decides on that list and not on the windows it can make of it: an
+// answer with a list is the console's answer, even when every entry in
+// it is a bucket the plan does not have.
+func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 	var env struct {
 		BaseResp *struct {
 			StatusCode int    `json:"status_code"`
@@ -11513,7 +12268,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("no plan in the reply: %w", err)
+		return nil, false, fmt.Errorf("no plan in the reply: %w", err)
 	}
 	if env.BaseResp != nil && env.BaseResp.StatusCode != 0 {
 		// The reference names the status code when the answer has no
@@ -11522,7 +12277,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 		if msg == "" {
 			msg = fmt.Sprintf("MiniMax said %d", env.BaseResp.StatusCode)
 		}
-		return nil, errors.New(msg)
+		return nil, false, errors.New(msg)
 	}
 	var out []Window
 	for _, m := range env.ModelRemains {
@@ -11588,7 +12343,13 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			}
 			w := Window{Name: own, ModelName: name, Used: used}
 			if x.end > 0 {
-				w.ResetsAt = time.UnixMilli(x.end)
+				// The end of the window is a time the site wrote, and
+				// the site does not say in which unit: a number
+				// below a trillion is seconds. The reference reads it
+				// the same way, and the window's own length is read
+				// that way too — so the two agree on how long the
+				// window is.
+				w.ResetsAt = time.UnixMilli(planMS(x.end))
 			}
 			// The site counts the items a window has. A count that is
 			// not there is zero, the way the reference reads it, so a
@@ -11621,7 +12382,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			out = append(out, w)
 		}
 	}
-	return out, nil
+	return out, len(env.ModelRemains) > 0, nil
 }
 
 // isThree says whether a number is 3.
@@ -13440,9 +14201,52 @@ MiniMax Code 国际站的多账号网关。
 - **轮转**：会话粘在一个账号上，配额耗尽时自动换号。
 - **代理**：按账号、按出口组或全局指定出口，Cloudflare WARP 可作额外出口。
 
+## 快速开始
+
+```bash
+# 编译
+go build -o mmxcode ./cmd/mmxcode
+
+# 配置文件：照着 config.example.yaml 改一份
+cp config.example.yaml config.yaml
+# 把 server.listen 改成 "127.0.0.1:8080"（本机用），
+# 或者写上 server.api_keys（给别的机器用）
+
+# 登录一个账号：命令会打印一个链接和一个验证码
+./mmxcode --config config.yaml --db ./mmxcode.db login
+
+# 看看账号、签到、看积分
+./mmxcode --config config.yaml --db ./mmxcode.db accounts list
+./mmxcode --config config.yaml --db ./mmxcode.db checkin
+./mmxcode --config config.yaml --db ./mmxcode.db usage
+
+# 起网关
+./mmxcode --config config.yaml --db ./mmxcode.db serve
+```
+
+数据库路径由 `--db` 覆盖（示例配置里的 `db: /data/mmxcode.db` 是容器里的路径，本机跑要换掉）。
+
+起完网关之后，客户端指过来就行：
+
+```bash
+curl -s http://127.0.0.1:8080/v1/messages \
+  -H "content-type: application/json" \
+  -d '{"model":"MiniMax-M3","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
+配了 `server.api_keys` 的话，请求要带上 key：
+
+```bash
+curl -s http://127.0.0.1:8080/v1/messages \
+  -H "content-type: application/json" \
+  -H "x-api-key: sk-local-xxxx" \
+  -d '{"model":"MiniMax-M3","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
 ## 命令
 
 ```
+mmxcode serve                     # 起 HTTP 服务、WebUI 与定时任务
 mmxcode login                    # 登录一个账号
 mmxcode accounts list            # 列出账号
 mmxcode accounts proxy <id> --group warp
@@ -13451,18 +14255,172 @@ mmxcode usage                    # 积分汇总
 mmxcode models                   # 模型列表
 ```
 
+全局开关，对所有子命令有效：
+
+- `--config <path>`：配置文件路径。默认取环境变量 `MMXCODE_CONFIG`；都不给就用内置默认值。
+- `--db <path>`：数据库路径，覆盖配置文件里的 `db`。
+
+`serve` 自己没有别的开关：监听地址、key、轮转参数都在配置文件里。
+
+其余子命令的开关：`login --name`（账号标签）、`accounts proxy --group/--url`（出口组名 / 单独的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）。
+
+## 对外接口
+
+聊天协议：
+
+| 路由 | 用途 |
+|---|---|
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | Codex Responses |
+| `GET /v1/models` | 模型列表 |
+
+管理接口，都在 `/api/` 下：
+
+| 路由 | 方法 | 用途 |
+|---|---|---|
+| `/api/accounts` | GET / POST | 列出账号 / 发起一次登录 |
+| `/api/accounts/poll` | POST | 查登录进度 |
+| `/api/accounts/{id}` | PATCH / DELETE | 改账号（名字、出口组、代理地址）/ 删除账号 |
+| `/api/accounts/{id}/checkin` | POST | 给这个账号签到 |
+| `/api/accounts/{id}/usage` | GET | 读这个账号的积分 |
+| `/api/usage` | GET | 所有账号的积分汇总 |
+| `/api/egress` | GET | 出口组和它们的状态 |
+| `/api/egress/test` | POST | 立刻测一个出口组 |
+| `/api/sessions` | GET | 会话绑定（目前是空列表） |
+| `/api/events` | GET | SSE，每 30 秒一个心跳 |
+| `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
+
+WebUI 页面：
+
+| 路由 | 页面 |
+|---|---|
+| `/` | 账号 |
+| `/login` | 登录 |
+| `/egress` | 出口 |
+| `/usage` | 用量 |
+| `/signin` | 交 key 的登录页 |
+| `/static/app.js` | 页面上的脚本 |
+
+### 鉴权
+
+- 配了 `server.api_keys` 时，每个请求都要带 `x-api-key` 或 `Authorization: Bearer <key>`；两个头都没有、或者 key 不对，一律 401。
+- 一个 key 都不配时，鉴权整体跳过。所以 `mmxcode serve` 只允许听本机地址：`server.listen` 不是回环地址（`:8080`、`0.0.0.0:8080` 都不算）就直接报错退出：
+
+  ```
+  no api key is configured, so the gateway would listen on :8080 for everyone; put api_keys in the config or listen on 127.0.0.1
+  ```
+
+- 鉴权对所有路径生效。带 key 的请求（`x-api-key` 头或 `Authorization: Bearer`）一律放行；不带 key 的请求分两种：`/api/` 下的接口回 401，浏览器要开的页面回登录页 `/signin`（200），登录页上填 key 换来的 cookie 之后就能进管理界面。
+- cookie 的值是拿 key 算出来的 HMAC，服务器自己不留东西；`HttpOnly`、`SameSite=Strict`，走 TLS 时才加 `Secure`。
+
+### 轮转
+
+**会话怎么定。** 请求的会话优先看客户端给的头：`X-Session-Id`（也认 `X-Conversation-Id`、`X-Session-Id-Codex`、`Session-Id`）。有就用它的哈希当账号绑定键。客户端没带头，就用 system prompt 加第一条 user 消息的哈希当绑定键。两样都没有就没有会话，按轮转挑账号。
+
+**发给上游的会话 id。** 上游拿到的是数据库里存着的一个随机 id：一个会话一个，存下来不变，重启之后还是它，换号也不变。客户端自己那串字符串不外发，请求里的话的哈希也不外发。
+
+这个改不了有一种情况：两段 system prompt 和第一条 user 消息都一样的对话，客户端又不带会话 id 的时候，按上面的规则它们本来就是同一个会话，于是共用一个上游 id、一个上游会话。服务器分不出来 —— 请求里没有能分开它们的东西；要分开只能让客户端带上 `X-Session-Id`。
+
+**换号。** 账号的配额用完时，上游的拒绝被判定成配额耗尽，网关把这个账号的这个 plan 组标记成耗尽，换一个账号把请求重放一遍。重放只发生在还没往客户端写出任何字节的时候：流式响应会先读第一个 SSE 事件，判断它是错误还是回答；一旦写出去就不再换号，流到一半断了只给客户端补一个 error 事件收尾。
+
+- 耗尽的账号在 `rotation.exhausted_cooldown`（默认 5m）之内不再被挑中；能从上游读到窗口重置时间就按那个时间算，读不到才按 cooldown 算。
+- 这个请求里已经试过并失败的账号会被跳过：另一个账号来答这一次，但会话绑定留在原处 —— 一次 5xx 不会把整个会话搬到别的账号上去。
+
 ## 配置
 
-见 `config.example.yaml`。`MMXCODE_CONFIG` 环境变量指向配置文件，`--db` 覆盖数据库路径。
+见 `config.example.yaml`（容器里见 `config.docker.yaml`）。文件只需要写自己要改的键，剩下的走默认值；认不出的键直接报错。
+
+| 键 | 默认值 | 作用 |
+|---|---|---|
+| `server.listen` | `":8080"` | 监听地址 |
+| `server.api_keys` | 空 | 网关接受的 key 列表。空 = 不鉴权，只允许听本机 |
+| `db` | `"/data/mmxcode.db"` | SQLite 数据库路径 |
+| `upstream.timeout` | `120s` | 上游请求时限。流式对话也吃这份预算，想聊更久就调大 |
+| `upstream.site` | `"global"` | 上游站点，只支持 `global` |
+| `rotation.max_attempts` | `3` | 一个请求最多换几个账号 |
+| `rotation.strategy` | `"sticky"` | `sticky`（会话粘账号）或 `round-robin`（每次都转）。写错的值当 `sticky` 处理 |
+| `rotation.exhausted_cooldown` | `5m` | 配额耗尽后暂时不用这个账号的时间。读不到窗口重置时间时按它算 |
+| `proxy.default` | 空 | 全局默认出口 |
+| `proxy.groups` | 空 | 出口组：组名 → 地址。账号可以指向其中一组，一组共用一个出口 |
+| `schedule.checkin_at` | `"09:00"` | 每天签到的时间，本地时区，`HH:MM` |
+| `schedule.usage_refresh` | `15m` | 积分刷新间隔 |
+| `schedule.token_refresh` | `5m` | token 续期检查间隔 |
+| `schedule.egress_health` | `2m` | 出口健康检查间隔 |
+
+环境变量：`MMXCODE_CONFIG` 是 `--config` 的默认值；`MMXCODE_PROXY_DEFAULT` 覆盖 `proxy.default`（不设就不覆盖）。
+
+两个值写错了 `mmxcode serve` 会拒绝启动，而不是悄悄按别的来：`schedule.checkin_at` 不是 `HH:MM` 会报 `schedule.checkin_at = "..."; want HH:MM`，`upstream.site` 不是 `global` 会报 `upstream.site = "..."; only "global" is supported`。
+
+### 代理模型
+
+出口按这个顺序挑：
+
+1. 账号自己的代理地址：`mmxcode accounts proxy <id> --url <地址>`；
+2. 账号指向的出口组：`mmxcode accounts proxy <id> --group <组名>`，取组里的地址；
+3. 全局 `proxy.default`。
+
+组的地址写成空字符串时不算出口：它会落到全局默认，而不是变成直连。全局默认也是空（或明确写 `direct`）时才是直连。
+
+- 支持的 scheme：`http`、`https`、`socks5`、`socks5h`。没有 scheme 的地址会报错，不会默默直连。
+- `socks5://` 和 `socks5h://` 都把域名交给代理去解析（远端 DNS），跟 curl 的 `socks5://`（本地解析）不一样。
+
+## 部署
+
+```bash
+cp .env.example .env
+docker compose up -d
+```
+
+compose 做的事：
+
+- 用仓库里的 Dockerfile 构建，镜像名 `mmxcode-gateway:latest`。
+- 端口只绑本机：`127.0.0.1:8080:8080`，管理界面不暴露到公网。
+- 挂配置文件：默认挂仓库里的 `config.docker.yaml` 到 `/app/config.yaml`（只读）。要用自己的副本就设 `MMXCODE_CONFIG_FILE=./config.yaml`。
+- 挂数据目录：默认是 Docker 命名卷 `mmxcode-data`，容器里是 `/data`，数据库落在 `/data/mmxcode.db`。
+- 容器以非 root 用户 `mmxcode`（uid 10001）运行，`/data` 归它所有。
+- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）。
+
+数据目录：
+
+- 默认 `MMXCODE_DATA_DIR=mmxcode-data`，是 Docker 命名卷。Docker 按镜像里 `/data` 的属主（uid 10001）创建它，容器里的用户直接能读写。
+- 想把数据库留在宿主机目录上就写 `MMXCODE_DATA_DIR=./data`，但那个目录必须对 uid 10001 可写，否则容器建不了数据库文件、启动即失败：
+
+  ```bash
+  mkdir -p data && chown 10001:10001 data
+  ```
+
+### Cloudflare WARP
+
+WARP 是额外的出口选项，跟按账号单独指定的代理并列。
+
+- 默认是关的：`.env.example` 里 `COMPOSE_PROFILES=warp` 那行是注释掉的，所以普通的 `docker compose up` 不会起 WARP。
+- 打开：把 `.env` 里那行的注释去掉。宿主机的 `/dev/net/tun` 要可用，容器需要 `NET_ADMIN` 权限（compose 里已经写好）。
+- 起了以后，出口组 `warp` 指向 `socks5h://warp:4000`，账号用 `mmxcode accounts proxy <id> --group warp` 就走 WARP。
 
 ## 协议对齐
 
 上游行为对齐社区插件 [`@magpie-community/opencode-minimax-auth`](https://github.com/magpie-community/plugins/tree/main/packages/minimax) 的 `packages/minimax/index.mjs`：端点、请求签名、刷新语义、签到语义、配额拒绝的判定，都以它为准。
 
+### 上游只认 Anthropic 那条路
+
+参考插件只会打 Anthropic 的 `/messages`（它接的是 `@ai-sdk/anthropic`），它从来没走过 OpenAI 的 `/chat/completions`，也没走过 Codex 的 `/responses`。所以这两种客户端协议都备着本地转换：
+
+- **OpenAI**：先按原样发给上游的 `/chat/completions`；上游回 404（就是没有这个接口）时，改成本地转成 Anthropic 的 `/messages` 再发一次，回来的答案转回 OpenAI 的形状。这个判断只做一次，之后都走本地转换。
+- **Codex**：同样的办法，先试 `/responses`，404 就转成 Anthropic 再发。
+
+转换出来的形状是客户端真的能用的：Codex 的非流式回答里，工具调用是 `function_call` 条目（`call_id`、`name`、`arguments` 都在），不是一段空文本。
+
 ## 计划
 
-- 计划 A（本仓库已实现）：核心库与 CLI
-- 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署
+两个计划都已实现：
+
+- 计划 A：核心库与 CLI（`docs/superpowers/plans/2026-11-13-mmxcode-core.md`）
+- 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署（`docs/superpowers/plans/2026-11-13-mmxcode-gateway.md`）
+
+### 不做的
+
+图片生成、视频生成、语音、web search 这些**不做**。参考插件通过 MiniMax 的 Matrix 连接器（`/minimax-cloud/api/v1/connectors/*`）用得上它们，但那些是另一个量级的工作量，要做的时候单开一个计划 —— 设计文档 §1.5 记着调研到的东西。
 ````
 
 - [ ] **Step 3: 全量测试**
@@ -13507,6 +14465,868 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ---
+
+### Task 13: 实现期新增的文件（CLI 的测试）
+
+计划里原来只有 CLI 的实现。实现的时候给它补上了测试：命令行的参数、
+账号的出口、签到、serve 的开关，各有各的坑，测试把它们钉住。
+
+**Files:**
+- Create: `cmd/mmxcode/root_test.go`
+- Create: `cmd/mmxcode/accounts_test.go`
+- Create: `cmd/mmxcode/checkin_test.go`
+- Create: `cmd/mmxcode/serve_test.go`
+
+- [ ] **Step 1: 写测试**
+
+创建 `cmd/mmxcode/root_test.go`：
+
+```go
+package main
+
+import (
+	"context"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"mmxcode/internal/config"
+	"mmxcode/internal/store"
+)
+
+// captureStdout runs fn and gives back what it wrote to the standard
+// output.
+//
+// The commands write with fmt.Print, not with the command's own writer,
+// so the only way to see what they printed is to catch the file
+// descriptor.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	fn()
+	w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+func TestRootHasEveryCommand(t *testing.T) {
+	root := newRoot()
+	have := map[string]bool{}
+	for _, c := range root.Commands() {
+		have[c.Name()] = true
+	}
+	for _, want := range []string{"login", "accounts", "checkin", "usage", "models"} {
+		if !have[want] {
+			t.Errorf("the root command has no %q command", want)
+		}
+	}
+}
+
+func TestModelsPrintsTheFallbackList(t *testing.T) {
+	cmd := newModelsCmd(&env{})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	out := captureStdout(t, func() {
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("models: %v", err)
+		}
+	})
+	lines := 0
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines++
+	}
+	if lines != 4 {
+		t.Errorf("models printed %d lines, want 4:\n%s", lines, out)
+	}
+	if !strings.Contains(out, "MiniMax-M3") {
+		t.Errorf("models did not mention MiniMax-M3:\n%s", out)
+	}
+}
+
+func TestAccountsListWithNoAccounts(t *testing.T) {
+	e := testEnv(t)
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	if !strings.Contains(out, "还没有账号") {
+		t.Errorf("accounts list said nothing about having no accounts:\n%s", out)
+	}
+}
+
+func TestAccountsListShowsTheAccount(t *testing.T) {
+	e := testEnv(t)
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", UserID: "u1", Email: "one@example.com",
+		Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	for _, want := range []string{"acc_1", "一号", "one@example.com", "active"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("accounts list did not show %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestAccountsProxyRefusesAnUnknownGroup(t *testing.T) {
+	e := testEnv(t)
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "nope"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("accounts proxy took an unknown group")
+	}
+	if !strings.Contains(err.Error(), "nope") {
+		t.Errorf("the error does not name the group: %v", err)
+	}
+}
+
+func TestAccountsProxySetsTheGroup(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy: %v", err)
+	}
+	a, err := e.store.GetAccount(context.Background(), "acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if a.ProxyGroup != "hk" {
+		t.Errorf("the account's group is %q, want %q", a.ProxyGroup, "hk")
+	}
+}
+
+func TestUsageWithNothingReadYet(t *testing.T) {
+	e := testEnv(t)
+	out := captureStdout(t, func() {
+		cmd := newUsageCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("usage: %v", err)
+		}
+	})
+	if !strings.Contains(out, "总积分") {
+		t.Errorf("usage printed no totals:\n%s", out)
+	}
+}
+
+func TestUsageJSON(t *testing.T) {
+	e := testEnv(t)
+	out := captureStdout(t, func() {
+		cmd := newUsageCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("usage: %v", err)
+		}
+	})
+	if !strings.Contains(out, "\"total_granted\"") {
+		t.Errorf("usage --json printed no totals:\n%s", out)
+	}
+}
+
+func TestNewAccountIDIsNotEmpty(t *testing.T) {
+	if !strings.HasPrefix(newAccountID(), "acc_") {
+		t.Errorf("the account id does not start with acc_: %q", newAccountID())
+	}
+}
+
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty("", "", "c"); got != "c" {
+		t.Errorf("firstNonEmpty gave %q, want %q", got, "c")
+	}
+	if got := firstNonEmpty(); got != "" {
+		t.Errorf("firstNonEmpty of nothing gave %q, want %q", got, "")
+	}
+}
+
+func TestGroupNames(t *testing.T) {
+	got := groupNames(map[string]string{"b": "", "a": ""})
+	if got != "a, b" {
+		t.Errorf("groupNames gave %q, want %q", got, "a, b")
+	}
+}
+
+// testEnv gives an environment with a store in a temporary file.
+func testEnv(t *testing.T) *env {
+	t.Helper()
+	path := t.TempDir() + "/mmxcode.db"
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return &env{cfg: config.Default(), store: s}
+}
+
+// TestAccountsRemoveSaysThereIsNoSuchAccount says removing an account
+// that is not there says so in words a person can act on.
+//
+// 删一个没有的账号，要说"没有这个账号"，不是"store: not found"。
+func TestAccountsRemoveSaysThereIsNoSuchAccount(t *testing.T) {
+	e := testEnv(t)
+	cmd := newAccountsRemoveCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_nope"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("accounts remove took an account that is not there")
+	}
+	if !strings.Contains(err.Error(), "no such account") {
+		t.Errorf("the error does not say there is no such account: %v", err)
+	}
+	if !strings.Contains(err.Error(), "acc_nope") {
+		t.Errorf("the error does not name the account: %v", err)
+	}
+}
+
+// TestAccountsProxyKeepsTheOtherField says changing the group leaves
+// the address alone, and the other way round.
+//
+// 改组不动地址，改地址不动组。
+func TestAccountsProxyKeepsTheOtherField(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--url", "http://127.0.0.1:2:8080"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy --url: %v", err)
+	}
+
+	cmd = newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy --group: %v", err)
+	}
+
+	a, err := e.store.GetAccount(context.Background(), "acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if a.ProxyGroup != "hk" {
+		t.Errorf("the group is %q, want %q", a.ProxyGroup, "hk")
+	}
+	if a.ProxyURL != "http://127.0.0.1:2:8080" {
+		t.Errorf("the address is %q, want it kept", a.ProxyURL)
+	}
+}
+
+// TestAccountsProxyDoesNotUndoASignOut says changing an account's
+// outlet does not put a signed-out account back to active.
+//
+// 改出口不能把登出的账号改回 active。
+func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := e.store.UpdateAccountStatus(context.Background(), "acc_1",
+		store.StatusSignedOut, "the site refused the token", now); err != nil {
+		t.Fatalf("sign out: %v", err)
+	}
+
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy: %v", err)
+	}
+
+	a, err := e.store.GetAccount(context.Background(), "acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Errorf("the status is %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.LastError != "the site refused the token" {
+		t.Errorf("the last error is %q", a.LastError)
+	}
+}
+```
+
+创建 `cmd/mmxcode/accounts_test.go`：
+
+```go
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"mmxcode/internal/store"
+)
+
+// TestAccountsListKeepsTheProxySecret says the proxy's credentials are
+// not printed.
+//
+// 代理地址里的账号密码是秘密。`mmxcode accounts list` 的输出会留在终端
+// 的回滚里，也会被 CI 收进日志里。
+func TestAccountsListKeepsTheProxySecret(t *testing.T) {
+	e := testEnv(t)
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		ProxyURL:  "socks5h://bob:hunter2@127.0.0.1:1080",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(nil)
+		cmd.SetErr(nil)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	if strings.Contains(out, "hunter2") {
+		t.Errorf("the proxy's password is in the output:\n%s", out)
+	}
+	if strings.Contains(out, "bob") {
+		t.Errorf("the proxy's name is in the output:\n%s", out)
+	}
+	if !strings.Contains(out, "127.0.0.1:1080") {
+		t.Errorf("the proxy's host is not in the output:\n%s", out)
+	}
+}
+
+// TestAccountsListKeepsTheDefaultProxySecret says the global default
+// proxy's credentials are not printed either.
+//
+// 全局默认的代理地址也一样：账号没有自己的地址时打印的就是它。
+func TestAccountsListKeepsTheDefaultProxySecret(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Default = "http://carol:s3cret@proxy.example:8080"
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(nil)
+		cmd.SetErr(nil)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	if strings.Contains(out, "s3cret") {
+		t.Errorf("the default proxy's password is in the output:\n%s", out)
+	}
+	if !strings.Contains(out, "proxy.example:8080") {
+		t.Errorf("the default proxy's host is not in the output:\n%s", out)
+	}
+}
+
+// TestAccountsListShowsTheGroupName says a group's name is printed as
+// it is: a name is not a secret.
+//
+// 组名不是秘密，照原样打印，才看得出这个账号走的是哪一组。
+func TestAccountsListShowsTheGroupName(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "socks5h://bob:hunter2@127.0.0.1:1080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		ProxyGroup: "hk", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(nil)
+		cmd.SetErr(nil)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	if strings.Contains(out, "hunter2") {
+		t.Errorf("the group's password is in the output:\n%s", out)
+	}
+	if !strings.Contains(out, "hk") {
+		t.Errorf("the group is not in the output:\n%s", out)
+	}
+}
+```
+
+创建 `cmd/mmxcode/checkin_test.go`：
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/oauth"
+	"mmxcode/internal/store"
+	"mmxcode/internal/upstream"
+)
+
+// checkinServer is a stand-in for MiniMax: the token endpoint, the
+// sign-in panel and the claim.
+//
+// 签到的测试不能碰真的站点：一次续期花掉一个 refresh token。
+func checkinServer(t *testing.T, refuse bool) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var refreshes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			refreshes.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  "new-access",
+				"refresh_token": "new-refresh",
+				"expires_in":    3600,
+			})
+		case "/minimax-cloud/api/v1/signin/status":
+			if refuse {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"base_resp":{"status_code":1000048}}`))
+				return
+			}
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &refreshes
+}
+
+// testEnvWithServer gives an environment whose accounts are served by
+// the stand-in.
+func testEnvWithServer(t *testing.T, srv *httptest.Server) *env {
+	t.Helper()
+	e := testEnv(t)
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	// 账号的请求要走到那台假服务器上，不然测试就问真的站点去了。
+	acc.SetBase(srv.URL, srv.URL)
+	e.up = up
+	e.acc = acc
+	e.egr = egress.New(nil, "")
+	e.mgr = manager.New(e.store, up, acc, e.egr, oauth.NewRenewer())
+	e.mgr.TokenURL = srv.URL + "/oauth2/token"
+	return e
+}
+
+// seedAccount gives an account whose token is old.
+func seedAccount(t *testing.T, e *env, expires time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	if err := e.store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "一号", UserID: "u1", Email: "one@example.com",
+		Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := e.store.SaveToken(ctx, store.Token{
+		AccountID: "acc_1", Access: "old-access", Refresh: "old-refresh",
+		ExpiresAt: expires, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+}
+
+// TestCheckinRenewsTheToken says the command renews the token before
+// it checks in.
+//
+// 90 分钟没人续期，命令自己拿库里那份令牌去签到，站点回 401，签到
+// 根本没发生，命令却说是成功的。
+func TestCheckinRenewsTheToken(t *testing.T) {
+	srv, refreshes := checkinServer(t, false)
+	e := testEnvWithServer(t, srv)
+	// 一个半小时以前就签到的账号：令牌早就过期了。
+	seedAccount(t, e, time.Now().Add(-90*time.Minute))
+
+	var err error
+	out := captureStdout(t, func() {
+		cmd := newCheckinCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		err = cmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("checkin: %v\n%s", err, out)
+	}
+	if refreshes.Load() != 1 {
+		t.Errorf("the token was renewed %d times, want 1", refreshes.Load())
+	}
+	if !strings.Contains(out, "claimed") {
+		t.Errorf("the check-in was not claimed:\n%s", out)
+	}
+	// 记录是 manager 写的，日子是站点的那一天。
+	rows, err := e.store.ListCheckins(context.Background(), "acc_1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the check-in table has %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].Day != store.DayKey(time.Now()) {
+		t.Errorf("the record is for %q, want %q", rows[0].Day, store.DayKey(time.Now()))
+	}
+	if rows[0].Outcome != "claimed" {
+		t.Errorf("the record says %q, want %q", rows[0].Outcome, "claimed")
+	}
+}
+
+// TestCheckinFailsWhenTheSignInIsRefused says a refused check-in makes
+// the command fail.
+//
+// 被拒的签到不是签到：命令要报错，cron 才不会每天都看着是成功。
+func TestCheckinFailsWhenTheSignInIsRefused(t *testing.T) {
+	srv, _ := checkinServer(t, true)
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(-90*time.Minute))
+
+	var err error
+	out := captureStdout(t, func() {
+		cmd := newCheckinCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		err = cmd.Execute()
+	})
+	if err == nil {
+		t.Fatalf("the command succeeded although the sign-in was refused:\n%s", out)
+	}
+	if !strings.Contains(out, "failed") {
+		t.Errorf("the command did not say the check-in failed:\n%s", out)
+	}
+}
+
+// TestCheckinOnlyOneAccount says the --account flag picks one.
+func TestCheckinOnlyOneAccount(t *testing.T) {
+	srv, refreshes := checkinServer(t, false)
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(-90*time.Minute))
+	ctx := context.Background()
+	now := time.Now()
+	if err := e.store.CreateAccount(ctx, store.Account{
+		ID: "acc_2", Name: "二号", UserID: "u2", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := e.store.SaveToken(ctx, store.Token{
+		AccountID: "acc_2", Access: "old-access", Refresh: "old-refresh",
+		ExpiresAt: now.Add(-90 * time.Minute), UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+
+	cmd := newCheckinCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--account", "acc_2"})
+	out := captureStdout(t, func() {
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("checkin: %v", err)
+		}
+	})
+	if strings.Contains(out, "一号") {
+		t.Errorf("the other account was checked in too:\n%s", out)
+	}
+	if refreshes.Load() != 1 {
+		t.Errorf("the token was renewed %d times, want 1", refreshes.Load())
+	}
+}
+```
+
+创建 `cmd/mmxcode/serve_test.go`：
+
+```go
+package main
+
+import (
+	"context"
+	"io"
+	"net"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/oauth"
+	"mmxcode/internal/store"
+	"mmxcode/internal/upstream"
+)
+
+// TestIsLoopback says which listen addresses stay on this machine.
+//
+// ":8080" and "0.0.0.0:8080" mean every interface of the machine, so
+// they are not loopback: with no api key they would hand the models to
+// whoever can reach the machine.
+func TestIsLoopback(t *testing.T) {
+	cases := []struct {
+		listen string
+		want   bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"127.0.0.5:8080", true},
+		{"localhost:8080", true},
+		{"[::1]:8080", true},
+		{":8080", false},
+		{"0.0.0.0:8080", false},
+		{"[::]:8080", false},
+		{"192.168.1.5:8080", false},
+	}
+	for _, c := range cases {
+		if got := isLoopback(c.listen); got != c.want {
+			t.Errorf("isLoopback(%q) = %v, want %v", c.listen, got, c.want)
+		}
+	}
+}
+
+// serveCmdFor gives a serve command that says nothing but its error.
+func serveCmdFor(t *testing.T, cfg config.Config) *cobra.Command {
+	t.Helper()
+	cmd := newServeCmd(&env{cfg: cfg})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd
+}
+
+// TestServeRefusesWithoutAnAPIKeyOnAWideAddress says the gateway does
+// not come up for everyone when nobody has to give a key.
+func TestServeRefusesWithoutAnAPIKeyOnAWideAddress(t *testing.T) {
+	for _, listen := range []string{"0.0.0.0:8080", ":8080", "192.168.1.5:8080"} {
+		cfg := config.Default()
+		cfg.Server.Listen = listen
+		cfg.Server.APIKeys = nil
+		err := serveCmdFor(t, cfg).Execute()
+		if err == nil {
+			t.Fatalf("serve started on %s with no api key", listen)
+		}
+		if !strings.Contains(err.Error(), "no api key is configured") {
+			t.Errorf("the error for %s does not say the key is missing: %v", listen, err)
+		}
+	}
+}
+
+// TestServeRefusesANonGlobalSite says the Chinese site is refused
+// rather than served with the wrong token.
+func TestServeRefusesANonGlobalSite(t *testing.T) {
+	cfg := config.Default()
+	cfg.Upstream.Site = "cn"
+	err := serveCmdFor(t, cfg).Execute()
+	if err == nil {
+		t.Fatal("serve started with upstream.site = cn")
+	}
+	if !strings.Contains(err.Error(), "only \"global\" is supported") {
+		t.Errorf("the error does not name the site: %v", err)
+	}
+}
+
+// TestServeRefusesABadCheckinTime says a check-in time that cannot be
+// read is refused instead of quietly run at the default time.
+func TestServeRefusesABadCheckinTime(t *testing.T) {
+	cfg := config.Default()
+	cfg.Schedule.CheckinAt = "nine o'clock"
+	err := serveCmdFor(t, cfg).Execute()
+	if err == nil {
+		t.Fatal("serve started with a check-in time that cannot be read")
+	}
+	if !strings.Contains(err.Error(), "want HH:MM") {
+		t.Errorf("the error does not say the format: %v", err)
+	}
+}
+
+// TestServeStartsOnLoopbackWithoutAnAPIKey says a loopback address
+// with no api key is fine: only this machine can reach it.
+//
+// The port is taken first, so the server cannot come up and the run
+// ends at once. What matters here is which error comes back: not the
+// one about the missing key.
+func TestServeStartsOnLoopbackWithoutAnAPIKey(t *testing.T) {
+	err := serveUntilThePortIsTaken(t, "127.0.0.1", nil)
+	if err == nil {
+		t.Fatal("serve came up on a port that was already taken")
+	}
+	if strings.Contains(err.Error(), "no api key is configured") {
+		t.Errorf("serve refused a loopback address with no api key: %v", err)
+	}
+}
+
+// TestServeAllowsAWideAddressWithAnAPIKey says a wide address is fine
+// when a key is configured: the key is what keeps the gateway closed.
+func TestServeAllowsAWideAddressWithAnAPIKey(t *testing.T) {
+	err := serveUntilThePortIsTaken(t, "0.0.0.0", []string{"sk-local-test"})
+	if err == nil {
+		t.Fatal("serve came up on a port that was already taken")
+	}
+	if strings.Contains(err.Error(), "no api key is configured") {
+		t.Errorf("serve refused a wide address that has an api key: %v", err)
+	}
+}
+
+// serveUntilThePortIsTaken runs serve on an address whose port is
+// already taken, so the run ends at once, and gives back the error.
+func serveUntilThePortIsTaken(t *testing.T, host string, keys []string) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", host+":0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	cfg := config.Default()
+	cfg.Server.Listen = addr
+	cfg.Server.APIKeys = keys
+
+	cmd := newServeCmd(serveEnv(t, cfg))
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd.Execute()
+}
+
+// serveEnv gives an environment with a store and a manager, the way
+// the root command builds them.
+func serveEnv(t *testing.T, cfg config.Config) *env {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mmxcode.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	egr := egress.New(cfg.Proxy.Groups, cfg.Proxy.Default)
+	tr, err := egr.Transport(egr.Resolve(store.Account{}))
+	if err != nil {
+		t.Fatalf("transport: %v", err)
+	}
+	up := upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
+	acc := account.New(up)
+	return &env{
+		cfg:   cfg,
+		store: s,
+		up:    up,
+		egr:   egr,
+		acc:   acc,
+		mgr:   manager.New(s, up, acc, egr, oauth.NewRenewer()),
+	}
+}
+```
+
+
+
 
 ## 完成标准
 
