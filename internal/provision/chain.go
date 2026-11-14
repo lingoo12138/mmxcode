@@ -146,6 +146,9 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 // An account that is already in the database is signed in again and its
 // row is updated: one site account must not have two live rows.
 func (c *Chain) Import(ctx context.Context, email, password string) (Result, error) {
+	// 地址前后带的空格是要去掉的：地址是去重的键之一，同一个地址写成
+	// 两种样子，库里就会看成两个账号。
+	email = strings.TrimSpace(email)
 	tok, err := c.SignIn(ctx, email, password)
 	if err != nil {
 		return Result{Email: email}, err
@@ -159,6 +162,7 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	if c.Identity != nil {
 		got, err := c.Identity(ctx, tok.Access, tok.Subject)
 		if err == nil {
+			got.Email = strings.TrimSpace(got.Email)
 			id = got
 		} else {
 			// 身份没问出来，账号还是在的，只是不知道站点那边是不是就认
@@ -215,6 +219,21 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
 			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
 			// 账号当成新账号，再插一行。
+			if wantMail != row.Email {
+				// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
+				// 以后重登就分不清该登谁了——密码是对着其中一个的。
+				other, err := tx.AccountByEmail(ctx, wantMail)
+				switch {
+				case err == nil && other.ID != row.ID:
+					notes = append(notes, "另一个账号（"+other.ID+
+						"）也在用这个地址，地址没有换过去："+wantMail)
+					wantMail = row.Email
+				case err != nil && !errors.Is(err, store.ErrNotFound):
+					notes = append(notes, "没能查这个地址有没有别人在用，地址没有换过去："+
+						wantMail+"（"+err.Error()+"）")
+					wantMail = row.Email
+				}
+			}
 			if wantMail != row.Email || wantUserID != row.UserID {
 				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
 					return err

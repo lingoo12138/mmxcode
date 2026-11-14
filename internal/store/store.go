@@ -706,7 +706,7 @@ func (s *Store) createAccount(ctx context.Context, db execer, a Account) error {
 		INSERT INTO accounts (id, name, user_id, email, status, proxy_group, proxy_url,
 			last_error, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.UserID, a.Email, a.Status, a.ProxyGroup, a.ProxyURL,
+		a.ID, a.Name, a.UserID, strings.TrimSpace(a.Email), a.Status, a.ProxyGroup, a.ProxyURL,
 		a.LastError, ms(s.stamp(a.CreatedAt)), ms(s.stamp(a.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("create account: %w", err)
@@ -815,6 +815,9 @@ func (s *Store) setAccountName(ctx context.Context, db execer, id, name string, 
 // 它是窄的：只写这两样。站点那边报出来的真邮箱和真用户 id 知道了就写
 // 上去——不去重的时候邮箱是键之一，键停在旧的地方，下一次导入就会把
 // 这个账号当成新账号，再插一行。
+//
+// 地址写进去之前是要去空格的：地址是去重的键之一，同一个地址写成两种
+// 样子，就看成两个账号。
 func (s *Store) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
 	return s.setAccountIdentity(ctx, s.db, id, email, userID, updatedAt)
 }
@@ -822,7 +825,7 @@ func (s *Store) SetAccountIdentity(ctx context.Context, id, email, userID string
 func (s *Store) setAccountIdentity(ctx context.Context, db execer, id, email, userID string, updatedAt time.Time) error {
 	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET email=?, user_id=?, updated_at=? WHERE id=?`,
-		email, userID, ms(s.stamp(updatedAt)), id)
+		strings.TrimSpace(email), userID, ms(s.stamp(updatedAt)), id)
 	if err != nil {
 		return fmt.Errorf("set the identity of the account %s: %w", id, err)
 	}
@@ -830,6 +833,113 @@ func (s *Store) setAccountIdentity(ctx context.Context, db execer, id, email, us
 		return fmt.Errorf("set the identity of the account %s: %w", id, ErrNotFound)
 	}
 	return nil
+}
+
+// SignIn records a sign-in: the account and its token.
+//
+// 一个站点账号在库里只能有一行。库里已经有这一行的时候改那一行，不另
+// 起一行——同一个站点账号两行都是活的，轮转会挑到两次，页面把它列两遍，
+// 而且其中一个的令牌迟早被另一个的重登作废。
+//
+// 找的是令牌里带的那个 sub：那是站点账号自己的 id，一个站点账号一个，
+// 重登多少次都是它。清单上的邮箱可能是别名，站点那边报的邮箱又可能一
+// 时问不出来，只有它是一直在的。邮箱是第二条路：有的登录那条路上，令牌
+// 里的 sub 是空的。
+//
+// a 是这个账号该有的样子：它的 id 只在没有那一行的时候才用得上。a.Email
+// 是站点那边说的地址：它是空的，说明这一次没问出身份来——那就不动那一
+// 行上的地址和用户 id，把空的写上去等于把知道的东西换成不知道的。
+//
+// 名字是人自己写的标签：给了就写上去，没给就把原来那一行上的留着。
+func (s *Store) SignIn(ctx context.Context, a Account, tok Token) (Account, error) {
+	var out Account
+	err := s.Tx(ctx, func(tx Tx) error {
+		row, err := findForSignIn(ctx, tx, a, tok)
+		if err != nil {
+			return err
+		}
+		now := a.UpdatedAt
+		if row.ID == "" {
+			// 没有那一行：这就是一个新账号。名字没有给定的时候，用知道
+			// 的东西起：地址、用户 id、令牌里带的那个站点账号 id。
+			acc := a
+			acc.Name = firstNonEmpty(a.Name, a.Email, a.UserID, tok.Subject)
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			row = acc
+		} else {
+			// 已经有这一行了：改它，不另起一行。
+			if a.Email != "" && (a.Email != row.Email || a.UserID != row.UserID) {
+				if err := tx.SetAccountIdentity(ctx, row.ID, a.Email, a.UserID, now); err != nil {
+					return err
+				}
+				row.Email = a.Email
+				row.UserID = a.UserID
+			}
+			if a.Name != "" && a.Name != row.Name {
+				if err := tx.SetAccountName(ctx, row.ID, a.Name, now); err != nil {
+					return err
+				}
+				row.Name = a.Name
+			}
+			if row.Status != StatusActive {
+				// 它刚登进来：状态回到 active。
+				if err := tx.UpdateAccountStatus(ctx, row.ID, StatusActive, "", now); err != nil {
+					return err
+				}
+				row.Status = StatusActive
+			}
+		}
+		if err := tx.SaveToken(ctx, Token{
+			AccountID: row.ID, Access: tok.Access, Refresh: tok.Refresh,
+			ExpiresAt: tok.ExpiresAt, Subject: tok.Subject, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		out = row
+		return nil
+	})
+	if err != nil {
+		return Account{}, err
+	}
+	return out, nil
+}
+
+// findForSignIn gives the row that belongs to this site account.
+//
+// It gives an empty account when there is none: that is a new account,
+// not an error.
+func findForSignIn(ctx context.Context, tx Tx, a Account, tok Token) (Account, error) {
+	if tok.Subject != "" {
+		row, err := tx.AccountBySubject(ctx, tok.Subject)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
+	if a.Email != "" {
+		row, err := tx.AccountByEmail(ctx, a.Email)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
+	return Account{}, nil
+}
+
+// firstNonEmpty gives the first value that is not empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // MarkSignedOut writes the reason a sign-in failed, but only while the
@@ -850,6 +960,92 @@ func (s *Store) MarkSignedOut(ctx context.Context, id, lastError string, updated
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// SignOutIfTheTokenIsStillThere signs the account out and takes its
+// token away, but only while the token row still holds that access
+// token.
+//
+// 签出是**有条件**地写的：另一个进程可能刚把这个账号登回去了。手里这
+// 份令牌就是这次失败说的那份；库里换成了别的，就是有人替它登好了，这
+// 时候把它写回签出，就是把别人刚换好的令牌作废掉，还让这个账号显示成
+// 登出的状态——手里却握着一份能用的凭据，轮转池不用它，下一轮又要登
+// 一次。
+//
+// 它说有没有写下去。没有写，说明库里那一份令牌已经不是手里这一份了：
+// 有人在这中间把账号救回来了，这次的失败说的已经不是它了。
+//
+// 写状态和收走令牌是一起写的。中间插进来一个写，账号就会停在「状态是
+// 签出、令牌还在」的样子：状态说它登出了，令牌却还在，每次请求都要
+// 去续一次，续不回来。
+//
+// 令牌行里的 subject 留着。那是站点那边账号自己的 id，不是凭据——它是
+// 「这个站点账号在库里是哪一行」的键。抹掉它，下次导入这个账号就会当
+// 成新账号再插一行，而那一行是活的。
+func (s *Store) SignOutIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	written := false
+	err := s.tx(ctx, func(tx *sqlTx) error {
+		n, err := tx.setStatusIfTokenUnchanged(ctx, id, access, StatusSignedOut, reason, updatedAt)
+		if err != nil || !n {
+			return err
+		}
+		written = true
+		return tx.blankToken(ctx, id, updatedAt)
+	})
+	if err != nil {
+		return false, err
+	}
+	return written, nil
+}
+
+// MarkErrorIfTheTokenIsStillThere writes the error state down, but only
+// while the token row still holds that access token.
+//
+// 它和 SignOutIfTheTokenIsStillThere 是同一个条件、同一件事：这个错误
+// 说的是手里这份令牌的事，库里换成了别的令牌，说的就不是这个账号了。
+// 把别人刚换好的状态改回出错，页面就会说一个好好在用的账号出错了。
+func (s *Store) MarkErrorIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	return s.setStatusIfTokenUnchanged(ctx, s.db, id, access, StatusError, reason, updatedAt)
+}
+
+// setStatusIfTokenUnchanged writes the state and the reason, but only
+// while the token row still holds that access token.
+//
+// The access token is what says the chain in hand is still the chain in
+// the store: every renewal hands out a new access token, so a different
+// one means somebody else has moved the account on since.
+//
+// 手里没有令牌可比的时候不写：这次失败说的不是库里那一份令牌，写下去
+// 只能靠猜。
+func (s *Store) setStatusIfTokenUnchanged(ctx context.Context, db execer, id, access, status, reason string, updatedAt time.Time) (bool, error) {
+	if strings.TrimSpace(access) == "" {
+		return false, nil
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE accounts SET status=?, last_error=?, updated_at=?
+		WHERE id=? AND EXISTS (
+			SELECT 1 FROM tokens t WHERE t.account_id=accounts.id AND t.access=?
+		)`, status, reason, ms(s.stamp(updatedAt)), id, access)
+	if err != nil {
+		return false, fmt.Errorf("set the state of the account %s: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// blankToken takes an account's token away.
+//
+// The subject stays: it is the site account's own id, not a credential,
+// and it is what says which site account the row is. Wiping it would
+// make the next import of that account make a second row — a live one.
+func (s *Store) blankToken(ctx context.Context, db execer, id string, updatedAt time.Time) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE tokens SET access='', refresh='', expires_at=0, updated_at=? WHERE account_id=?`,
+		ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("take the token of the account %s away: %w", id, err)
+	}
+	return nil
 }
 
 // SetAccountLastError writes the account's last error.
@@ -1079,6 +1275,14 @@ type Tx interface {
 // been cut short, and the half of the transaction that did land has to
 // go back all the same.
 func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
+	return s.tx(ctx, func(tx *sqlTx) error { return fn(tx) })
+}
+
+// tx runs fn inside one write transaction.
+//
+// It is what Tx hands out, and what the store's own two-step writes use
+// when the two steps have to land together.
+func (s *Store) tx(ctx context.Context, fn func(*sqlTx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin a transaction: %w", err)
@@ -1133,6 +1337,14 @@ func (t *sqlTx) SetAccountProxy(ctx context.Context, id, group, url string, upda
 
 func (t *sqlTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
 	return t.s.updateAccountStatus(ctx, t.tx, id, status, lastError, updatedAt)
+}
+
+func (t *sqlTx) setStatusIfTokenUnchanged(ctx context.Context, id, access, status, reason string, updatedAt time.Time) (bool, error) {
+	return t.s.setStatusIfTokenUnchanged(ctx, t.tx, id, access, status, reason, updatedAt)
+}
+
+func (t *sqlTx) blankToken(ctx context.Context, id string, updatedAt time.Time) error {
+	return t.s.blankToken(ctx, t.tx, id, updatedAt)
 }
 
 // DeleteAccount removes an account and everything under it.

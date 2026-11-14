@@ -36,38 +36,25 @@ func newLoginCmd(e *env) *cobra.Command {
 			if err != nil {
 				fmt.Printf("登录成功，但读不到账户信息：%v\n", err)
 			}
-			label := name
-			if label == "" {
-				label = id.Email
-			}
-			if label == "" {
-				label = id.RealUserID
-			}
-			if label == "" {
-				label = tok.Subject
-			}
 
 			now := time.Now()
-			acc := store.Account{
+			// 库里已经有这个站点账号了（多半是批量导入进来的）：改那一行，
+			// 不再另起一行——同一个站点账号两行都是活的，轮转会挑到两次。
+			acc, err := e.store.SignIn(ctx, store.Account{
 				ID:        newAccountID(),
-				Name:      label,
+				Name:      name,
 				UserID:    firstNonEmpty(id.RealUserID, tok.Subject),
 				Email:     id.Email,
 				Status:    store.StatusActive,
 				CreatedAt: now,
 				UpdatedAt: now,
-			}
-			if err := e.store.CreateAccount(ctx, acc); err != nil {
-				return err
-			}
-			if err := e.store.SaveToken(ctx, store.Token{
-				AccountID: acc.ID,
+			}, store.Token{
 				Access:    tok.Access,
 				Refresh:   tok.Refresh,
 				ExpiresAt: tok.Expires,
 				Subject:   tok.Subject,
-				UpdatedAt: now,
-			}); err != nil {
+			})
+			if err != nil {
 				return err
 			}
 			fmt.Printf("已登录：%s (%s)\n", acc.Name, acc.ID)

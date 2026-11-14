@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -252,9 +253,12 @@ func (s *fakeStore) updateAccountStatus(id, status string) error {
 }
 
 // lookup gives the account with that email.
+//
+// 真的库里比的时候两边都折成小写、去空格：清单上写的是哪个样子，库里
+// 存的是哪个样子，人看着是同一个就是同一个。
 func (s *fakeStore) lookup(email string) (store.Account, error) {
 	for _, r := range s.rows {
-		if strings.EqualFold(r.Email, email) {
+		if strings.EqualFold(strings.TrimSpace(r.Email), strings.TrimSpace(email)) {
 			return r, nil
 		}
 	}
@@ -264,7 +268,10 @@ func (s *fakeStore) lookup(email string) (store.Account, error) {
 // lookupSubject gives the account whose token carries that subject.
 //
 // 真的库里是顺着令牌那一行找的：令牌里的那个 sub 是站点账号自己的 id。
+// 找到好几行的时候取最早的那一行（先建的先算），跟真的库一个样子。
 func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
+	var found store.Account
+	have := false
 	for _, t := range s.subjects {
 		at := strings.LastIndex(t, ":")
 		if at < 0 || t[at+1:] != subject {
@@ -272,12 +279,19 @@ func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
 		}
 		id := t[:at]
 		for _, r := range s.rows {
-			if r.ID == id {
-				return r, nil
+			if r.ID != id {
+				continue
+			}
+			if !have || r.CreatedAt.Before(found.CreatedAt) ||
+				(r.CreatedAt.Equal(found.CreatedAt) && r.ID < found.ID) {
+				found, have = r, true
 			}
 		}
 	}
-	return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
+	if !have {
+		return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
+	}
+	return found, nil
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
@@ -385,7 +399,10 @@ func (w *fakeWeb) Approve(ctx context.Context, userCode string) error {
 }
 
 // aChain is a chain that does everything but talk to the site.
-func aChain(st *fakeStore) *Chain {
+//
+// It takes the Store interface: the fake one and the real library both fit,
+// so a test can run the same chain against either.
+func aChain(st Store) *Chain {
 	return &Chain{
 		Store: st,
 		Start: func(ctx context.Context) (*oauth.Device, error) {
@@ -1021,6 +1038,87 @@ func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T)
 	}
 }
 
+// TestTheAddressIsNotTakenOverFromAnotherAccount says an address that
+// another account already has is not written onto this one.
+//
+// 两个账号共用一个地址不是好事：掉线以后重登，分不清该拿哪个密码去登
+// ——密码是对着其中一个的，登错了就是把这个账号也登坏了。
+//
+// 这一行是按令牌里那个 id 找到的（那是站点账号自己的 id），站点那边报
+// 出来的地址却是另一个账号的：这时候地址不能换过去。
+func TestTheAddressIsNotTakenOverFromAnotherAccount(t *testing.T) {
+	st := &fakeStore{
+		rows: []store.Account{
+			{ID: "acc_a", Name: "a", Email: "taken@example.com", Status: store.StatusActive},
+			{ID: "acc_b", Name: "b", Email: "b@example.com", Status: store.StatusActive},
+		},
+		subjects: []string{"acc_b:sub-b"},
+	}
+	c := aChain(st)
+	c.NewID = func() string { return "acc_new" }
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		return &oauth.Token{Access: "acc", Refresh: "ref", Subject: "sub-b"}, nil
+	}
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "taken@example.com", RealUserID: "u9"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "b@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AccountID != "acc_b" {
+		t.Fatalf("account id = %q, want acc_b", res.AccountID)
+	}
+	if st.rows[1].Email != "b@example.com" {
+		t.Fatalf("email = %q, want the address the account already had", st.rows[1].Email)
+	}
+	if !strings.Contains(res.Message, "acc_a") {
+		t.Fatalf("message = %q, want it to name the account that has the address", res.Message)
+	}
+}
+
+// TestTheRealLibraryHasOneRowForOneSiteAccount says the real library
+// keeps one row for one site account, even when the address on the list
+// is not the one the site knows.
+//
+// 假的库和真的库不是一回事：真的库按令牌里那个 sub 顺着令牌那一行找，假
+// 的那套是自己的一套规矩。这一条拿真的库走一遍：清单上的地址换了，站点
+// 那边一时又问不出身份，库里还是只有一行。
+func TestTheRealLibraryHasOneRowForOneSiteAccount(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	c := aChain(s)
+	// 第一趟：站点那边报了地址，那一行上的地址是站点认的那个。
+	if _, err := c.Import(ctx, "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	// 第二趟：清单上的地址换了，站点那边问不出身份了。
+	c.Identity = nil
+	if _, err := c.Import(ctx, "other@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", rows)
+	}
+	if rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one the site says", rows[0].Email)
+	}
+}
+
 // TestTheRowIsBroughtInLineWithWhatTheSiteSays says the address and
 // the user id on the row are the ones the site says.
 //
@@ -1067,14 +1165,24 @@ func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
 //
 // 站点那边一时问不出身份，手里的地址就只剩原来那一行的：那是站点自己
 // 认过的，比清单上的更靠得住。
+//
+// 这一条要能分清两件事：地址留在原来那一行，和地址换成清单上那个。这两
+// 件事在清单上的地址跟原来那一行一样的时候是一样的事——所以这里清单上
+// 的地址跟那一行的不一样，换成清单上那个是看得出来的。
 func TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+	// 第一趟：站点那边说了它是谁，那一行上的地址是站点认的那个。
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
 	}
+	if st.rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one the site says", st.rows[0].Email)
+	}
+
+	// 第二趟：站点那边问不出身份了，清单上的地址是另一个。
 	c.Identity = nil
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
 	}
 	if st.rows[0].Email != "a@example.com" {
