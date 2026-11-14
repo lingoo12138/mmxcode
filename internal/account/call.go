@@ -151,6 +151,11 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 			CurrentWeeklyTotalCnt    *float64 `json:"current_weekly_total_count"`
 			WeeklyStartTime          int64    `json:"weekly_start_time"`
 			WeeklyEndTime            int64    `json:"weekly_end_time"`
+			// WeeklyBoostPermille is the boost an older plan or a
+			// tier's own allowance gives the week. The site writes it
+			// in permille, and it is the week's total when the site
+			// does not write a total of its own.
+			WeeklyBoostPermille *float64 `json:"weekly_boost_permille"`
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -188,11 +193,12 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 			start     int64
 			end       int64
 			weekly    bool
+			boost     *float64
 		}{
 			{m.CurrentIntervalStatus, m.CurrentIntervalRemaining, m.CurrentIntervalUsed, m.CurrentIntervalTotal,
-				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false},
+				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false, nil},
 			{m.CurrentWeeklyStatus, m.CurrentWeeklyRemaining, m.CurrentWeeklyUsed, m.CurrentWeeklyTotal,
-				m.CurrentWeeklyUsedCount, m.CurrentWeeklyTotalCnt, m.WeeklyStartTime, m.WeeklyEndTime, true},
+				m.CurrentWeeklyUsedCount, m.CurrentWeeklyTotalCnt, m.WeeklyStartTime, m.WeeklyEndTime, true, m.WeeklyBoostPermille},
 		} {
 			status := 0.0
 			if x.status != nil {
@@ -215,8 +221,17 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 				continue
 			}
 			total := 100.0
-			if x.total != nil && *x.total > 0 {
-				total = *x.total
+			switch {
+			case x.total != nil:
+				// A total the site wrote. A zero is not a total.
+				if *x.total > 0 {
+					total = *x.total
+				}
+			case x.boost != nil && *x.boost > 1000:
+				// The week has no total of its own: the boost is the
+				// total. The site writes it in permille, and the
+				// reference reads it the same way.
+				total = *x.boost / 10
 			}
 			used := 0.0
 			switch {

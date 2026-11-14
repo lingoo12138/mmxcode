@@ -462,6 +462,12 @@ COMPOSE_PROFILES=warp        # 删掉这行 = 不启动 WARP
 - `granted` = `granted_amount`；`remaining` = `min(remaining_amount, granted)`（`remaining_amount` 为负按 0）
 - `consumed` = `granted - remaining`（不直接用 `consumed_amount`，以免与 `remaining` 口径不一致）
 - **套餐窗口**：`{platform}/backend/account/token_plan/remains_percent`（带 `X-Group-Id`），失败回退 `{platform}/v1/api/openplatform/coding_plan/remains`
+- **套餐窗口怎么读**（跟参考实现一样）：
+  - 控制台的回答里有非空的 `model_remains` 列表，那就是答案，不再问第二次；列表在但每一项都是这个套餐没有的桶（两个窗口都是无限、两个都没有计数），答案是"这个套餐没有窗口"。
+  - 站点写的时间不说是秒还是毫秒：**小于一万亿的是秒**，其余是毫秒。窗口的开始、结束、长度都按这个读 —— 秒写成毫秒读，结束时间就落到 1970 年，耗尽的账号会被一次又一次地挑中。
+  - 窗口的名字是它自己的长度："7 days" / "N days" / "N hours" / "N minutes" / "Allowance"。
+  - 总量不是一百的时候（老套餐的加成、某个档位自己的额度），那个总量就是这个窗口的总额，用掉的百分比按它算，界面上显示成"用了多少 / 多少 %"。`weekly_boost_permille` 是周窗口的总量（千分数），站点没写周窗口自己的总量时才用它。
+  - 两个窗口都是 status 3（无限）且都没有计数，是这个套餐没有的桶，跳过。
 - **会员信息**：`get_user_extra_info` + `get_membership_info`（国际站预期 404 → 套餐未知）
 - **套餐名称**：`cycle_audio_resource_package` 的 `current_subscribe.current_subscribe_title`
 

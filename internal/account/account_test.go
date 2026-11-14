@@ -500,6 +500,57 @@ func TestPlanWindowsNameTheWindowByItsLength(t *testing.T) {
 	}
 }
 
+// TestTheWeeksBoostIsItsTotal says the week's boost is the week's
+// total when the site writes no total of its own.
+//
+// 站点给的是千分数：1200 是一百二十。用掉的百分比是按这个总数算的，
+// 所以六成是"这个总数的六成"，不是"一百的六成"。
+func TestTheWeeksBoostIsItsTotal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":1,"current_interval_remaining_percent":50,
+				 "current_interval_total_percent":100,
+				 "start_time":1763000000000,"end_time":1763010800000,
+				 "current_weekly_status":1,"current_weekly_used_percent":72,"weekly_boost_permille":1200,
+				 "weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	week := ws[1]
+	if week.Name != "7 days" {
+		t.Fatalf("the weekly window is called %q, want %q", week.Name, "7 days")
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+	// 用掉的七十二点是一百二十点里的六成。
+	if week.Used != 60 {
+		t.Errorf("the week is %v%% used, want 60%%", week.Used)
+	}
+	if week.Amount != 72 {
+		t.Errorf("the week used %v of %v, want 72", week.Amount, week.Limit)
+	}
+	if week.Unit != "%" {
+		t.Errorf("the week's unit is %q, want %%", week.Unit)
+	}
+}
+
 func TestPlanTitle(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.URL.Path, "cycle_audio_resource_package") {
