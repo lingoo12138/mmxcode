@@ -4141,6 +4141,62 @@ func TestImportStopsAtItsTimeout(t *testing.T) {
 		t.Fatal("the import ran past its timeout")
 	}
 }
+
+func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
+	// 时限到了的时候，已经进来的账号不能白跑：记录要收尾，页面上这趟
+	// 导入不能永远显示成「还在跑」。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.txt")
+	if err := os.WriteFile(path, []byte("a@example.com|pw\nb@example.com|pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := testEnv(t)
+	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+		return &provision.Runner{
+			Importer: &provision.Importer{
+				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
+					if email == "a@example.com" {
+						return provision.Result{Email: email, OK: true, AccountID: "acc_1"}, nil
+					}
+					// 站点那边没有回答：时限到了，这一趟就卡在这里。
+					<-ctx.Done()
+					return provision.Result{Email: email}, ctx.Err()
+				},
+			},
+			Interval: interval,
+			Sleep:    func(context.Context, time.Duration) error { return nil },
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	var out bytes.Buffer
+	if err := runImport(ctx, e, &out, path, "", time.Millisecond, false); err == nil {
+		t.Fatal("the import ran past its deadline")
+	}
+	// 已经进来的那个账号要说出来，也要说清楚这趟是被掐断的。
+	if !strings.Contains(out.String(), "a@example.com") {
+		t.Fatalf("out = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "截断") {
+		t.Fatalf("out = %q, want it to say the run was cut short", out.String())
+	}
+	runs, err := e.store.ListImportRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs", len(runs))
+	}
+	if runs[0].FinishedAt.IsZero() {
+		t.Fatal("the run was never finished")
+	}
+	if runs[0].OK != 1 {
+		t.Fatalf("ok = %d, want the one that got in", runs[0].OK)
+	}
+	if !strings.Contains(runs[0].Results, "a@example.com") {
+		t.Fatalf("results = %q", runs[0].Results)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -4280,10 +4336,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		}
 	}
 
-	results, err := runner.Run(ctx, entries)
-	if err != nil {
-		return err
-	}
+	results, runErr := runner.Run(ctx, entries)
 	// 清单里的第几行：出错的账号要能找回去。
 	lines := map[string]int{}
 	for _, en := range entries {
@@ -4313,7 +4366,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		}
 		fmt.Fprintln(out, "）")
 	}
-	fmt.Fprintf(out, "\n共 %d 个，成功 %d，失败 %d。\n", len(results), ok, len(results)-ok)
+	fmt.Fprintf(out, "\n已处理 %d 个，成功 %d，失败 %d。\n", len(results), ok, len(results)-ok)
 	switch {
 	case keeper != nil:
 		fmt.Fprintf(out, "密码已加密入库（%s）。\n", PasswordKeyEnv)
@@ -4325,9 +4378,19 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		fmt.Fprintf(out, "密码没有存进库里（没有 %s）。\n", PasswordKeyEnv)
 	}
 	if e.store != nil {
-		if err := e.store.FinishImportRun(ctx, runID, time.Now(), ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
+		// 收尾的这一笔不能被掐断的上下文掐掉：时限到了的时候，已经
+		// 进来的那些账号要留在记录里，不能白跑一场。写不进去也要说。
+		if err := e.store.FinishImportRun(context.WithoutCancel(ctx), runID, time.Now(),
+			ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
 			return err
 		}
+	}
+	if runErr != nil {
+		// 说清楚这趟是被掐断的：不是所有账号都失败了，是有人不想让它
+		// 再跑下去了。已经进来的那些在上面写着。
+		fmt.Fprintf(out, "清单里共 %d 个，还有 %d 个没轮到：这趟导入被中途截断了（%v）。\n",
+			len(entries), len(entries)-len(results), runErr)
+		return runErr
 	}
 	return nil
 }

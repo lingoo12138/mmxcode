@@ -111,10 +111,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		}
 	}
 
-	results, err := runner.Run(ctx, entries)
-	if err != nil {
-		return err
-	}
+	results, runErr := runner.Run(ctx, entries)
 	// 清单里的第几行：出错的账号要能找回去。
 	lines := map[string]int{}
 	for _, en := range entries {
@@ -144,7 +141,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		}
 		fmt.Fprintln(out, "）")
 	}
-	fmt.Fprintf(out, "\n共 %d 个，成功 %d，失败 %d。\n", len(results), ok, len(results)-ok)
+	fmt.Fprintf(out, "\n已处理 %d 个，成功 %d，失败 %d。\n", len(results), ok, len(results)-ok)
 	switch {
 	case keeper != nil:
 		fmt.Fprintf(out, "密码已加密入库（%s）。\n", PasswordKeyEnv)
@@ -156,9 +153,19 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		fmt.Fprintf(out, "密码没有存进库里（没有 %s）。\n", PasswordKeyEnv)
 	}
 	if e.store != nil {
-		if err := e.store.FinishImportRun(ctx, runID, time.Now(), ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
+		// 收尾的这一笔不能被掐断的上下文掐掉：时限到了的时候，已经
+		// 进来的那些账号要留在记录里，不能白跑一场。写不进去也要说。
+		if err := e.store.FinishImportRun(context.WithoutCancel(ctx), runID, time.Now(),
+			ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
 			return err
 		}
+	}
+	if runErr != nil {
+		// 说清楚这趟是被掐断的：不是所有账号都失败了，是有人不想让它
+		// 再跑下去了。已经进来的那些在上面写着。
+		fmt.Fprintf(out, "清单里共 %d 个，还有 %d 个没轮到：这趟导入被中途截断了（%v）。\n",
+			len(entries), len(entries)-len(results), runErr)
+		return runErr
 	}
 	return nil
 }
