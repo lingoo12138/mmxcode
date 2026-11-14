@@ -4395,6 +4395,46 @@ func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
 	}
 }
 
+// TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith
+// says the group the import carries wins over the address on the
+// account.
+//
+// 出口是按「先看地址、再看组」找的：地址留着，账号还是从那个地方出去，
+// 组写着是 hk 也没用。导入是人明确做的一件事，它带的组说了算，所以那个
+// 地址清掉，而且要说出来——地址没了，人得知道。
+func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	c.ProxyGroup = "hk"
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 人给这个账号手设了一个地址。
+	if err := st.SetAccountProxy(context.Background(), res.AccountID, "hk",
+		"socks5h://127.0.0.1:1080", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyURL == "" {
+		t.Fatalf("the address was not set: %+v", st.rows[0])
+	}
+
+	res, err = c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyURL != "" {
+		t.Fatalf("the address is still there: %+v", st.rows[0])
+	}
+	if st.rows[0].ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
+	}
+	if !strings.Contains(res.Message, "地址") {
+		t.Fatalf("message = %q, want it to say the address was cleared", res.Message)
+	}
+}
+
 func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
@@ -4714,10 +4754,17 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 		}
 	}
 	// 出口组：导入是从哪个口登的，账号以后就走哪个口。没带组的导入不动
-	// 原来那一行的组——那是人自己设的，不能因为一次没带组的导入就没了。
-	if c.ProxyGroup != "" && c.ProxyGroup != acc.ProxyGroup {
-		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, acc.ProxyURL, now); err != nil {
+	// 原来那一行的组和地址——那是人自己设的，不能因为一次没带组的导入就没了。
+	//
+	// 带了组的时候，账号自己那个地址要让位：出口是按「先看地址、再看组」
+	// 找的（internal/egress），地址留着就还是从那个地方出去，组写着是 hk
+	// 也没用。导入是人明确做的一件事，它带的组说了算，所以那个地址清掉，
+	// 而且要说出来——地址没了是件人该知道的事。
+	if c.ProxyGroup != "" && (c.ProxyGroup != acc.ProxyGroup || acc.ProxyURL != "") {
+		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, "", now); err != nil {
 			notes = append(notes, "出口组没能更新："+err.Error())
+		} else if acc.ProxyURL != "" {
+			notes = append(notes, "账号自己那个出口地址清掉了，改走导入带的出口组")
 		}
 	}
 	return notes
@@ -5194,7 +5241,7 @@ func newImportCmd(e *env) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "账号清单（每行 邮箱|密码）")
-	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组")
+	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组；账号自己那个出口地址会被这个组换掉")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "每个账号之间的间隔")
 	cmd.Flags().BoolVar(&noStore, "no-store-password", false, "登录成功就丢密码，不入库")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")

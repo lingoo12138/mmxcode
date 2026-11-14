@@ -276,10 +276,17 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 		}
 	}
 	// 出口组：导入是从哪个口登的，账号以后就走哪个口。没带组的导入不动
-	// 原来那一行的组——那是人自己设的，不能因为一次没带组的导入就没了。
-	if c.ProxyGroup != "" && c.ProxyGroup != acc.ProxyGroup {
-		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, acc.ProxyURL, now); err != nil {
+	// 原来那一行的组和地址——那是人自己设的，不能因为一次没带组的导入就没了。
+	//
+	// 带了组的时候，账号自己那个地址要让位：出口是按「先看地址、再看组」
+	// 找的（internal/egress），地址留着就还是从那个地方出去，组写着是 hk
+	// 也没用。导入是人明确做的一件事，它带的组说了算，所以那个地址清掉，
+	// 而且要说出来——地址没了是件人该知道的事。
+	if c.ProxyGroup != "" && (c.ProxyGroup != acc.ProxyGroup || acc.ProxyURL != "") {
+		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, "", now); err != nil {
 			notes = append(notes, "出口组没能更新："+err.Error())
+		} else if acc.ProxyURL != "" {
+			notes = append(notes, "账号自己那个出口地址清掉了，改走导入带的出口组")
 		}
 	}
 	return notes

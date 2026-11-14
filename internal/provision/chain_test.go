@@ -805,6 +805,46 @@ func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
 	}
 }
 
+// TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith
+// says the group the import carries wins over the address on the
+// account.
+//
+// 出口是按「先看地址、再看组」找的：地址留着，账号还是从那个地方出去，
+// 组写着是 hk 也没用。导入是人明确做的一件事，它带的组说了算，所以那个
+// 地址清掉，而且要说出来——地址没了，人得知道。
+func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	c.ProxyGroup = "hk"
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 人给这个账号手设了一个地址。
+	if err := st.SetAccountProxy(context.Background(), res.AccountID, "hk",
+		"socks5h://127.0.0.1:1080", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyURL == "" {
+		t.Fatalf("the address was not set: %+v", st.rows[0])
+	}
+
+	res, err = c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyURL != "" {
+		t.Fatalf("the address is still there: %+v", st.rows[0])
+	}
+	if st.rows[0].ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
+	}
+	if !strings.Contains(res.Message, "地址") {
+		t.Fatalf("message = %q, want it to say the address was cleared", res.Message)
+	}
+}
+
 func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)

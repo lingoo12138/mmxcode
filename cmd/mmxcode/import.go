@@ -66,7 +66,7 @@ func newImportCmd(e *env) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "账号清单（每行 邮箱|密码）")
-	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组")
+	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组；账号自己那个出口地址会被这个组换掉")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "每个账号之间的间隔")
 	cmd.Flags().BoolVar(&noStore, "no-store-password", false, "登录成功就丢密码，不入库")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")
