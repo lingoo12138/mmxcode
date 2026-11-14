@@ -66,9 +66,6 @@ const (
 	// maxTokenSeconds is the longest an access token can live: a day.
 	// A number longer than that is not a number of seconds.
 	maxTokenSeconds = 24 * 60 * 60
-	// maxPollSeconds is the longest a poll interval can be: ten
-	// minutes. A longer wait is not a poll.
-	maxPollSeconds = 10 * 60
 	// epochSecondsFloor is the first Unix second of this century
 	// (2001-09-09). A number above it is a timestamp, not a length of
 	// time.
@@ -104,11 +101,13 @@ func expiresDuration(v int64) time.Duration {
 
 // pollInterval reads how long to wait between two polls.
 //
-// A poll that waits more than ten minutes is not a poll, so a number
-// that big is a number of milliseconds: 3000 is three seconds and not
-// fifty minutes, and 300 is five minutes and not a third of a second.
+// The ordinary device-code flow says the interval in seconds. The
+// reference reads it that way, and so do we: 5 is five seconds, and
+// 3000 is fifty minutes, not three seconds. The site's own variant
+// says the interval in milliseconds and is read separately, in
+// StartDevice.
 func pollInterval(v int64) time.Duration {
-	return siteDuration(v, maxPollSeconds)
+	return time.Duration(v) * time.Second
 }
 
 // siteDeadline reads when a device code ends.

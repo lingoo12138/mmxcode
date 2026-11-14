@@ -78,6 +78,9 @@ type Failure struct {
 //     is spent: another account is tried;
 //   - a 429 that does not name the credits is a rate limit, and the
 //     same account is asked again after a pause;
+//   - a 402 or a 403 that does not name the credits is the site saying
+//     no: the answer goes to the client as it is, because asking the
+//     same account with the same token again gives the same answer;
 //   - a 5xx or a network error is the same: the same account, again;
 //   - a 401 means the token is stale: it is renewed first;
 //   - a redirect to the other site is neither of these: the account is
@@ -117,10 +120,19 @@ func Decide(f Failure) Action {
 			return ActionFailover
 		}
 		return ActionGiveUp
-	case 402, 403, 429:
+	case 402, 403:
+		// 站点自己说不行：不是限流，也不是令牌旧了。同一个账号、
+		// 同一个令牌再问一次，问出来的还是这个答案 —— 参考实现
+		// 也是原样交给客户端，不重试。
 		if spent {
 			return ActionFailover
 		}
+		return ActionGiveUp
+	case 429:
+		if spent {
+			return ActionFailover
+		}
+		// 限流：等一等，还是这个账号。
 		return ActionRetrySame
 	}
 	if f.Status >= 500 {
@@ -154,6 +166,18 @@ func (f Failure) business() (code int, message string, refused bool) {
 		refused = r
 	}
 	return code, message, refused
+}
+
+// UpstreamMessage reads the message out of an upstream body.
+//
+// It reads it the way the decision reads it: MiniMax's own shape
+// first, then the plain shapes the site uses when it answers with a
+// plain error. A caller that shows the upstream's words to the client
+// reads them here, so that the words the client sees and the words the
+// decision was made on are the same words.
+func UpstreamMessage(body []byte) string {
+	_, msg, _ := parseBusiness(body)
+	return msg
 }
 
 // parseBusiness reads the business error out of a body.

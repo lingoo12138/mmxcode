@@ -128,6 +128,30 @@ func TestStartDeviceUserCodeIntervalIsInMilliseconds(t *testing.T) {
 	}
 }
 
+func TestStartDeviceIntervalIsInSeconds(t *testing.T) {
+	// 普通那套（device_code 轮询）的间隔是秒：3000 是五十分钟，
+	// 不是三秒。参考实现也是这么读的。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"device_code":      "dev-1",
+			"user_code":        "ABCD-EFGH",
+			"verification_uri": "https://example.invalid/activate",
+			"expires_in":       600,
+			"interval":         3000,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.interval != 50*time.Minute {
+		t.Fatalf("interval = %v, want 50m", d.interval)
+	}
+}
+
 func TestStartDeviceExpiredInSeconds(t *testing.T) {
 	// expired_in 小于 1e12 时是"还剩多少秒"，不是绝对时间。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -443,7 +467,7 @@ func TestTheUnitsOfTheSite(t *testing.T) {
 			t.Errorf("expiresDuration(%d) = %v, want %v (%s)", c.in, got, c.want, c.name)
 		}
 	}
-	// 轮询间隔的单位
+	// 轮询间隔的单位：普通那套是秒
 	for _, c := range []struct {
 		name string
 		in   int64
@@ -451,7 +475,7 @@ func TestTheUnitsOfTheSite(t *testing.T) {
 	}{
 		{"five seconds", 5, 5 * time.Second},
 		{"five minutes", 300, 5 * time.Minute},
-		{"three seconds in milliseconds", 3000, 3 * time.Second},
+		{"fifty minutes", 3000, 50 * time.Minute},
 		{"nothing", 0, 0},
 	} {
 		if got := pollInterval(c.in); got != c.want {

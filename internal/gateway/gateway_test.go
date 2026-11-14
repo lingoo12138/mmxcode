@@ -597,6 +597,52 @@ func TestUnauthorizedRenewsTheToken(t *testing.T) {
 // 聊天这条路只有 401 才续签：403 是站点自己不答，不是令牌旧了。
 // 续签一次就是花掉一个只能用一次的 refresh token，不该花在每个
 // 403 上。
+// TestTheForbiddenIsNotAskedAgain says a 403 that does not name the
+// credits is not asked again.
+//
+// 同一个账号、同一个令牌再问一次，问出来的还是这个答案。参考实现
+// 是原样交给客户端的。
+func TestTheForbiddenIsNotAskedAgain(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	h.mu.Lock()
+	hits := h.hits
+	h.mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("the upstream was asked %d times, want 1", hits)
+	}
+}
+
+// TestTheClientIsToldTheUpstreamsOwnWords says the words the client is
+// given are the words the upstream said, even when the error is a
+// plain string.
+//
+// 站点答 {"error":"insufficient_balance"} 时，那句话就是上游说的拒绝，
+// 客户端该看到它，而不是一句"额度用完了"。
+func TestTheClientIsToldTheUpstreamsOwnWords(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"insufficient_balance"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "usage limit reached: insufficient_balance") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
 func TestForbiddenDoesNotRenewTheToken(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

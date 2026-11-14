@@ -508,51 +508,28 @@ accountLoop:
 func (s *Server) failure(status int, raw []byte) rotator.Failure {
 	f := rotator.Failure{Status: status, Body: raw}
 	err := upstream.CheckEnvelope("chat", raw)
-	if err == nil {
-		return f
-	}
 	var be *upstream.BusinessError
-	if !errors.As(err, &be) {
+	if errors.As(err, &be) {
+		f.Code = be.Code
+		f.Message = be.Message
+		// 1000048：站点说签到被拒了。令牌照旧了，账号本身没问题。
+		if errors.Is(err, upstream.ErrSignInRefused) {
+			f.Refused = true
+		}
 		return f
 	}
-	f.Code = be.Code
-	f.Message = be.Message
-	// 1000048：站点说签到被拒了。令牌照旧了，账号本身没问题。
-	if errors.Is(err, upstream.ErrSignInRefused) {
-		f.Refused = true
-	}
+	// 没有 MiniMax 自己的形状：消息按它平常的样子读，rotator 读的
+	// 也是同一份 —— 客户端看到的和它做决定用的是同一句话。
+	f.Message = rotator.UpstreamMessage(raw)
 	return f
 }
 
 // upstreamMessage reads the message out of an upstream body.
 //
 // 上游的话要看得见：客户端和运维都要知道上游说了什么，而不是只知道
-// 一个状态码。这和 rotator 读消息的办法是一样的，但那是它做决定要
-// 用的，这里只是把它说出来。
+// 一个状态码。这和 rotator 读消息的是同一份。
 func upstreamMessage(raw []byte) string {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
-		return ""
-	}
-	for _, key := range []string{"message", "msg"} {
-		var s string
-		if json.Unmarshal(obj[key], &s) == nil && s != "" {
-			return s
-		}
-	}
-	for _, key := range []string{"error", "err"} {
-		var sub map[string]json.RawMessage
-		if json.Unmarshal(obj[key], &sub) != nil {
-			continue
-		}
-		for _, k := range []string{"message", "msg"} {
-			var s string
-			if json.Unmarshal(sub[k], &s) == nil && s != "" {
-				return s
-			}
-		}
-	}
-	return ""
+	return rotator.UpstreamMessage(raw)
 }
 
 // action says what to do about the answer.

@@ -876,3 +876,44 @@ func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
 	}
 }
+
+// TestDecideGivesUpOnAForbiddenThatIsNotAboutTheCredits says a 403
+// that does not name the credits is the site's own no.
+//
+// 同一个账号、同一个令牌再问一次，问出来的还是这个答案。参考实现
+// 是原样交给客户端的。
+func TestDecideGivesUpOnAForbiddenThatIsNotAboutTheCredits(t *testing.T) {
+	f := Failure{Status: 403, Body: []byte(`{"message":"forbidden"}`)}
+	if got := Decide(f); got != ActionGiveUp {
+		t.Fatalf("Decide = %v, want %v", got, ActionGiveUp)
+	}
+}
+
+// TestDecideRetriesTheSameAccountOnARateLimit says a 429 that does not
+// name the credits is a rate limit: wait, then ask the same account.
+func TestDecideRetriesTheSameAccountOnARateLimit(t *testing.T) {
+	f := Failure{Status: 429, Body: []byte(`{"message":"too many requests"}`)}
+	if got := Decide(f); got != ActionRetrySame {
+		t.Fatalf("Decide = %v, want %v", got, ActionRetrySame)
+	}
+}
+
+// TestTheUpstreamMessageIsReadTheSameWay says the message the client
+// is given is the message the decision was made on.
+func TestTheUpstreamMessageIsReadTheSameWay(t *testing.T) {
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`{"message":"insufficient balance"}`, "insufficient balance"},
+		{`{"error":{"message":"insufficient balance"}}`, "insufficient balance"},
+		{`{"error":"insufficient_balance"}`, "insufficient_balance"},
+		{`{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}`, "insufficient balance"},
+		{`{"nothing":"here"}`, ""},
+	}
+	for _, c := range cases {
+		if got := UpstreamMessage([]byte(c.body)); got != c.want {
+			t.Errorf("UpstreamMessage(%s) = %q, want %q", c.body, got, c.want)
+		}
+	}
+}

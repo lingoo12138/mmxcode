@@ -3951,6 +3951,47 @@ func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
 	}
 }
+
+// TestDecideGivesUpOnAForbiddenThatIsNotAboutTheCredits says a 403
+// that does not name the credits is the site's own no.
+//
+// 同一个账号、同一个令牌再问一次，问出来的还是这个答案。参考实现
+// 是原样交给客户端的。
+func TestDecideGivesUpOnAForbiddenThatIsNotAboutTheCredits(t *testing.T) {
+	f := Failure{Status: 403, Body: []byte(`{"message":"forbidden"}`)}
+	if got := Decide(f); got != ActionGiveUp {
+		t.Fatalf("Decide = %v, want %v", got, ActionGiveUp)
+	}
+}
+
+// TestDecideRetriesTheSameAccountOnARateLimit says a 429 that does not
+// name the credits is a rate limit: wait, then ask the same account.
+func TestDecideRetriesTheSameAccountOnARateLimit(t *testing.T) {
+	f := Failure{Status: 429, Body: []byte(`{"message":"too many requests"}`)}
+	if got := Decide(f); got != ActionRetrySame {
+		t.Fatalf("Decide = %v, want %v", got, ActionRetrySame)
+	}
+}
+
+// TestTheUpstreamMessageIsReadTheSameWay says the message the client
+// is given is the message the decision was made on.
+func TestTheUpstreamMessageIsReadTheSameWay(t *testing.T) {
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`{"message":"insufficient balance"}`, "insufficient balance"},
+		{`{"error":{"message":"insufficient balance"}}`, "insufficient balance"},
+		{`{"error":"insufficient_balance"}`, "insufficient_balance"},
+		{`{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}`, "insufficient balance"},
+		{`{"nothing":"here"}`, ""},
+	}
+	for _, c := range cases {
+		if got := UpstreamMessage([]byte(c.body)); got != c.want {
+			t.Errorf("UpstreamMessage(%s) = %q, want %q", c.body, got, c.want)
+		}
+	}
+}
 ```
 
 
@@ -4433,6 +4474,9 @@ type Failure struct {
 //     is spent: another account is tried;
 //   - a 429 that does not name the credits is a rate limit, and the
 //     same account is asked again after a pause;
+//   - a 402 or a 403 that does not name the credits is the site saying
+//     no: the answer goes to the client as it is, because asking the
+//     same account with the same token again gives the same answer;
 //   - a 5xx or a network error is the same: the same account, again;
 //   - a 401 means the token is stale: it is renewed first;
 //   - a redirect to the other site is neither of these: the account is
@@ -4472,10 +4516,19 @@ func Decide(f Failure) Action {
 			return ActionFailover
 		}
 		return ActionGiveUp
-	case 402, 403, 429:
+	case 402, 403:
+		// 站点自己说不行：不是限流，也不是令牌旧了。同一个账号、
+		// 同一个令牌再问一次，问出来的还是这个答案 —— 参考实现
+		// 也是原样交给客户端，不重试。
 		if spent {
 			return ActionFailover
 		}
+		return ActionGiveUp
+	case 429:
+		if spent {
+			return ActionFailover
+		}
+		// 限流：等一等，还是这个账号。
 		return ActionRetrySame
 	}
 	if f.Status >= 500 {
@@ -4509,6 +4562,18 @@ func (f Failure) business() (code int, message string, refused bool) {
 		refused = r
 	}
 	return code, message, refused
+}
+
+// UpstreamMessage reads the message out of an upstream body.
+//
+// It reads it the way the decision reads it: MiniMax's own shape
+// first, then the plain shapes the site uses when it answers with a
+// plain error. A caller that shows the upstream's words to the client
+// reads them here, so that the words the client sees and the words the
+// decision was made on are the same words.
+func UpstreamMessage(body []byte) string {
+	_, msg, _ := parseBusiness(body)
+	return msg
 }
 
 // parseBusiness reads the business error out of a body.
@@ -8029,6 +8094,52 @@ func TestUnauthorizedRenewsTheToken(t *testing.T) {
 // 聊天这条路只有 401 才续签：403 是站点自己不答，不是令牌旧了。
 // 续签一次就是花掉一个只能用一次的 refresh token，不该花在每个
 // 403 上。
+// TestTheForbiddenIsNotAskedAgain says a 403 that does not name the
+// credits is not asked again.
+//
+// 同一个账号、同一个令牌再问一次，问出来的还是这个答案。参考实现
+// 是原样交给客户端的。
+func TestTheForbiddenIsNotAskedAgain(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	h.mu.Lock()
+	hits := h.hits
+	h.mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("the upstream was asked %d times, want 1", hits)
+	}
+}
+
+// TestTheClientIsToldTheUpstreamsOwnWords says the words the client is
+// given are the words the upstream said, even when the error is a
+// plain string.
+//
+// 站点答 {"error":"insufficient_balance"} 时，那句话就是上游说的拒绝，
+// 客户端该看到它，而不是一句"额度用完了"。
+func TestTheClientIsToldTheUpstreamsOwnWords(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"insufficient_balance"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "usage limit reached: insufficient_balance") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
 func TestForbiddenDoesNotRenewTheToken(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -9647,51 +9758,28 @@ accountLoop:
 func (s *Server) failure(status int, raw []byte) rotator.Failure {
 	f := rotator.Failure{Status: status, Body: raw}
 	err := upstream.CheckEnvelope("chat", raw)
-	if err == nil {
-		return f
-	}
 	var be *upstream.BusinessError
-	if !errors.As(err, &be) {
+	if errors.As(err, &be) {
+		f.Code = be.Code
+		f.Message = be.Message
+		// 1000048：站点说签到被拒了。令牌照旧了，账号本身没问题。
+		if errors.Is(err, upstream.ErrSignInRefused) {
+			f.Refused = true
+		}
 		return f
 	}
-	f.Code = be.Code
-	f.Message = be.Message
-	// 1000048：站点说签到被拒了。令牌照旧了，账号本身没问题。
-	if errors.Is(err, upstream.ErrSignInRefused) {
-		f.Refused = true
-	}
+	// 没有 MiniMax 自己的形状：消息按它平常的样子读，rotator 读的
+	// 也是同一份 —— 客户端看到的和它做决定用的是同一句话。
+	f.Message = rotator.UpstreamMessage(raw)
 	return f
 }
 
 // upstreamMessage reads the message out of an upstream body.
 //
 // 上游的话要看得见：客户端和运维都要知道上游说了什么，而不是只知道
-// 一个状态码。这和 rotator 读消息的办法是一样的，但那是它做决定要
-// 用的，这里只是把它说出来。
+// 一个状态码。这和 rotator 读消息的是同一份。
 func upstreamMessage(raw []byte) string {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
-		return ""
-	}
-	for _, key := range []string{"message", "msg"} {
-		var s string
-		if json.Unmarshal(obj[key], &s) == nil && s != "" {
-			return s
-		}
-	}
-	for _, key := range []string{"error", "err"} {
-		var sub map[string]json.RawMessage
-		if json.Unmarshal(obj[key], &sub) != nil {
-			continue
-		}
-		for _, k := range []string{"message", "msg"} {
-			var s string
-			if json.Unmarshal(sub[k], &s) == nil && s != "" {
-				return s
-			}
-		}
-	}
-	return ""
+	return rotator.UpstreamMessage(raw)
 }
 
 // action says what to do about the answer.
@@ -12820,6 +12908,11 @@ FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
+# 受限网络下构建时要给出出口：docker build --build-arg GOPROXY=...
+# 默认值就是 go 自己的默认值，不传也不影响。
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+
 # 先只拷依赖清单，依赖没变这一层就不用重建
 COPY go.mod go.sum ./
 RUN go mod download
@@ -12838,6 +12931,10 @@ RUN apk add --no-cache ca-certificates tzdata \
     && chown mmxcode:mmxcode /data
 
 COPY --from=builder /out/mmxcode /usr/local/bin/mmxcode
+
+# 默认配置打进镜像：没有 bind mount 时镜像自己也能跑。
+# 想改配置就挂载自己的文件盖住它。
+COPY config.docker.yaml /app/config.yaml
 
 USER mmxcode
 WORKDIR /app
@@ -12864,6 +12961,17 @@ tmp.db
 tmp.db-wal
 tmp.db-shm
 *.md
+
+# 本地的东西不进构建上下文：配置文件里有 api key，.env 里也是。
+config.yaml
+config.local.yaml
+.env
+.env.*
+!.env.example
+
+# 计划同步脚本和别的工作文件
+.tmp-review
+.worktrees
 ```
 
 - [ ] **Step 3: 写 docker-compose.yml**
@@ -12880,8 +12988,15 @@ services:
       # 只绑本机，管理界面不暴露到公网
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
+      # 数据目录。默认用 Docker 命名卷：Docker 会按镜像里 /data 的属主
+      # （uid 10001）创建它，容器里的 mmxcode 用户可以直接写。
+      # 想把数据库留在宿主机目录上就设 MMXCODE_DATA_DIR=./data，
+      # 但宿主机那个目录必须对 uid 10001 可写，否则容器建不了数据库文件：
+      #   mkdir -p data && chown 10001:10001 data
+      - ${MMXCODE_DATA_DIR:-mmxcode-data}:/data
+      # 默认挂仓库里自带的 config.docker.yaml；要用自己的副本就设
+      # MMXCODE_CONFIG_FILE=./config.yaml（相对路径按 compose 文件所在目录解析）。
+      - ${MMXCODE_CONFIG_FILE:-./config.docker.yaml}:/app/config.yaml:ro
     environment:
       MMXCODE_CONFIG: /app/config.yaml
       # 容器内访问宿主机的代理要写 host.docker.internal
@@ -12918,6 +13033,8 @@ services:
       - "4000"
 
 volumes:
+  # 数据库数据目录（见上面 MMXCODE_DATA_DIR 的说明）。
+  mmxcode-data:
   warp-state:
 ```
 
@@ -12931,9 +13048,25 @@ volumes:
 # 容器内走宿主机的代理。要用别的出口就改这里。
 MMXCODE_PROXY_DEFAULT=http://host.docker.internal:7890
 
+# 挂进容器的配置文件（宿主机路径）。
+# 默认用仓库自带的 config.docker.yaml；要改成自己的副本就写绝对路径，
+# 例如 MMXCODE_CONFIG_FILE=./config.yaml（相对路径按 compose 文件所在目录解析）。
+MMXCODE_CONFIG_FILE=./config.docker.yaml
+
+# 数据目录的挂载源（宿主机侧）。
+# 默认 mmxcode-data = Docker 命名卷：Docker 按镜像里 /data 的属主（uid 10001）
+# 创建它，容器里的 mmxcode 用户（uid 10001）能直接读写，数据库落在
+# /data/mmxcode.db。
+# 想把数据库留在宿主机目录上就写 MMXCODE_DATA_DIR=./data（相对路径按 compose
+# 文件所在目录解析）。注意：宿主机那个目录必须对 uid 10001 可写，否则容器
+# 建不了数据库文件、启动即失败：
+#   mkdir -p data && chown 10001:10001 data
+MMXCODE_DATA_DIR=mmxcode-data
+
 # 开启 Cloudflare WARP 出口：把这行的值写成 warp。
-# 删掉这一行 = 不启动 WARP。
-COMPOSE_PROFILES=warp
+# 默认是关的 —— 下面这行保持注释，容器就不会启动 WARP。
+# 打开时（取消注释）宿主机的 /dev/net/tun 要可用，容器需要 NET_ADMIN。
+#COMPOSE_PROFILES=warp
 ```
 
 - [ ] **Step 5: 写一份容器里用的配置**
