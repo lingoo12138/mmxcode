@@ -1,0 +1,36 @@
+{{define "content"}}
+<section>
+  <h1>批量导入</h1>
+  {{if .UploadOpen}}
+    <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
+    <form id="import-form" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".txt" required>
+      <button type="submit">开始</button>
+    </form>
+    <p class="muted" id="import-status"></p>
+    <table id="import-results" hidden>
+      <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  {{else}}
+    <p class="muted">已经配了 API key，出于安全考虑这里不开放上传。请在服务器上跑
+      <code>mmxcode import --file accounts.txt</code>。</p>
+  {{end}}
+  {{if .Runs}}
+  <h2>最近的导入</h2>
+  <table>
+    <thead><tr><th>时间</th><th>来源</th><th>成功</th><th>失败</th></tr></thead>
+    <tbody>
+      {{range .Runs}}
+      <tr>
+        <td>{{.StartedAt.Format "2006-01-02 15:04:05"}}</td>
+        <td>{{.Source}}</td>
+        <td class="good">{{.OK}}</td>
+        <td class="bad">{{.Failed}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</section>
+{{end}}

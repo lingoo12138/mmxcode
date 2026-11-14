@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/usage"
@@ -71,6 +73,12 @@ type WebUI struct {
 	Cfg config.Config
 	// Store is the database.
 	Store *store.Store
+	// Import brings a batch of accounts in. It is a field so that the
+	// page and the command share one task, and so that a test can
+	// stand in for the network.
+	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
+	// Relogin signs the accounts that are signed out in again.
+	Relogin func(ctx context.Context) (fixed, failed int)
 
 	tmpl    *template.Template
 	mu      sync.Mutex
@@ -123,9 +131,19 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/events":
 		w.apiEvents(rw, r)
 		return
+	case "/api/import":
+		w.apiImport(rw, r)
+		return
+	case "/api/relogin":
+		w.apiRelogin(rw, r)
+		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/accounts/") {
 		w.apiAccount(rw, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/import/") {
+		w.apiImportRun(rw, r)
 		return
 	}
 	switch r.URL.Path {
@@ -137,6 +155,17 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		w.page(rw, r, "usage.html", w.usageData)
 	case "/login":
 		w.page(rw, r, "login.html", w.loginData)
+	case "/import":
+		// 只有没配 key 的网关才开放上传：配了 key 就说明别的机器能
+		// 进来，明文密码不该从那儿过。
+		if len(w.Cfg.Server.APIKeys) > 0 {
+			http.NotFound(rw, r)
+			return
+		}
+		w.page(rw, r, "import.html", w.importData)
+	case "/relogin":
+		// 重登页不受上传那个闸限制：它不接触明文密码。
+		w.page(rw, r, "relogin.html", w.reloginData)
 	default:
 		http.NotFound(rw, r)
 	}
@@ -715,4 +744,166 @@ func (w *WebUI) apiEvents(rw http.ResponseWriter, r *http.Request) {
 func writeJSON(rw http.ResponseWriter, v any) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(rw).Encode(v)
+}
+
+// maxImportBytes is how big an uploaded list may be.
+//
+// 一行一个账号，八兆字节已经是很长的一份清单了。
+const maxImportBytes = 8 << 20
+
+// importData is the import page's data.
+func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
+	runs, err := w.Store.ListImportRuns(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"UploadOpen": len(w.Cfg.Server.APIKeys) == 0,
+		"Runs":       runs,
+	}, nil
+}
+
+// apiImport takes a list of accounts and brings them in.
+//
+// The list is a file: every line is an account. The work goes on in
+// the background, and the answer says which run to watch.
+//
+// The file is read into memory and thrown away afterwards: it holds
+// passwords in the clear, and it must not land on the disk.
+func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
+	if len(w.Cfg.Server.APIKeys) > 0 {
+		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
+		return
+	}
+	if w.Import == nil {
+		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
+		return
+	}
+	// The request has a size limit, and the memory that ParseMultipartForm
+	// is given is bigger than it: the list therefore never reaches a
+	// temporary file, it stays in memory.
+	r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
+	if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(rw, "没有文件", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	entries, bad := provision.Parse(file)
+	for _, b := range bad {
+		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了。
+		log.Printf("import: 第 %d 行：%s", b.Line, b.Reason)
+	}
+	if len(entries) == 0 {
+		http.Error(rw, "清单里没有能用的账号", http.StatusBadRequest)
+		return
+	}
+	runID := newImportRunID()
+	now := time.Now()
+	if err := w.Store.CreateImportRun(r.Context(), store.ImportRun{
+		ID: runID, Source: "web", StartedAt: now, Total: len(entries),
+	}); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	go w.runImport(runID, entries)
+	// writeJSON 在这个包里只有两个参数，自己不写状态码：要 202 就先写。
+	rw.WriteHeader(http.StatusAccepted)
+	writeJSON(rw, map[string]any{"id": runID})
+}
+
+// newImportRunID makes the name of one import run.
+//
+// 时间还不够：两次上传可能落在同一毫秒里，那样的第二个会被主键挡下。
+func newImportRunID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("run_%d", time.Now().UnixMilli())
+	}
+	return fmt.Sprintf("run_%d_%s", time.Now().UnixMilli(), hex.EncodeToString(b))
+}
+
+// runImport brings a batch in and writes down what came of it.
+func (w *WebUI) runImport(runID string, entries []provision.Entry) {
+	ctx := context.Background()
+	results, err := w.Import(ctx, entries)
+	ok := 0
+	for _, r := range results {
+		if r.OK {
+			ok++
+		}
+	}
+	failed := len(results) - ok
+	if err != nil {
+		failed++
+	}
+	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
+		log.Printf("import %s: %v", runID, err)
+	}
+}
+
+// apiRelogin signs the accounts that are signed out in again.
+func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
+	if w.Relogin == nil {
+		http.Error(rw, "这个网关没有重登", http.StatusNotImplemented)
+		return
+	}
+	fixed, failed := w.Relogin(r.Context())
+	writeJSON(rw, map[string]any{"fixed": fixed, "failed": failed})
+}
+
+// apiImportRun says how one batch import is going.
+func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/import/")
+	run, err := w.Store.GetImportRun(r.Context(), id)
+	if err != nil {
+		http.Error(rw, "没有这一次导入", http.StatusNotFound)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"id":          run.ID,
+		"source":      run.Source,
+		"total":       run.Total,
+		"ok":          run.OK,
+		"failed":      run.Failed,
+		"results":     run.Results,
+		"finished_at": !run.FinishedAt.IsZero(),
+	})
+}
+
+// reloginData is the relogin page's data.
+//
+// Only the accounts that are signed out and still have a password are
+// listed: the others cannot be signed in again, and saying so is
+// better than a button that cannot work.
+func (w *WebUI) reloginData(ctx context.Context) (map[string]any, error) {
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0)
+	for _, a := range accounts {
+		if a.Status != store.StatusSignedOut {
+			continue
+		}
+		cipher, err := w.Store.Password(ctx, a.ID)
+		if err != nil || cipher == "" {
+			continue
+		}
+		// 存着的密码是加密的，可它也不该到页面上：这里只说这个账号
+		// 还能登回去。
+		out = append(out, map[string]any{
+			"ID": a.ID, "Name": a.Name, "Email": a.Email, "Error": a.LastError,
+		})
+	}
+	return map[string]any{"SignedOut": out}, nil
 }

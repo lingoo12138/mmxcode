@@ -1,0 +1,19 @@
+{{define "content"}}
+<section>
+  <h1>重登</h1>
+  <p class="muted">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
+  <p><button id="relogin-all">全部重登</button> <span class="muted" id="relogin-status"></span></p>
+  <table>
+    <thead><tr><th>账号</th><th>邮箱</th><th>上次为什么掉的</th></tr></thead>
+    <tbody>
+      {{range .SignedOut}}
+      <tr>
+        <td>{{.Name}}</td>
+        <td>{{.Email}}</td>
+        <td class="err">{{.Error}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}

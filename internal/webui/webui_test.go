@@ -1,10 +1,14 @@
 package webui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +18,16 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
 
-func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
+// newTestWebUIWithConfig makes a WebUI with a given configuration.
+//
+// The import page is only there when no API key is set, so a test that
+// wants to see it there needs a configuration of its own.
+func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Store) {
 	t.Helper()
 	s, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -49,12 +58,30 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
 	mgr := manager.New(s, up, acc, egress.New(groups, ""), oauth.NewRenewer())
-	cfg := config.Default()
 	// The outlet groups are the configuration's; the resolver is built
 	// from the same map, so the page and the resolver agree on which
 	// groups there are.
-	cfg.Proxy.Groups = groups
-	return New(mgr, cfg, s), s
+	if len(cfg.Proxy.Groups) == 0 {
+		cfg.Proxy.Groups = groups
+	}
+	w := New(mgr, cfg, s)
+	// The import and the relogin talk to the site, and a test must
+	// never talk to MiniMax itself: they are fields so that the test
+	// can stand in for the network.
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		out := make([]provision.Result, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, provision.Result{Email: e.Email, OK: true, AccountID: "acc_02"})
+		}
+		return out, nil
+	}
+	w.Relogin = func(ctx context.Context) (int, int) { return 1, 0 }
+	return w, s
+}
+
+func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
+	t.Helper()
+	return newTestWebUIWithConfig(t, config.Default())
 }
 
 func TestAccountsPage(t *testing.T) {
@@ -512,5 +539,409 @@ func TestAPIPatchOfAnAccountThatIsNotThere(t *testing.T) {
 	w.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheImportPageIsThereWhenNoAPIKeysAreSet says the import page is
+// there when the gateway has no key.
+//
+// 没有 key 的网关只听本机，明文密码不出这台机器，所以上传是开的。
+func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "批量导入") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
+// shut when the gateway has a key.
+//
+// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
+func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatal("the import page is open with API keys set")
+	}
+}
+
+// TestTheImportIsNotTakenWithAPIKeysAreSet says the upload itself is
+// shut too, not only the page.
+//
+// 页面关着而接口开着，那道闸就没有意义。
+func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestUploadingAFileAnswersWithAJobID says an upload gets an answer
+// that says which run to watch.
+//
+// 导入在后台跑，回答里给的是那一次的编号。
+func TestUploadingAFileAnswersWithAJobID(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"id\"") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheImportIsWrittenDown says the run is written down, so that the
+// page can say how it went.
+//
+// 跑完了要有痕迹：不然人只能盯着一个转圈的页面等。
+func TestTheImportIsWrittenDown(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	if run.OK != 1 || run.Failed != 0 {
+		t.Fatalf("run = %+v", run)
+	}
+}
+
+// TestTheAnswerToTheUploadHasNoPassword says the password of the list
+// does not go back out in the answer.
+//
+// 清单里有明文密码，回答里不能有。
+func TestTheAnswerToTheUploadHasNoPassword(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|secretpassword\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secretpassword") {
+		t.Fatalf("the password is in the answer: %s", rec.Body.String())
+	}
+}
+
+// TestTheBadLinesAreLoggedWithoutTheirPasswords says the log of a
+// list that cannot be read has no password in it.
+//
+// 清单里的密码是明文，日志是会被人看见的东西。
+func TestTheBadLinesAreLoggedWithoutTheirPasswords(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	var logged bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("notanemail|secretpassword\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(logged.String(), "secretpassword") {
+		t.Fatalf("the password is in the log: %s", logged.String())
+	}
+}
+
+// TestTheImportPageShowsTheRunsBefore says the import page says what
+// the last imports came to.
+//
+// 跑过的导入要在页面上看得见：人得知道刚才那趟成了几个。
+func TestTheImportPageShowsTheRunsBefore(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateImportRun(context.Background(), store.ImportRun{
+		ID: "run_1", Source: "web", StartedAt: now, Total: 3, OK: 2, Failed: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "最近的导入") {
+		t.Fatalf("the runs are not on the page: %q", body)
+	}
+	if !strings.Contains(body, "web") {
+		t.Fatalf("the source of the run is not on the page: %q", body)
+	}
+}
+
+// TestAListThatIsTooBigIsRefused says a list that is too big is turned
+// away.
+//
+// 清单是有上限的：请求的大小是有限的，而清单进内存的地方比这个上限
+// 大，所以它不会落到磁盘上的临时文件里去。
+func TestAListThatIsTooBigIsRefused(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("a@example.com|pw\n", 700000)
+	fw.Write([]byte(big))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAnUploadWithoutAFileIsRefused says an upload that has no file in
+// it is turned away.
+func TestAnUploadWithoutAFileIsRefused(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("other", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheUploadedListNeverLandsOnTheDisk says the uploaded list is not
+// written to a temporary file.
+//
+// 清单里有明文密码：它只该在内存里走一趟，不该落到磁盘上。
+// 清单比解析器的内存上限还大的时候，它本来会写进临时文件。
+func TestTheUploadedListNeverLandsOnTheDisk(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	// 临时目录换成一个空的：请求之后它里面不该多出东西来。
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 五兆字节：比解析器给的内存还多，比请求的上限还少。
+	fw.Write([]byte(strings.Repeat("a@example.com|pw\n", 300000)))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		names := make([]string, 0, len(left))
+		for _, e := range left {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("the list is on the disk: %v", names)
+	}
+}
+
+// TestTheReloginIsAskedFor says the relogin can be asked for.
+//
+// 重登是页面上一个按钮点出来的。
+// 重登是页面上一个按钮点出来的。
+func TestTheReloginIsAskedFor(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	req := httptest.NewRequest(http.MethodPost, "/api/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fixed") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageListsTheSignedOutAccounts says the relogin page
+// says which accounts are signed out.
+//
+// 签出了的账号要看得见，才知道该重登谁。
+func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_09", Name: "掉了的", Email: "b@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 没有密码就登不回去：这样的账号才拿得出手。
+	if err := s.SetPassword(context.Background(), "acc_09", "cipher", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "b@example.com") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageHasNoAccountWithoutAPassword says an account that
+// has no password is not on the relogin page.
+//
+// 没有密码就没有能登回去的东西，把它摆在那儿只会让人白按一次。
+func TestTheReloginPageHasNoAccountWithoutAPassword(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_10", Name: "没有密码的", Email: "c@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "c@example.com") {
+		t.Fatalf("an account without a password is on the page: %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageHasNoCipherText says the page does not carry the
+// password that is stored.
+//
+// 存的密码是加密的，可它也不该到页面上。
+func TestTheReloginPageHasNoCipherText(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_11", Name: "掉了的", Email: "d@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(context.Background(), "acc_11", "ciphertext", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "ciphertext") {
+		t.Fatalf("the stored password is on the page: %q", rec.Body.String())
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/gateway"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/scheduler"
 	"mmxcode/internal/webui"
 )
@@ -43,6 +44,24 @@ func newServeCmd(e *env) *cobra.Command {
 			}
 
 			ui := webui.New(e.mgr, e.cfg, e.store)
+			// 页面上传和命令行导入走的是同一件事：批量入号和重登。
+			//
+			// 密钥有问题的时候导入要停下来：悄悄把密码丢掉，会留下
+			// 一库谁也登不回去的账号。
+			keeper, keeperErr := passwordKeeper(false)
+			ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+				if keeperErr != nil {
+					return nil, keeperErr
+				}
+				runner, err := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
+				if err != nil {
+					return nil, err
+				}
+				return runner.Run(ctx, entries)
+			}
+			ui.Relogin = func(ctx context.Context) (int, int) {
+				return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
+			}
 			gw := gateway.New(e.mgr, e.cfg, e.store, ui)
 			sc := scheduler.New(e.mgr, e.cfg)
 

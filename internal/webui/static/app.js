@@ -234,3 +234,84 @@ function poll(id) {
     }
   }, 3000);
 }
+
+// 导入：把文件交上去，然后一直问那一次导入走到哪儿了。
+//
+// 上传回来的只有一次导入的编号，进度得自己问。
+document.addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#import-form');
+  if (!form) return;
+  ev.preventDefault();
+  const status = document.getElementById('import-status');
+  const input = form.querySelector('input[type=file]');
+  if (!input || !input.files || !input.files[0]) return;
+  status.textContent = '上传中……';
+  const data = new FormData();
+  data.append('file', input.files[0]);
+  try {
+    const res = await fetch('/api/import', { method: 'POST', body: data });
+    const answer = await readAnswer(res);
+    if (!answer.ok) throw new Error(messageOf(answer));
+    status.textContent = '导入中……';
+    watchImport(answer.json.id);
+  } catch (e) {
+    status.textContent = '失败：' + e.message;
+  }
+});
+
+function watchImport(id) {
+  const timer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/import/' + encodeURIComponent(id));
+      const answer = await readAnswer(res);
+      if (!answer.ok) throw new Error(messageOf(answer));
+      const run = answer.json;
+      const status = document.getElementById('import-status');
+      status.textContent = '导入中……成功 ' + run.ok + '，失败 ' + run.failed;
+      if (run.finished_at) {
+        clearInterval(timer);
+        showImportResults(run);
+      }
+    } catch (e) {
+      clearInterval(timer);
+      const status = document.getElementById('import-status');
+      if (status) status.textContent = '失败：' + e.message;
+    }
+  }, 3000);
+}
+
+function showImportResults(run) {
+  const table = document.getElementById('import-results');
+  if (!table) return;
+  const body = table.querySelector('tbody');
+  body.textContent = '';
+  let results = [];
+  try { results = JSON.parse(run.results || '[]'); } catch (e) { results = []; }
+  for (const r of results) {
+    const tr = document.createElement('tr');
+    const cells = [r.email, r.ok ? '成功' : '失败', r.message || ''];
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+  table.hidden = false;
+}
+
+// 重登：把签出的账号重新登一遍。
+document.addEventListener('click', async (ev) => {
+  const button = ev.target.closest('#relogin-all');
+  if (!button) return;
+  const status = document.getElementById('relogin-status');
+  status.textContent = '重登中……';
+  try {
+    const res = await fetch('/api/relogin', { method: 'POST' });
+    const answer = await readAnswer(res);
+    if (!answer.ok) throw new Error(messageOf(answer));
+    status.textContent = '成功 ' + answer.json.fixed + '，失败 ' + answer.json.failed;
+  } catch (e) {
+    status.textContent = '失败：' + e.message;
+  }
+});
