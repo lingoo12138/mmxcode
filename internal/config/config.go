@@ -127,6 +127,29 @@ type Schedule struct {
 	EgressHealth Duration `yaml:"egress_health" json:"egress_health"`
 }
 
+// Batch is how a batch import runs.
+type Batch struct {
+	// Interval is the wait between two accounts.
+	Interval Duration `yaml:"interval" json:"interval"`
+	// Group is the egress group the logins go through. An empty one
+	// is the default proxy.
+	Group string `yaml:"group" json:"group"`
+	// Relogin is the automatic signing-in again.
+	Relogin Relogin `yaml:"relogin" json:"relogin"`
+}
+
+// Relogin is the automatic signing-in again.
+type Relogin struct {
+	// Enabled says whether it runs at all. It is off by default:
+	// signing in again is the site's business, and a person should
+	// say so.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Cooldown is how long the scheduler waits between two rounds.
+	Cooldown Duration `yaml:"cooldown" json:"cooldown"`
+	// MaxAccounts is how many accounts one round touches.
+	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
+}
+
 // Config is the whole configuration.
 type Config struct {
 	Server   Server   `yaml:"server" json:"server"`
@@ -134,6 +157,7 @@ type Config struct {
 	Upstream Upstream `yaml:"upstream" json:"upstream"`
 	Rotation Rotation `yaml:"rotation" json:"rotation"`
 	Schedule Schedule `yaml:"schedule" json:"schedule"`
+	Batch    Batch    `yaml:"batch" json:"batch"`
 	DB       string   `yaml:"db" json:"db"`
 }
 
@@ -149,6 +173,13 @@ func Default() Config {
 			UsageRefresh: Duration(15 * time.Minute),
 			TokenRefresh: Duration(5 * time.Minute),
 			EgressHealth: Duration(2 * time.Minute),
+		},
+		Batch: Batch{
+			Interval: Duration(3 * time.Second),
+			Relogin: Relogin{
+				Cooldown:    Duration(time.Hour),
+				MaxAccounts: 20,
+			},
 		},
 		DB: "/data/mmxcode.db",
 	}

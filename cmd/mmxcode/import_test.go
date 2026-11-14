@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,5 +83,35 @@ func TestImportSaysWhyAnAccountDidNotMakeIt(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "密码") {
 		t.Fatalf("out = %q", out.String())
+	}
+}
+
+func TestImportStopsAtItsTimeout(t *testing.T) {
+	// 整趟导入有个时限：清单很大的时候，人不想等到天亮才知道它卡住了。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.txt")
+	if err := os.WriteFile(path, []byte("a@example.com|pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := aFakeEnv(t)
+	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+		return &provision.Runner{
+			Importer: &provision.Importer{
+				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
+					// 站点那边没有回答：这一趟就卡在这里。
+					<-ctx.Done()
+					return provision.Result{Email: email}, ctx.Err()
+				},
+			},
+			Interval: interval,
+			Sleep:    func(context.Context, time.Duration) error { return nil },
+		}
+	}
+	cmd := newImportCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--file", path, "--timeout", "100ms"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("the import ran past its timeout")
 	}
 }

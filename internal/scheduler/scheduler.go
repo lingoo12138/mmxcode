@@ -126,6 +126,18 @@ func (s *Scheduler) RenewTokens(ctx context.Context) {
 	}
 }
 
+// Relogin signs in again the accounts that are signed out.
+//
+// It runs on its own clock: the cooldown is how long the scheduler
+// waits between two rounds, so a sign-in that failed is not retried
+// every minute.
+func (s *Scheduler) Relogin(ctx context.Context) {
+	fixed, failed := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
+	if fixed > 0 || failed > 0 {
+		fmt.Printf("relogin: %d fixed, %d failed\n", fixed, failed)
+	}
+}
+
 // CheckEgress tests every outlet and records the result.
 //
 // The probe and the write have a context each. The probe's timeout is
@@ -177,6 +189,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 	go s.loop(ctx, usageEvery, s.RefreshUsage)
 	go s.loop(ctx, tokenEvery, s.RenewTokens)
 	go s.loop(ctx, egressEvery, s.CheckEgress)
+
+	// 重登是单独的活儿，不在续期器那条热路径上：续期器照旧把链断的
+	// 账号标成 signed_out，签回来的活儿交给这里。
+	if s.Cfg.Batch.Relogin.Enabled {
+		every := s.Cfg.Batch.Relogin.Cooldown.Duration()
+		if every <= 0 {
+			every = time.Hour
+		}
+		go s.loop(ctx, every, s.Relogin)
+	}
 
 	for {
 		next := NextCheckin(time.Now(), at, 30*time.Minute)

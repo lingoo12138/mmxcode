@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/provision"
 	"mmxcode/internal/secret"
@@ -44,6 +45,7 @@ func newImportCmd(e *env) *cobra.Command {
 	var group string
 	var interval time.Duration
 	var noStore bool
+	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "按清单批量登录账号",
@@ -51,13 +53,22 @@ func newImportCmd(e *env) *cobra.Command {
 			"密码登录之后默认加密存进库里（密钥在 " + PasswordKeyEnv + "），\n" +
 			"没有这个环境变量就登录一次就丢。",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runImport(cmd.Context(), e, cmd.OutOrStdout(), file, group, interval, noStore)
+			ctx := cmd.Context()
+			if timeout > 0 {
+				// 整趟导入有个时限：清单很大的时候，人不愿意等到
+				// 天亮才知道它卡住了。
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			return runImport(ctx, e, cmd.OutOrStdout(), file, group, interval, noStore)
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "账号清单（每行 邮箱|密码）")
 	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "每个账号之间的间隔")
 	cmd.Flags().BoolVar(&noStore, "no-store-password", false, "登录成功就丢密码，不入库")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")
 	_ = cmd.MarkFlagRequired("file")
 	return cmd
 }
@@ -171,6 +182,41 @@ func passwordKeeper(noStore bool) (func(string) (string, error), error) {
 		return nil, err
 	}
 	return key.Seal, nil
+}
+
+// reloginFn makes the function that signs an account in again.
+//
+// The account is already in the database: only the token is new. The
+// way out is the account's own proxy group, so that the sign-in comes
+// from where the account usually comes from — unless the person
+// asked for another group.
+func (e *env) reloginFn(group string) manager.ReloginFunc {
+	return func(ctx context.Context, acc store.Account, password string) error {
+		if group != "" {
+			// 人指名的组得是真的：组名写错而默默走全局默认出口，
+			// 看着跑通了，其实请求根本没走要去的那条路。
+			if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+				return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+			}
+		}
+		g := group
+		if g == "" {
+			g = acc.ProxyGroup
+		}
+		chain := e.chain(g, nil)
+		tok, err := chain.SignIn(ctx, acc.Email, password)
+		if err != nil {
+			return err
+		}
+		return e.store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID,
+			Access:    tok.Access,
+			Refresh:   tok.Refresh,
+			ExpiresAt: tok.Expires,
+			Subject:   tok.Subject,
+			UpdatedAt: time.Now(),
+		})
+	}
 }
 
 // runner makes the batch driver.

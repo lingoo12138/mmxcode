@@ -20,6 +20,7 @@ import (
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/provision"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -93,6 +94,14 @@ func newRoot() *cobra.Command {
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
+		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
+		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
+			e.mgr.Key = key
+		} else if strings.TrimSpace(os.Getenv(PasswordKeyEnv)) != "" {
+			// 密钥设了但是不对：说一声，别让人以为密码存下了。
+			fmt.Fprintf(os.Stderr, "warning: %s is set but unusable: %v\n", PasswordKeyEnv, err)
+		}
+		e.mgr.ReloginFn = e.reloginFn("")
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -103,6 +112,7 @@ func newRoot() *cobra.Command {
 
 	root.AddCommand(newLoginCmd(e))
 	root.AddCommand(newImportCmd(e))
+	root.AddCommand(newReloginCmd(e))
 	root.AddCommand(newAccountsCmd(e))
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))

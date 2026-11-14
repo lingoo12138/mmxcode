@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -249,5 +251,53 @@ func TestCheckEgressWritesAFailedHealth(t *testing.T) {
 	}
 	if rows[0].Error == "" {
 		t.Error("the row does not say why the outlet is broken")
+	}
+}
+
+func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(ctx, "acc_01", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr.Key = key
+	mgr.ReloginFn = func(ctx context.Context, a store.Account, password string) error {
+		return s.SaveToken(ctx, store.Token{
+			AccountID: a.ID, Access: "a", Refresh: "r",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+
+	sc := New(mgr, config.Default())
+	sc.Relogin(ctx)
+
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.StatusActive {
+		t.Fatalf("status = %q", got.Status)
 	}
 }

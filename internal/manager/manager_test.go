@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
@@ -1614,5 +1616,277 @@ func TestTheUnknownOutcomeKeepsTheCause(t *testing.T) {
 	}
 	if !strings.Contains(a.LastError, tokErr.Error()) {
 		t.Fatalf("last error = %q, want the cause %q", a.LastError, tokErr)
+	}
+}
+
+func TestReloginSignsTheAccountInAgain(t *testing.T) {
+	// 账号签出了，而且它有密码：拿密码重新登一次，状态回到 active。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		if password != "hunter2" {
+			t.Fatalf("password = %q", password)
+		}
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: "acc_1", Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	if err := m.Relogin(ctx, "acc_1"); err != nil {
+		t.Fatal(err)
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusActive {
+		t.Fatalf("status = %q", acc.Status)
+	}
+	if acc.LastError != "" {
+		t.Fatalf("last error = %q, want none", acc.LastError)
+	}
+	tok, err := m.Store.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new-access" || tok.Refresh != "new-refresh" {
+		t.Fatalf("token = %+v, want the new one", tok)
+	}
+}
+
+func TestReloginWithoutAPasswordSaysSo(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Relogin(ctx, "acc_1"); err == nil {
+		t.Fatal("no error for an account without a password")
+	}
+}
+
+func TestReloginWithoutAKeySaysSo(t *testing.T) {
+	// 密文在、密钥没了：说的是密钥的事，不是账号的事。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	err = m.Relogin(ctx, "acc_1")
+	if err == nil {
+		t.Fatal("no error without a key")
+	}
+	if !strings.Contains(err.Error(), "密钥") {
+		t.Fatalf("error = %q, want it to name the key", err)
+	}
+}
+
+func TestAFailedReloginLeavesTheAccountSignedOutWithTheReason(t *testing.T) {
+	// 登不回去的账号还是签出的，而且要说清楚为什么。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return errors.New("the site refused the password")
+	}
+	if err := m.Relogin(ctx, "acc_1"); err == nil {
+		t.Fatal("no error for a failed sign-in")
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want signed out", acc.Status)
+	}
+	if !strings.Contains(acc.LastError, "refused the password") {
+		t.Fatalf("last error = %q, want the reason", acc.LastError)
+	}
+}
+
+func TestReloginAllOnlyTouchesTheAccountsThatHaveAPassword(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	m.Key = key
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"acc_1", "acc_2"} {
+		if err := m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID, Access: "a", Refresh: "r",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	fixed, failed := m.ReloginAll(ctx, 10)
+	if fixed != 1 || failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusSignedOut {
+		t.Fatalf("the account without a password was touched: %q", acc.Status)
+	}
+}
+
+func TestReloginAllStopsAtTheLimit(t *testing.T) {
+	// 一轮只动几个号：剩下的留给下一轮。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	m.Key = key
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"acc_1", "acc_2", "acc_3"} {
+		if err := m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Store.SetPassword(ctx, id, cipher, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID, Access: "a", Refresh: "r",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	fixed, failed := m.ReloginAll(ctx, 2)
+	if fixed != 2 || failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	}
+}
+
+func TestReloginAllLeavesTheActiveAccountsAlone(t *testing.T) {
+	// 好着的账号不动：重登是给签出的号用的。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		called = true
+		return nil
+	}
+	fixed, failed := m.ReloginAll(ctx, 0)
+	if fixed != 0 || failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	}
+	if called {
+		t.Fatal("an active account was signed in again")
+	}
+}
+
+func TestTheReloginDropsTheOldChain(t *testing.T) {
+	// 新的登录换来的是新的链：旧的刷新令牌就此作废，不会再被发出去。
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	// 旧的那条链：renewer 手里有一份。
+	if _, err := m.Renewer.Renew(ctx, "acc_1", &oauth.Token{
+		Access: "old-access", Refresh: "old-refresh", Expires: now.Add(time.Hour),
+	}, func(ctx context.Context, refresh string) (*oauth.Token, error) {
+		return &oauth.Token{
+			Access: "old-access-2", Refresh: "old-refresh-2", Expires: now.Add(2 * time.Hour),
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Renewer.Newest("acc_1"); !ok {
+		t.Fatal("the renewer does not hold the old chain")
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: "acc_1", Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	if err := m.Relogin(ctx, "acc_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Renewer.Newest("acc_1"); ok {
+		t.Fatal("the old chain is still there: its refresh token could be sent again")
 	}
 }

@@ -45,6 +45,41 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestTheBatchSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `
+batch:
+  interval: 5s
+  group: clash
+  relogin:
+    enabled: true
+    cooldown: 2h
+    max_accounts: 30
+`
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Batch.Interval.Duration() != 5*time.Second {
+		t.Errorf("interval = %v", cfg.Batch.Interval)
+	}
+	if cfg.Batch.Group != "clash" {
+		t.Errorf("group = %q", cfg.Batch.Group)
+	}
+	if !cfg.Batch.Relogin.Enabled {
+		t.Error("the relogin is not on")
+	}
+	if cfg.Batch.Relogin.Cooldown.Duration() != 2*time.Hour {
+		t.Errorf("cooldown = %v", cfg.Batch.Relogin.Cooldown)
+	}
+	if cfg.Batch.Relogin.MaxAccounts != 30 {
+		t.Errorf("max accounts = %d", cfg.Batch.Relogin.MaxAccounts)
+	}
+}
+
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

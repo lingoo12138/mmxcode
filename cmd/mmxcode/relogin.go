@@ -1,0 +1,56 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"github.com/spf13/cobra"
+)
+
+func newReloginCmd(e *env) *cobra.Command {
+	var all bool
+	var accountID string
+	var group string
+	cmd := &cobra.Command{
+		Use:   "relogin",
+		Short: "把签出的账号登回去",
+		Long: "用存着的密码，把签出（signed_out）的账号重新登一遍。\n" +
+			"没有存密码的账号登不回去——那个键没有就是没有。",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, group, all)
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "重登所有签出且有密码的账号")
+	cmd.Flags().StringVar(&accountID, "account", "", "只重登这一个账号")
+	cmd.Flags().StringVar(&group, "group", "", "走哪个出口组（空 = 各账号自己的组）")
+	return cmd
+}
+
+// runRelogin signs the signed-out accounts in again.
+//
+// Either one account or all of them: "all of them" without saying so
+// is a surprise waiting to happen, and a named account is not a
+// surprise at all.
+func runRelogin(ctx context.Context, e *env, out io.Writer, accountID, group string, all bool) error {
+	if accountID == "" && !all {
+		return fmt.Errorf("要么说 --all，要么给一个 --account")
+	}
+	if group != "" {
+		// 人说了走哪个出口组，就走那个：账号自己的组这时不算数。
+		e.mgr.ReloginFn = e.reloginFn(group)
+	}
+	if accountID != "" {
+		if err := e.mgr.Relogin(ctx, accountID); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "重登完成：%s\n", accountID)
+		return nil
+	}
+	fixed, failed := e.mgr.ReloginAll(ctx, 0)
+	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", fixed, failed)
+	if failed > 0 {
+		return fmt.Errorf("有 %d 个账号没登回去", failed)
+	}
+	return nil
+}

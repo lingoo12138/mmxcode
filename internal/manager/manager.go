@@ -31,6 +31,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
@@ -84,6 +85,14 @@ type Manager struct {
 	Renewer *oauth.Renewer
 	// TokenURL is where a refresh token is traded in.
 	TokenURL string
+	// Key opens the passwords the accounts were brought in with.
+	//
+	// It is empty when there is no key: then an account cannot be
+	// signed in again, and saying so is better than pretending.
+	Key secret.Key
+	// ReloginFn signs an account in again. It is a field so that a
+	// test can stand in for the network.
+	ReloginFn ReloginFunc
 }
 
 // New makes a manager.
@@ -507,6 +516,86 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 	// not read back to be written again. A sign-out that happened
 	// while this was being written must not be undone by it.
 	_ = m.Store.SetAccountLastError(ctx, accountID, reason, time.Now())
+}
+
+// ReloginFunc signs an account in again with the password it was
+// brought in with.
+type ReloginFunc func(ctx context.Context, acc store.Account, password string) error
+
+// Relogin signs an account in again with the password it was brought
+// in with.
+//
+// An account without a password cannot be signed in again: there is
+// nothing to sign in with. That is an error, not a silent skip — the
+// person who asked wants to know.
+func (m *Manager) Relogin(ctx context.Context, accountID string) error {
+	acc, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	cipher, err := m.Store.Password(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if cipher == "" {
+		return errors.New("这个账号没有存密码，没法自己登回去")
+	}
+	if len(m.Key) == 0 {
+		// 没有密钥，密文就开不了。密文在，说明当初是存过的，是密钥
+		// 现在没了——说清楚，别让人以为是账号的问题。
+		return errors.New("没有密码的密钥，存着的密文开不了")
+	}
+	password, err := m.Key.Open(cipher)
+	if err != nil {
+		return err
+	}
+	if m.ReloginFn == nil {
+		return errors.New("没有地方能重新登录")
+	}
+	if err := m.ReloginFn(ctx, acc, password); err != nil {
+		if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+			return errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
+		}
+		return err
+	}
+	// 旧的那条链就此作废：这次登录换来的令牌是新的链，旧的刷新令牌
+	// 再也不会被发出去了。
+	m.Renewer.Forget(accountID)
+	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusActive, "", time.Now())
+}
+
+// ReloginAll signs in again every account that is signed out and has
+// a password.
+//
+// It gives back how many it fixed and how many it did not. The limit
+// says how many one round touches; zero means all of them.
+//
+// An account without a password is skipped and is not a failure: it
+// was never brought in with one, so there is nothing to sign in with,
+// and that is not this round's fault.
+func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int) {
+	accounts, err := m.Store.ListAccounts(ctx)
+	if err != nil {
+		return 0, 0
+	}
+	for _, acc := range accounts {
+		if acc.Status != store.StatusSignedOut {
+			continue
+		}
+		if limit > 0 && fixed+failed >= limit {
+			break
+		}
+		cipher, err := m.Store.Password(ctx, acc.ID)
+		if err != nil || cipher == "" {
+			continue
+		}
+		if err := m.Relogin(ctx, acc.ID); err != nil {
+			failed++
+			continue
+		}
+		fixed++
+	}
+	return fixed, failed
 }
 
 // spentRefresh remembers the refresh token that really went to the
