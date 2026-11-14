@@ -1058,16 +1058,81 @@ func TestARunThatFailedAsAWholeStillHasAnArrayOfResults(t *testing.T) {
 	if run.FinishedAt.IsZero() {
 		t.Fatalf("the run did not finish: %+v", run)
 	}
-	if run.Results != "[]" {
-		t.Fatalf("results = %q, want an empty array", run.Results)
+	if run.Results == "" || !strings.HasPrefix(run.Results, "[") {
+		t.Fatalf("results = %q, want an array", run.Results)
 	}
 	// The stored text has to be an array the page can walk through.
 	var results []map[string]any
 	if err := json.Unmarshal([]byte(run.Results), &results); err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 0 {
-		t.Fatalf("results = %v, want none", results)
+	// "null" parses all right and then comes out as nothing: the page
+	// walks through it and falls over.
+	if results == nil {
+		t.Fatalf("results = %q, want an array, not a null", run.Results)
+	}
+}
+
+// TestTheReasonARunFailedAsAWholeIsNotLost says the reason a whole
+// run failed does not disappear.
+//
+// 整趟失败的时候，原因原来既没进日志，也没进结果表：页面上只有「失
+// 败 1」，人永远不知道是钥匙写错了还是站点在限流。钥匙写错这一件
+// 事，页面上得说得出来。
+func TestTheReasonARunFailedAsAWholeIsNotLost(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return nil, errors.New("the key is not right")
+	}
+	var logged bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	// The reason has to be in the results: that is what the page shows.
+	if !strings.Contains(run.Results, "the key is not right") {
+		t.Fatalf("results = %q, want the reason in them", run.Results)
+	}
+	if run.Failed != 1 {
+		t.Fatalf("run = %+v, want the failure counted", run)
+	}
+	// And in the log: the run has no column of its own for the reason.
+	if !strings.Contains(logged.String(), "the key is not right") {
+		t.Fatalf("the log does not say why the run failed: %q", logged.String())
 	}
 }
 

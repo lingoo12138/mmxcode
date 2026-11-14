@@ -853,6 +853,12 @@ func newImportRunID() string {
 }
 
 // runImport brings a batch in and writes down what came of it.
+//
+// A run that fails as a whole says why, in two places: in the log, and
+// in the results the page shows. The run has no column of its own for
+// it, so the reason goes in as a row of its own — otherwise the page
+// says only "failed 1" and the operator never learns that the key was
+// wrong.
 func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 	ctx := context.Background()
 	results, err := w.Import(ctx, entries)
@@ -864,11 +870,29 @@ func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 	}
 	failed := len(results) - ok
 	if err != nil {
+		log.Printf("import %s: %v", runID, err)
+		results = append(results, provision.Result{
+			Email:   "（整趟）",
+			OK:      false,
+			Stage:   stageOf(err),
+			Message: "整趟导入没能完成：" + err.Error(),
+		})
 		failed++
 	}
 	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
 		log.Printf("import %s: %v", runID, err)
 	}
+}
+
+// stageOf says where an import failed, when it says.
+//
+// 整趟失败的时候，失败在哪儿也是话的一部分：错在哪一步，人要看得见。
+func stageOf(err error) provision.Stage {
+	var pe *provision.Error
+	if errors.As(err, &pe) {
+		return pe.Stage
+	}
+	return ""
 }
 
 // apiRelogin signs the accounts that are signed out in again.
