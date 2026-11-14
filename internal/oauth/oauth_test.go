@@ -579,10 +579,11 @@ func TestSignedOutNeedsTheStatus(t *testing.T) {
 }
 
 // TestStartDeviceUserCodeWithAZeroExpiredIn says a zero in the
-// expired_in field is a field that is there.
+// expired_in field is not a field the site means.
 //
-// expired_in 是 0 也是"有这个字段"，不是"没有这个字段"。没有这个
-// 字段和有这个字段是两件事：一个 plain int 分不出来。
+// expired_in 是 0 的时候，参考实现把它当没有这个字段（它的 pos() 只
+// 认大于零的值），于是这个答案不是拿 user code 去轮询的那种答案。
+// 一个零的截止时间不是截止时间。
 func TestStartDeviceUserCodeWithAZeroExpiredIn(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -594,12 +595,16 @@ func TestStartDeviceUserCodeWithAZeroExpiredIn(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t)
-	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
-	if err != nil {
-		t.Fatal(err)
+	_, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err == nil {
+		t.Fatal("expected an error")
 	}
-	if d.pollField != "user_code" || d.pollValue != "WXYZ-1234" {
-		t.Fatalf("poll = %s/%s", d.pollField, d.pollValue)
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "invalid_device_authorization_response" {
+		t.Fatalf("code = %q, want the invalid answer", oe.Code)
 	}
 }
 

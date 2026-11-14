@@ -149,7 +149,7 @@ mmxcode-api/
 3. 响应取 `user_code`、`device_code`、`verification_uri` / `verification_url`、`verification_uri_complete`、`expires_in` / `expired_in`、`interval`
 4. 向用户展示 user_code 与链接，轮询 `{account}/oauth2/token`，form：`grant_type=urn:ietf:params:oauth:grant-type:device_code`、`device_code`（或 `user_code`）、`client_id`、`code_verifier`
 
-**MiniMax 变体**：响应里可能没有 `device_code`，而是用 `user_code` 轮询、且 `expired_in` 可能是绝对毫秒时间戳。两 种形式都要支持，由 `expired_in` 是否存在且 `device_code` 是否缺失来判断。
+**MiniMax 变体**：响应里可能没有 `device_code`，而是用 `user_code` 轮询、且 `expired_in` 可能是绝对毫秒时间戳。两 种形式都要支持，由 `expired_in` 是否存在且大于零、`device_code` 是否缺失来判断。参考实现的 `pos()` 只认大于零的值，所以 `expired_in: 0` 等于没有这个字段 —— 一个零的截止时间不是截止时间。
 
 **轮询语义**：
 - `authorization_pending` / `status=pending` → 继续等

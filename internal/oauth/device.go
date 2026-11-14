@@ -284,6 +284,10 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		// is told from an answer whose field is zero. The two are not
 		// the same: the field says the site is polling for the user
 		// code, and a zero is a field that is there.
+		//
+		// A zero, though, is not a field the site means: the reference
+		// reads it as absent (its pos() only takes a value above
+		// zero), and so do we.
 		ExpiredIn *int64 `json:"expired_in"`
 		Interval  int64  `json:"interval"`
 	}
@@ -306,8 +310,10 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	//
 	// The field being there is what says so, and the user code has to
 	// be there to be polled for. A field that is not there at all is
-	// not a user-code poll, however the answer looks.
-	byUser := deviceCode == "" && userCode != "" && b.ExpiredIn != nil
+	// not a user-code poll, however the answer looks. A field that is
+	// there but says zero says nothing: the reference reads it as
+	// absent, and a zero end is not an end.
+	byUser := deviceCode == "" && userCode != "" && b.ExpiredIn != nil && *b.ExpiredIn > 0
 	switch {
 	case byUser:
 		d.pollField, d.pollValue = "user_code", userCode

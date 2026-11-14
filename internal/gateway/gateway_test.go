@@ -837,6 +837,73 @@ func TestAWrongKeySetsNoCookie(t *testing.T) {
 	}
 }
 
+// TestAScriptGetsJSONWhenItSignsIn says a script that posts JSON gets
+// JSON and the cookie, not a page.
+//
+// 脚本要的是一张票，不是一页 HTML：跟着重定向走会拿到一页它用不了
+// 的东西。
+func TestAScriptGetsJSONWhenItSignsIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader(`{"key":"sk-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("body = %s, want the ok answer", body)
+	}
+	found := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no cookie was given: %v", w.Header()["Set-Cookie"])
+	}
+}
+
+// TestAScriptIsToldInJSONThatItsKeyWasRefused says a refused key is
+// refused in JSON when the caller asked in JSON.
+//
+// 脚本拿到一页 HTML 的话，它读不出那句"key 不对"。
+func TestAScriptIsToldInJSONThatItsKeyWasRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader(`{"key":"sk-wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Fatalf("the answer is a page: %s", body)
+	}
+	if !strings.Contains(body, "refused") {
+		t.Fatalf("body = %s, want the refusal", body)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for a wrong key: %+v", c)
+		}
+	}
+}
+
 // TestACookieOfARotatedKeyIsRefused says a cookie stops working when
 // the key it was made of is not configured any more.
 //

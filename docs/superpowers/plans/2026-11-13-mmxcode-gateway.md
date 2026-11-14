@@ -5510,11 +5510,27 @@ Expected: FAIL —— `undefined: ToAnthropic`
 // MiniMax Code speaks the Anthropic Messages protocol natively. The
 // Responses protocol is turned into it here: the request is rewritten,
 // and the upstream's stream is rewritten back into Responses events.
+//
+// Two rules hold for the whole package:
+//
+//   - A piece of the answer that the Responses protocol has no shape
+//     for is left out, not faked. An Anthropic image block, a document
+//     or a tool result has no output item of its own in the Responses
+//     protocol, so it gets no item at all. Turning it into an empty
+//     message would tell the client that the model said nothing,
+//     which is not what happened.
+//
+//   - A tool call's arguments have to be a JSON object on the
+//     Anthropic side and a JSON string on the Responses side.
+//     Arguments that are neither are refused rather than turned into
+//     an empty object: an empty object is a tool call with arguments
+//     the caller never wrote.
 package convert
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // responsesRequest is the part of a Responses request that is read.
@@ -5525,6 +5541,7 @@ type responsesRequest struct {
 	MaxOutputTokens int             `json:"max_output_tokens"`
 	Stream          bool            `json:"stream"`
 	Tools           []responsesTool `json:"tools"`
+	ToolChoice      json.RawMessage `json:"tool_choice"`
 	Reasoning       *struct {
 		Effort string `json:"effort"`
 	} `json:"reasoning"`
@@ -5540,13 +5557,18 @@ type responsesTool struct {
 
 // anthropicRequest is the Anthropic Messages request that comes out.
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	MaxTokens int                `json:"max_tokens"`
-	Stream    bool               `json:"stream,omitempty"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
-	Thinking  *thinking          `json:"thinking,omitempty"`
+	Model      string               `json:"model"`
+	System     string               `json:"system,omitempty"`
+	Messages   []anthropicMessage   `json:"messages"`
+	MaxTokens  int                  `json:"max_tokens"`
+	Stream     bool                 `json:"stream,omitempty"`
+	Tools      []anthropicTool      `json:"tools,omitempty"`
+	ToolChoice *anthropicToolChoice `json:"tool_choice,omitempty"`
+	Thinking   *thinking            `json:"thinking,omitempty"`
+	// StopSequences are the sequences that end the answer. The
+	// Responses protocol has no such field, so it is only filled in
+	// when the request came from the OpenAI protocol.
+	StopSequences []string `json:"stop_sequences,omitempty"`
 }
 
 // anthropicMessage is one message.
@@ -5573,6 +5595,15 @@ type anthropicTool struct {
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
+// anthropicToolChoice is Anthropic's tool_choice.
+//
+// Anthropic always wants an object, even for the choices that the
+// Responses protocol writes as a plain string.
+type anthropicToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
+}
+
 // thinking is the Anthropic thinking setting.
 type thinking struct {
 	Type string `json:"type"`
@@ -5581,9 +5612,9 @@ type thinking struct {
 // ToAnthropic turns a Responses request into an Anthropic Messages
 // request.
 //
-// The model, the messages, the tools and the streaming flag all come
-// across. The Responses protocol's tool calls and tool results become
-// Anthropic's tool_use and tool_result blocks.
+// The model, the messages, the tools, the tool choice and the
+// streaming flag all come across. The Responses protocol's tool calls
+// and tool results become Anthropic's tool_use and tool_result blocks.
 func ToAnthropic(body []byte) ([]byte, error) {
 	var in responsesRequest
 	if err := json.Unmarshal(body, &in); err != nil {
@@ -5612,6 +5643,7 @@ func ToAnthropic(body []byte) ([]byte, error) {
 			InputSchema: schema,
 		})
 	}
+	out.ToolChoice = toolChoice(in.ToolChoice)
 	if in.Reasoning != nil && in.Reasoning.Effort != "" {
 		out.Thinking = &thinking{Type: "adaptive"}
 	}
@@ -5621,6 +5653,41 @@ func ToAnthropic(body []byte) ([]byte, error) {
 	}
 	out.Messages = msgs
 	return json.Marshal(out)
+}
+
+// toolChoice turns the Responses tool_choice into Anthropic's.
+//
+// The Responses protocol says "required" where Anthropic says "any",
+// and it names a function where Anthropic names a tool. A choice that
+// has no counterpart is left out: a different choice would silently
+// change what the model is allowed to do.
+func toolChoice(raw json.RawMessage) *anthropicToolChoice {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		switch s {
+		case "auto":
+			return &anthropicToolChoice{Type: "auto"}
+		case "none":
+			return &anthropicToolChoice{Type: "none"}
+		case "required":
+			return &anthropicToolChoice{Type: "any"}
+		}
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	if obj.Type == "function" && obj.Name != "" {
+		return &anthropicToolChoice{Type: "tool", Name: obj.Name}
+	}
+	return nil
 }
 
 // messages turns the Responses input into Anthropic messages.
@@ -5646,16 +5713,16 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 		switch typ {
 		case "function_call":
 			var fc struct {
-				CallID    string `json:"call_id"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
+				CallID    string          `json:"call_id"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
 			}
 			if err := json.Unmarshal(mustMarshal(item), &fc); err != nil {
 				return nil, err
 			}
-			input := json.RawMessage(fc.Arguments)
-			if len(input) == 0 {
-				input = json.RawMessage(`{}`)
+			input, err := toolInput(fc.Arguments)
+			if err != nil {
+				return nil, err
 			}
 			out = append(out, anthropicMessage{
 				Role: "assistant",
@@ -5708,6 +5775,49 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 		}}
 	}
 	return out, nil
+}
+
+// toolInput turns the arguments of a Responses tool call into the
+// input of an Anthropic tool_use.
+//
+// Anthropic wants an object and the Responses protocol carries the
+// arguments as a JSON string. Arguments that are not a JSON object
+// cannot be used, so they are refused: an empty object would be a
+// tool call with arguments the caller never wrote.
+func toolInput(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			// 没有参数的工具就是这样写的。
+			return json.RawMessage(`{}`), nil
+		}
+		if _, err := jsonObject([]byte(s)); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(s), nil
+	}
+	if _, err := jsonObject(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// jsonObject says whether a piece of JSON is an object.
+func jsonObject(raw []byte) (map[string]json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("responses: the tool call's arguments are not a JSON object")
+	}
+	if obj == nil {
+		// "null" reads as an object with nothing in it, but it is
+		// not one.
+		return nil, fmt.Errorf("responses: the tool call's arguments are not a JSON object")
+	}
+	return obj, nil
 }
 
 // blocks turns a Responses message's content into Anthropic blocks.
@@ -6249,7 +6359,10 @@ func TestCodexUsesAnthropicFallback(t *testing.T) {
 		if r.URL.Path != "/mavis/api/v1/llm/v1/messages" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
-		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"ok"}]}`))
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[` +
+			`{"type":"text","text":"ok"},` +
+			`{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Beijing"}}` +
+			`]}`))
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
 	w := httptest.NewRecorder()
@@ -6260,6 +6373,97 @@ func TestCodexUsesAnthropicFallback(t *testing.T) {
 	// 回退路径非流式时返回 Responses 的形状
 	if !strings.Contains(w.Body.String(), `"object":"response"`) {
 		t.Fatalf("body = %s", w.Body.String())
+	}
+	var resp struct {
+		Object     string `json:"object"`
+		Status     string `json:"status"`
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Type      string `json:"type"`
+			ID        string `json:"id"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Status    string `json:"status"`
+			Content   []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if resp.Object != "response" || resp.Status != "completed" {
+		t.Fatalf("the answer = %s", w.Body.String())
+	}
+	if resp.OutputText != "ok" {
+		t.Fatalf("output_text = %q", resp.OutputText)
+	}
+	// 工具调用不能被丢掉：模型要调工具，客户端得看得见它调的是哪个
+	// 工具、拿什么参数去调。非流式这条路以前只留 text 块，tool_use
+	// 块一个都没有，模型永远调不了工具。
+	var call *struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Status    string `json:"status"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	for i := range resp.Output {
+		if resp.Output[i].Type == "function_call" {
+			call = &resp.Output[i]
+		}
+	}
+	if call == nil {
+		t.Fatalf("the tool call was thrown away: %s", w.Body.String())
+	}
+	if call.CallID != "toolu_1" {
+		t.Fatalf("call_id = %q, want the tool_use block's id", call.CallID)
+	}
+	if call.Name != "get_weather" {
+		t.Fatalf("name = %q", call.Name)
+	}
+	if call.Arguments != `{"city":"Beijing"}` {
+		t.Fatalf("arguments = %q", call.Arguments)
+	}
+	if call.Status != "completed" {
+		t.Fatalf("status = %q", call.Status)
+	}
+	if call.ID == "" {
+		t.Fatal("the tool call has no id of its own")
+	}
+	// 文字块还是那一个文字块：两条路对同一个上游答案要一样。
+	var text *struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Status    string `json:"status"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	for i := range resp.Output {
+		if resp.Output[i].Type == "message" {
+			text = &resp.Output[i]
+		}
+	}
+	if text == nil {
+		t.Fatalf("the text block was thrown away: %s", w.Body.String())
+	}
+	if len(text.Content) != 1 || text.Content[0].Text != "ok" {
+		t.Fatalf("the message item = %+v", text.Content)
+	}
+	if text.ID == "" {
+		t.Fatal("the message item has no id of its own")
 	}
 }
 
@@ -6848,6 +7052,73 @@ func TestAWrongKeySetsNoCookie(t *testing.T) {
 	h.gw.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatalf("a cookie was given for a wrong key: %+v", c)
+		}
+	}
+}
+
+// TestAScriptGetsJSONWhenItSignsIn says a script that posts JSON gets
+// JSON and the cookie, not a page.
+//
+// 脚本要的是一张票，不是一页 HTML：跟着重定向走会拿到一页它用不了
+// 的东西。
+func TestAScriptGetsJSONWhenItSignsIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader(`{"key":"sk-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"ok":true`) {
+		t.Fatalf("body = %s, want the ok answer", body)
+	}
+	found := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no cookie was given: %v", w.Header()["Set-Cookie"])
+	}
+}
+
+// TestAScriptIsToldInJSONThatItsKeyWasRefused says a refused key is
+// refused in JSON when the caller asked in JSON.
+//
+// 脚本拿到一页 HTML 的话，它读不出那句"key 不对"。
+func TestAScriptIsToldInJSONThatItsKeyWasRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/api/session", strings.NewReader(`{"key":"sk-wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<html") {
+		t.Fatalf("the answer is a page: %s", body)
+	}
+	if !strings.Contains(body, "refused") {
+		t.Fatalf("body = %s, want the refusal", body)
 	}
 	for _, c := range w.Result().Cookies() {
 		if c.Name == sessionCookie && c.Value != "" {
@@ -7446,10 +7717,13 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 // The key comes from the form the browser posts, or from a JSON body a
 // script sends. The page that comes back never carries the key: it is a
 // secret, and the page might sit in a cache.
+//
+// A script gets JSON and the cookie, not a page: a redirect would send
+// it to a page it cannot use. The browser gets the page.
 func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	keys := s.Cfg.Server.APIKeys
 	if len(keys) == 0 {
-		writeError(w, http.StatusBadRequest, "this gateway has no api key configured")
+		writeError(w, protocolOf(r.URL.Path), http.StatusBadRequest, "this gateway has no api key configured")
 		return
 	}
 	key := submittedKey(r)
@@ -7457,11 +7731,28 @@ func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	if k, ok := matchingKey(key, keys); ok {
 		s.setSessionCookie(w, r, k)
 		w.Header().Set("Cache-Control", "no-store")
+		if wantsJSON(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	// 错的 key：不发 cookie
+	if wantsJSON(r) {
+		writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
+		return
+	}
 	s.signInPage(w, r, http.StatusUnauthorized, "the key was refused")
+}
+
+// wantsJSON says the caller wants an answer in JSON rather than a page.
+//
+// 浏览器交表单，脚本交 JSON。分清楚了，脚本才拿得到 JSON：它要是
+// 跟着重定向走，拿回来的是一页 HTML，那对它没有用。
+func wantsJSON(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("Content-Type"), "application/json")
 }
 
 // signOut takes the cookie away.
@@ -7599,16 +7890,14 @@ import (
 )
 
 // writeError writes a plain error answer.
-func writeError(w http.ResponseWriter, status int, msg string) {
+//
+// The shape is the one of the protocol the client speaks: an OpenAI
+// client reads the error out of "error", and an Anthropic or a Codex
+// client reads the type out of it as well.
+func writeError(w http.ResponseWriter, proto protocol, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type":    "api_error",
-			"message": msg,
-		},
-	})
+	json.NewEncoder(w).Encode(errorBody(proto, "api_error", msg))
 }
 
 // writeRateLimit writes the answer for a refusal that is about the
@@ -7616,16 +7905,28 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 //
 // The client is told the limit was reached, so it knows to wait and
 // try again rather than that something broke.
-func writeRateLimit(w http.ResponseWriter, message string) {
+func writeRateLimit(w http.ResponseWriter, proto protocol, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
-	json.NewEncoder(w).Encode(map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type":    "rate_limit_error",
-			"message": "usage limit reached: " + message,
-		},
-	})
+	json.NewEncoder(w).Encode(errorBody(proto, "rate_limit_error", "usage limit reached: "+message))
+}
+
+// errorBody gives the body of an error.
+//
+// The Anthropic and the Codex protocols carry the type beside the
+// error; the OpenAI one carries the error on its own.
+func errorBody(proto protocol, kind, msg string) map[string]any {
+	errObj := map[string]any{
+		"type":    kind,
+		"message": msg,
+	}
+	if proto == protocolOpenAI {
+		return map[string]any{"error": errObj}
+	}
+	return map[string]any{
+		"type":  "error",
+		"error": errObj,
+	}
 }
 ```
 
@@ -7707,6 +8008,14 @@ type Server struct {
 	// 每个请求都读它，而第一个 404 会把它写掉：一个字段被一个请求写、
 	// 被别的请求读，就是数据竞争。所以它是 atomic 的。
 	NativeResponses atomic.Bool
+	// NativeChatCompletions says the upstream speaks the OpenAI chat
+	// completions protocol itself. It is tried and turned off when the
+	// upstream says no.
+	//
+	// 参考实现只走 Anthropic 的 /messages，这条路是照着同目录下的
+	// /messages 推的：站点也许有，也许没有。它和 NativeResponses 是
+	// 同一根杆，同一个理由才用 atomic。
+	NativeChatCompletions atomic.Bool
 	// WebUI serves the management pages, when there is one.
 	WebUI http.Handler
 }
@@ -7722,6 +8031,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	}
 	// 原生路径先开着：上游说它没有 /responses 的时候再关。
 	g.NativeResponses.Store(true)
+	g.NativeChatCompletions.Store(true)
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -7839,7 +8149,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.auth(r) {
 		if isAPIPath(r.URL.Path) {
-			writeError(w, http.StatusUnauthorized, "the key was refused")
+			writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
 			return
 		}
 		// 浏览器来的是页面：给它登录页，不是一段 JSON。
@@ -7868,7 +8178,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.WebUI.ServeHTTP(w, r)
 		return
 	}
-	writeError(w, http.StatusNotFound, "no such endpoint")
+	writeError(w, protocolOf(r.URL.Path), http.StatusNotFound, "no such endpoint")
 }
 
 // protocol is the protocol the client speaks.
@@ -7880,11 +8190,41 @@ const (
 	protocolCodex
 )
 
+// protocolOf says which protocol a path speaks.
+//
+// 一个路径一个协议：错误的样子也跟着协议走，所以路由和错误都要问
+// 同一句。
+func protocolOf(path string) protocol {
+	switch path {
+	case "/v1/chat/completions":
+		return protocolOpenAI
+	case "/v1/responses":
+		return protocolCodex
+	default:
+		return protocolAnthropic
+	}
+}
+
+// maxBodyBytes is how large a request body may be.
+//
+// 一段对话的长上下文是几兆，32 MiB 已经很宽裕。再大的请求不是对话，
+// 是要把它这个网关的内存吃光的东西：没有上限的时候，一个请求就能
+// 让网关没有内存可用。
+const maxBodyBytes = 32 << 20
+
 // handleChat serves a chat request.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
+	// 请求体有个上限：不然一个客户端发来一大块东西，网关就把它整个
+	// 读进内存里，然后就没有内存了。
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "the request body could not be read")
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, proto, http.StatusRequestEntityTooLarge, "the request body is too large")
+			return
+		}
+		writeError(w, proto, http.StatusBadRequest, "the request body could not be read")
 		return
 	}
 	// 上游请求的时限就是配的那一个。流式对话也吃这份预算：想要更长的
@@ -7903,7 +8243,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 那个上游没见过，会把这段对话当成新的一段。
 	upstreamID, err := s.Rot.UpstreamID(ctx, sess)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
@@ -7913,6 +8253,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 客户端最后看到的是上游的话，不是网关自己编的一句。
 	var quota bool
 	var quotaMsg string
+	// lastStatus 是上游最后一次给的状态，lastMsg 是它自己说的那句。
+	// 客户端最后看到的是上游的状态，不是网关编出来的一个 429：上游说
+	// 503 就是 503，客户端才知道是上游坏了，而不是自己被限流了。
+	var lastStatus int
+	var lastMsg string
 	attempts := s.Cfg.Rotation.MaxAttempts
 	if attempts <= 0 {
 		attempts = 3
@@ -7922,10 +8267,10 @@ accountLoop:
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
 			if lastErr != nil {
-				s.writeFailure(w, quota, quotaMsg, lastErr)
+				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 				return
 			}
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		used[plan.AccountID] = true
@@ -7941,7 +8286,11 @@ accountLoop:
 			continue
 		}
 
-		upBody, upPath, convertBack := s.upstreamShape(body, proto)
+		upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
+		if err != nil {
+			writeError(w, proto, http.StatusBadRequest, err.Error())
+			return
+		}
 		chatReq := upstream.ChatRequest{
 			BaseURL:   s.UpstreamBase,
 			Path:      upPath,
@@ -7968,32 +8317,43 @@ accountLoop:
 				var oe *upstream.OtherSiteError
 				if errors.As(err, &oe) {
 					// 跨站：不换号、不消耗 refresh token
-					writeError(w, http.StatusBadGateway, oe.Error())
+					writeError(w, proto, http.StatusBadGateway, oe.Error())
 					return
 				}
-				// 网络没通：还是这个账号，等一等再来。
+				// 网络没通：还是这个账号，等一等再来。上游没有给出
+				// 状态：这是网关自己的问题。
 				lastErr = err
-				time.Sleep(backoff(try))
+				lastStatus = 0
+				lastMsg = ""
+				if !sleepCtx(ctx, backoff(try)) {
+					break accountLoop
+				}
 				continue
 			}
 
-			// 上游没有 /responses：改用本地转换，同一个账号再来一次
-			if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses.Load() {
-				s.NativeResponses.Store(false)
-				upBody, upPath, convertBack = s.upstreamShape(body, proto)
-				chatReq.Body = upBody
-				chatReq.Path = upPath
-				chatReq.Anthropic = upPath == site.MessagesPath
-				resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
-				if err != nil {
-					var oe *upstream.OtherSiteError
-					if errors.As(err, &oe) {
-						writeError(w, http.StatusBadGateway, oe.Error())
-						return
+			// 上游没有这条路：改用本地转换，同一个账号再来一次
+			if resp.StatusCode == http.StatusNotFound {
+				fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
+				if ok {
+					upBody, upPath, convertBack = fb, fp, fback
+					chatReq.Body = upBody
+					chatReq.Path = upPath
+					chatReq.Anthropic = upPath == site.MessagesPath
+					resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+					if err != nil {
+						var oe *upstream.OtherSiteError
+						if errors.As(err, &oe) {
+							writeError(w, proto, http.StatusBadGateway, oe.Error())
+							return
+						}
+						lastErr = err
+						lastStatus = 0
+						lastMsg = ""
+						if !sleepCtx(ctx, backoff(try)) {
+							break accountLoop
+						}
+						continue
 					}
-					lastErr = err
-					time.Sleep(backoff(try))
-					continue
 				}
 			}
 
@@ -8006,12 +8366,19 @@ accountLoop:
 			// 200 但身体里有业务错误
 			if resp.StatusCode == http.StatusOK {
 				if err := upstream.CheckEnvelope("chat", raw); err == nil {
-					s.writeJSON(w, resp, raw, proto, convertBack)
+					s.writeJSON(w, resp, raw, proto, convertBack, model)
 					return
 				}
 			}
 
 			failure := s.failure(resp.StatusCode, raw)
+			lastStatus = resp.StatusCode
+			lastMsg = failure.Message
+			if lastMsg == "" {
+				// 上游自己说的话要给客户端和运维看：只知道一个状态码，
+				// 谁也说不清到底是哪一件事坏了。
+				lastMsg = upstreamMessage(raw)
+			}
 			switch s.action(failure) {
 			case rotator.ActionFailover:
 				// 额度用完了：这个账号的窗口记成用完，换一个账号。
@@ -8033,8 +8400,10 @@ accountLoop:
 				if rerr != nil {
 					// 跨站：不换号、不消耗 refresh token
 					var oe *upstream.OtherSiteError
+					// 续签自己的错要看 rerr：err 是上一次尝试的，
+					// 那时候它是空的，看它永远看不出来。
 					if errors.As(rerr, &oe) {
-						writeError(w, http.StatusBadGateway, oe.Error())
+						writeError(w, proto, http.StatusBadGateway, oe.Error())
 						return
 					}
 					lastErr = rerr
@@ -8053,13 +8422,13 @@ accountLoop:
 				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 				quota = false
 				quotaMsg = ""
-				time.Sleep(backoff(try))
+				if !sleepCtx(ctx, backoff(try)) {
+					break accountLoop
+				}
 				continue
 			default:
-				// 给不出别的说法：上游的答案原样给客户端。
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(resp.StatusCode)
-				w.Write(raw)
+				// 给不出别的说法：上游的状态原样给客户端。
+				s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
 				return
 			}
 		}
@@ -8067,7 +8436,7 @@ accountLoop:
 	if lastErr == nil {
 		lastErr = fmt.Errorf("the request could not be served")
 	}
-	s.writeFailure(w, quota, quotaMsg, lastErr)
+	s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 }
 
 // failure says what went wrong upstream.
@@ -8094,6 +8463,37 @@ func (s *Server) failure(status int, raw []byte) rotator.Failure {
 	return f
 }
 
+// upstreamMessage reads the message out of an upstream body.
+//
+// 上游的话要看得见：客户端和运维都要知道上游说了什么，而不是只知道
+// 一个状态码。这和 rotator 读消息的办法是一样的，但那是它做决定要
+// 用的，这里只是把它说出来。
+func upstreamMessage(raw []byte) string {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	for _, key := range []string{"message", "msg"} {
+		var s string
+		if json.Unmarshal(obj[key], &s) == nil && s != "" {
+			return s
+		}
+	}
+	for _, key := range []string{"error", "err"} {
+		var sub map[string]json.RawMessage
+		if json.Unmarshal(obj[key], &sub) != nil {
+			continue
+		}
+		for _, k := range []string{"message", "msg"} {
+			var s string
+			if json.Unmarshal(sub[k], &s) == nil && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // action says what to do about the answer.
 //
 // The rotator owns the rule. The one thing it cannot know is that the
@@ -8118,19 +8518,40 @@ func (s *Server) action(failure rotator.Failure) rotator.Action {
 
 // writeFailure writes the answer of a request that could not be served.
 //
+// The status is the upstream's own, when the upstream gave one: a 503
+// is a 503 and a 400 is a 400. Calling both of them a 429 tells the
+// client it was sent too fast, and it backs off from a gateway that is
+// not the problem. The one that stays a 429 is the refusal about the
+// credits: that is the one the client can do something about.
+//
+// A failure with no upstream status at all is the gateway's own: the
+// request never got through, and that is a 502.
+//
 // The words the client is given are the upstream's own when it said the
 // credits are gone: "usage limit reached: …" tells the client to wait
 // and try again, which a plain error does not.
-func (s *Server) writeFailure(w http.ResponseWriter, quota bool, quotaMsg string, err error) {
+func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool, quotaMsg string, status int, message string, err error) {
 	if quota {
-		message := quotaMsg
-		if message == "" {
-			message = "the account's credits or plan are used up"
+		msg := quotaMsg
+		if msg == "" {
+			msg = "the account's credits or plan are used up"
 		}
-		writeRateLimit(w, message)
+		writeRateLimit(w, proto, msg)
 		return
 	}
-	writeError(w, http.StatusTooManyRequests, err.Error())
+	if status == 0 {
+		// 上游没有给出状态：网络没通。这是网关自己的问题。
+		msg := "the request did not get through"
+		if err != nil {
+			msg = err.Error()
+		}
+		writeError(w, proto, http.StatusBadGateway, msg)
+		return
+	}
+	if message == "" {
+		message = fmt.Sprintf("the upstream answered with HTTP %d", status)
+	}
+	writeError(w, proto, status, message)
 }
 
 // attempt sends the request upstream and gives the answer back.
@@ -8238,25 +8659,70 @@ func sseHasError(head []byte) bool {
 
 // upstreamShape gives the request the upstream is to get.
 //
-// Anthropic and OpenAI go through untouched: the site speaks both. The
-// Responses protocol is turned into the Anthropic one, unless the site
-// has shown it speaks Responses itself.
-func (s *Server) upstreamShape(body []byte, proto protocol) (out []byte, path string, convertBack bool) {
+// Anthropic goes through untouched: the site speaks it. The OpenAI and
+// the Responses protocols go through untouched as long as the site is
+// thought to speak them; when the site says it does not have them (a
+// 404), the request is turned into an Anthropic one and the answer is
+// turned back afterwards.
+func (s *Server) upstreamShape(body []byte, proto protocol) (out []byte, path string, convertBack bool, err error) {
 	switch proto {
 	case protocolAnthropic:
-		return body, site.MessagesPath, false
+		return body, site.MessagesPath, false, nil
 	case protocolOpenAI:
-		return body, site.ChatCompletionsPath, false
+		if s.NativeChatCompletions.Load() {
+			return body, site.ChatCompletionsPath, false, nil
+		}
+		b, cerr := convert.ToAnthropicOpenAI(body)
+		if cerr != nil {
+			return nil, "", false, fmt.Errorf("the request could not be turned into the upstream's format: %w", cerr)
+		}
+		return b, site.MessagesPath, true, nil
 	default:
 		if s.NativeResponses.Load() {
-			return body, site.ResponsesPath, false
+			return body, site.ResponsesPath, false, nil
 		}
-		b, err := convert.ToAnthropic(body)
-		if err != nil {
-			return body, site.ResponsesPath, false
+		b, cerr := convert.ToAnthropic(body)
+		if cerr != nil {
+			return nil, "", false, fmt.Errorf("the request could not be turned into the upstream's format: %w", cerr)
 		}
-		return b, site.MessagesPath, true
+		return b, site.MessagesPath, true, nil
 	}
+}
+
+// fallbackShape gives the shape to use when the upstream does not have
+// the path the request went out to.
+//
+// The site may well serve /chat/completions and /responses itself, and
+// that is the better way: nothing is converted and nothing is lost.
+// When it answers a 404 instead, the path is closed for everybody and
+// the request is turned into an Anthropic one; the answer is turned
+// back afterwards.
+//
+// The path the request went out to is what decides: a request that
+// already went out as an Anthropic one has no fallback left, and its
+// 404 is the upstream's own answer.
+func (s *Server) fallbackShape(body []byte, proto protocol, path string) (out []byte, newPath string, convertBack bool, ok bool) {
+	switch proto {
+	case protocolCodex:
+		if path != site.ResponsesPath {
+			return nil, "", false, false
+		}
+		// 上游说它没有 /responses：这条路就关掉了。
+		s.NativeResponses.Store(false)
+	case protocolOpenAI:
+		if path != site.ChatCompletionsPath {
+			return nil, "", false, false
+		}
+		// 上游说它没有 /chat/completions：这条路就关掉了。
+		s.NativeChatCompletions.Store(false)
+	default:
+		return nil, "", false, false
+	}
+	b, p, back, err := s.upstreamShape(body, proto)
+	if err != nil {
+		return nil, "", false, false
+	}
+	return b, p, back, true
 }
 
 // copyHeaders gives the client's the upstream's headers.
@@ -8293,9 +8759,14 @@ func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto p
 
 	var err error
 	if convertBack {
-		// 转换器自己收尾：它失败的时候已经写了一个 response.failed，
+		// 转换器自己收尾：它失败的时候已经写了一个失败事件，
 		// 网关再写一个就是第二次失败，形状还不一样。
-		err = convert.StreamResponses(resp.Body, w, model)
+		switch proto {
+		case protocolCodex:
+			err = convert.StreamResponses(resp.Body, w, model)
+		case protocolOpenAI:
+			err = convert.StreamChatCompletions(resp.Body, w, model)
+		}
 	} else {
 		sniffer := &idSniffer{w: w}
 		_, err = io.Copy(sniffer, resp.Body)
@@ -8383,11 +8854,11 @@ func (s *idSniffer) responseID() string {
 var responseIDPattern = regexp.MustCompile(`"id"\s*:\s*"(resp[^"]*)"`)
 
 // writeJSON writes a whole answer to the client.
-func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []byte, proto protocol, convertBack bool) {
+func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []byte, proto protocol, convertBack bool, model string) {
 	if convertBack {
-		out, err := convertResponses(body, proto)
+		out, err := backConvert(body, proto, model)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, proto, http.StatusBadGateway, err.Error())
 			return
 		}
 		body = out
@@ -8400,70 +8871,42 @@ func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []by
 	w.Write(body)
 }
 
-// convertResponses turns an Anthropic answer into a Responses answer.
-func convertResponses(body []byte, proto protocol) ([]byte, error) {
-	if proto != protocolCodex {
+// backConvert turns the upstream's Anthropic answer into the shape the
+// client speaks.
+//
+// The upstream answered in Anthropic because the site has no endpoint
+// of the client's own: the Codex protocol gets a Responses answer, the
+// OpenAI protocol a chat completion.
+func backConvert(body []byte, proto protocol, model string) ([]byte, error) {
+	switch proto {
+	case protocolCodex:
+		return convert.ToResponses(body, model)
+	case protocolOpenAI:
+		return convert.ToChatCompletion(body, model)
+	default:
 		return body, nil
 	}
-	var msg struct {
-		ID      string `json:"id"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(body, &msg); err != nil {
-		return nil, fmt.Errorf("the upstream's answer could not be read")
-	}
-	text := ""
-	for _, c := range msg.Content {
-		if c.Type == "text" {
-			text += c.Text
-		}
-	}
-	out := map[string]any{
-		"id":     msg.ID,
-		"object": "response",
-		"status": "completed",
-		"output": []any{map[string]any{
-			"type": "message", "role": "assistant",
-			"content": []any{map[string]any{"type": "output_text", "text": text}},
-		}},
-		"output_text": text,
-	}
-	return json.Marshal(out)
 }
 
 // handleModels serves the model list.
+//
+// The list is the built-in one. The site's own model endpoint answers
+// the shape of the provider config and not the shape of a model list,
+// so the live list was never read: it was fetched on every call and
+// thrown away, and it could even renew a token on the way.
+//
+// 现场的模型列表不在这个网关的活儿里：网关给的是它自己知道的那一份。
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	var access string
-	accounts, err := s.Store.ListAccounts(r.Context())
-	if err == nil && len(accounts) > 0 {
-		if tok, err := s.Mgr.Token(r.Context(), accounts[0].ID); err == nil {
-			access = tok.Access
-		}
-	}
-	raw, err := s.Mgr.Up.Models(r.Context(), s.UpstreamBase, access)
-	if err != nil || len(raw) == 0 {
-		raw = nil
-	}
-	var out struct {
-		Data []map[string]any `json:"data"`
-	}
-	if raw != nil {
-		json.Unmarshal(raw, &out)
-	}
-	if len(out.Data) == 0 {
-		for _, m := range site.FallbackModels() {
-			out.Data = append(out.Data, map[string]any{
-				"id": m.ID, "object": "model", "owned_by": "minimax",
-			})
-		}
+	data := []map[string]any{}
+	for _, m := range site.FallbackModels() {
+		data = append(data, map[string]any{
+			"id": m.ID, "object": "model", "owned_by": "minimax",
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
-		"data":   out.Data,
+		"data":   data,
 	})
 }
 
@@ -8494,6 +8937,24 @@ func backoff(attempt int) time.Duration {
 		d = 4 * time.Second
 	}
 	return d
+}
+
+// sleepCtx waits, unless the request is over.
+//
+// 客户端走了就不必再等：等着只是白占着上游的次数和时间，一个请求能
+// 让九次上游调用和三十秒的睡觉一起吊着。
+//
+// It says whether the wait was over: false means the request is over
+// and nothing more should be asked upstream.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // clientHeaders gives the headers the client set that are worth
@@ -9457,16 +9918,20 @@ package webui
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"mmxcode/internal/account"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
@@ -9489,8 +9954,26 @@ type pendingLogin struct {
 	URL       string
 	Device    *oauth.Device
 	CreatedAt time.Time
-	Err       string
+	// Err says why the sign-in did not work. It is empty while the
+	// sign-in is still going on.
+	//
+	// It is written and read under the WebUI's lock. A string is two
+	// words, and reading one of them while the other one is being
+	// written gives a string that is half of one thing and half of
+	// another: a pointer to nowhere with a length that is not there.
+	Err string
+	// FailedAt is when the sign-in failed. It is zero while the sign-in
+	// is still going on.
+	FailedAt time.Time
 }
+
+// defaultPendingTTL is how long a sign-in that has ended is kept.
+//
+// A sign-in that failed has to be kept long enough for the browser to
+// be told why: the page asks about it every few seconds. After that it
+// goes, so that a server that is up for a long time does not keep every
+// sign-in it ever had.
+const defaultPendingTTL = 10 * time.Minute
 
 // WebUI serves the pages and the API.
 type WebUI struct {
@@ -9504,6 +9987,9 @@ type WebUI struct {
 	tmpl    *template.Template
 	mu      sync.Mutex
 	pending map[string]*pendingLogin
+	// pendingTTL is how long a sign-in that has ended is kept. It is a
+	// field so that a test can make it short.
+	pendingTTL time.Duration
 }
 
 // New makes the WebUI.
@@ -9513,11 +9999,12 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 	// last page's content, so every page would render the last one.
 	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
-		Mgr:     mgr,
-		Cfg:     cfg,
-		Store:   s,
-		tmpl:    tmpl,
-		pending: map[string]*pendingLogin{},
+		Mgr:        mgr,
+		Cfg:        cfg,
+		Store:      s,
+		tmpl:       tmpl,
+		pending:    map[string]*pendingLogin{},
+		pendingTTL: defaultPendingTTL,
 	}
 }
 
@@ -9752,6 +10239,12 @@ func (w *WebUI) loginData(ctx context.Context) (map[string]any, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, p := range w.pending {
+		// A sign-in that failed is not waiting for anybody any more. It
+		// is kept a while so that the page can say why it failed, and
+		// it must not be shown as one that is still going on.
+		if p.Err != "" {
+			continue
+		}
 		return map[string]any{"Pending": map[string]any{
 			"UserCode": p.UserCode, "URL": p.URL,
 		}}, nil
@@ -9804,36 +10297,109 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	tok, err := d.Poll(ctx, w.Mgr.Up, site.AccountURL(site.TokenPath))
-	w.mu.Lock()
-	p := w.pending[id]
-	w.mu.Unlock()
 	if err != nil {
-		w.mu.Lock()
-		if p != nil {
-			p.Err = err.Error()
-		}
-		w.mu.Unlock()
+		w.failLogin(id, err.Error())
 		return
 	}
 	now := time.Now()
 	acc := store.Account{
-		ID:        fmt.Sprintf("acc_%d", now.UnixMilli()),
-		Name:      tok.Subject,
-		UserID:    tok.Subject,
+		ID:        newAccountID(),
 		Status:    store.StatusActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	// 账户是谁，要问站点本人：令牌里的那个 sub 是猜的，签到和积分
+	// 明细要的是真的那个 user id。命令行就是这么做的，这里也一样。
+	who, ierr := w.identity(ctx, tok)
+	if ierr != nil {
+		// 登录成功了，只是读不到账户信息：账号还是建起来，用令牌
+		// 自己带着的东西填。
+		fmt.Fprintf(os.Stderr, "webui: signed in, but the account's identity could not be read: %v\n", ierr)
+	}
+	acc.Name = firstNonEmpty(who.Email, who.RealUserID, tok.Subject)
+	acc.UserID = firstNonEmpty(who.RealUserID, tok.Subject)
+	acc.Email = who.Email
 	if err := w.Store.CreateAccount(ctx, acc); err != nil {
+		// 建账号失败要说出来：不然这一次登录就悄悄没了，人只看到
+		// 页面在转圈。
+		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
-	_ = w.Store.SaveToken(ctx, store.Token{
+	if err := w.Store.SaveToken(ctx, store.Token{
 		AccountID: acc.ID, Access: tok.Access, Refresh: tok.Refresh,
 		ExpiresAt: tok.Expires, Subject: tok.Subject, UpdatedAt: now,
-	})
+	}); err != nil {
+		w.failLogin(id, "the token could not be written down: "+err.Error())
+		return
+	}
 	w.mu.Lock()
 	delete(w.pending, id)
 	w.mu.Unlock()
+}
+
+// identity reads who the account is.
+//
+// The token's own claims are guesses, so the site is asked. A failure
+// is not fatal: the sign-in worked, and the caller falls back to what
+// the token carries.
+func (w *WebUI) identity(ctx context.Context, tok *oauth.Token) (account.Identity, error) {
+	if w.Mgr == nil || w.Mgr.Acc == nil {
+		return account.Identity{}, errors.New("no account client")
+	}
+	return w.Mgr.Acc.Identity(ctx, tok.Access, tok.Subject)
+}
+
+// failLogin says the sign-in did not work.
+//
+// The reason is kept on the entry, so that the page can be told why.
+// The entry itself goes away after a while: a server that is up for a
+// long time must not keep every sign-in it ever had.
+//
+// The entry is not taken away at once, because the browser has to be
+// able to read the reason. The page asks every few seconds, and it
+// stops asking once it has the answer.
+func (w *WebUI) failLogin(id string, reason string) {
+	w.mu.Lock()
+	p := w.pending[id]
+	if p != nil {
+		p.Err = reason
+		p.FailedAt = time.Now()
+	}
+	ttl := w.pendingTTL
+	w.mu.Unlock()
+	if p == nil {
+		return
+	}
+	time.AfterFunc(ttl, func() {
+		w.mu.Lock()
+		delete(w.pending, id)
+		w.mu.Unlock()
+	})
+}
+
+// newAccountID makes an id for a new account.
+//
+// The time alone is not enough: two sign-ins that end in the same
+// millisecond get the same id, and the second one is refused by the
+// primary key. So the id has a random part too.
+func newAccountID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// 没有随机数的时候只能用时间：撞车的机会很小，撞上了也
+		// 只是这一次登录白做。
+		return fmt.Sprintf("acc_%d", time.Now().UnixMilli())
+	}
+	return "acc_" + hex.EncodeToString(b)
+}
+
+// firstNonEmpty gives the first value that is not empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // apiPoll says how a sign-in is going.
@@ -9842,15 +10408,22 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 		ID string `json:"id"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
+	// The reason is read under the lock and copied out of it. It is
+	// written under the same lock, and reading it outside would read
+	// half of one string and half of another.
 	w.mu.Lock()
 	p := w.pending[body.ID]
+	reason := ""
+	if p != nil {
+		reason = p.Err
+	}
 	w.mu.Unlock()
-	if p == nil {
-		writeJSON(rw, map[string]any{"done": true})
+	if reason != "" {
+		writeJSON(rw, map[string]any{"error": reason})
 		return
 	}
-	if p.Err != "" {
-		writeJSON(rw, map[string]any{"error": p.Err})
+	if p == nil {
+		writeJSON(rw, map[string]any{"done": true})
 		return
 	}
 	writeJSON(rw, map[string]any{"done": false})
@@ -10251,6 +10824,99 @@ func TestCheckinAll(t *testing.T) {
 		t.Fatalf("outcome = %q", results[0].Outcome)
 	}
 }
+
+// TestCheckEgressWritesTheHealth says the result of the outlet check
+// reaches the database.
+//
+// 出口的健康检查写不进数据库，WebUI 的出口页就永远是"没查过"：
+// 控制台说两个出口都是好的，表里一行也没有。
+func TestCheckEgressWritesTheHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`ok`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	// "direct" 不走代理，请求直接到那台假服务器上。
+	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	sc := New(mgr, cfg)
+	sc.target = srv.URL
+
+	sc.CheckEgress(ctx)
+
+	rows, err := s.EgressHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the health table has %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].URL != "direct" {
+		t.Errorf("the row is for %q, want %q", rows[0].URL, "direct")
+	}
+	if !rows[0].OK {
+		t.Errorf("the row says the outlet is not usable: %+v", rows[0])
+	}
+	if rows[0].Error != "" {
+		t.Errorf("the row carries an error: %q", rows[0].Error)
+	}
+}
+
+// TestCheckEgressWritesAFailedHealth says a broken outlet is written
+// down as broken.
+//
+// 出口不通的时候，表里要有那一行，而且要写清楚为什么不通。
+func TestCheckEgressWritesAFailedHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	sc := New(mgr, cfg)
+	sc.target = srv.URL
+
+	sc.CheckEgress(ctx)
+
+	rows, err := s.EgressHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the health table has %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].OK {
+		t.Errorf("the row says the outlet is usable: %+v", rows[0])
+	}
+	if rows[0].Error == "" {
+		t.Error("the row does not say why the outlet is broken")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -10281,17 +10947,33 @@ import (
 	"mmxcode/internal/manager"
 )
 
+// egressTarget is the address the outlets are checked against.
+//
+// It is MiniMax's own agent host: a proxy that cannot reach it cannot
+// carry a request to MiniMax either.
+const egressTarget = "https://agent.minimax.io/"
+
+// egressWriteTimeout is how long the health row may take to be
+// written.
+//
+// The write is a small one, and it must not hold the scheduler up.
+const egressWriteTimeout = 5 * time.Second
+
 // Scheduler runs the recurring work.
 type Scheduler struct {
 	// Mgr holds the accounts.
 	Mgr *manager.Manager
 	// Cfg is the configuration.
 	Cfg config.Config
+	// target is the address the outlets are checked against. A test
+	// points it at a stand-in, so that the check never leaves the
+	// machine.
+	target string
 }
 
 // New makes a scheduler.
 func New(mgr *manager.Manager, cfg config.Config) *Scheduler {
-	return &Scheduler{Mgr: mgr, Cfg: cfg}
+	return &Scheduler{Mgr: mgr, Cfg: cfg, target: egressTarget}
 }
 
 // CheckinResult is one account's check-in.
@@ -10379,17 +11061,30 @@ func (s *Scheduler) RenewTokens(ctx context.Context) {
 }
 
 // CheckEgress tests every outlet and records the result.
+//
+// The probe and the write have a context each. The probe's timeout is
+// over when the answer is in, and a write under that context would be
+// thrown away before it reaches the database: the health table would
+// stay empty and the WebUI would say "not checked" for ever.
 func (s *Scheduler) CheckEgress(ctx context.Context) {
-	groups := s.Cfg.Proxy.Groups
-	for name, url := range groups {
-		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := s.Mgr.Egress.Check(ctx, url, "https://agent.minimax.io/")
+	target := s.target
+	if target == "" {
+		target = egressTarget
+	}
+	for name, url := range s.Cfg.Proxy.Groups {
+		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := s.Mgr.Egress.Check(probeCtx, url, target)
 		cancel()
 		msg := ""
 		if err != nil {
 			msg = err.Error()
 		}
-		_ = s.Mgr.Store.SetEgressHealth(ctx, url, err == nil, msg)
+		// The write runs under a context of its own: the caller's may
+		// be over already, and the health of the outlet has to be
+		// written down all the same.
+		writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), egressWriteTimeout)
+		_ = s.Mgr.Store.SetEgressHealth(writeCtx, url, err == nil, msg)
+		writeCancel()
 		_ = name
 	}
 }
@@ -10599,6 +11294,41 @@ import 补上 `"github.com/spf13/cobra"`。
 把 `env` 结构体改成：
 
 ```go
+// This file holds the mmxcode command line.
+//
+// Everything in this directory is package main: the directory is the
+// binary, and a directory holds one package.
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/oauth"
+	"mmxcode/internal/store"
+	"mmxcode/internal/upstream"
+)
+
+// Execute runs the command line and gives the process its exit code.
+func Execute() int {
+	if err := newRoot().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	return 0
+}
+
+// env is what the commands share.
 type env struct {
 	cfg   config.Config
 	store *store.Store
@@ -10606,6 +11336,81 @@ type env struct {
 	egr   *egress.Resolver
 	acc   *account.Client
 	mgr   *manager.Manager
+}
+
+func newRoot() *cobra.Command {
+	var (
+		configPath string
+		dbPath     string
+	)
+	root := &cobra.Command{
+		Use:          "mmxcode",
+		Short:        "MiniMax Code 多账号网关",
+		SilenceUsage: true,
+	}
+	root.PersistentFlags().StringVar(&configPath, "config", os.Getenv("MMXCODE_CONFIG"), "配置文件路径")
+	root.PersistentFlags().StringVar(&dbPath, "db", "", "数据库路径（覆盖配置）")
+
+	e := &env{}
+	ctx := context.Background()
+
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			return err
+		}
+		if dbPath != "" {
+			cfg.DB = dbPath
+		}
+		if v := os.Getenv("MMXCODE_PROXY_DEFAULT"); v != "" {
+			cfg.Proxy.Default = v
+		}
+		e.cfg = cfg
+		s, err := store.Open(cfg.DB)
+		if err != nil {
+			return err
+		}
+		if err := s.Migrate(ctx); err != nil {
+			return err
+		}
+		e.store = s
+		e.egr = egress.New(cfg.Proxy.Groups, cfg.Proxy.Default)
+		// 登录和账户 API 也走代理。配了不用等于没配：国内的网络
+		// 连不上国际站，登录就停在第一步。
+		tr, err := e.egr.Transport(e.egr.Resolve(store.Account{}))
+		if err != nil {
+			return err
+		}
+		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
+		e.acc = account.New(e.up)
+		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
+		return nil
+	}
+	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
+		if e.store != nil {
+			e.store.Close()
+		}
+	}
+
+	root.AddCommand(newLoginCmd(e))
+	root.AddCommand(newAccountsCmd(e))
+	root.AddCommand(newCheckinCmd(e))
+	root.AddCommand(newUsageCmd(e))
+	root.AddCommand(newModelsCmd(e))
+	root.AddCommand(newServeCmd(e))
+	return root
+}
+
+func nowUTC() time.Time { return time.Now().UTC() }
+
+// groupNames lists the outlet groups, for an error message.
+func groupNames(groups map[string]string) string {
+	names := make([]string, 0, len(groups))
+	for n := range groups {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 ```
 

@@ -119,6 +119,9 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 // The key comes from the form the browser posts, or from a JSON body a
 // script sends. The page that comes back never carries the key: it is a
 // secret, and the page might sit in a cache.
+//
+// A script gets JSON and the cookie, not a page: a redirect would send
+// it to a page it cannot use. The browser gets the page.
 func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	keys := s.Cfg.Server.APIKeys
 	if len(keys) == 0 {
@@ -130,11 +133,28 @@ func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	if k, ok := matchingKey(key, keys); ok {
 		s.setSessionCookie(w, r, k)
 		w.Header().Set("Cache-Control", "no-store")
+		if wantsJSON(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	// 错的 key：不发 cookie
+	if wantsJSON(r) {
+		writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
+		return
+	}
 	s.signInPage(w, r, http.StatusUnauthorized, "the key was refused")
+}
+
+// wantsJSON says the caller wants an answer in JSON rather than a page.
+//
+// 浏览器交表单，脚本交 JSON。分清楚了，脚本才拿得到 JSON：它要是
+// 跟着重定向走，拿回来的是一页 HTML，那对它没有用。
+func wantsJSON(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("Content-Type"), "application/json")
 }
 
 // signOut takes the cookie away.

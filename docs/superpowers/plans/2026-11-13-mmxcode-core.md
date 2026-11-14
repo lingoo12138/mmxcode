@@ -7123,6 +7123,791 @@ func TestTheUnitsOfTheSite(t *testing.T) {
 		t.Error("siteDeadline(0) said something")
 	}
 }
+
+func TestRefreshToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("grant_type"); got != "refresh_token" {
+			t.Errorf("grant_type = %q", got)
+		}
+		if got := r.Form.Get("refresh_token"); got != "old-refresh" {
+			t.Errorf("refresh_token = %q", got)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new-access" || tok.Refresh != "new-refresh" {
+		t.Fatalf("token = %+v", tok)
+	}
+}
+
+func TestRefreshKeepsOldTokenWhenNoNewOneGiven(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "new-access",
+			"expires_in":   3600,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Refresh != "old-refresh" {
+		t.Fatalf("refresh = %q, want the old one", tok.Refresh)
+	}
+}
+
+func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if !oe.IsSignedOut() {
+		t.Fatal("expected the error to be a sign-out")
+	}
+}
+
+func TestRefreshSignOutInA200Body(t *testing.T) {
+	// MiniMax 把业务错误放在 200 的 body 里。签出不是这么来的：
+	// 参考实现读的是 invalid_grant 加 400。200 body 里的
+	// invalid_grant 是别的事，不能拿来把账号登出。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.HTTPStatus != 200 {
+		t.Fatalf("error = %+v", oe)
+	}
+	if oe.IsSignedOut() {
+		t.Fatal("a sign-out in a 200 body was a sign-out")
+	}
+}
+
+// TestSignedOutNeedsTheStatus says only invalid_grant with a 400 signs
+// an account out.
+//
+// 登出是贵的事：账号的续期链断了，只能人再登一次。401 或者 500 带着
+// 同样的 code 不是登出，是路过。
+func TestSignedOutNeedsTheStatus(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusBadRequest, true},
+		{http.StatusUnauthorized, false},
+		{http.StatusInternalServerError, false},
+		{http.StatusOK, false},
+	}
+	for _, c := range cases {
+		e := &Error{Code: "invalid_grant", HTTPStatus: c.status}
+		if got := e.IsSignedOut(); got != c.want {
+			t.Errorf("invalid_grant with %d is a sign-out = %v, want %v", c.status, got, c.want)
+		}
+	}
+	// 别的 code 不是登出，400 也不行。
+	if (&Error{Code: "invalid_request", HTTPStatus: http.StatusBadRequest}).IsSignedOut() {
+		t.Error("invalid_request with a 400 was a sign-out")
+	}
+}
+
+// TestStartDeviceUserCodeWithAZeroExpiredIn says a zero in the
+// expired_in field is not a field the site means.
+//
+// expired_in 是 0 的时候，参考实现把它当没有这个字段（它的 pos() 只
+// 认大于零的值），于是这个答案不是拿 user code 去轮询的那种答案。
+// 一个零的截止时间不是截止时间。
+func TestStartDeviceUserCodeWithAZeroExpiredIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       0,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "invalid_device_authorization_response" {
+		t.Fatalf("code = %q, want the invalid answer", oe.Code)
+	}
+}
+
+// TestStartDeviceWithoutExpiredIn says an answer without the
+// expired_in field is not a user-code poll.
+//
+// 没有 expired_in 这个字段，就不是拿 user code 去轮询的那种答案。
+func TestStartDeviceWithoutExpiredIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "invalid_device_authorization_response" {
+		t.Fatalf("error = %+v", oe)
+	}
+}
+
+func TestRefreshKeepsTheMessage(t *testing.T) {
+	// 有的 4xx 只带 message：这个说明是账号的 last error。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_request","message":"the code is wrong"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "the code is wrong") {
+		t.Fatalf("err = %v, want the message", err)
+	}
+	// 刷新的错误说的是 token 端点，不是登录服务器。
+	if !strings.Contains(err.Error(), "token endpoint") {
+		t.Fatalf("err = %v, want it to name the token endpoint", err)
+	}
+}
+
+func TestRefreshWithALostAnswer(t *testing.T) {
+	// 请求到了站点，答案没了：站点可能已经把 refresh token 用了。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+}
+
+func TestRefreshWithARefusedConnection(t *testing.T) {
+	// 连都没连上：请求肯定没到站点，同一个 token 再来一次是安全的。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	endpoint := srv.URL + "/oauth2/token"
+	srv.Close()
+
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, endpoint, "old-refresh")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want a plain failure", err)
+	}
+}
+
+func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
+	var calls int32
+	release := make(chan struct{})
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	var wg sync.WaitGroup
+	var started sync.WaitGroup
+	started.Add(8)
+	results := make([]*Token, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			started.Done()
+			tok, err := r.Renew(context.Background(), "acc_01", current, spend)
+			if err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+			results[i] = tok
+		}(i)
+	}
+	started.Wait()
+	// 让每个 goroutine 都进到 Renew 里去：它们都得等同一个刷新。
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
+	}
+	for i, tok := range results {
+		if tok == nil || tok.Access != "new-access" {
+			t.Fatalf("result %d = %+v", i, tok)
+		}
+	}
+}
+
+func TestRenewerWalksTheChainOnAfterALostStoreWrite(t *testing.T) {
+	// 站点给了新 token，存库失败，库里还是那个已经用过的。
+	// renewer 手上有新的：它得把它用掉，链才走得下去。
+	var calls int32
+	var mu sync.Mutex
+	var spent []string
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		spent = append(spent, refresh)
+		mu.Unlock()
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	first, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 存库失败：调用方手上还是那个旧 token。
+	second, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the chain was walked %d times, want 2", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if spent[1] != "new-old-refresh" {
+		t.Fatalf("the second spend used %q, want the token the renewer held", spent[1])
+	}
+	if second.Refresh == first.Refresh {
+		t.Fatalf("the chain did not move on: %+v", second)
+	}
+}
+
+func TestRenewerSpendsAgainWhenTheSiteDoesNotRotate(t *testing.T) {
+	// 站点不给新的 refresh token：它没有把旧的用掉，
+	// 所以下一次刷新还得再发一次。
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{
+			Access:  fmt.Sprintf("acc-%d", atomic.LoadInt32(&calls)),
+			Refresh: refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "same-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was spent %d times, want 2", got)
+	}
+	if tok.Access == "old-access" {
+		t.Fatalf("the token = %+v, want a new one", tok)
+	}
+}
+
+func TestRenewerFollowsTheCallersNewerToken(t *testing.T) {
+	// renewer 手上的 token 调用方不知道：调用方拿的是新的
+	// （刚登录的，或者别的进程写进去的）。调用方说了算。
+	var calls int32
+	var mu sync.Mutex
+	var spent []string
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		spent = append(spent, refresh)
+		mu.Unlock()
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	newer := &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
+	tok, err := r.Renew(context.Background(), "acc_01", newer, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spent) != 2 || spent[1] != "r2" {
+		t.Fatalf("spent = %v, want the caller's token", spent)
+	}
+	if tok.Access != "acc-for-r2" {
+		t.Fatalf("token = %+v, want the answer of the caller's own renewal", tok)
+	}
+}
+
+func TestRenewerDoesNotMarkAFailedRefreshSpent(t *testing.T) {
+	// 这个包的全部承诺：失败的刷新不把 token 记成用掉了。
+	var calls int32
+	var fail atomic.Bool
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		if fail.Load() {
+			return nil, errors.New("the network is down")
+		}
+		return &Token{
+			Access:  "new-access",
+			Refresh: "new-refresh",
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	fail.Store(true)
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err == nil {
+		t.Fatal("expected an error")
+	}
+	fail.Store(false)
+	// 失败过的 token 还能再发：它多半没有到站点。
+	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was sent %d times, want 2", got)
+	}
+	if tok.Access != "new-access" {
+		t.Fatalf("token = %+v", tok)
+	}
+}
+
+func TestRenewerDoesNotSendATokenOfUnknownOutcomeAgain(t *testing.T) {
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, fmt.Errorf("the answer was lost: %w", ErrRefreshOutcomeUnknown)
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+	// 再来一次：答案不知道的 token 不再发。
+	_, err = r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
+		t.Fatalf("err = %v, want an unknown outcome", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", got)
+	}
+}
+
+func TestRenewerGivesEveryCallerItsOwnToken(t *testing.T) {
+	// 两个调用方各拿一个 refresh token：各发各的，
+	// 谁也不能拿别人的答案。
+	var calls int32
+	release := make(chan struct{})
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		mu.Lock()
+		seen[refresh] = true
+		mu.Unlock()
+		<-release
+		return &Token{
+			Access:  "acc-for-" + refresh,
+			Refresh: "new-" + refresh,
+			Expires: time.Now().Add(time.Hour),
+		}, nil
+	}
+	tokens := map[string]*Token{
+		"r1": {Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)},
+		"r2": {Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)},
+	}
+	results := map[string]*Token{}
+	var wg sync.WaitGroup
+	var mu2 sync.Mutex
+	for name, tok := range tokens {
+		wg.Add(1)
+		go func(name string, tok *Token) {
+			defer wg.Done()
+			got, err := r.Renew(context.Background(), "acc_01", tok, spend)
+			if err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+			mu2.Lock()
+			results[name] = got
+			mu2.Unlock()
+		}(name, tok)
+	}
+	// 等两个刷新都开始了。
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) < 2; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !seen["r1"] || !seen["r2"] {
+		t.Fatalf("spent = %v, want both tokens", seen)
+	}
+	for name, tok := range results {
+		if tok == nil {
+			t.Fatalf("%s got nothing", name)
+		}
+		if want := "acc-for-" + name; tok.Access != want {
+			t.Fatalf("%s got %+v, want the answer of its own renewal", name, tok)
+		}
+	}
+}
+
+func TestRenewerLeaderCancellationDoesNotKillTheFollowers(t *testing.T) {
+	// 第一个来的调用方断线了，别的调用方还在等：
+	// 刷新不该跟着死。
+	var calls int32
+	release := make(chan struct{})
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := r.Renew(leaderCtx, "acc_01", stored, spend)
+		leaderErr <- err
+	}()
+	// 等刷新真的开始了。
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	followerErr := make(chan error, 1)
+	followerTok := make(chan *Token, 1)
+	go func() {
+		tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
+		followerTok <- tok
+		followerErr <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// 第一个来的调用方走了。
+	cancel()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the leader got %v, want the cancellation", err)
+	}
+	close(release)
+	if err := <-followerErr; err != nil {
+		t.Fatalf("the follower got %v", err)
+	}
+	if tok := <-followerTok; tok == nil || tok.Access != "new-access" {
+		t.Fatalf("the follower got %+v", tok)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
+	}
+}
+
+func TestRenewerForget(t *testing.T) {
+	r := NewRenewer()
+	var calls int32
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Newest("acc_01"); !ok {
+		t.Fatal("the renewer holds nothing")
+	}
+	r.Forget("acc_01")
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token is still held after Forget")
+	}
+	// 已经用掉的记录也没了：这个账号签出了，它的东西都不作数了。
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatalf("Renew after Forget: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("the refresh token was spent %d times, want 2", got)
+	}
+}
+
+func TestRenewerForgetLeavesARunningRenewalAlone(t *testing.T) {
+	// 账号正在签出时在跑的刷新，完了不能把 token 放回来。
+	var calls int32
+	release := make(chan struct{})
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Renew(context.Background(), "acc_01", stored, spend)
+	}()
+	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.Forget("acc_01")
+	close(release)
+	<-done
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token came back from the dead")
+	}
+}
+
+func TestRenewerReset(t *testing.T) {
+	// Reset 把链忘掉，"用掉了"的记录还在。
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
+
+	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
+		t.Fatal(err)
+	}
+	r.Reset("acc_01")
+	if _, ok := r.Newest("acc_01"); ok {
+		t.Fatal("the token is still held after Reset")
+	}
+	// 用掉的 token 不能再发：链断了，账号得重新登录。
+	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", got)
+	}
+}
+
+func TestRenewerChainBroken(t *testing.T) {
+	// renewer 手上的 token 也用掉了：链断了，没有能走的路了。
+	var calls int32
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		atomic.AddInt32(&calls, 1)
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	r.mu.Lock()
+	r.latest["acc_01"] = &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
+	r.spent["acc_01"] = map[string]bool{
+		tokenHash("r1"): true,
+		tokenHash("r2"): true,
+	}
+	r.mu.Unlock()
+
+	_, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend)
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("a spent token was sent %d times", got)
+	}
+}
+
+func TestRenewerRefusesAnotherAccountsToken(t *testing.T) {
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		return &Token{
+			Access:  "new-access",
+			Refresh: "new-refresh",
+			Expires: time.Now().Add(time.Hour),
+			Subject: "user-1",
+		}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a1", Refresh: "r1", Subject: "user-1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a9", Refresh: "r9", Subject: "user-2", Expires: time.Now().Add(time.Hour)}, spend)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "another account") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRenewerNewestGivesACopy(t *testing.T) {
+	r := NewRenewer()
+	spend := func(ctx context.Context, refresh string) (*Token, error) {
+		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
+	}
+	if _, err := r.Renew(context.Background(), "acc_01",
+		&Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := r.Newest("acc_01")
+	if !ok || got.Access != "new-access" {
+		t.Fatalf("newest = %+v, ok = %v", got, ok)
+	}
+	got.Access = "changed"
+	again, _ := r.Newest("acc_01")
+	if again.Access == "changed" {
+		t.Fatal("the caller changed what the renewer holds")
+	}
+	// 没有 token 时 Latest 给的是调用方自己的。
+	empty := NewRenewer()
+	cur := &Token{Access: "mine"}
+	if got := empty.Latest("acc_02", cur); got != cur {
+		t.Fatalf("latest = %+v, want the caller's own token", got)
+	}
+	if _, ok := empty.Newest("acc_02"); ok {
+		t.Fatal("the renewer holds a token it does not have")
+	}
+}
+
+func TestNoSecretIsInAnyErrorOrURL(t *testing.T) {
+	const secret = "the-secret-refresh-token"
+	const verifier = "the-secret-pkce-verifier"
+
+	// 刷新的错误。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant","message":"no"}`))
+	}))
+	defer srv.Close()
+	c := testClient(t)
+	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", secret)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+
+	// renewer 的错误。
+	r := NewRenewer()
+	_, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return nil, errors.New("nope")
+		})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+	// 链断了的错误也不带 token。
+	// 先成功一次：那个 token 就用掉了。
+	if _, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
+		}); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	r.Reset("acc_01")
+	_, err = r.Renew(context.Background(), "acc_01",
+		&Token{Access: "a", Refresh: secret},
+		func(ctx context.Context, refresh string) (*Token, error) {
+			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
+		})
+	if !errors.Is(err, ErrRefreshChainBroken) {
+		t.Fatalf("err = %v, want a broken chain", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the refresh token is in the error: %v", err)
+	}
+
+	// 设备码的错误和地址。
+	d := &Device{
+		UserCode: "ABCD",
+		URL:      "https://example.invalid/activate?code=ABCD",
+		verifier: verifier,
+	}
+	for _, text := range []string{d.String(), fmt.Sprintf("%+v", d), d.URL} {
+		if strings.Contains(text, verifier) {
+			t.Fatalf("the verifier is in %q", text)
+		}
+	}
+}
 ```
 
 测试文件顶部还需要这个助手：
@@ -7164,6 +7949,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -7315,12 +8101,15 @@ func (e *Error) Error() string {
 
 // IsSignedOut says the answer is the one that signs an account out.
 //
-// The sign-out is invalid_grant. The site sends it with a 400, but it
-// also puts its business errors in the body of a 200, so the code is
-// what is looked at and not the status: a sign-out is a sign-out
-// however it arrives.
+// The sign-out is invalid_grant with a 400, the way MiniMax Code
+// reads it. The status is part of the answer and not a detail: a 401
+// or a 500 that carries the same code is passing, and the sign-in is
+// kept.
+//
+// A sign-out is expensive to get wrong — the account loses its refresh
+// token chain — so the answer has to be the one the site means.
 func (e *Error) IsSignedOut() bool {
-	return e.Code == "invalid_grant"
+	return e.Code == "invalid_grant" && e.HTTPStatus == http.StatusBadRequest
 }
 
 // Token is an account's sign-in.
@@ -7427,8 +8216,16 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		VerificationURL         string `json:"verification_url"`
 		VerificationURIComplete string `json:"verification_uri_complete"`
 		ExpiresIn               int64  `json:"expires_in"`
-		ExpiredIn               int64  `json:"expired_in"`
-		Interval                int64  `json:"interval"`
+		// ExpiredIn is a pointer, so that an answer without the field
+		// is told from an answer whose field is zero. The two are not
+		// the same: the field says the site is polling for the user
+		// code, and a zero is a field that is there.
+		//
+		// A zero, though, is not a field the site means: the reference
+		// reads it as absent (its pos() only takes a value above
+		// zero), and so do we.
+		ExpiredIn *int64 `json:"expired_in"`
+		Interval  int64  `json:"interval"`
 	}
 	if err := json.Unmarshal(body, &b); err != nil {
 		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
@@ -7446,7 +8243,13 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	d := &Device{UserCode: userCode, verifier: verifier, slowDown: slowDownWait}
 	// MiniMax's own variant has no device_code: the user code is polled
 	// for, and the end may be an absolute time in milliseconds.
-	byUser := deviceCode == "" && b.ExpiredIn != 0
+	//
+	// The field being there is what says so, and the user code has to
+	// be there to be polled for. A field that is not there at all is
+	// not a user-code poll, however the answer looks. A field that is
+	// there but says zero says nothing: the reference reads it as
+	// absent, and a zero end is not an end.
+	byUser := deviceCode == "" && userCode != "" && b.ExpiredIn != nil && *b.ExpiredIn > 0
 	switch {
 	case byUser:
 		d.pollField, d.pollValue = "user_code", userCode
@@ -7465,8 +8268,8 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	switch {
 	case b.ExpiresIn > 0:
 		deadline = time.Now().Add(expiresDuration(b.ExpiresIn))
-	case b.ExpiredIn > 0:
-		deadline, _ = siteDeadline(b.ExpiredIn)
+	case b.ExpiredIn != nil && *b.ExpiredIn > 0:
+		deadline, _ = siteDeadline(*b.ExpiredIn)
 	}
 	if deadline.IsZero() {
 		deadline = time.Now().Add(signInTimeout)
@@ -8930,6 +9733,7 @@ import (
 	"testing"
 	"time"
 
+	"mmxcode/internal/site"
 	"mmxcode/internal/upstream"
 )
 
@@ -9193,8 +9997,65 @@ func TestPlanWindows(t *testing.T) {
 	}
 }
 
-func TestPlanWindowsEmpty(t *testing.T) {
+// TestPlanWindowsFallsBackToTheOpenPlatform says the open platform's
+// answer is used when the console's own answer has no windows in it.
+//
+// 控制台自己的 remains_percent 在国际站上可能回一个空的 model_remains。
+// 参考实现这时候去问 coding_plan/remains，Go 代码原来直接说"没有窗口"：
+// 账号的额度用完了却看不出来，故障转移一直挑它。
+func TestPlanWindowsFallsBackToTheOpenPlatform(t *testing.T) {
+	var asked []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		case site.CodingPlanPath:
+			w.Write([]byte(`{"model_remains":[
+				{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+				 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+				 "start_time":1763000000000,"end_time":1763010000000,
+				 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+				 "current_weekly_total_percent":100,"weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if ws[0].Amount != 150 || ws[0].Limit != 150 {
+		t.Fatalf("window = %+v", ws[0])
+	}
+	want := []string{site.PlanRemainsPath, site.CodingPlanPath}
+	if len(asked) != len(want) {
+		t.Fatalf("asked %v, want %v", asked, want)
+	}
+	for i := range want {
+		if asked[i] != want[i] {
+			t.Fatalf("asked %v, want %v", asked, want)
+		}
+	}
+}
+
+// TestPlanWindowsEmpty says a plan with no windows at all is no
+// windows, and not an error.
+//
+// 两个端点都没有窗口的时候，答案是"没有窗口"，不是"读不出来"。
+func TestPlanWindowsEmpty(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
 		w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
 	}))
 	defer srv.Close()
@@ -9207,6 +10068,84 @@ func TestPlanWindowsEmpty(t *testing.T) {
 	}
 	if len(ws) != 0 {
 		t.Fatalf("got %+v", ws)
+	}
+	want := []string{site.PlanRemainsPath, site.CodingPlanPath}
+	if len(asked) != len(want) {
+		t.Fatalf("asked %v, want %v", asked, want)
+	}
+	for i := range want {
+		if asked[i] != want[i] {
+			t.Fatalf("asked %v, want %v", asked, want)
+		}
+	}
+}
+
+// TestWindowName says a window is named after its own length.
+//
+// 窗口的名字是它自己的长度：三小时的窗口叫 "3 hours"，不是写死的
+// "5 hours"。一周的窗口叫 "7 days"，没有长度的窗口叫 "Allowance"。
+func TestWindowName(t *testing.T) {
+	cases := []struct {
+		name   string
+		weekly bool
+		span   time.Duration
+		want   string
+	}{
+		{"three hours", false, 3 * time.Hour, "3 hours"},
+		{"five hours", false, 5 * time.Hour, "5 hours"},
+		{"one hour", false, time.Hour, "1 hours"},
+		{"a day", false, 24 * time.Hour, "24 hours"},
+		{"two days", false, 48 * time.Hour, "2 days"},
+		{"forty five minutes", false, 45 * time.Minute, "45 minutes"},
+		{"a week", true, 7 * 24 * time.Hour, "7 days"},
+		{"a week without a span", true, 0, "7 days"},
+		{"no span", false, 0, "Allowance"},
+	}
+	for _, c := range cases {
+		got := windowName(c.weekly, c.span)
+		if got != c.want {
+			t.Errorf("windowName(%v, %v) = %q, want %q", c.weekly, c.span, got, c.want)
+		}
+	}
+}
+
+// TestPlanWindowsNameTheWindowByItsLength says the name of a window
+// comes from the answer.
+//
+// 站点给三小时的窗口，名字就该是 "3 hours"。
+func TestPlanWindowsNameTheWindowByItsLength(t *testing.T) {
+	// 三小时：开始 1763000000000，结束 1763010800000。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+				 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+				 "start_time":1763000000000,"end_time":1763010800000,
+				 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+				 "current_weekly_total_percent":100,"weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if ws[0].Name != "3 hours" {
+		t.Errorf("the window is called %q, want %q", ws[0].Name, "3 hours")
+	}
+	if ws[1].Name != "7 days" {
+		t.Errorf("the weekly window is called %q, want %q", ws[1].Name, "7 days")
 	}
 }
 
@@ -10010,9 +10949,20 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 //
 // The console's own answer comes first; the open platform's is the
 // fallback.
+//
+// The console's answer is used only when it has windows in it. The
+// reference uses it only when the answer is a list that is not empty,
+// and asks the open platform otherwise: the international site's
+// remains_percent answers 200 with an empty list, and the windows are
+// at the other endpoint.
+//
+// An answer the console could not give is not thrown away when the
+// open platform has the windows: the two endpoints are two ways of
+// asking the same question, and the one that answered is the one that
+// counts.
 func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Window, error) {
 	ws, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
-	if err == nil {
+	if err == nil && len(ws) > 0 {
 		return ws, nil
 	}
 	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)
@@ -10419,6 +11369,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10606,10 +11557,16 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			if x.status != nil {
 				status = *x.status
 			}
+			// The window is named after its own length. A window of
+			// three hours is "3 hours" and not "5 hours": the length is
+			// the window's own, and the site does not always give
+			// five.
+			span := windowSpan(x.start, x.end, x.weekly)
+			own := windowName(x.weekly, span)
 			if status == 3 {
 				// An unlimited window is said so on the general model.
 				if general {
-					out = append(out, Window{Name: windowName(x.weekly), ModelName: name, Unlimited: true})
+					out = append(out, Window{Name: own, ModelName: name, Unlimited: true})
 				}
 				continue
 			}
@@ -10629,7 +11586,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			case x.remaining != nil:
 				used = clampPercent(100 - *x.remaining)
 			}
-			w := Window{Name: windowName(x.weekly), ModelName: name, Used: used}
+			w := Window{Name: own, ModelName: name, Used: used}
 			if x.end > 0 {
 				w.ResetsAt = time.UnixMilli(x.end)
 			}
@@ -10673,11 +11630,65 @@ func isThree(v *float64) bool { return v != nil && *v == 3 }
 // isZeroCount says whether a count is missing or zero.
 func isZeroCount(v *float64) bool { return v == nil || *v == 0 }
 
-func windowName(weekly bool) string {
+// windowSpan is how long a plan window is.
+//
+// The site writes the two ends of a window in seconds or in
+// milliseconds, and the reference reads them the same way: a number
+// that is too long to be a time in seconds is in milliseconds.
+//
+// A weekly window without times of its own is a week long. Every other
+// window without times is of no length at all, and says so.
+func windowSpan(start, end int64, weekly bool) time.Duration {
+	ms := int64(0)
+	switch {
+	case start > 0 && end > start:
+		ms = planMS(end) - planMS(start)
+	case weekly:
+		ms = 7 * 86400_000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// planMS reads a time the site wrote.
+//
+// A time in seconds is shorter than a time in milliseconds by a
+// thousand, and the site does not say which it wrote. The reference
+// tells them apart by their length: a number below a trillion is in
+// seconds.
+func planMS(v int64) int64 {
+	if v < 1e12 {
+		return v * 1000
+	}
+	return v
+}
+
+// windowName is the name of a plan window.
+//
+// The name says how long the window is, and the length is the
+// window's own: a window of three hours is "3 hours", and a window
+// that is a day long is "24 hours" and not "1 days", the way the
+// reference reads it.
+//
+// A weekly window is "7 days" whatever its times say, and a window
+// without a length is "Allowance".
+func windowName(weekly bool, span time.Duration) string {
 	if weekly {
 		return "7 days"
 	}
-	return "5 hours"
+	ms := span.Milliseconds()
+	switch {
+	case ms > 86400_000 && ms%86400_000 == 0:
+		return fmt.Sprintf("%d days", ms/86400_000)
+	case ms >= 3600_000 && ms%3600_000 == 0:
+		return fmt.Sprintf("%d hours", ms/3600_000)
+	case ms > 0:
+		// The reference floors the minutes, and Go's division rounds
+		// towards zero. The span is never negative here, but the
+		// floor is what the reference does.
+		return fmt.Sprintf("%d minutes", int64(math.Floor(float64(ms)/60_000)))
+	default:
+		return "Allowance"
+	}
 }
 
 func clampPercent(f float64) float64 {
@@ -11838,6 +12849,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -11845,6 +12858,7 @@ import (
 	"mmxcode/internal/account"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
@@ -11866,6 +12880,7 @@ type env struct {
 	up    *upstream.Client
 	egr   *egress.Resolver
 	acc   *account.Client
+	mgr   *manager.Manager
 }
 
 func newRoot() *cobra.Command {
@@ -11913,6 +12928,7 @@ func newRoot() *cobra.Command {
 		}
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
+		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -11926,34 +12942,20 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
+	root.AddCommand(newServeCmd(e))
 	return root
 }
 
-// accFor gives the account API client an account's calls go out with.
-//
-// Every fetch an account makes goes through the account's own way out,
-// or the global one. The transport is cached by the resolver, so making
-// a client for it is cheap.
-func (e *env) accFor(a store.Account) (*account.Client, error) {
-	tr, err := e.egr.Transport(e.egr.Resolve(a))
-	if err != nil {
-		return nil, err
-	}
-	return e.acc.With(upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})), nil
-}
+func nowUTC() time.Time { return time.Now().UTC() }
 
-// tokenFor gives an account's token, or says it is not signed in.
-func (e *env) tokenFor(ctx context.Context, accountID string) (*oauth.Token, error) {
-	t, err := e.store.GetToken(ctx, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("account %s is not signed in", accountID)
+// groupNames lists the outlet groups, for an error message.
+func groupNames(groups map[string]string) string {
+	names := make([]string, 0, len(groups))
+	for n := range groups {
+		names = append(names, n)
 	}
-	return &oauth.Token{
-		Access:  t.Access,
-		Refresh: t.Refresh,
-		Expires: t.ExpiresAt,
-		Subject: t.Subject,
-	}, nil
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 ```
 
@@ -12076,6 +13078,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"mmxcode/internal/egress"
 	"mmxcode/internal/store"
 )
 
@@ -12107,12 +13110,15 @@ func newAccountsListCmd(e *env) *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t出口组\t代理")
 			for _, a := range list {
-				proxy := a.ProxyURL
+				// 代理地址里的账号和密码是秘密，而这份输出会进到终端的
+				// 回滚里，也会进到 CI 的日志里。egress.Redacted 就是
+				// 为了这个。组名不是秘密，照原样打印。
+				proxy := egress.Redacted(a.ProxyURL)
 				if proxy == "" {
 					proxy = a.ProxyGroup
 				}
 				if proxy == "" {
-					proxy = e.cfg.Proxy.Default
+					proxy = egress.Redacted(e.cfg.Proxy.Default)
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 					a.ID, a.Name, a.Email, a.Status, a.ProxyGroup, proxy)
@@ -12208,7 +13214,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/checkin"
-	"mmxcode/internal/store"
 )
 
 func newCheckinCmd(e *env) *cobra.Command {
@@ -12227,33 +13232,28 @@ func newCheckinCmd(e *env) *cobra.Command {
 				if accountID != "" && a.ID != accountID {
 					continue
 				}
-				tok, err := e.tokenFor(ctx, a.ID)
-				if err != nil {
-					fmt.Printf("%s\t%s\n", a.Name, err)
-					failed = true
-					continue
-				}
-				// 每个账号走自己的出口
-				acc, err := e.accFor(a)
-				if err != nil {
-					fmt.Printf("%s\t失败：%v\n", a.Name, err)
-					failed = true
-					continue
-				}
-				out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
+				// 走 manager 那条路：它先续期，再用账号自己的出口，
+				// 签到记录也由它写（日子是站点的那一天）。
+				//
+				// 命令自己读库里的令牌是不续期的。一个 90 分钟没续过
+				// 的令牌发过去，站点回 401，签到根本没发生，而命令
+				// 还会说成功。
+				out, err := e.mgr.Checkin(ctx, a.ID)
 				if err != nil {
 					fmt.Printf("%s\t失败：%v\n", a.Name, err)
 					failed = true
 					continue
 				}
 				fmt.Printf("%s\t%s\t积分 %g\t连续 %d 天\n", a.Name, out.Outcome, out.Credit, out.Streak)
-				day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
-				if err := e.store.SaveCheckin(ctx, store.Checkin{
-					AccountID: a.ID, Day: day, Outcome: out.Outcome,
-					Credit: out.Credit, Streak: out.Streak, Message: out.Message,
-					CreatedAt: time.Now(),
-				}); err != nil {
-					return err
+				if out.Outcome == checkin.OutcomeFailed {
+					// 被拒的签到不是签到成功。命令要失败，cron 才
+					// 知道今天什么都没领到。
+					msg := out.Message
+					if msg == "" {
+						msg = "the sign-in was refused"
+					}
+					fmt.Printf("%s\t失败：%s\n", a.Name, msg)
+					failed = true
 				}
 			}
 			if failed {
