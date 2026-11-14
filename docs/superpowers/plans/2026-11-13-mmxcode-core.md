@@ -4789,10 +4789,15 @@ func (s *Store) SessionAccount(ctx context.Context, sessionKey string) (string, 
 // UpstreamID gives the session's upstream id, making one if the
 // session has none.
 //
-// The id is random: two conversations that begin with the same words
-// are two conversations, and the upstream must not be told they are
-// one. It is also kept: the same session has the same upstream id
-// every time it is asked for.
+// The id is random: it is not derived from the session key, so the
+// upstream never sees a hash of the words in the request. It is also
+// kept: the same session has the same upstream id every time it is
+// asked for.
+//
+// The key is what decides which id a conversation gets, and two
+// conversations that arrive under the same key are one conversation as
+// far as this store can tell. Telling them apart is the caller's job:
+// it has to give them different keys.
 //
 // The session does not have to be bound to an account yet: a
 // conversation has an upstream id before it has an account.
