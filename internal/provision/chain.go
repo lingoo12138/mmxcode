@@ -135,7 +135,7 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	tok, err := c.Poll(ctx, d)
 	if err != nil {
-		return nil, c.pollError(err)
+		return nil, c.pollError(ctx, err)
 	}
 	return tok, nil
 }
@@ -378,9 +378,14 @@ func (c *Chain) webError(stage Stage, err error) error {
 //
 // 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）；429 退避
 // 30s 重试 1 次；设备码过期不重试。
-func (c *Chain) pollError(err error) error {
+//
+// ctx 是这一趟导入的上下文：只有它自己没了的时候，超时才算「不用再试
+// 了」。客户端自己的超时（http.Client.Timeout）报出来的错也是
+// context.DeadlineExceeded，但那时候这个上下文还好好的活着——那是连接
+// 那边的事，跟前面几步的连接断了是一回事，值得再试一次。
+func (c *Chain) pollError(ctx context.Context, err error) error {
 	// 上下文没了：再试也是白试，等的那一下也是白等。
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil {
 		return &Error{Stage: StageToken, Message: err.Error()}
 	}
 	var oe *oauth.Error

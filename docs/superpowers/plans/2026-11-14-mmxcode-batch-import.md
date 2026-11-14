@@ -3545,6 +3545,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -3847,7 +3849,7 @@ func TestALostConnectionIsTriedAgain(t *testing.T) {
 func TestALostConnectionWhilePollingIsTriedAgain(t *testing.T) {
 	// 轮询的时候连接断了，跟前面几步的连接断了是一回事：再来一次。
 	c := &Chain{}
-	err := c.pollError(errors.New("device token: connection reset"))
+	err := c.pollError(context.Background(), errors.New("device token: connection reset"))
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -3862,7 +3864,7 @@ func TestARefusedDeviceCodeIsNotTriedAgain(t *testing.T) {
 	// 设备码过期了，或者站点不让这个码进来：再来一次也是这个答案。
 	for _, code := range []string{"expired_token", "access_denied"} {
 		c := &Chain{}
-		err := c.pollError(&oauth.Error{Code: code, What: oauth.WhatSignIn})
+		err := c.pollError(context.Background(), &oauth.Error{Code: code, What: oauth.WhatSignIn})
 
 		var pe *Error
 		if !errors.As(err, &pe) {
@@ -3877,7 +3879,7 @@ func TestARefusedDeviceCodeIsNotTriedAgain(t *testing.T) {
 func TestASiteThatIsLimitingIsWaitedFor(t *testing.T) {
 	// 429：等久一点再来一次，试一次就够。
 	c := &Chain{}
-	err := c.pollError(&oauth.Error{Code: "too_many_requests", HTTPStatus: 429, What: oauth.WhatSignIn})
+	err := c.pollError(context.Background(), &oauth.Error{Code: "too_many_requests", HTTPStatus: 429, What: oauth.WhatSignIn})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -3890,8 +3892,10 @@ func TestASiteThatIsLimitingIsWaitedFor(t *testing.T) {
 
 func TestACancelledPollIsNotTriedAgain(t *testing.T) {
 	// 上下文没了：再试也是白试。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	c := &Chain{}
-	err := c.pollError(context.Canceled)
+	err := c.pollError(ctx, context.Canceled)
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -3900,6 +3904,54 @@ func TestACancelledPollIsNotTriedAgain(t *testing.T) {
 	if pe.Retry {
 		t.Fatalf("err = %+v", pe)
 	}
+}
+
+func TestAClientSideTimeoutWhilePollingIsTriedAgain(t *testing.T) {
+	// 客户端自己的超时（http.Client.Timeout）报出来的错也是
+	// context.DeadlineExceeded，但那是连接那边的事：调用方的上下文还
+	// 好好地活着，这种要再试一次，跟前面几步的连接断了是一回事。
+	//
+	// 真的一次超时长什么样：拿真的客户端去问一个不吭声的服务。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+	hc := &http.Client{Timeout: 30 * time.Millisecond}
+	_, err := hc.Get(srv.URL)
+	if err == nil {
+		t.Fatal("the request did not time out")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want it to be a deadline", err)
+	}
+
+	c := &Chain{}
+	pe := pollErrorOf(t, c.pollError(context.Background(), err))
+	if !pe.Retry {
+		t.Fatalf("err = %+v, want it to be tried again", pe)
+	}
+}
+
+func TestAPollTimeoutIsNotTriedAgainWhenTheRunIsOver(t *testing.T) {
+	// 上下文没了：再试也是白试。这时候超时就是超时，不再试。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c := &Chain{}
+	pe := pollErrorOf(t, c.pollError(ctx, context.DeadlineExceeded))
+	if pe.Retry {
+		t.Fatalf("err = %+v, want it not to be tried again", pe)
+	}
+}
+
+// pollErrorOf says what the error the chain made was.
+func pollErrorOf(t *testing.T, err error) *Error {
+	t.Helper()
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	return pe
 }
 
 func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
@@ -4232,7 +4284,7 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	tok, err := c.Poll(ctx, d)
 	if err != nil {
-		return nil, c.pollError(err)
+		return nil, c.pollError(ctx, err)
 	}
 	return tok, nil
 }
@@ -4475,9 +4527,14 @@ func (c *Chain) webError(stage Stage, err error) error {
 //
 // 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）；429 退避
 // 30s 重试 1 次；设备码过期不重试。
-func (c *Chain) pollError(err error) error {
+//
+// ctx 是这一趟导入的上下文：只有它自己没了的时候，超时才算「不用再试
+// 了」。客户端自己的超时（http.Client.Timeout）报出来的错也是
+// context.DeadlineExceeded，但那时候这个上下文还好好的活着——那是连接
+// 那边的事，跟前面几步的连接断了是一回事，值得再试一次。
+func (c *Chain) pollError(ctx context.Context, err error) error {
 	// 上下文没了：再试也是白试，等的那一下也是白等。
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil {
 		return &Error{Stage: StageToken, Message: err.Error()}
 	}
 	var oe *oauth.Error
