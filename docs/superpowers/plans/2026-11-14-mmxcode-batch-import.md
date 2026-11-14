@@ -4312,21 +4312,53 @@ func TestTheSameAccountTwiceIsOneRow(t *testing.T) {
 func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
 	// 令牌没写下去的时候，库里原来那一行不能动：它还带着一条能用的
 	// 链，把它删掉就是毁掉一个还能用的账号。
+	//
+	// 而且动的得是原来那一行，不是新来的一行：新来的一行号不一样，
+	// 原来那条链也没有被换掉。这两样都要看得见——「还剩一行」是看不
+	// 出来的（新来的一行建了又删，看着也像没动过）。
 	st := &fakeStore{}
 	c := aChain(st)
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+	// 两次导入给两个不同的号：新来的一行一眼就看得出来。
+	ids := 0
+	c.NewID = func() string {
+		ids++
+		return fmt.Sprintf("acc_%d", ids)
+	}
+	// 两次登进去的令牌不一样：换了令牌一眼就看得出来。
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		return &oauth.Token{Access: "acc", Refresh: fmt.Sprintf("ref%d", polls), Subject: "sub"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
 		t.Fatal(err)
 	}
+	first := res.AccountID
+	firstToken := st.tokens[0]
+
 	st.failToken = true
-	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	res, err = c.Import(context.Background(), "a@example.com", "hunter2")
 	if err == nil {
 		t.Fatal("no error for a token that could not be saved")
 	}
 	if res.OK {
 		t.Fatalf("res = %+v", res)
 	}
-	if len(st.accounts) != 1 {
-		t.Fatalf("accounts = %v, want the row still there", st.accounts)
+	if len(st.accounts) != 1 || st.accounts[0] != first+":a@example.com" {
+		t.Fatalf("accounts = %v, want the original row %q", st.accounts, first)
+	}
+	if len(st.rows) != 1 || st.rows[0].ID != first {
+		t.Fatalf("rows = %v, want the original row %q", st.rows, first)
+	}
+	// 令牌没有换：写失败的时候不能换。
+	if len(st.tokens) != 1 || st.tokens[0] != firstToken {
+		t.Fatalf("tokens = %v, want the token that is there", st.tokens)
+	}
+	// 第二次导入没有另起一行：它用的就是原来那一行。
+	if ids != 1 {
+		t.Fatalf("the import made %d ids, want 1", ids)
 	}
 }
 
@@ -6138,7 +6170,10 @@ func newReloginCmd(e *env) *cobra.Command {
 		Use:   "relogin",
 		Short: "把签出的账号登回去",
 		Long: "用存着的密码，把签出（signed_out）的账号重新登一遍。\n" +
-			"没有存密码的账号登不回去——那个键没有就是没有。",
+			"没有存密码的账号登不回去——那个键没有就是没有。\n" +
+			"同一个账号不会同时登两遍，不过这只在一个进程里算数：这个命令跟\n" +
+			"一个正在跑着的 mmxcode serve 用同一个库的时候，两个进程可能同时登\n" +
+			"同一个账号。要是不想撞上，就别一边开着 serve 一边跑这一条。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, group, all)
 		},
