@@ -32,10 +32,480 @@
 
 在 `internal/sign/sign_test.go` 末尾加：
 
+整个文件写成这样（下面是它的全文）：
+
 ```go
-func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
-	// 网页把公共 query 放在调用方的 query 后面（JS 的 {...params, ...common}
-	// 是这样展开的），而 CLI 是放在中间。两边的键序不一样，签名就不一样。
+package sign
+
+import (
+	"strings"
+	"testing"
+
+	"mmxcode/internal/site"
+)
+
+// The vectors were produced by running the reference implementation
+// (magpie-community/plugins, packages/minimax/index.mjs) under Node 24.
+// They are the contract: if these pass, our signature is byte-identical
+// to the one MiniMax Code sends.
+func TestSignGoldenVectors(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		opts    Options
+		wantURL string
+		wantYY  string
+		wantTS  string
+		wantSig string
+	}{
+		{
+			name: "identity GET",
+			path: "/v1/api/user/info",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			},
+			wantURL: "https://agent.minimax.io/v1/api/user/info?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY:  "40865acf7e929978824a2892b1cc0e7b",
+			wantTS:  "1763150000",
+			wantSig: "12f7ac9ac565a90bb1d7652ab46ac58c",
+		},
+		{
+			name: "signin status GET",
+			path: "/minimax-cloud/api/v1/signin/status",
+			opts: Options{
+				Access: "tok_2", UserID: "1234567890",
+				Now: 1763150001000, TZOffset: -480, OSName: "linux",
+				Query: []KV{
+					{"device_platform", "web"},
+					{"is_desktop", "1"},
+					{"desktop_version", "0.6.12"},
+				},
+			},
+			wantURL: "https://agent.minimax.io/minimax-cloud/api/v1/signin/status?device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1&desktop_version=0.6.12&unix=1763150001000&timezone_offset=-480&sys_language=en&lang=en&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY:  "843dc3e76c9fb3ad20efd5e21ec0d694",
+			wantTS:  "1763150001",
+			wantSig: "76c77cb5d0d6379b5e3c327e1dcfc792",
+		},
+		{
+			name: "signin claim POST",
+			path: "/minimax-cloud/api/v1/signin/claim",
+			opts: Options{
+				Access: "tok_3", UserID: "1234567890",
+				Body: []byte("{}"),
+				Now:  1763150002000, TZOffset: -480, OSName: "linux",
+				Query: []KV{
+					{"device_platform", "web"},
+					{"is_desktop", "1"},
+					{"desktop_version", "0.6.12"},
+				},
+			},
+			wantURL: "https://agent.minimax.io/minimax-cloud/api/v1/signin/claim?device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1&desktop_version=0.6.12&unix=1763150002000&timezone_offset=-480&sys_language=en&lang=en&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY:  "6b25db8b3affd0acc6649a069504ae44",
+			wantTS:  "1763150002",
+			wantSig: "df32c8dde2f6a4ca656915a2b3d6cdb9",
+		},
+		{
+			name: "credit details GET",
+			path: "/minimax-cloud/api/v1/credit/details",
+			opts: Options{
+				Access: "tok_4", UserID: "1234567890",
+				Now: 1763150003000, TZOffset: -480, OSName: "linux",
+				Query: []KV{
+					{"device_platform", "web"},
+					{"is_desktop", "1"},
+					{"desktop_version", "0.6.12"},
+					{"page_number", "1"},
+					{"page_size", "20"},
+					{"include_expired", "true"},
+				},
+			},
+			wantURL: "https://agent.minimax.io/minimax-cloud/api/v1/credit/details?device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1&desktop_version=0.6.12&page_number=1&page_size=20&include_expired=true&unix=1763150003000&timezone_offset=-480&sys_language=en&lang=en&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY:  "08b8e40788854e52e454ba9368e06170",
+			wantTS:  "1763150003",
+			wantSig: "d85b51c8028ad38c89a641b2b7a02a6d",
+		},
+		{
+			name: "membership POST",
+			path: "/matrix/api/v1/commerce/get_membership_info",
+			opts: Options{
+				Access: "tok_5", UserID: "1234567890",
+				Body: []byte("{}"),
+				Now:  1763150004000, TZOffset: -480, OSName: "linux",
+			},
+			wantURL: "https://agent.minimax.io/matrix/api/v1/commerce/get_membership_info?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201&unix=1763150004000&timezone_offset=-480&sys_language=en&lang=en&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY:  "13ceb091e21212e52bb130743981aa78",
+			wantTS:  "1763150004",
+			wantSig: "3bb29287aeeb77d318ea9c5f3dc1e0a6",
+		},
+		{
+			name: "workspace POST with empty user id",
+			path: "/matrix/api/v1/user/get_user_extra_info",
+			opts: Options{
+				Access: "tok_6", UserID: "",
+				Body: []byte("{}"),
+				Now:  1763150005000, TZOffset: 0, OSName: "darwin",
+			},
+			wantURL: "https://agent.minimax.io/matrix/api/v1/user/get_user_extra_info?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201&unix=1763150005000&timezone_offset=0&sys_language=en&lang=en&device_id=0&os_name=darwin&browser_name=mcode&user_id=0&client=mcode",
+			wantYY:  "d654afea9c1c4f667f82ecf2c7e175da",
+			wantTS:  "1763150005",
+			wantSig: "b8aec2aec964042d1b477b48ecbf1324",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", c.path, c.opts)
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+			if got.Timestamp != c.wantTS {
+				t.Errorf("timestamp = %s, want %s", got.Timestamp, c.wantTS)
+			}
+			if got.Signature != c.wantSig {
+				t.Errorf("signature = %s, want %s", got.Signature, c.wantSig)
+			}
+
+			headers := got.Headers()
+			want := map[string]string{
+				"Authorization": "Bearer " + c.opts.Access,
+				"Accept":        "application/json",
+				"Content-Type":  "application/json",
+				"User-Agent":    site.AccountUserAgent,
+				"yy":            c.wantYY,
+				"x-timestamp":   c.wantTS,
+				"x-signature":   c.wantSig,
+			}
+			for name, value := range want {
+				if headers[name] != value {
+					t.Errorf("header %s = %q, want %q", name, headers[name], value)
+				}
+			}
+		})
+	}
+}
+
+// The query the reference builds for a plain request, so that the cases
+// below can spell out only what they change.
+const plainQuery = "device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+	"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+	"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode"
+
+// The reference resolves the path against the origin and signs the
+// resolved, percent-encoded path, so these all sign something other
+// than what the path looks like.
+func TestSignResolvesThePath(t *testing.T) {
+	cases := []struct {
+		name    string
+		origin  string
+		path    string
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:   "a path without a leading slash",
+			origin: "https://agent.minimax.io",
+			path:   "v1/api/user/info",
+			// The reference resolves it against the origin, so it is
+			// the same request as the golden identity GET.
+			wantURL: "https://agent.minimax.io/v1/api/user/info?" + plainQuery,
+			wantYY:  "40865acf7e929978824a2892b1cc0e7b",
+		},
+		{
+			name:    "a path with a space in it",
+			origin:  "https://agent.minimax.io",
+			path:    "/v1/a b",
+			wantURL: "https://agent.minimax.io/v1/a%20b?" + plainQuery,
+			wantYY:  "5bf73d0b32d9919785be6e1cf3b76a84",
+		},
+		{
+			name:   "a path with a query of its own",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/x?a=1",
+			// The reference assigns the defaults to url.search, which
+			// replaces the path's own query.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "an origin with a path of its own",
+			origin: "https://agent.minimax.io/base/",
+			path:   "/v1/x",
+			// An absolute path replaces the origin's path.
+			wantURL: "https://agent.minimax.io/v1/x?" + plainQuery,
+			wantYY:  "390ae9a1f47d7d6bb3e1146f2ae666e5",
+		},
+		{
+			name:   "a path with a percent that is not an escape",
+			origin: "https://agent.minimax.io",
+			path:   "/v1/100%",
+			// JavaScript keeps a "%" that is not an escape as it is,
+			// so the reference signs it as it is too.
+			wantURL: "https://agent.minimax.io/v1/100%?" + plainQuery,
+			wantYY:  "203556ac721d12836c9fa21a52201df3",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign(c.origin, c.path, Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// The reference builds its query as an object literal with the
+// caller's query spread into the middle of it, so a repeated key takes
+// the caller's place but only the leading defaults take the caller's
+// value.
+func TestQueryDefaults(t *testing.T) {
+	cases := []struct {
+		name    string
+		query   []KV
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name:  "a leading default is the caller's to override",
+			query: []KV{{"device_platform", "web"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "98e6fa51a036f804c2c65e80295a731b",
+		},
+		{
+			name:  "lang keeps the reference's value",
+			query: []KV{{"lang", "zh"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&lang=en&unix=1763150000000&timezone_offset=-480&sys_language=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d2e7a1e8b377f6fa116a09b1d9825613",
+		},
+		{
+			name:  "client keeps the reference's value",
+			query: []KV{{"client", "x"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&client=mcode&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890",
+			wantYY: "f73c2ba5320fdc2145e65d82d40b14b8",
+		},
+		{
+			name:  "user_id keeps the option's value",
+			query: []KV{{"user_id", "q"}},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&user_id=1234567890&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&client=mcode",
+			wantYY: "84f842303887f8956faa37fad5226a13",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: c.query,
+			})
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+func TestQueryOverrideKeepsPosition(t *testing.T) {
+	// The reference spreads the caller's query over the defaults, so a
+	// repeated key changes its value but keeps its place.
+	got := Sign("https://agent.minimax.io", "/p", Options{
+		Now: 1763150000000, TZOffset: -480, OSName: "linux",
+		Query: []KV{{"device_platform", "web"}, {"is_desktop", "1"}},
+	})
+	want := "device_platform=web&biz_id=3&app_id=3001&version_code=22201&is_desktop=1"
+	if !strings.Contains(got.URL, want) {
+		t.Fatalf("URL %s does not contain %s", got.URL, want)
+	}
+}
+
+// The options that fall back to a default, and the ones that are
+// trimmed, are all part of the signed query.
+func TestSignOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    Options
+		wantURL string
+		wantYY  string
+	}{
+		{
+			name: "a language of its own",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Lang: "zh",
+			},
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&unix=1763150000000&timezone_offset=-480&sys_language=zh&lang=zh" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "d6bbe2721fce479b89ca1b7c05de3591",
+		},
+		{
+			name: "no platform name falls back to linux",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480,
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a user id with whitespace around it",
+			opts: Options{
+				Access: "tok_1", UserID: "  1234567890  ",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+			},
+			wantURL: "https://agent.minimax.io/p?" + plainQuery,
+			wantYY:  "cf6860c1fac0feba1367dc97c06cd876",
+		},
+		{
+			name: "a query value with a space and a non-ASCII character",
+			opts: Options{
+				Access: "tok_1", UserID: "1234567890",
+				Now: 1763150000000, TZOffset: -480, OSName: "linux",
+				Query: []KV{{"q", "a b 中文"}},
+			},
+			// URLSearchParams encodes a space as "+" and everything
+			// else as UTF-8 percent escapes.
+			wantURL: "https://agent.minimax.io/p?device_platform=mcode&biz_id=3&app_id=3001&version_code=22201" +
+				"&q=a+b+%E4%B8%AD%E6%96%87&unix=1763150000000&timezone_offset=-480&sys_language=en&lang=en" +
+				"&device_id=0&os_name=linux&browser_name=mcode&user_id=1234567890&client=mcode",
+			wantYY: "79bfb3e01c70c286bc75523a8c43a2b2",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Sign("https://agent.minimax.io", "/p", c.opts)
+			if got.URL != c.wantURL {
+				t.Errorf("URL\n got %s\nwant %s", got.URL, c.wantURL)
+			}
+			if got.YY != c.wantYY {
+				t.Errorf("yy = %s, want %s", got.YY, c.wantYY)
+			}
+		})
+	}
+}
+
+// An empty body is a GET: the reference has no way to send one, and a
+// POST with an empty body would sign a body the reference never signs.
+func TestSignEmptyBodyIsGet(t *testing.T) {
+	opts := Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: 1763150000000, TZOffset: -480, OSName: "linux",
+	}
+	get := Sign("https://agent.minimax.io", "/p", opts)
+	empty := Sign("https://agent.minimax.io", "/p", Options{
+		Access: opts.Access, UserID: opts.UserID, Body: []byte{},
+		Now: opts.Now, TZOffset: opts.TZOffset, OSName: opts.OSName,
+	})
+	if empty.YY != get.YY {
+		t.Errorf("yy = %s, want the GET one %s", empty.YY, get.YY)
+	}
+	if empty.Signature != get.Signature {
+		t.Errorf("signature = %s, want the GET one %s", empty.Signature, get.Signature)
+	}
+	if want := "cf6860c1fac0feba1367dc97c06cd876"; empty.YY != want {
+		t.Errorf("yy = %s, want %s", empty.YY, want)
+	}
+	if want := "12f7ac9ac565a90bb1d7652ab46ac58c"; empty.Signature != want {
+		t.Errorf("signature = %s, want %s", empty.Signature, want)
+	}
+}
+
+// The reference floors the seconds and Go's division truncates towards
+// zero.
+func TestSignFloorsNegativeSeconds(t *testing.T) {
+	got := Sign("https://agent.minimax.io", "/p", Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: -1500, TZOffset: -480, OSName: "linux",
+	})
+	if got.Timestamp != "-2" {
+		t.Errorf("timestamp = %s, want -2", got.Timestamp)
+	}
+	if want := "f13f639021bd969f8a1dad1c171b5785"; got.YY != want {
+		t.Errorf("yy = %s, want %s", got.YY, want)
+	}
+	if want := "c70bef52e842c40feaa0a33d76040802"; got.Signature != want {
+		t.Errorf("signature = %s, want %s", got.Signature, want)
+	}
+}
+
+// The user id is trimmed the way JavaScript trims a string, which is
+// not quite strings.TrimSpace: JavaScript strips U+FEFF and keeps
+// U+0085, and Go does the opposite.
+func TestJSTrimMatchesJavaScript(t *testing.T) {
+	bom := string(rune(0xFEFF))
+	nel := string(rune(0x0085))
+	cases := map[string]string{
+		"  42  ":     "42",
+		"\t\n42\r\n": "42",
+		bom + "42":   "42",
+		"42" + nel:   "42" + nel,
+	}
+	for in, want := range cases {
+		if got := jsTrim(in); got != want {
+			t.Errorf("jsTrim(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEncodeURIComponentMatchesJS(t *testing.T) {
+	cases := map[string]string{
+		"/v1/api/user/info?a=b&c=d": "%2Fv1%2Fapi%2Fuser%2Finfo%3Fa%3Db%26c%3Dd",
+		"a b":                       "a%20b",
+		"~":                         "~",
+		"*":                         "*",
+		// encodeURIComponent keeps !'()* — unlike URLSearchParams, which
+		// escapes them. The two encoders differ exactly here.
+		"!'()": "!'()",
+	}
+	for in, want := range cases {
+		if got := encodeURIComponent(in); got != want {
+			t.Errorf("encodeURIComponent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormEncodeMatchesJS(t *testing.T) {
+	cases := map[string]string{
+		"a b": "a+b",
+		"~":   "%7E",
+		"*":   "*",
+		"-._": "-._",
+		"/":   "%2F",
+		// URLSearchParams escapes these; encodeURIComponent does not.
+		"!'()": "%21%27%28%29",
+	}
+	for in, want := range cases {
+		if got := formEncode(in); got != want {
+			t.Errorf("formEncode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The web flavour puts the common parameters first and the caller's own
+// parameter after them, the way the browser fills a URLSearchParams.
+// A key that is in both halves is in the query twice, and the parsers
+// take the first one they see, so the common block's value counts.
+func TestTheWebFlavorSignsItsOwnQuery(t *testing.T) {
 	now := int64(1763000000000)
 	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
 		Flavor:   FlavorWeb,
@@ -46,20 +516,57 @@ func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
 		DeviceID: "574786429807779842",
 	})
 	want := "https://account.minimax.io/oauth2/login" +
-		"?uuid=0f8fad5b-d9cb-469f-a165-70867728950e" +
-		"&device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+		"?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
 		"&unix=1763000000000&timezone_offset=28800&sys_language=en&lang=en" +
 		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
 		"&os_name=Windows&browser_name=chrome&device_memory=16&cpu_core_num=16" +
 		"&browser_language=en-US&browser_platform=Win32&user_id=0&op_ticket=undefined" +
-		"&screen_width=1280&screen_height=800&client=web"
+		"&screen_width=1280&screen_height=800&client=web" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e"
 	if s.URL != want {
 		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
 	}
 }
 
-func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
-	// 签的就是发的：把 URL 拿来重算一遍 yy 和 x-signature，两个都要对得上。
+// Every option the web flavour has, set to something other than its
+// default, so that a field that is wired up wrong — the screen's width
+// and height swapped, say — cannot hide behind a default.
+func TestTheWebFlavorSignsEveryOption(t *testing.T) {
+	now := int64(1763000000000)
+	s := Sign("https://account.minimax.io", "/v1/api/user/device/register", Options{
+		Flavor:          FlavorWeb,
+		Now:             now,
+		TZOffset:        -18000,
+		Lang:            "zh",
+		OSName:          "macOS",
+		BrowserLanguage: "zh-CN",
+		BrowserPlatform: "MacIntel",
+		ScreenWidth:     2560,
+		ScreenHeight:    1440,
+		DeviceMemory:    32,
+		CPUCores:        10,
+		OpTicket:        "ticket-1",
+		UUID:            "0f8fad5b-d9cb-469f-a165-70867728950e",
+		DeviceID:        "574786429807779842",
+		UserID:          "9876543210",
+		Query:           []KV{{K: "uuid", V: "0f8fad5b-d9cb-469f-a165-70867728950e"}},
+	})
+	want := "https://account.minimax.io/v1/api/user/device/register" +
+		"?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+		"&unix=1763000000000&timezone_offset=-18000&sys_language=zh&lang=zh" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
+		"&os_name=macOS&browser_name=chrome&device_memory=32&cpu_core_num=10" +
+		"&browser_language=zh-CN&browser_platform=MacIntel&user_id=9876543210&op_ticket=ticket-1" +
+		"&screen_width=2560&screen_height=1440&client=web" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e"
+	if s.URL != want {
+		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
+	}
+}
+
+func TestTheWebFlavorSignsWhatItSends(t *testing.T) {
+	// The signature is over what is sent: take the URL and work the two
+	// hashes out of it again, and both have to come out the same.
 	now := int64(1763000000000)
 	body := []byte(`{"loginType":"20","email":"a@example.com"}`)
 	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
@@ -82,28 +589,114 @@ func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
 	}
 }
 
-func TestTheMCodeFlavourIsUnchanged(t *testing.T) {
-	// CLI 那套不能动：调用方的 query 在中间，device_platform 是 mcode。
-	now := int64(1763000000000)
-	s := Sign("https://account.minimax.io", "/v1/api/user/identity", Options{
-		Now:      now,
-		TZOffset: 0,
-		Query:    []KV{{K: "group_id", V: "g1"}},
-	})
-	if !strings.Contains(s.URL, "device_platform=mcode") ||
-		!strings.Contains(s.URL, "browser_name=mcode") ||
-		!strings.Contains(s.URL, "client=mcode") {
-		t.Fatalf("url = %s", s.URL)
+// The CLI branch is the contract the six golden vectors depend on, so
+// it has to stay exactly as it was: the same output as when the flavor
+// is left unset, and none of the web's parameters.
+func TestTheMCodeFlavorIsUnchanged(t *testing.T) {
+	opts := Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: 1763000000000, TZOffset: -480, OSName: "linux",
+		Query: []KV{{K: "group_id", V: "g1"}},
 	}
-	if strings.Contains(s.URL, "device_platform=web") {
-		t.Fatalf("url = %s", s.URL)
+	unset := Sign("https://account.minimax.io", "/v1/api/user/identity", opts)
+	opts.Flavor = FlavorMCode
+	explicit := Sign("https://account.minimax.io", "/v1/api/user/identity", opts)
+	if explicit.URL != unset.URL {
+		t.Errorf("url =\n%s\nwant\n%s", explicit.URL, unset.URL)
+	}
+	if explicit.YY != unset.YY {
+		t.Errorf("yy = %s, want %s", explicit.YY, unset.YY)
+	}
+	if explicit.Signature != unset.Signature {
+		t.Errorf("signature = %s, want %s", explicit.Signature, unset.Signature)
+	}
+	// The CLI sends none of the web client's own parameters.
+	for _, key := range []string{
+		"browser_language=", "browser_platform=", "screen_width=",
+		"screen_height=", "device_memory=", "cpu_core_num=", "op_ticket=",
+	} {
+		if strings.Contains(explicit.URL, key) {
+			t.Errorf("the CLI's query carries the web's %s: %s", key, explicit.URL)
+		}
+	}
+}
+
+// The parameter set is ordered: setting a key that is already there
+// changes its value and keeps its place, and appending a key puts it
+// there a second time, further down.
+func TestParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		steps      []func(p *params)
+		wantEncode string
+		wantGet    map[string]string
+	}{
+		{
+			name: "setting a key twice leaves one entry in its place",
+			steps: []func(p *params){
+				func(p *params) { p.set("a", "1") },
+				func(p *params) { p.set("b", "2") },
+				func(p *params) { p.set("a", "3") },
+			},
+			wantEncode: "a=3&b=2",
+			wantGet:    map[string]string{"a": "3", "b": "2"},
+		},
+		{
+			name: "appending a key twice leaves two entries",
+			steps: []func(p *params){
+				func(p *params) { p.append("a", "1") },
+				func(p *params) { p.append("a", "2") },
+			},
+			wantEncode: "a=1&a=2",
+			wantGet:    map[string]string{"a": "2"},
+		},
+		{
+			name: "setting an appended key changes the appended one",
+			steps: []func(p *params){
+				func(p *params) { p.append("a", "1") },
+				func(p *params) { p.append("b", "2") },
+				func(p *params) { p.set("a", "3") },
+			},
+			wantEncode: "a=3&b=2",
+			wantGet:    map[string]string{"a": "3"},
+		},
+		{
+			name: "the entries come out in the order they went in",
+			steps: []func(p *params){
+				func(p *params) { p.set("z", "1") },
+				func(p *params) { p.set("a", "2") },
+				func(p *params) { p.append("m", "3") },
+			},
+			wantEncode: "z=1&a=2&m=3",
+			wantGet:    map[string]string{"z": "1", "a": "2", "m": "3"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := newParams()
+			for _, step := range c.steps {
+				step(p)
+			}
+			if got := p.encode(); got != c.wantEncode {
+				t.Errorf("encode = %q, want %q", got, c.wantEncode)
+			}
+			for k, want := range c.wantGet {
+				if got := p.get(k); got != want {
+					t.Errorf("get(%q) = %q, want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// A key that was never set has no value.
+func TestParamsGetOfAMissingKey(t *testing.T) {
+	p := newParams()
+	if got := p.get("nothing"); got != "" {
+		t.Errorf("get = %q, want an empty string", got)
 	}
 }
 ```
-
-（`x-signature` 算的是**秒**那个时间戳，不是毫秒：抓包笔记里
-`x-timestamp = floor(unix_ms / 1000)`，签名里用的是这个秒数。写成
-毫秒的话，站点会验不过。）
 
 - [ ] **Step 2: 跑测试，确认它失败**
 
@@ -114,7 +707,53 @@ Expected: FAIL（`FlavorWeb` 还没有，编译就过不去）
 
 在 `internal/sign/sign.go` 里加：
 
+整个文件写成这样（下面是它的全文）：
+
 ```go
+// Package sign builds the headers MiniMax's account API expects.
+//
+// MiniMax Code signs each account API request: "yy" over the path, the
+// query and the body, and "x-signature" over the time and the body. The
+// secret is MiniMax Code's own.
+//
+// Three details make this different from an ordinary query builder, and
+// all three come from how JavaScript does it:
+//
+//   - the query keeps its insertion order. URLSearchParams does not sort
+//     its keys, and the signature is over the encoded text, so the order
+//     is part of the contract. Go's url.Values.Encode() sorts, and would
+//     produce a different signature every time;
+//   - the encoding is JavaScript's. URLSearchParams keeps "*-._", encodes
+//     a space as "+" and encodes "~"; encodeURIComponent keeps
+//     "!*'()~", encodes a space as "%20" and does not touch "~". Go's
+//     url.QueryEscape does neither exactly;
+//   - the path is resolved before it is signed. The reference resolves
+//     the path against the origin with `new URL(path, origin)` and signs
+//     the resolved, percent-encoded path, so a path without a leading
+//     slash, a path with a space in it and a path with a query of its own
+//     all sign something other than what they look like.
+package sign
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"mmxcode/internal/site"
+)
+
+// Secret is MiniMax Code's request-signing secret.
+const Secret = "I*7Cf%WZ#S&%1RlZJ&C2"
+
+// KV is one query parameter.
+type KV struct {
+	K string
+	V string
+}
+
 // Flavor is which client a signed request claims to be.
 //
 // The two clients sign the same way but send different things: the
@@ -129,11 +768,62 @@ const (
 	// FlavorWeb is the MiniMax account website.
 	FlavorWeb
 )
-```
 
-在 `Options` 里加：
-
-```go
+// Options is what a request's signature is made of.
+type Options struct {
+	// Access is the account's access token, put in Authorization.
+	Access string
+	// UserID is the account's MiniMax user id. It is trimmed the way
+	// JavaScript trims a string — the WhiteSpace and LineTerminator
+	// characters, which is not quite what strings.TrimSpace does — and
+	// an empty one becomes "0".
+	UserID string
+	// Body is the request's JSON body. Its bytes go into both hashes
+	// as they are, so the caller must pass exactly the bytes it will
+	// put on the wire. Go's json.Marshal is not JSON.stringify: it
+	// escapes "<", ">" and "&" and it sorts a map's keys, and
+	// JSON.stringify does neither. A body that has to match the
+	// reference byte for byte is built by hand.
+	//
+	// A nil or empty body means a GET.
+	Body []byte
+	// Query holds the caller's extra query parameters, in order.
+	//
+	// The CLI builds its query as an object literal with the caller's
+	// query spread into the middle of it, and the two halves do not
+	// treat a repeated key the same way:
+	//
+	//   - the four leading defaults — device_platform, biz_id, app_id
+	//     and version_code — come before the spread, so a repeated key
+	//     takes the caller's value and keeps the caller's place;
+	//   - the trailing defaults — unix, timezone_offset, sys_language,
+	//     lang, device_id, os_name, browser_name, user_id and client —
+	//     come after it, so a repeated key keeps the caller's place but
+	//     takes the reference's value. "lang" and "client" are the
+	//     reference's, "user_id" is the option's.
+	//
+	// The web client builds its query the other way round. It fills a
+	// URLSearchParams: the common parameters go in first and the
+	// caller's own parameter is appended after them. A key that is in
+	// both halves is therefore in the query twice, and the parsers the
+	// site uses — url.Values.Get, URLSearchParams.get, Java's
+	// getParameter — take the first one they see, so for the web
+	// flavour it is the common block's value that counts.
+	Query []KV
+	// Now is the request's time in Unix milliseconds.
+	//
+	// It is required. There is no default on purpose — a default of
+	// time.Now() would make a signed request unreproducible — and the
+	// zero value signs the Unix epoch, which the server reads as a
+	// stale request.
+	Now int64
+	// TZOffset is the client's timezone offset in seconds.
+	TZOffset int
+	// OSName is the client's platform name. An empty one is "linux"
+	// for the CLI and "Windows" for the web client.
+	OSName string
+	// Lang is the site's language. An empty one is the site's own.
+	Lang string
 	// Flavor says which client the request claims to be. The zero
 	// value is the CLI, so the existing callers do not change.
 	Flavor Flavor
@@ -156,115 +846,55 @@ const (
 	// OpTicket is the web session's ticket. Before signing in the
 	// browser sends the word "undefined", and so does this.
 	OpTicket string
-```
-
-`params` 要多一个 `append`：网页那边是"接上去"的，同一个键可以出现两次
-（调用方的在前面，公共的在后面），而 CLI 那边是 `set`——改值但不改位置。
-把 `params` 改成一张有序的表：
-
-```go
-// params is an ordered query parameter set: setting a key that is
-// already there changes its value and keeps its place, and appending a
-// key puts it there a second time, further down.
-type params struct {
-	entries []KV
-	// index is where a key's value is set, so that setting a key again
-	// changes its value and keeps its place.
-	index map[string]int
 }
 
-func newParams() *params {
-	return &params{index: map[string]int{}}
+// Signed is a signed request's URL and headers.
+type Signed struct {
+	// URL is the full URL, query included.
+	URL string
+	// YY is the header "yy".
+	YY string
+	// Timestamp is the header "x-timestamp", in seconds.
+	Timestamp string
+	// Signature is the header "x-signature".
+	Signature string
+
+	// access is the account's access token, put in Authorization.
+	access string
 }
 
-func (p *params) set(k, v string) {
-	if i, ok := p.index[k]; ok {
-		p.entries[i].V = v
-		return
+// Headers gives the headers a signed request carries.
+func (s Signed) Headers() map[string]string {
+	return map[string]string{
+		"Accept":        "application/json",
+		"Content-Type":  "application/json",
+		"User-Agent":    site.AccountUserAgent,
+		"Authorization": "Bearer " + s.access,
+		"yy":            s.YY,
+		"x-timestamp":   s.Timestamp,
+		"x-signature":   s.Signature,
 	}
-	p.index[k] = len(p.entries)
-	p.entries = append(p.entries, KV{K: k, V: v})
 }
 
-// append puts the key at the end, even when it is already there.
-//
-// The web client builds its query by appending: the caller's own
-// parameters first and the common ones after them, so a key that is in
-// both is in the query twice.
-func (p *params) append(k, v string) {
-	p.entries = append(p.entries, KV{K: k, V: v})
-}
+// Sign builds the signed request for a path on origin.
+func Sign(origin, path string, o Options) Signed {
+	lang := o.Lang
+	if lang == "" {
+		lang = site.Lang
+	}
 
-func (p *params) get(k string) string {
-	if i, ok := p.index[k]; ok {
-		return p.entries[i].V
-	}
-	return ""
-}
-
-func (p *params) encode() string {
-	var b strings.Builder
-	for i, e := range p.entries {
-		if i > 0 {
-			b.WriteByte('&')
-		}
-		b.WriteString(formEncode(e.K))
-		b.WriteByte('=')
-		b.WriteString(formEncode(e.V))
-	}
-	return b.String()
-}
-```
-
-在 `Sign` 的开头（`lang` 那几行旁边）加网页那套默认值：
-
-```go
-	// The rest are what the web client claims about itself. The CLI
-	// sends none of them.
-	//
-	// The browser language is the one the client claims to have: the
-	// site says English and the browser behind it says English too.
-	browserLanguage := o.BrowserLanguage
-	if browserLanguage == "" {
-		browserLanguage = "en-US"
-	}
-	browserPlatform := o.BrowserPlatform
-	if browserPlatform == "" {
-		browserPlatform = "Win32"
-	}
-	deviceMemory := o.DeviceMemory
-	if deviceMemory == 0 {
-		deviceMemory = 16
-	}
-	cpuCores := o.CPUCores
-	if cpuCores == 0 {
-		cpuCores = 16
-	}
-	screenWidth := o.ScreenWidth
-	if screenWidth == 0 {
-		screenWidth = 1280
-	}
-	screenHeight := o.ScreenHeight
-	if screenHeight == 0 {
-		screenHeight = 800
-	}
-	opTicket := o.OpTicket
-	if opTicket == "" {
-		// The browser sends the word "undefined" before signing in:
-		// the ticket is not in the session yet.
-		opTicket = "undefined"
-	}
-```
-
-把 `Sign` 里拼 query 的那段改成两个分支：
-
-```go
 	p := newParams()
 	switch o.Flavor {
 	case FlavorWeb:
-		// The web client sends the caller's own parameters first and
-		// the common ones after them, so a key that is in both is in
-		// the query twice.
+		// The web client fills a URLSearchParams: the common parameters
+		// go in first and the caller's own parameter is appended after
+		// them. A key that is in both halves is in the query twice, and
+		// the usual parsers — url.Values.Get, URLSearchParams.get,
+		// Java's getParameter — take the first one they see, so it is
+		// the common block's value that counts here.
+		//
+		// The rest are what the web client claims about itself. The CLI
+		// sends none of them.
 		osName := o.OSName
 		if osName == "" {
 			osName = "Windows"
@@ -273,8 +903,38 @@ func (p *params) encode() string {
 		if userID == "" {
 			userID = "0"
 		}
-		for _, kv := range o.Query {
-			p.append(kv.K, kv.V)
+		// The browser language is the one the client claims to have:
+		// the site says English and the browser behind it says English
+		// too.
+		browserLanguage := o.BrowserLanguage
+		if browserLanguage == "" {
+			browserLanguage = "en-US"
+		}
+		browserPlatform := o.BrowserPlatform
+		if browserPlatform == "" {
+			browserPlatform = "Win32"
+		}
+		deviceMemory := o.DeviceMemory
+		if deviceMemory == 0 {
+			deviceMemory = 16
+		}
+		cpuCores := o.CPUCores
+		if cpuCores == 0 {
+			cpuCores = 16
+		}
+		screenWidth := o.ScreenWidth
+		if screenWidth == 0 {
+			screenWidth = 1280
+		}
+		screenHeight := o.ScreenHeight
+		if screenHeight == 0 {
+			screenHeight = 800
+		}
+		opTicket := o.OpTicket
+		if opTicket == "" {
+			// The browser sends the word "undefined" before signing in:
+			// the ticket is not in the session yet.
+			opTicket = "undefined"
 		}
 		p.append("device_platform", "web")
 		p.append("biz_id", "3")
@@ -297,6 +957,9 @@ func (p *params) encode() string {
 		p.append("screen_width", strconv.Itoa(screenWidth))
 		p.append("screen_height", strconv.Itoa(screenHeight))
 		p.append("client", "web")
+		for _, kv := range o.Query {
+			p.append(kv.K, kv.V)
+		}
 	default:
 		// The CLI puts the caller's parameters in the middle and the
 		// defaults around them. That is what the reference does, and
@@ -325,10 +988,248 @@ func (p *params) encode() string {
 		}
 		p.set("client", "mcode")
 	}
-```
 
-（`os_name` 的默认值分在两个分支里：网页是 "Windows"，CLI 还是
-"linux"。CLI 那一支一个字都不能变——原有的向量测试是它的契约。）
+	query := p.encode()
+	target, at := resolveURL(origin, path, query)
+	ts := o.Now / 1000
+	if o.Now < 0 && o.Now%1000 != 0 {
+		// The reference floors the seconds and Go's division truncates
+		// towards zero, so -1500 milliseconds is -2 seconds there and
+		// -1 second here.
+		ts--
+	}
+	nowText := strconv.FormatInt(o.Now, 10)
+
+	// The reference's signed() — packages/minimax/index.mjs of
+	// @magpie-community/opencode-minimax-auth, the one copied verbatim
+	// into testdata/regen-vectors.mjs — builds the two hashes out of
+	// the same parts:
+	//
+	//	yy:          md5(encodeURIComponent(at) + "_" + body + md5(now) + "ooui")
+	//	x-signature: md5(seconds + secret + body)
+	//
+	// The "_" separator, the md5 of the time and the "ooui" salt are
+	// the reference's, verbatim. They read like typos and are not.
+	var yy, signature string
+	if len(o.Body) == 0 {
+		// The reference has no body for a GET, and signs a literal
+		// "{}" in the body's place. The "{}" is the reference's too,
+		// and not a placeholder to be tidied away: dropping it changes
+		// every GET signature.
+		yy = md5Hex(encodeURIComponent(at) + "_" + "{}" + md5Hex(nowText) + "ooui")
+		signature = md5Hex(strconv.FormatInt(ts, 10) + Secret)
+	} else {
+		body := string(o.Body)
+		yy = md5Hex(encodeURIComponent(at) + "_" + body + md5Hex(nowText) + "ooui")
+		signature = md5Hex(strconv.FormatInt(ts, 10) + Secret + body)
+	}
+
+	return Signed{
+		URL:       target,
+		YY:        yy,
+		Timestamp: strconv.FormatInt(ts, 10),
+		Signature: signature,
+		access:    o.Access,
+	}
+}
+
+// resolveURL gives the URL a signed request goes to and the string the
+// reference signs.
+//
+// The reference resolves the path against the origin with
+// `new URL(path, origin)` and signs url.pathname, which is the
+// resolved and percent-encoded path. So a path without a leading slash
+// is resolved against the origin's own path, a space in the path is
+// escaped, and a query in the path is dropped — the reference assigns
+// the defaults to url.search afterwards, and that replaces it.
+//
+// The fragment is left out of the signed string, as it is in the
+// reference, and kept in the URL, as it is there too.
+func resolveURL(origin, path, query string) (target, at string) {
+	base, err := url.Parse(origin)
+	if err != nil || base.Host == "" {
+		// An origin that is not a URL is used as the prefix as it is,
+		// and the path is taken as an absolute path.
+		escaped := absolutePath(path)
+		return strings.TrimRight(origin, "/") + escaped + "?" + query, escaped + "?" + query
+	}
+	if base.Scheme == "" {
+		base.Scheme = "https"
+	}
+	ref, err := url.Parse(path)
+	if err != nil {
+		// url.Parse rejects a path with an invalid percent escape
+		// ("/v1/100%"), which JavaScript keeps as it is. Such a path
+		// is escaped here the way JavaScript escapes a path.
+		escaped := absolutePath(path)
+		return base.Scheme + "://" + base.Host + escaped + "?" + query, escaped + "?" + query
+	}
+	resolved := base.ResolveReference(ref)
+	// The reference replaces the search with the defaults, so the
+	// path's own query is dropped.
+	resolved.RawQuery = ""
+	resolved.ForceQuery = false
+	escaped := resolved.EscapedPath()
+	if escaped == "" {
+		// A URL always has a path, at least a slash.
+		escaped = "/"
+	}
+	target = resolved.Scheme + "://" + resolved.Host + escaped + "?" + query
+	if resolved.Fragment != "" {
+		target += "#" + resolved.EscapedFragment()
+	}
+	return target, escaped + "?" + query
+}
+
+// params is an ordered query parameter set: setting a key that is
+// already there changes its value and keeps its place, and appending a
+// key puts it there a second time, further down.
+type params struct {
+	entries []KV
+	// index is where a key's value is set, so that setting a key again
+	// changes its value and keeps its place.
+	index map[string]int
+}
+
+func newParams() *params {
+	return &params{index: map[string]int{}}
+}
+
+func (p *params) set(k, v string) {
+	if i, ok := p.index[k]; ok {
+		p.entries[i].V = v
+		return
+	}
+	p.index[k] = len(p.entries)
+	p.entries = append(p.entries, KV{K: k, V: v})
+}
+
+// append puts the key at the end, even when it is already there.
+//
+// The web client builds its query by filling a URLSearchParams: the
+// common parameters go in first and the caller's own parameter is
+// appended after them, so a key that is in both halves is in the query
+// twice.
+//
+// The key is registered in the index as well, so that get sees the most
+// recent value and set changes the appended entry in place instead of
+// appending a third copy of it.
+func (p *params) append(k, v string) {
+	p.entries = append(p.entries, KV{K: k, V: v})
+	p.index[k] = len(p.entries) - 1
+}
+
+func (p *params) get(k string) string {
+	if i, ok := p.index[k]; ok {
+		return p.entries[i].V
+	}
+	return ""
+}
+
+func (p *params) encode() string {
+	var b strings.Builder
+	for i, e := range p.entries {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(formEncode(e.K))
+		b.WriteByte('=')
+		b.WriteString(formEncode(e.V))
+	}
+	return b.String()
+}
+
+// formEncode encodes one value the way URLSearchParams does.
+func formEncode(s string) string {
+	const kept = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*-._"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case strings.IndexByte(kept, c) >= 0:
+			b.WriteByte(c)
+		case c == ' ':
+			b.WriteByte('+')
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+// encodeURIComponent encodes one value the way JavaScript's
+// encodeURIComponent does.
+func encodeURIComponent(s string) string {
+	const kept = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if strings.IndexByte(kept, c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+// absolutePath escapes a path the way JavaScript escapes one and makes
+// it absolute.
+func absolutePath(path string) string {
+	escaped := jsPath(path)
+	if !strings.HasPrefix(escaped, "/") {
+		escaped = "/" + escaped
+	}
+	return escaped
+}
+
+// jsPath escapes a path the way JavaScript's URL parser escapes one:
+// the C0 controls, everything above "~" and " # < > ? ` { }" are
+// percent-encoded and the rest is left as it is. A "%" that is not a
+// valid escape is left alone, as JavaScript leaves it.
+func jsPath(s string) string {
+	const escaped = "\"#<>?`{}"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c <= 0x20 || c >= 0x7F:
+			fmt.Fprintf(&b, "%%%02X", c)
+		case strings.IndexByte(escaped, c) >= 0:
+			fmt.Fprintf(&b, "%%%02X", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// jsTrim trims a string the way JavaScript's String.prototype.trim
+// does: the WhiteSpace and LineTerminator characters.
+//
+// It is not quite strings.TrimSpace, which differs on two code points —
+// JavaScript strips U+FEFF and keeps U+0085 — and the difference
+// matters here, because the user id goes into the signed query.
+func jsTrim(s string) string {
+	return strings.TrimFunc(s, isJSSpace)
+}
+
+// isJSSpace says whether a rune is one of JavaScript's WhiteSpace and
+// LineTerminator characters.
+func isJSSpace(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', ' ', 0x00A0, 0xFEFF,
+		0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200A
+}
+
+func md5Hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+```
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
@@ -854,6 +1755,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 创建 `internal/webauth/webauth_test.go`：
 
+整个文件写成这样（下面是它的全文）：
+
 ```go
 package webauth
 
@@ -889,10 +1792,17 @@ func newFakeSite(t *testing.T) *fakeSite {
 				t.Errorf("the device registration is not signed")
 			}
 			// The device registration is the one call whose own query
-			// is the uuid, and the web client puts the caller's query
-			// in front (design document 3.2).
-			if !strings.HasPrefix(r.URL.RawQuery, "uuid=") {
-				t.Errorf("the device registration query = %q, want it to start with the uuid", r.URL.RawQuery)
+			// is the uuid. The web client puts the common parameters
+			// first and the caller's own parameter after them, so the
+			// query ends with the uuid — which is in the common block
+			// as well, mid-list (design document 3.2).
+			parts := strings.Split(r.URL.RawQuery, "&")
+			last := parts[len(parts)-1]
+			if !strings.HasPrefix(last, "uuid=") {
+				t.Errorf("the device registration query = %q, want it to end with the uuid", r.URL.RawQuery)
+			}
+			if n := strings.Count(r.URL.RawQuery, "uuid="); n != 2 {
+				t.Errorf("the device registration query has %d uuid parameters, want 2: %q", n, r.URL.RawQuery)
 			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"deviceIDStr": f.deviceID},
@@ -1213,8 +2123,6 @@ func TestEachClientHasItsOwnSession(t *testing.T) {
 }
 ```
 
-（`errorsAs` 是这个测试文件里的小帮手：`func errorsAs(err error, target **SiteError) bool { return errors.As(err, target) }`，或者直接用 `errors.As` 并 import `"errors"`。用后者更省事。）
-
 - [ ] **Step 2: 跑测试，确认它失败**
 
 Run: `go test ./internal/webauth/ -count=1`
@@ -1223,6 +2131,8 @@ Expected: FAIL（包还不存在）
 - [ ] **Step 3: 写实现**
 
 创建 `internal/webauth/webauth.go`：
+
+整个文件写成这样（下面是它的全文）：
 
 ```go
 // Package webauth signs in to MiniMax's account site the way the web
@@ -1353,8 +2263,10 @@ func (c *Client) RegisterDevice(ctx context.Context) (string, error) {
 		return "", err
 	}
 	// The device registration is the one call whose own query is the
-	// uuid (design document 3.2). The web client puts the caller's
-	// query first, so the url starts with it.
+	// uuid (design document 3.2). The web client appends the common
+	// parameters first and its own afterwards, so the uuid comes last
+	// -- and it is in the query twice, because the common block has
+	// one of its own.
 	s := c.sign(DeviceRegisterPath, body, []sign.KV{{K: "uuid", V: c.uuid}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
 	if err != nil {
@@ -1555,8 +2467,15 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 			}
 		}
 	}
-	return "", errors.New("device authorize: there is no default group to approve")
+	return "", ErrNoDefaultGroup
 }
+
+// ErrNoDefaultGroup is the answer when the site has no default group
+// to approve the code into.
+//
+// It is not worth trying again: the group is not there, and it will
+// not be there in five seconds either.
+var ErrNoDefaultGroup = errors.New("device authorize: there is no default group to approve")
 
 // findGroups finds the groups in the site's answer.
 //
@@ -1598,8 +2517,9 @@ func findGroups(v any) []map[string]any {
 
 // sign makes a signed request for the web flavour.
 //
-// The query is the caller's own query, which the web client puts in
-// front of the common one.
+// The query is the caller's own query. The web flavour puts the common
+// parameters first and the caller's after them, so a key that is in
+// both halves is in the query twice.
 func (c *Client) sign(path string, body []byte, query []sign.KV) sign.Signed {
 	return sign.Sign(c.base, path, sign.Options{
 		Flavor:   sign.FlavorWeb,
@@ -1732,6 +2652,8 @@ func newUUID() string {
 }
 ```
 
+
+
 再创建 `internal/webauth/rsa.go`：
 
 ```go
@@ -1787,7 +2709,6 @@ func encryptPassword(password string) (string, error) {
 	return base64.StdEncoding.EncodeToString(cipher), nil
 }
 ```
-
 - [ ] **Step 4: 跑测试，确认它过了**
 
 Run: `go test ./internal/webauth/ -count=1`
@@ -2426,6 +3347,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 创建 `internal/provision/chain_test.go`：
 
+整个文件写成这样（下面是它的全文）：
+
 ```go
 package provision
 
@@ -2447,6 +3370,8 @@ type fakeStore struct {
 	accounts []string
 	tokens   []string
 	password []string
+	// failToken makes the token refuse to be saved.
+	failToken bool
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
@@ -2455,6 +3380,9 @@ func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
 }
 
 func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
+	if s.failToken {
+		return errors.New("the disk is full")
+	}
 	s.tokens = append(s.tokens, t.AccountID+":"+t.Refresh)
 	return nil
 }
@@ -2462,6 +3390,53 @@ func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
 func (s *fakeStore) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
 	s.password = append(s.password, id+":"+cipher)
 	return nil
+}
+
+// DeleteAccount takes an account back out.
+func (s *fakeStore) DeleteAccount(ctx context.Context, id string) error {
+	for i, a := range s.accounts {
+		if strings.HasPrefix(a, id+":") {
+			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+// fakeWeb stands in for the account site.
+type fakeWeb struct {
+	deviceID   string
+	probed     []string
+	signed     []string
+	approved   []string
+	email      string
+	password   string
+	redirect   string
+	approveErr error
+}
+
+func (w *fakeWeb) RegisterDevice(ctx context.Context) (string, error) {
+	return w.deviceID, nil
+}
+
+func (w *fakeWeb) Probe(ctx context.Context, email, deviceID, redirect string) error {
+	w.probed = append(w.probed, email)
+	w.email = email
+	w.redirect = redirect
+	return nil
+}
+
+func (w *fakeWeb) Password(ctx context.Context, email, password, deviceID, redirect string) error {
+	w.signed = append(w.signed, email)
+	w.email = email
+	w.password = password
+	w.redirect = redirect
+	return nil
+}
+
+func (w *fakeWeb) Approve(ctx context.Context, userCode string) error {
+	w.approved = append(w.approved, userCode)
+	return w.approveErr
 }
 
 // aChain is a chain that does everything but talk to the site.
@@ -2477,7 +3452,7 @@ func aChain(st *fakeStore) *Chain {
 		Identity: func(ctx context.Context, access, subject string) (account.Identity, error) {
 			return account.Identity{Email: "a@example.com", RealUserID: "u1"}, nil
 		},
-		Web:   &webauth.Client{},
+		Web:   &fakeWeb{deviceID: "574786429807779842"},
 		Now:   func() time.Time { return time.Unix(1763000000, 0) },
 		NewID: func() string { return "acc_1" },
 	}
@@ -2506,6 +3481,31 @@ func TestTheChainSignsInAndStores(t *testing.T) {
 	}
 }
 
+func TestTheChainRunsTheWebStepsInOrder(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(web.probed) != 1 || web.probed[0] != "a@example.com" {
+		t.Fatalf("probed = %v", web.probed)
+	}
+	if len(web.signed) != 1 || web.signed[0] != "a@example.com" {
+		t.Fatalf("signed = %v", web.signed)
+	}
+	if web.password != "hunter2" {
+		t.Fatalf("password = %q", web.password)
+	}
+	if len(web.approved) != 1 || web.approved[0] != "ABCD" {
+		t.Fatalf("approved = %v", web.approved)
+	}
+	if !strings.Contains(web.redirect, "user_code=ABCD") {
+		t.Fatalf("redirect = %q", web.redirect)
+	}
+}
+
 func TestTheChainDoesNotKeepThePasswordWithoutAKey(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
@@ -2519,7 +3519,7 @@ func TestTheChainDoesNotKeepThePasswordWithoutAKey(t *testing.T) {
 }
 
 func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
-	c := &Chain{Web: &webauth.Client{}}
+	c := &Chain{}
 	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200046})
 
 	var pe *Error
@@ -2533,6 +3533,85 @@ func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
 		t.Fatalf("message = %q", pe.Message)
 	}
 }
+
+func TestARefusalWithoutACodeIsStillExplained(t *testing.T) {
+	c := &Chain{}
+	err := c.webError(StageApprove, &webauth.SiteError{Reason: "login_required"})
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Message == "" || !strings.Contains(pe.Message, "登录") {
+		t.Fatalf("message = %q", pe.Message)
+	}
+}
+
+func TestAMissingDefaultGroupIsNotTriedAgain(t *testing.T) {
+	c := &Chain{
+		Start: func(ctx context.Context) (*oauth.Device, error) {
+			return &oauth.Device{UserCode: "ABCD"}, nil
+		},
+		Web: &fakeWeb{deviceID: "d1", approveErr: webauth.ErrNoDefaultGroup},
+	}
+	_, err := c.SignIn(context.Background(), "a@example.com", "hunter2")
+	if err == nil {
+		t.Fatal("no error")
+	}
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Stage != StageApprove || pe.Retry {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestAStaleLoginIsTriedAgain(t *testing.T) {
+	c := &Chain{}
+	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200007})
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if !pe.Retry {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestALostConnectionIsTriedAgain(t *testing.T) {
+	c := &Chain{}
+	err := c.webError(StageProbe, errors.New("connection reset"))
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if !pe.Retry || pe.Wait <= 0 {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestAnAccountWithoutATokenIsTakenBackOut(t *testing.T) {
+	st := &fakeStore{failToken: true}
+	c := aChain(st)
+
+	_, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err == nil {
+		t.Fatal("no error")
+	}
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Stage != StageStore {
+		t.Fatalf("err = %+v", pe)
+	}
+	if len(st.accounts) != 0 {
+		t.Fatalf("the broken account was left behind: %v", st.accounts)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -2544,11 +3623,15 @@ Expected: FAIL（`Chain` 还没有）
 
 创建 `internal/provision/chain.go`：
 
+整个文件写成这样（下面是它的全文）：
+
 ```go
 package provision
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -2568,6 +3651,25 @@ type Store interface {
 	SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error
 }
 
+// Web is the part of the account site the chain talks to.
+//
+// It is an interface so that a test can bring an account in without a
+// network: the real one is a webauth.Client, and the session it keeps
+// belongs to one account.
+type Web interface {
+	RegisterDevice(ctx context.Context) (string, error)
+	Probe(ctx context.Context, email, deviceID, redirect string) error
+	Password(ctx context.Context, email, password, deviceID, redirect string) error
+	Approve(ctx context.Context, userCode string) error
+}
+
+// The real ones fit the interfaces, so that a caller can put them in
+// without an adapter.
+var (
+	_ Web   = (*webauth.Client)(nil)
+	_ Store = (*store.Store)(nil)
+)
+
 // Chain is the importer that does the real work.
 //
 // It signs in to the account site with the email and the password,
@@ -2579,12 +3681,14 @@ type Chain struct {
 	// Web signs in to the account site. It is one per account: the
 	// site keeps the session in a cookie, and two accounts sharing one
 	// session would be signing in as each other.
-	Web *webauth.Client
+	Web Web
 	// Start begins a device authorization.
 	Start func(ctx context.Context) (*oauth.Device, error)
 	// Poll waits for the sign-in to finish.
 	Poll func(ctx context.Context, d *oauth.Device) (*oauth.Token, error)
-	// Identity reads who the account is.
+	// Identity reads who the account is. A nil one means the account's
+	// email is the one from the list and its user id is the token's
+	// subject.
 	Identity func(ctx context.Context, access, subject string) (account.Identity, error)
 	// Keeper encrypts the password so that it can be kept. A nil one
 	// means the password is not kept: it is used once and thrown away.
@@ -2604,6 +3708,12 @@ type Chain struct {
 // account that is new also needs a row of its own. Import does both,
 // SignIn only the first.
 func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Token, error) {
+	if c.Web == nil {
+		return nil, &Error{Stage: StageProbe, Message: "没有站点可说话"}
+	}
+	if c.Start == nil {
+		return nil, &Error{Stage: StageToken, Message: "没有设备码可等"}
+	}
 	d, err := c.Start(ctx)
 	if err != nil {
 		return nil, &Error{Stage: StageToken, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
@@ -2629,7 +3739,10 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 			// 站点没有默认组可批准，重试多少次都一样。
 			return nil, &Error{Stage: StageApprove, Message: err.Error()}
 		}
-		return nil, &Error{Stage: StageApprove, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
+		return nil, c.webError(StageApprove, err)
+	}
+	if c.Poll == nil {
+		return nil, &Error{Stage: StageToken, Message: "没有地方等这个令牌"}
 	}
 	tok, err := c.Poll(ctx, d)
 	if err != nil {
@@ -2643,6 +3756,9 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	tok, err := c.SignIn(ctx, email, password)
 	if err != nil {
 		return Result{Email: email}, err
+	}
+	if c.Store == nil {
+		return Result{Email: email}, &Error{Stage: StageStore, Message: "没有数据库可放"}
 	}
 
 	id := account.Identity{}
@@ -2681,6 +3797,9 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		Subject:   tok.Subject,
 		UpdatedAt: now,
 	}); err != nil {
+		// 账号的行已经写进去了，令牌却没有：这样的账号是残的，
+		// 把它拿掉，导入才能干净地再来一次。
+		c.undo(ctx, acc.ID)
 		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
 	}
 	if c.Keeper != nil {
@@ -2699,6 +3818,28 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	return Result{Email: email, OK: true, AccountID: acc.ID}, nil
 }
 
+// deleter is a store that can take an account back out.
+//
+// It is not part of the Store interface: taking the row back out is
+// only possible with a store that has DeleteAccount, and the chain
+// works without it.
+type deleter interface {
+	DeleteAccount(ctx context.Context, id string) error
+}
+
+// undo takes the account row back out.
+//
+// A store that cannot take the row out is left alone: the row stays
+// where it is, broken but visible, and the message says what happened
+// to it.
+func (c *Chain) undo(ctx context.Context, id string) {
+	d, ok := c.Store.(deleter)
+	if !ok {
+		return
+	}
+	_ = d.DeleteAccount(ctx, id)
+}
+
 // webError turns what the site said into what the runner needs to
 // know: the stage, the site's own code, and whether trying again could
 // work.
@@ -2707,15 +3848,34 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 func (c *Chain) webError(stage Stage, err error) error {
 	var se *webauth.SiteError
 	if errors.As(err, &se) {
-		return &Error{
+		pe := &Error{
 			Stage: stage,
 			Code:  se.Code,
 			// ExplainText 是一句话的说法：有错误码就用错误码，没有
 			// 就用站点自己那个词（login_required 那种）。
 			Message: se.ExplainText(),
 		}
+		if retryableCode(se.Code) {
+			pe.Retry = true
+			pe.Wait = 5 * time.Second
+		}
+		return pe
 	}
 	return &Error{Stage: stage, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
+}
+
+// retryableCode says whether the site's own code is worth trying again.
+//
+// Most of them are not: a password that is wrong will be wrong the
+// next time as well. The one that is different is the login that has
+// gone stale -- a new sign-in may well work.
+func retryableCode(code int) bool {
+	switch code {
+	case 1200007:
+		// UNAUTHENTICATED: 登录状态无效，重试一次。
+		return true
+	}
+	return false
 }
 
 // now is the clock.
@@ -2727,11 +3887,21 @@ func (c *Chain) now() time.Time {
 }
 
 // newID makes an account id.
+//
+// The time alone is not enough: two accounts that are brought in in the
+// same millisecond get the same id, and the second one is refused by
+// the primary key. So the id has a random part too.
 func (c *Chain) newID() string {
-	if c.NewID == nil {
+	if c.NewID != nil {
+		return c.NewID()
+	}
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// 没有随机数的时候只能用时间：撞车的机会很小，撞上了也
+		// 只是这一个账号白做。
 		return fmt.Sprintf("acc_%d", c.now().UnixMilli())
 	}
-	return c.NewID()
+	return "acc_" + hex.EncodeToString(b)
 }
 ```
 
@@ -2822,7 +3992,8 @@ func TestImportReadsTheFileAndSaysWhatHappened(t *testing.T) {
 func TestImportSaysALineItCouldNotRead(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.txt")
-	if err := os.WriteFile(path, []byte("not-an-email\n"), 0o600); err != nil {
+	// 清单里得有一个能用的号：光有坏行的话，整趟导入是空跑。
+	if err := os.WriteFile(path, []byte("not-an-email\nb@example.com|pw\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
@@ -2993,15 +4164,21 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 
 // passwordKeeper gives the function that encrypts a password, or nil
 // when the password is not to be kept.
+//
+// The key is not set: no key, no password kept. The key is set but
+// wrong: that is a mistake, and the import stops on it — quietly
+// throwing the password away would leave a database of accounts that
+// nobody can sign in again.
 func passwordKeeper(noStore bool) (func(string) (string, error), error) {
 	if noStore {
 		return nil, nil
 	}
+	if strings.TrimSpace(os.Getenv(PasswordKeyEnv)) == "" {
+		return nil, nil
+	}
 	key, err := secret.FromEnv(PasswordKeyEnv)
 	if err != nil {
-		// No key is not a mistake that stops the import: the password
-		// is used once and thrown away.
-		return nil, nil
+		return nil, err
 	}
 	return key.Seal, nil
 }
@@ -3272,7 +4449,82 @@ Expected: FAIL
 
 - [ ] **Step 3: 写实现**
 
-在 `internal/manager/manager.go` 的 `Manager` 结构里加两个字段：
+先在 `internal/config/config.go` 里加一节 `Batch`——调度器要读它，没有
+这一节这一步编不过。（Task 10 只剩那些 yaml 文件了。）
+
+```go
+// Batch is how a batch import runs.
+type Batch struct {
+	// Interval is the wait between two accounts.
+	Interval Duration `yaml:"interval" json:"interval"`
+	// Group is the egress group the logins go through. An empty one
+	// is the default proxy.
+	Group string `yaml:"group" json:"group"`
+	// Relogin is the automatic signing-in again.
+	Relogin Relogin `yaml:"relogin" json:"relogin"`
+}
+
+// Relogin is the automatic signing-in again.
+type Relogin struct {
+	// Enabled says whether it runs at all. It is off by default:
+	// signing in again is the site's business, and a person should
+	// say so.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Cooldown is how long the scheduler waits between two rounds.
+	Cooldown Duration `yaml:"cooldown" json:"cooldown"`
+	// MaxAccounts is how many accounts one round touches.
+	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
+}
+```
+
+在 `Config` 里加 `Batch Batch \`yaml:"batch" json:"batch"\``，在 `Default()` 里给它默认值：
+
+```go
+		Batch: Batch{
+			Interval: Duration(3 * time.Second),
+			Relogin: Relogin{
+				Cooldown:    Duration(time.Hour),
+				MaxAccounts: 20,
+			},
+		},
+```
+
+在 `internal/config/config_test.go` 末尾加一个测试（照着那个包里已有的测
+试写，临时配置文件怎么建就照着建）：
+
+```go
+func TestTheBatchSection(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+batch:
+  interval: 5s
+  group: clash
+  relogin:
+    enabled: true
+    cooldown: 2h
+    max_accounts: 30
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Batch.Interval.Duration() != 5*time.Second {
+		t.Errorf("interval = %v", cfg.Batch.Interval)
+	}
+	if cfg.Batch.Group != "clash" {
+		t.Errorf("group = %q", cfg.Batch.Group)
+	}
+	if !cfg.Batch.Relogin.Enabled {
+		t.Error("the relogin is not on")
+	}
+	if cfg.Batch.Relogin.Cooldown.Duration() != 2*time.Hour {
+		t.Errorf("cooldown = %v", cfg.Batch.Relogin.Cooldown)
+	}
+	if cfg.Batch.Relogin.MaxAccounts != 30 {
+		t.Errorf("max accounts = %d", cfg.Batch.Relogin.MaxAccounts)
+	}
+}
+```
+
+然后在 `internal/manager/manager.go` 的 `Manager` 结构里加两个字段：
 
 ```go
 	// Key opens the passwords the accounts were brought in with.
@@ -3892,57 +5144,20 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 10: 配置与部署
 
 **Files:**
-- Modify: `internal/config/config.go`
-- Modify: `internal/config/config_test.go`
 - Modify: `config.example.yaml`
 - Modify: `config.docker.yaml`
 - Modify: `docker-compose.yml`
-- Modify: `.env.example`
+- Create: `.env.example`
 
-- [ ] **Step 1: 写失败的测试**
+（`internal/config/config.go` 里的 `Batch` 一节已经在 Task 8 加了——调
+度器要读它，那一步没有它编不过。这一步只管那些 yaml 文件。）
 
-在 `internal/config/config_test.go` 末尾加：
+- [ ] **Step 1: 看看现在是什么样**
 
-```go
-func TestTheBatchSection(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
-batch:
-  interval: 5s
-  group: clash
-  relogin:
-    enabled: true
-    cooldown: 2h
-    max_accounts: 30
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Batch.Interval.Duration() != 5*time.Second {
-		t.Errorf("interval = %v", cfg.Batch.Interval)
-	}
-	if cfg.Batch.Group != "clash" {
-		t.Errorf("group = %q", cfg.Batch.Group)
-	}
-	if !cfg.Batch.Relogin.Enabled {
-		t.Error("the relogin is not on")
-	}
-	if cfg.Batch.Relogin.Cooldown.Duration() != 2*time.Hour {
-		t.Errorf("cooldown = %v", cfg.Batch.Relogin.Cooldown)
-	}
-	if cfg.Batch.Relogin.MaxAccounts != 30 {
-		t.Errorf("max accounts = %d", cfg.Batch.Relogin.MaxAccounts)
-	}
-}
-```
+Run: `cat config.example.yaml config.docker.yaml docker-compose.yml`
+Expected: 看得见现在的样子。仓库里还没有 `.env.example`，这一步把它建出来。
 
-（`writeConfig` / `Load` 的用法照着这个包里已有的测试来；没有 `writeConfig` 就照着那个包建一个临时配置文件。）
-
-- [ ] **Step 2: 跑测试，确认它失败**
-
-Run: `go test ./internal/config/ -count=1 -run Batch`
-Expected: FAIL
-
-- [ ] **Step 3: 写实现**
+- [ ] **Step 2: 写实现**
 
 在 `internal/config/config.go` 里加：
 
@@ -4111,3 +5326,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 4. 大陆出口下 `account.minimax.io` 是否也被 307 到 `.cn`（笔记里只记了 `agent.minimax.io`）
 5. Akamai 的 `_abck` / `bm_sz` 在批量登录时会不会真的拦
 6. 批量到多少个号会触发风控
+7. **抓一个真的网页请求存成金标准**：整条 URL 加 `yy` 加 `x-signature`。
+   命令行那边的六个向量是照着参考实现重算出来的，网页这一边目前只是照
+   着笔记里的散文推的——两边只有一边有金标准，这个不对称才是最大的风险。
+   抓包笔记里已经有 `x-signature` 的那半个向量（`abd7da0095474425f28458b7b56a6626`
+   能用 `md5(秒 + 密钥 + body)` 复现），`yy` 那一半缺的是完整 URL。
+8. `op_ticket` 到底在不在：抓包笔记 §4 的公共 query 里没有它，是设计文档从
+   js/204 里读出来的。它在 query 里就改了签名的字节
+9. `uuid` 出现两次的时候，站点读的是哪一个。网页那边公共的那一份在前、自己
+   的那一份在后，常见的解析器取第一个（`url.Values.Get`、`URLSearchParams.get`、
+   Java 的 `getParameter`）——但这是猜的
+10. 同一个账号导两次会不会在库里留下两行。`Chain.Import` 每回都新建一行，
+    库里没有按邮箱找账号的法子
