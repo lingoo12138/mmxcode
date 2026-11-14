@@ -20,10 +20,15 @@ var sessionHeaders = []string{
 // The two things it holds are different on purpose. The key says which
 // account the conversation belongs to, and it is ours alone. The
 // upstream id says which conversation it is, and MiniMax sees it.
+//
+// The upstream id in here is the derived one: the client's own session
+// id when it sent one, and a hash of the first message when it did not.
+// It is the fallback, used when the pool keeps no id of its own.
 type Session struct {
 	// Key is the account affinity key. Always a hash.
 	Key string
-	// UpstreamID is the session id sent to MiniMax.
+	// UpstreamID is the derived session id, used when the pool keeps
+	// none.
 	UpstreamID string
 }
 
@@ -38,22 +43,26 @@ type Session struct {
 // The key is a hash either way. A client's own string is not ours to
 // keep, and it has no business becoming a database key as it came.
 //
-// The upstream id is the client's own when it sent one: it names the
-// conversation, not the account, so it stays the same when the
-// conversation moves to another account.
+// The derived upstream id is the client's own when it sent one: it
+// names the conversation, not the account, so it stays the same when
+// the conversation moves to another account. It is what the upstream
+// is told when the pool keeps no id of its own.
 //
 // When there is neither a header nor a message to hash, the session is
 // empty and the request is handled by round robin.
 //
-// The upstream id of a conversation that brought no header of its own
-// is the hash of its first message. Two users whose first messages
-// happen to be the same therefore share one upstream id, and one
-// account: the upstream sees one conversation as two, and one user's
-// messages can turn up in another user's conversation. A random id per
-// conversation would not, but the id has to be kept from one turn to
-// the next and there is nowhere to keep it: the sessions table holds
-// the key and the account and nothing else. It needs a column of its
-// own before this can be done.
+// The derived id of a conversation that brought no header of its own is
+// the hash of its first message. Two users whose first messages
+// happen to be the same are one session by this design's own
+// definition -- the session key is a hash of the same two things -- so
+// they share one upstream id, and one upstream conversation, and one
+// user's messages can turn up in another user's conversation. A kept
+// id does not change that: it is kept per session key, and the two
+// conversations have one key. Nothing in the request tells them
+// apart, so no server can: the client has to send X-Session-Id. What
+// a kept id does fix is that the upstream stops seeing the client's
+// own string and a hash of the request's words, and that the mapping
+// from the session to the upstream's conversation survives a restart.
 func SessionOf(headers map[string][]string, system, firstUser string) Session {
 	for _, h := range sessionHeaders {
 		for _, v := range headers[h] {

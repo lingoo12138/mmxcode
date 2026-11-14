@@ -3661,6 +3661,7 @@ func TestTheStrategyIsChecked(t *testing.T) {
 ```
 
 
+
 - [ ] **Step 2: 写会话键与判定的测试**
 
 在同一个文件末尾追加：
@@ -3720,9 +3721,11 @@ func TestSessionFromHash(t *testing.T) {
 }
 
 func TestTwoIdenticalFirstMessagesShareTheUpstreamID(t *testing.T) {
-	// 这是已知的碰撞：两个用户的第一条消息一样，就共用一个上游会话，
-	// 上游分不出是两个会话。给每个会话一个随机的上游 id 需要 sessions
-	// 表多一列，现在没有。
+	// 这是已知的碰撞，而且是定义上的碰撞：会话键就是 system prompt 加
+	// 第一条 user 消息的哈希，两段一样的开场白是同一个会话。数据库里
+	// 存着的上游 id 也是按会话键给的，所以这两个会话共用一个上游会话，
+	// 上游分不出是两个会话。服务器分不出来：请求里没有能分开它们的东西，
+	// 要分开只能让客户端带上 X-Session-Id。
 	a := SessionOf(nil, "sys", "hello")
 	b := SessionOf(nil, "sys", "hello")
 	if a.UpstreamID != b.UpstreamID {
@@ -3734,6 +3737,147 @@ func TestSessionEmpty(t *testing.T) {
 	s := SessionOf(nil, "", "")
 	if s.Key != "" || s.UpstreamID != "" {
 		t.Fatalf("session = %+v", s)
+	}
+}
+
+// idPool is a pool that keeps an upstream id for every session.
+//
+// 有上游 id 的池子：id 是它自己给的，不是请求算出来的。
+type idPool struct {
+	*fakePool
+	ids map[string]string
+	// asked holds the keys the pool was asked for.
+	asked []string
+	// err is what UpstreamID fails with.
+	err error
+}
+
+func (p *idPool) UpstreamID(_ context.Context, key string) (string, error) {
+	p.asked = append(p.asked, key)
+	if p.err != nil {
+		return "", p.err
+	}
+	if id, ok := p.ids[key]; ok {
+		return id, nil
+	}
+	id := "up-" + key
+	p.ids[key] = id
+	return id, nil
+}
+
+func newIDPool(accounts ...store.Account) *idPool {
+	return &idPool{fakePool: newFakePool(accounts...), ids: map[string]string{}}
+}
+
+// TestTheUpstreamIDComesFromThePool says the id the upstream is told
+// about is the one the pool keeps.
+//
+// 上游看到的是数据库里存着的那个 id，不是请求算出来的那个。
+func TestTheUpstreamIDComesFromThePool(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+	sess := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+
+	got, err := r.UpstreamID(context.Background(), sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "up-"+sess.Key {
+		t.Fatalf("upstream id = %q", got)
+	}
+	if len(p.asked) != 1 || p.asked[0] != sess.Key {
+		t.Fatalf("the pool was asked %v", p.asked)
+	}
+}
+
+// TestTheUpstreamIDFallsBackToTheDerivedOne says a pool that keeps no
+// id leaves the derived one in place.
+//
+// 没有上游 id 的池子：退回请求自己算出来的那个，规则和从前一样。
+func TestTheUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
+	// fakePool 没有 UpstreamID 方法：它就是那种给不出 id 的池子。
+	p := newFakePool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 客户端带了会话 id：退回的就是客户端自己那串。
+	withHeader := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+	got, err := r.UpstreamID(context.Background(), withHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "client-1" {
+		t.Fatalf("upstream id = %q, want the client's own", got)
+	}
+
+	// 客户端没带：退回的是第一条消息的哈希。
+	fromMessage := SessionOf(nil, "sys", "hello")
+	got, err = r.UpstreamID(context.Background(), fromMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" || got != fromMessage.UpstreamID {
+		t.Fatalf("upstream id = %q, want the hash of the first message", got)
+	}
+}
+
+// TestTwoSessionsGetDifferentUpstreamIDs says two conversations do not
+// share the id the upstream is told about.
+//
+// 两个会话拿到两个不同的上游 id。
+func TestTwoSessionsGetDifferentUpstreamIDs(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	a, err := r.UpstreamID(context.Background(),
+		SessionOf(map[string][]string{"X-Session-Id": {"a"}}, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.UpstreamID(context.Background(),
+		SessionOf(map[string][]string{"X-Session-Id": {"b"}}, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == "" || b == "" {
+		t.Fatalf("upstream ids = %q and %q", a, b)
+	}
+	if a == b {
+		t.Fatalf("the two sessions got the same upstream id %q", a)
+	}
+}
+
+// TestASessionWithNoKeyHasNoUpstreamID says a request with no
+// conversation at all names nothing.
+//
+// 没有会话就没有对话要命名：池子也不问。
+func TestASessionWithNoKeyHasNoUpstreamID(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.UpstreamID(context.Background(), SessionOf(nil, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("upstream id = %q", got)
+	}
+	if len(p.asked) != 0 {
+		t.Fatalf("the pool was asked %v", p.asked)
+	}
+}
+
+// TestTheUpstreamIDFailsWhenThePoolCannotBeAsked says a pool that has
+// the id but cannot read it is an error.
+//
+// 读不到存着的 id 就不能装作没有：上游会把这段对话当成新的一段。
+func TestTheUpstreamIDFailsWhenThePoolCannotBeAsked(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	p.err = errors.New("the database is down")
+	r := New(p, Options{MaxAttempts: 3})
+
+	sess := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+	if _, err := r.UpstreamID(context.Background(), sess); err == nil {
+		t.Fatal("expected an error")
 	}
 }
 
@@ -3805,6 +3949,7 @@ func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
 ```
 
 
+
 - [ ] **Step 3: 运行测试确认失败**
 
 ```bash
@@ -3840,10 +3985,15 @@ var sessionHeaders = []string{
 // The two things it holds are different on purpose. The key says which
 // account the conversation belongs to, and it is ours alone. The
 // upstream id says which conversation it is, and MiniMax sees it.
+//
+// The upstream id in here is the derived one: the client's own session
+// id when it sent one, and a hash of the first message when it did not.
+// It is the fallback, used when the pool keeps no id of its own.
 type Session struct {
 	// Key is the account affinity key. Always a hash.
 	Key string
-	// UpstreamID is the session id sent to MiniMax.
+	// UpstreamID is the derived session id, used when the pool keeps
+	// none.
 	UpstreamID string
 }
 
@@ -3858,22 +4008,26 @@ type Session struct {
 // The key is a hash either way. A client's own string is not ours to
 // keep, and it has no business becoming a database key as it came.
 //
-// The upstream id is the client's own when it sent one: it names the
-// conversation, not the account, so it stays the same when the
-// conversation moves to another account.
+// The derived upstream id is the client's own when it sent one: it
+// names the conversation, not the account, so it stays the same when
+// the conversation moves to another account. It is what the upstream
+// is told when the pool keeps no id of its own.
 //
 // When there is neither a header nor a message to hash, the session is
 // empty and the request is handled by round robin.
 //
-// The upstream id of a conversation that brought no header of its own
-// is the hash of its first message. Two users whose first messages
-// happen to be the same therefore share one upstream id, and one
-// account: the upstream sees one conversation as two, and one user's
-// messages can turn up in another user's conversation. A random id per
-// conversation would not, but the id has to be kept from one turn to
-// the next and there is nowhere to keep it: the sessions table holds
-// the key and the account and nothing else. It needs a column of its
-// own before this can be done.
+// The derived id of a conversation that brought no header of its own is
+// the hash of its first message. Two users whose first messages
+// happen to be the same are one session by this design's own
+// definition -- the session key is a hash of the same two things -- so
+// they share one upstream id, and one upstream conversation, and one
+// user's messages can turn up in another user's conversation. A kept
+// id does not change that: it is kept per session key, and the two
+// conversations have one key. Nothing in the request tells them
+// apart, so no server can: the client has to send X-Session-Id. What
+// a kept id does fix is that the upstream stops seeing the client's
+// own string and a hash of the request's words, and that the mapping
+// from the session to the upstream's conversation survives a restart.
 func SessionOf(headers map[string][]string, system, firstUser string) Session {
 	for _, h := range sessionHeaders {
 		for _, v := range headers[h] {
@@ -3895,6 +4049,7 @@ func digest(s string) string {
 	return hex.EncodeToString(sum[:])[:32]
 }
 ```
+
 
 
 - [ ] **Step 5: 实现故障转移判定**
@@ -4147,6 +4302,7 @@ func isQuotaMessage(message string) bool {
 ```
 
 
+
 - [ ] **Step 6: 实现选号**
 
 创建 `internal/rotator/rotator.go`：
@@ -4174,13 +4330,20 @@ func isQuotaMessage(message string) bool {
 // none of its models until the window comes back, and a model of
 // another group is not touched by it.
 //
-// The upstream conversation id of a conversation that brought no
-// session id of its own is derived from the content of its first
-// message. Two users whose first messages happen to be the same
-// therefore share one upstream conversation id, and one account: the
-// upstream sees one conversation as two. The sessions table has no
-// column for an upstream id of its own, so a random one cannot be
-// kept; giving every conversation an id of its own needs that column.
+// The upstream conversation id is the one the database keeps: an
+// opaque id, made once and kept, so the upstream sees one conversation
+// and the mapping survives a restart. A pool that cannot supply one
+// falls back to the id the request derives: the client's own session id
+// when it sent one, and a hash of the first message when it did not.
+//
+// What that does not fix: two conversations whose system prompt and
+// first user message are the same, from a client that sends no session
+// id of its own, are one session by this design's own definition -- the
+// session key is a hash of those two things. They therefore share one
+// upstream id, and one upstream conversation, however random that id
+// is. The server cannot tell them apart: there is nothing in the
+// request that does. The fix for that case is the client sending
+// X-Session-Id.
 package rotator
 
 import (
@@ -4225,6 +4388,19 @@ type Pool interface {
 // that is not in it has not been read yet.
 type RemainingFor interface {
 	RemainingAll(ctx context.Context, accountIDs []string) map[string]Remaining
+}
+
+// UpstreamIDs is an optional part of a Pool: it gives the upstream id
+// of a session.
+//
+// The id is the one MiniMax is told about. It belongs to the
+// conversation and not to the account the conversation is bound to, so
+// it does not change when the conversation moves to another account.
+//
+// A pool that has it is asked for the id it keeps; a pool without it is
+// asked for nothing, and the id the request derives is used instead.
+type UpstreamIDs interface {
+	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 }
 
 // Remaining is what is left of an account's credits.
@@ -4520,6 +4696,43 @@ func (r *Rotator) plan(a store.Account, group string, rebound, retried bool) Pla
 	}
 }
 
+// UpstreamID gives the id the upstream is told about for a session.
+//
+// The pool's id is used when the pool has one: it is kept in the
+// database, so it is the same for every request of the conversation,
+// and it survives a restart.
+//
+// A pool that cannot supply one is asked for nothing, and the derived
+// id the session carries is used: the client's own session id when it
+// sent one, and the hash of the first message when it did not.
+//
+// A session with no key names no conversation: the id is empty and the
+// upstream is told nothing.
+//
+// A pool that has the id but cannot read it is an error. The derived id
+// would be a working id, but it is not the one the conversation was
+// sent with before, and the upstream would take the conversation for a
+// new one. Saying so is better than that.
+func (r *Rotator) UpstreamID(ctx context.Context, sess Session) (string, error) {
+	if sess.Key == "" {
+		// 没有会话就没有对话要命名：池子也不问，空的会话行不该有。
+		return "", nil
+	}
+	pool, ok := r.pool.(UpstreamIDs)
+	if !ok {
+		// 这个池子没有存着的上游 id：退回请求自己算出来的那个。
+		return sess.UpstreamID, nil
+	}
+	id, err := pool.UpstreamID(ctx, sess.Key)
+	if err != nil {
+		return "", fmt.Errorf("the upstream id could not be read: %w", err)
+	}
+	if id == "" {
+		return sess.UpstreamID, nil
+	}
+	return id, nil
+}
+
 // accountByID finds an account in a list.
 func accountByID(accounts []store.Account, id string) (store.Account, bool) {
 	for _, a := range accounts {
@@ -4705,6 +4918,7 @@ func (r *Rotator) isExhausted(exhausted []store.Exhausted, accountID, windowKey 
 	return false
 }
 ```
+
 
 
 - [ ] **Step 7: 运行测试确认通过**

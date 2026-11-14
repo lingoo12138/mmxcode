@@ -20,13 +20,20 @@
 // none of its models until the window comes back, and a model of
 // another group is not touched by it.
 //
-// The upstream conversation id of a conversation that brought no
-// session id of its own is derived from the content of its first
-// message. Two users whose first messages happen to be the same
-// therefore share one upstream conversation id, and one account: the
-// upstream sees one conversation as two. The sessions table has no
-// column for an upstream id of its own, so a random one cannot be
-// kept; giving every conversation an id of its own needs that column.
+// The upstream conversation id is the one the database keeps: an
+// opaque id, made once and kept, so the upstream sees one conversation
+// and the mapping survives a restart. A pool that cannot supply one
+// falls back to the id the request derives: the client's own session id
+// when it sent one, and a hash of the first message when it did not.
+//
+// What that does not fix: two conversations whose system prompt and
+// first user message are the same, from a client that sends no session
+// id of its own, are one session by this design's own definition -- the
+// session key is a hash of those two things. They therefore share one
+// upstream id, and one upstream conversation, however random that id
+// is. The server cannot tell them apart: there is nothing in the
+// request that does. The fix for that case is the client sending
+// X-Session-Id.
 package rotator
 
 import (
@@ -71,6 +78,19 @@ type Pool interface {
 // that is not in it has not been read yet.
 type RemainingFor interface {
 	RemainingAll(ctx context.Context, accountIDs []string) map[string]Remaining
+}
+
+// UpstreamIDs is an optional part of a Pool: it gives the upstream id
+// of a session.
+//
+// The id is the one MiniMax is told about. It belongs to the
+// conversation and not to the account the conversation is bound to, so
+// it does not change when the conversation moves to another account.
+//
+// A pool that has it is asked for the id it keeps; a pool without it is
+// asked for nothing, and the id the request derives is used instead.
+type UpstreamIDs interface {
+	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 }
 
 // Remaining is what is left of an account's credits.
@@ -364,6 +384,43 @@ func (r *Rotator) plan(a store.Account, group string, rebound, retried bool) Pla
 		Rebound:   rebound,
 		Retried:   retried,
 	}
+}
+
+// UpstreamID gives the id the upstream is told about for a session.
+//
+// The pool's id is used when the pool has one: it is kept in the
+// database, so it is the same for every request of the conversation,
+// and it survives a restart.
+//
+// A pool that cannot supply one is asked for nothing, and the derived
+// id the session carries is used: the client's own session id when it
+// sent one, and the hash of the first message when it did not.
+//
+// A session with no key names no conversation: the id is empty and the
+// upstream is told nothing.
+//
+// A pool that has the id but cannot read it is an error. The derived id
+// would be a working id, but it is not the one the conversation was
+// sent with before, and the upstream would take the conversation for a
+// new one. Saying so is better than that.
+func (r *Rotator) UpstreamID(ctx context.Context, sess Session) (string, error) {
+	if sess.Key == "" {
+		// 没有会话就没有对话要命名：池子也不问，空的会话行不该有。
+		return "", nil
+	}
+	pool, ok := r.pool.(UpstreamIDs)
+	if !ok {
+		// 这个池子没有存着的上游 id：退回请求自己算出来的那个。
+		return sess.UpstreamID, nil
+	}
+	id, err := pool.UpstreamID(ctx, sess.Key)
+	if err != nil {
+		return "", fmt.Errorf("the upstream id could not be read: %w", err)
+	}
+	if id == "" {
+		return sess.UpstreamID, nil
+	}
+	return id, nil
 }
 
 // accountByID finds an account in a list.
