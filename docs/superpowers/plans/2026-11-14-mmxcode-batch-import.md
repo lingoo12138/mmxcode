@@ -1863,25 +1863,155 @@ type Tx interface {
 // been cut short, and the half of the transaction that did land has to
 // go back all the same.
 func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin a transaction: %w", err)
-	}
-	if err := fn(&sqlTx{s: s, tx: tx}); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("commit the transaction: %w", err)
-	}
-	return nil
+	return s.tx(ctx, func(tx *sqlTx) error { return fn(tx) })
 }
 
 ```
 
 （事务里跑的语句和事务外的是同一批：能跑语句的就连接池和事务两样，
 所以语句只写一遍，`*sql.DB` 和 `*sql.Tx` 都当同一个接口使。）
+
+还要两个跟「签出」有关的方法。签出不是把状态改一下就完了：令牌要收走，
+而且**只在手里那份令牌还是库里那一份的时候**才写。另一个进程可能刚把这
+个账号登回去了（库里换成了新令牌），这时候把签出写下去，就是把别人刚登
+好的账号作废掉，还把那份新令牌收走——页面说这个账号登出了，轮转池也不
+用它，而它手里握着一份能用的凭据。
+
+写状态和收走令牌是一个事务里一起写的：中间插进来一个写，账号就会停在
+「状态是签出、令牌还在」的样子（状态说它登出了，令牌却还在，每次请求都
+要去续一次，续不回来）。
+
+令牌行里的 `subject` 留着：那是站点那边账号自己的 id，不是凭据。它是「这
+个站点账号在库里是哪一行」的键——签出的账号恰恰是最要紧的那一个（人会
+重新导入它），键要是被抹掉，那一次导入就会当成新账号再插一行。
+
+```go
+// SignOutIfTheTokenIsStillThere signs the account out and takes its
+// token away, but only while the token row still holds that access
+// token.
+//
+// 签出是**有条件**地写的：另一个进程可能刚把这个账号登回去了。手里这
+// 份令牌就是这次失败说的那份；库里换成了别的，就是有人替它登好了，这
+// 时候把它写回签出，就是把别人刚换好的令牌作废掉，还让这个账号显示成
+// 登出的状态——手里却握着一份能用的凭据，轮转池不用它，下一轮又要登
+// 一次。
+//
+// 它说有没有写下去。没有写，说明库里那一份令牌已经不是手里这一份了：
+// 有人在这中间把账号救回来了，这次的失败说的已经不是它了。
+//
+// 写状态和收走令牌是一起写的。中间插进来一个写，账号就会停在「状态是
+// 签出、令牌还在」的样子：状态说它登出了，令牌却还在，每次请求都要
+// 去续一次，续不回来。
+//
+// 令牌行里的 subject 留着。那是站点那边账号自己的 id，不是凭据——它是
+// 「这个站点账号在库里是哪一行」的键。抹掉它，下次导入这个账号就会当
+// 成新账号再插一行，而那一行是活的。
+func (s *Store) SignOutIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	written := false
+	err := s.tx(ctx, func(tx *sqlTx) error {
+		n, err := tx.setStatusIfTokenUnchanged(ctx, id, access, StatusSignedOut, reason, updatedAt)
+		if err != nil || !n {
+			return err
+		}
+		written = true
+		return tx.blankToken(ctx, id, updatedAt)
+	})
+	if err != nil {
+		return false, err
+	}
+	return written, nil
+}
+```
+
+```go
+// MarkErrorIfTheTokenIsStillThere writes the error state down, but only
+// while the token row still holds that access token.
+//
+// 它和 SignOutIfTheTokenIsStillThere 是同一个条件、同一件事：这个错误
+// 说的是手里这份令牌的事，库里换成了别的令牌，说的就不是这个账号了。
+// 把别人刚换好的状态改回出错，页面就会说一个好好在用的账号出错了。
+func (s *Store) MarkErrorIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	return s.setStatusIfTokenUnchanged(ctx, s.db, id, access, StatusError, reason, updatedAt)
+}
+```
+
+还有登录那一条路要按同一套规矩走：`mmxcode login` 和页面上那个登录，以前
+都是直接建一行——登录一个批量导入进来的账号，库里就多一个活着的行。同一
+个站点账号在库里只能有一行：按令牌里的那个 `sub` 找那一行，找着就改它
+（令牌、状态、地址、用户 id），找不到才新建。
+
+```go
+// SignIn records a sign-in: the account and its token.
+//
+// 一个站点账号在库里只能有一行。库里已经有这一行的时候改那一行，不另
+// 起一行——同一个站点账号两行都是活的，轮转会挑到两次，页面把它列两遍，
+// 而且其中一个的令牌迟早被另一个的重登作废。
+//
+// 找的是令牌里带的那个 sub：那是站点账号自己的 id，一个站点账号一个，
+// 重登多少次都是它。清单上的邮箱可能是别名，站点那边报的邮箱又可能一
+// 时问不出来，只有它是一直在的。邮箱是第二条路：有的登录那条路上，令牌
+// 里的 sub 是空的。
+//
+// a 是这个账号该有的样子：它的 id 只在没有那一行的时候才用得上。a.Email
+// 是站点那边说的地址：它是空的，说明这一次没问出身份来——那就不动那一
+// 行上的地址和用户 id，把空的写上去等于把知道的东西换成不知道的。
+//
+// 名字是人自己写的标签：给了就写上去，没给就把原来那一行上的留着。
+func (s *Store) SignIn(ctx context.Context, a Account, tok Token) (Account, error) {
+	var out Account
+	err := s.Tx(ctx, func(tx Tx) error {
+		row, err := findForSignIn(ctx, tx, a, tok)
+		if err != nil {
+			return err
+		}
+		now := a.UpdatedAt
+		if row.ID == "" {
+			// 没有那一行：这就是一个新账号。名字没有给定的时候，用知道
+			// 的东西起：地址、用户 id、令牌里带的那个站点账号 id。
+			acc := a
+			acc.Name = firstNonEmpty(a.Name, a.Email, a.UserID, tok.Subject)
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			row = acc
+		} else {
+			// 已经有这一行了：改它，不另起一行。
+			if a.Email != "" && (a.Email != row.Email || a.UserID != row.UserID) {
+				if err := tx.SetAccountIdentity(ctx, row.ID, a.Email, a.UserID, now); err != nil {
+					return err
+				}
+				row.Email = a.Email
+				row.UserID = a.UserID
+			}
+			if a.Name != "" && a.Name != row.Name {
+				if err := tx.SetAccountName(ctx, row.ID, a.Name, now); err != nil {
+					return err
+				}
+				row.Name = a.Name
+			}
+			if row.Status != StatusActive {
+				// 它刚登进来：状态回到 active。
+				if err := tx.UpdateAccountStatus(ctx, row.ID, StatusActive, "", now); err != nil {
+					return err
+				}
+				row.Status = StatusActive
+			}
+		}
+		if err := tx.SaveToken(ctx, Token{
+			AccountID: row.ID, Access: tok.Access, Refresh: tok.Refresh,
+			ExpiresAt: tok.ExpiresAt, Subject: tok.Subject, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		out = row
+		return nil
+	})
+	if err != nil {
+		return Account{}, err
+	}
+	return out, nil
+}
+```
 
 - [x] **Step 4: 跑测试，确认它过了**
 
@@ -3626,6 +3756,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -3872,9 +4003,12 @@ func (s *fakeStore) updateAccountStatus(id, status string) error {
 }
 
 // lookup gives the account with that email.
+//
+// 真的库里比的时候两边都折成小写、去空格：清单上写的是哪个样子，库里
+// 存的是哪个样子，人看着是同一个就是同一个。
 func (s *fakeStore) lookup(email string) (store.Account, error) {
 	for _, r := range s.rows {
-		if strings.EqualFold(r.Email, email) {
+		if strings.EqualFold(strings.TrimSpace(r.Email), strings.TrimSpace(email)) {
 			return r, nil
 		}
 	}
@@ -3884,7 +4018,10 @@ func (s *fakeStore) lookup(email string) (store.Account, error) {
 // lookupSubject gives the account whose token carries that subject.
 //
 // 真的库里是顺着令牌那一行找的：令牌里的那个 sub 是站点账号自己的 id。
+// 找到好几行的时候取最早的那一行（先建的先算），跟真的库一个样子。
 func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
+	var found store.Account
+	have := false
 	for _, t := range s.subjects {
 		at := strings.LastIndex(t, ":")
 		if at < 0 || t[at+1:] != subject {
@@ -3892,12 +4029,19 @@ func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
 		}
 		id := t[:at]
 		for _, r := range s.rows {
-			if r.ID == id {
-				return r, nil
+			if r.ID != id {
+				continue
+			}
+			if !have || r.CreatedAt.Before(found.CreatedAt) ||
+				(r.CreatedAt.Equal(found.CreatedAt) && r.ID < found.ID) {
+				found, have = r, true
 			}
 		}
 	}
-	return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
+	if !have {
+		return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
+	}
+	return found, nil
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
@@ -4005,7 +4149,10 @@ func (w *fakeWeb) Approve(ctx context.Context, userCode string) error {
 }
 
 // aChain is a chain that does everything but talk to the site.
-func aChain(st *fakeStore) *Chain {
+//
+// It takes the Store interface: the fake one and the real library both fit,
+// so a test can run the same chain against either.
+func aChain(st Store) *Chain {
 	return &Chain{
 		Store: st,
 		Start: func(ctx context.Context) (*oauth.Device, error) {
@@ -4641,6 +4788,87 @@ func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T)
 	}
 }
 
+// TestTheAddressIsNotTakenOverFromAnotherAccount says an address that
+// another account already has is not written onto this one.
+//
+// 两个账号共用一个地址不是好事：掉线以后重登，分不清该拿哪个密码去登
+// ——密码是对着其中一个的，登错了就是把这个账号也登坏了。
+//
+// 这一行是按令牌里那个 id 找到的（那是站点账号自己的 id），站点那边报
+// 出来的地址却是另一个账号的：这时候地址不能换过去。
+func TestTheAddressIsNotTakenOverFromAnotherAccount(t *testing.T) {
+	st := &fakeStore{
+		rows: []store.Account{
+			{ID: "acc_a", Name: "a", Email: "taken@example.com", Status: store.StatusActive},
+			{ID: "acc_b", Name: "b", Email: "b@example.com", Status: store.StatusActive},
+		},
+		subjects: []string{"acc_b:sub-b"},
+	}
+	c := aChain(st)
+	c.NewID = func() string { return "acc_new" }
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		return &oauth.Token{Access: "acc", Refresh: "ref", Subject: "sub-b"}, nil
+	}
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "taken@example.com", RealUserID: "u9"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "b@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AccountID != "acc_b" {
+		t.Fatalf("account id = %q, want acc_b", res.AccountID)
+	}
+	if st.rows[1].Email != "b@example.com" {
+		t.Fatalf("email = %q, want the address the account already had", st.rows[1].Email)
+	}
+	if !strings.Contains(res.Message, "acc_a") {
+		t.Fatalf("message = %q, want it to name the account that has the address", res.Message)
+	}
+}
+
+// TestTheRealLibraryHasOneRowForOneSiteAccount says the real library
+// keeps one row for one site account, even when the address on the list
+// is not the one the site knows.
+//
+// 假的库和真的库不是一回事：真的库按令牌里那个 sub 顺着令牌那一行找，假
+// 的那套是自己的一套规矩。这一条拿真的库走一遍：清单上的地址换了，站点
+// 那边一时又问不出身份，库里还是只有一行。
+func TestTheRealLibraryHasOneRowForOneSiteAccount(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	c := aChain(s)
+	// 第一趟：站点那边报了地址，那一行上的地址是站点认的那个。
+	if _, err := c.Import(ctx, "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	// 第二趟：清单上的地址换了，站点那边问不出身份了。
+	c.Identity = nil
+	if _, err := c.Import(ctx, "other@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", rows)
+	}
+	if rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one the site says", rows[0].Email)
+	}
+}
+
 // TestTheRowIsBroughtInLineWithWhatTheSiteSays says the address and
 // the user id on the row are the ones the site says.
 //
@@ -4687,14 +4915,24 @@ func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
 //
 // 站点那边一时问不出身份，手里的地址就只剩原来那一行的：那是站点自己
 // 认过的，比清单上的更靠得住。
+//
+// 这一条要能分清两件事：地址留在原来那一行，和地址换成清单上那个。这两
+// 件事在清单上的地址跟原来那一行一样的时候是一样的事——所以这里清单上
+// 的地址跟那一行的不一样，换成清单上那个是看得出来的。
 func TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+	// 第一趟：站点那边说了它是谁，那一行上的地址是站点认的那个。
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
 	}
+	if st.rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one the site says", st.rows[0].Email)
+	}
+
+	// 第二趟：站点那边问不出身份了，清单上的地址是另一个。
 	c.Identity = nil
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
 	}
 	if st.rows[0].Email != "a@example.com" {
@@ -4909,6 +5147,9 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 // An account that is already in the database is signed in again and its
 // row is updated: one site account must not have two live rows.
 func (c *Chain) Import(ctx context.Context, email, password string) (Result, error) {
+	// 地址前后带的空格是要去掉的：地址是去重的键之一，同一个地址写成
+	// 两种样子，库里就会看成两个账号。
+	email = strings.TrimSpace(email)
 	tok, err := c.SignIn(ctx, email, password)
 	if err != nil {
 		return Result{Email: email}, err
@@ -4922,6 +5163,7 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	if c.Identity != nil {
 		got, err := c.Identity(ctx, tok.Access, tok.Subject)
 		if err == nil {
+			got.Email = strings.TrimSpace(got.Email)
 			id = got
 		} else {
 			// 身份没问出来，账号还是在的，只是不知道站点那边是不是就认
@@ -4978,6 +5220,21 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
 			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
 			// 账号当成新账号，再插一行。
+			if wantMail != row.Email {
+				// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
+				// 以后重登就分不清该登谁了——密码是对着其中一个的。
+				other, err := tx.AccountByEmail(ctx, wantMail)
+				switch {
+				case err == nil && other.ID != row.ID:
+					notes = append(notes, "另一个账号（"+other.ID+
+						"）也在用这个地址，地址没有换过去："+wantMail)
+					wantMail = row.Email
+				case err != nil && !errors.Is(err, store.ErrNotFound):
+					notes = append(notes, "没能查这个地址有没有别人在用，地址没有换过去："+
+						wantMail+"（"+err.Error()+"）")
+					wantMail = row.Email
+				}
+			}
 			if wantMail != row.Email || wantUserID != row.UserID {
 				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
 					return err
@@ -6018,9 +6275,12 @@ func TestReloginAllOnlyTouchesTheAccountsThatHaveAPassword(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 		})
 	}
-	fixed, failed := m.ReloginAll(ctx, 10)
-	if fixed != 1 || failed != 0 {
-		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	res, err := m.ReloginAll(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fixed != 1 || res.Failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", res.Fixed, res.Failed)
 	}
 	acc, err := m.Store.GetAccount(ctx, "acc_2")
 	if err != nil {
@@ -6255,6 +6515,33 @@ func (l *reloginLocks) lock(id string) func() {
 
 并在文件里加类型与两个方法：
 
+失败的那些也要说得出来：只给「成功几个、失败几个」，人得自己去一个一个
+看是哪个账号、为什么；而「这一趟根本没跑」（连账号都没列出来）和「都登回
+去了」在只看着两个数字的时候是一样的。
+
+```go
+// ReloginResult says what one round of re-logins came to.
+type ReloginResult struct {
+	// Fixed is how many accounts were signed in again.
+	Fixed int
+	// Failed is how many could not be signed in again.
+	Failed int
+	// Reasons says why the ones that failed failed: one line per account.
+	Reasons []string
+}
+```
+
+```go
+// reloginReason says which account did not sign in again, and why.
+func reloginReason(acc store.Account, err error) string {
+	who := acc.Name
+	if who == "" {
+		who = acc.ID
+	}
+	return who + "（" + acc.ID + "）：" + err.Error()
+}
+```
+
 ```go
 // ErrNotSignedOut says the account is not signed out.
 //
@@ -6345,22 +6632,28 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 // ReloginAll signs in again every account that is signed out and has
 // a password.
 //
-// It gives back how many it fixed and how many it did not. The limit
-// says how many one round touches; zero means all of them.
+// It gives back how many it fixed, how many it did not, and why.
+//
+// 理由是要的：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 而「一个都没试成」（连账号都没列出来）和「都试了，都登回去了」在只
+// 看着两个数字的时候是一样的——上一次那个错就是这样被藏起来的。
 //
 // An account without a password is skipped and is not a failure: it
 // was never brought in with one, so there is nothing to sign in with,
 // and that is not this round's fault.
-func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int) {
+func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, error) {
+	var out ReloginResult
 	accounts, err := m.Store.ListAccounts(ctx)
 	if err != nil {
-		return 0, 0
+		// 账号都没列出来，这一趟就根本没跑。把它说成「成功 0，失败 0」，
+		// 人会以为没什么要登的。
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
 	}
 	for _, acc := range accounts {
 		if acc.Status != store.StatusSignedOut {
 			continue
 		}
-		if limit > 0 && fixed+failed >= limit {
+		if limit > 0 && out.Fixed+out.Failed >= limit {
 			break
 		}
 		cipher, err := m.Store.Password(ctx, acc.ID)
@@ -6372,12 +6665,13 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int)
 				// 别人刚把它登回去了：这不算失败。
 				continue
 			}
-			failed++
+			out.Failed++
+			out.Reasons = append(out.Reasons, reloginReason(acc, err))
 			continue
 		}
-		fixed++
+		out.Fixed++
 	}
-	return fixed, failed
+	return out, nil
 }
 
 ```
@@ -6393,9 +6687,17 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int)
 // waits between two rounds, so a sign-in that failed is not retried
 // every minute.
 func (s *Scheduler) Relogin(ctx context.Context) {
-	fixed, failed := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
-	if fixed > 0 || failed > 0 {
-		fmt.Printf("relogin: %d fixed, %d failed\n", fixed, failed)
+	res, err := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
+	if err != nil {
+		// 这一趟根本没跑：说清楚，不然看着像「没什么要登的」。
+		fmt.Printf("relogin: %v\n", err)
+		return
+	}
+	if res.Fixed > 0 || res.Failed > 0 {
+		fmt.Printf("relogin: %d fixed, %d failed\n", res.Fixed, res.Failed)
+	}
+	for _, r := range res.Reasons {
+		fmt.Printf("relogin: %s\n", r)
 	}
 }
 
@@ -6534,10 +6836,16 @@ func runRelogin(ctx context.Context, e *env, out io.Writer, accountID, group str
 		fmt.Fprintf(out, "重登完成：%s\n", accountID)
 		return nil
 	}
-	fixed, failed := e.mgr.ReloginAll(ctx, 0)
-	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", fixed, failed)
-	if failed > 0 {
-		return fmt.Errorf("有 %d 个账号没登回去", failed)
+	res, err := e.mgr.ReloginAll(ctx, 0)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", res.Fixed, res.Failed)
+	for _, r := range res.Reasons {
+		fmt.Fprintf(out, "  %s\n", r)
+	}
+	if res.Failed > 0 {
+		return fmt.Errorf("有 %d 个账号没登回去", res.Failed)
 	}
 	return nil
 }
@@ -6686,7 +6994,9 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 		}
 		return out, nil
 	}
-	w.Relogin = func(ctx context.Context) (int, int) { return 1, 0 }
+	w.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
+		return manager.ReloginResult{Fixed: 1}, nil
+	}
 	return w, s
 }
 
@@ -6837,6 +7147,43 @@ Expected: FAIL
 
 3. 三个处理函数：
 
+页面上「最近的导入」那几行，成功和失败都是零的时候看不出这一趟出了什
+么事——像是什么都没干。所以每一趟还带着它整趟失败的原因。
+
+```go
+// importRunView is one import run as the page shows it.
+//
+// 整趟没成的导入，成功和失败都是零：光看那两个数，看不出这一趟出了什
+// 么事，像是这一趟什么都没干。理由得摆在眼前。
+type importRunView struct {
+	store.ImportRun
+	// Whole is why the run failed as a whole, when it did.
+	Whole string
+}
+```
+
+```go
+// wholeReason gives the reason a run failed as a whole.
+//
+// 整趟没成的时候，结果里有一行是整趟的（whole），它说的就是这一趟为什
+// 么没成。那一行不是账号：失败的账号数是零，可这一趟确实没成，得说。
+func wholeReason(results string) string {
+	if strings.TrimSpace(results) == "" {
+		return ""
+	}
+	var list []provision.Result
+	if err := json.Unmarshal([]byte(results), &list); err != nil {
+		return ""
+	}
+	for _, r := range list {
+		if r.Whole {
+			return r.Message
+		}
+	}
+	return ""
+}
+```
+
 ```go
 // importData is the import page's data.
 func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
@@ -6844,9 +7191,13 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	views := make([]importRunView, 0, len(runs))
+	for _, r := range runs {
+		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
+	}
 	return map[string]any{
 		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
-		"Runs":         runs,
+		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
 	}, nil
 }
@@ -6948,13 +7299,24 @@ func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 }
 
 // apiRelogin signs the accounts that are signed out in again.
+//
+// 理由要带回去：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 这一趟根本没跑的时候也要说，不能让它看着像「没什么要登的」。
 func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 	if w.Relogin == nil {
 		http.Error(rw, "这个网关没有重登", http.StatusNotImplemented)
 		return
 	}
-	fixed, failed := w.Relogin(r.Context())
-	writeJSON(rw, map[string]any{"fixed": fixed, "failed": failed})
+	res, err := w.Relogin(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"fixed":   res.Fixed,
+		"failed":  res.Failed,
+		"reasons": res.Reasons,
+	})
 }
 
 ```
@@ -7527,3 +7889,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 10. 同一个账号导两次，站点那边认不认。我们这边是一行：第二次导入会把这一行的
     令牌换掉。但站点那边——第二次登录换来的令牌会不会把第一次那把 refresh
     token 作废——只有真账号能试出来
+11. **令牌里那个 `sub` 是不是每一次登录都是同一个。** 我们整套去重都压在这个
+    前提上：导入按它找那一行，签出以后还留着它，下一次导入才不会把这个账号
+    当成新账号再插一行
+12. **站点那边报出来的地址能不能拿来登录。** `email` 那一栏写的是站点自己认的
+    地址，掉线以后重登用的就是它；清单上那个地址（登录时用的）留在导入的结
+    果里，库里没有那一份
