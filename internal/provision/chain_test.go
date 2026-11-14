@@ -92,7 +92,14 @@ func (s *fakeStore) SetPassword(ctx context.Context, id, cipher string, updatedA
 }
 
 // DeleteAccount takes an account back out.
+//
+// A context that is already done is refused, the way a real database
+// would refuse the delete: the test wants to see that the chain does
+// not need the caller's context to be alive.
 func (s *fakeStore) DeleteAccount(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for i, a := range s.accounts {
 		if strings.HasPrefix(a, id+":") {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
@@ -515,5 +522,21 @@ func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
 	}
 	if st.rows[0].ProxyGroup != "" {
 		t.Fatalf("group = %q, want the default one", st.rows[0].ProxyGroup)
+	}
+}
+
+func TestTheBrokenAccountIsTakenBackOutWhenTheRunWasCutShort(t *testing.T) {
+	// 导入被掐断的时候，令牌写不进去：那个半成的行要拿走。删它用的
+	// 上下文不能是调用方那个——那时候它已经没了。
+	st := &fakeStore{failToken: true}
+	c := aChain(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.Import(ctx, "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if len(st.accounts) != 0 {
+		t.Fatalf("the broken account was left behind: %v", st.accounts)
 	}
 }

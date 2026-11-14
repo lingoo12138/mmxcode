@@ -3614,7 +3614,14 @@ func (s *fakeStore) SetPassword(ctx context.Context, id, cipher string, updatedA
 }
 
 // DeleteAccount takes an account back out.
+//
+// A context that is already done is refused, the way a real database
+// would refuse the delete: the test wants to see that the chain does
+// not need the caller's context to be alive.
 func (s *fakeStore) DeleteAccount(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for i, a := range s.accounts {
 		if strings.HasPrefix(a, id+":") {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
@@ -4039,6 +4046,22 @@ func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
 		t.Fatalf("group = %q, want the default one", st.rows[0].ProxyGroup)
 	}
 }
+
+func TestTheBrokenAccountIsTakenBackOutWhenTheRunWasCutShort(t *testing.T) {
+	// 导入被掐断的时候，令牌写不进去：那个半成的行要拿走。删它用的
+	// 上下文不能是调用方那个——那时候它已经没了。
+	st := &fakeStore{failToken: true}
+	c := aChain(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.Import(ctx, "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if len(st.accounts) != 0 {
+		t.Fatalf("the broken account was left behind: %v", st.accounts)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -4383,12 +4406,17 @@ type deleter interface {
 // A store that cannot take the row out is left alone: the row stays
 // where it is, broken but visible, and the message says what happened
 // to it.
+//
+// The delete does not use the caller's context: the caller may have
+// been cut short (a deadline, a cancel), and then the delete would be
+// refused too, leaving a half-made account behind — one without a
+// token. The row has to go even when the run that made it is over.
 func (c *Chain) undo(ctx context.Context, id string) {
 	d, ok := c.Store.(deleter)
 	if !ok {
 		return
 	}
-	_ = d.DeleteAccount(ctx, id)
+	_ = d.DeleteAccount(context.WithoutCancel(ctx), id)
 }
 
 // webError turns what the site said into what the runner needs to
@@ -6455,6 +6483,7 @@ func passwordNote(keeper func(string) (string, error), keeperErr error) string {
 	}
 	return "密码没有存进库里（没有 " + PasswordKeyEnv + "）：账号掉线以后没有人能自己登回去。"
 }
+
 ```
 
 - [ ] **Step 4: 跑测试，确认它过了**

@@ -328,12 +328,17 @@ type deleter interface {
 // A store that cannot take the row out is left alone: the row stays
 // where it is, broken but visible, and the message says what happened
 // to it.
+//
+// The delete does not use the caller's context: the caller may have
+// been cut short (a deadline, a cancel), and then the delete would be
+// refused too, leaving a half-made account behind — one without a
+// token. The row has to go even when the run that made it is over.
 func (c *Chain) undo(ctx context.Context, id string) {
 	d, ok := c.Store.(deleter)
 	if !ok {
 		return
 	}
-	_ = d.DeleteAccount(ctx, id)
+	_ = d.DeleteAccount(context.WithoutCancel(ctx), id)
 }
 
 // webError turns what the site said into what the runner needs to
