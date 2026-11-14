@@ -3133,6 +3133,17 @@ func TestASiteThatIsLimitingIsTriedOnlyOnceMore(t *testing.T) {
 		t.Fatalf("out = %+v", out[0])
 	}
 }
+
+func TestTheResultsAreAnArrayEvenWhenThereAreNone(t *testing.T) {
+	// 一整趟导入失败的时候没有结果。存下来的那一串得是 "[]"：页面上
+	// 那个脚本 JSON.parse('null') 解析出来是 null，遍历它就炸了。
+	if got := ResultsJSON(nil); got != "[]" {
+		t.Fatalf("results = %q, want an empty array", got)
+	}
+	if got := ResultsJSON([]Result{}); got != "[]" {
+		t.Fatalf("results = %q, want an empty array", got)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -3478,7 +3489,15 @@ func mask(text string) string {
 }
 
 // ResultsJSON turns the results into the text the database keeps.
+//
+// 没有结果的时候给的是 `[]`，不是 `null`：页面上那个脚本
+// `JSON.parse(run.results || '[]')` 解析 `null` 是成的，出来的是
+// `null`，接着 `for (const r of results)` 就炸了——一整趟导入失败的
+// 时候，页面上那张结果表反而打不开。
 func ResultsJSON(results []Result) string {
+	if len(results) == 0 {
+		return "[]"
+	}
 	raw, err := json.Marshal(results)
 	if err != nil {
 		return "[]"
@@ -6194,6 +6213,7 @@ func writeJSONStatus(rw http.ResponseWriter, status int, v any) {
 	rw.WriteHeader(status)
 	json.NewEncoder(rw).Encode(v)
 }
+
 ```
 
 4. 页面的模板 `internal/webui/templates/import.html`：
@@ -6302,6 +6322,9 @@ function showImportResults(run) {
   body.textContent = '';
   let results = [];
   try { results = JSON.parse(run.results || '[]'); } catch (e) { results = []; }
+  // 解析出来的东西得是数组才能遍历：JSON.parse('null') 是成的，出来的是
+  // null，for...of 一个 null 就炸了，页面上写着「失败」，结果表也不出来。
+  if (!Array.isArray(results)) results = [];
   for (const r of results) {
     const tr = document.createElement('tr');
     const cells = [r.email, r.ok ? '成功' : '失败', r.message || ''];

@@ -298,3 +298,14 @@ func TestASiteThatIsLimitingIsTriedOnlyOnceMore(t *testing.T) {
 		t.Fatalf("out = %+v", out[0])
 	}
 }
+
+func TestTheResultsAreAnArrayEvenWhenThereAreNone(t *testing.T) {
+	// 一整趟导入失败的时候没有结果。存下来的那一串得是 "[]"：页面上
+	// 那个脚本 JSON.parse('null') 解析出来是 null，遍历它就炸了。
+	if got := ResultsJSON(nil); got != "[]" {
+		t.Fatalf("results = %q, want an empty array", got)
+	}
+	if got := ResultsJSON([]Result{}); got != "[]" {
+		t.Fatalf("results = %q, want an empty array", got)
+	}
+}

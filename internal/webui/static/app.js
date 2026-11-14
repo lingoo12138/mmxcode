@@ -287,6 +287,9 @@ function showImportResults(run) {
   body.textContent = '';
   let results = [];
   try { results = JSON.parse(run.results || '[]'); } catch (e) { results = []; }
+  // 解析出来的东西得是数组才能遍历：JSON.parse('null') 是成的，出来的是
+  // null，for...of 一个 null 就炸了，页面上写着「失败」，结果表也不出来。
+  if (!Array.isArray(results)) results = [];
   for (const r of results) {
     const tr = document.createElement('tr');
     const cells = [r.email, r.ok ? '成功' : '失败', r.message || ''];

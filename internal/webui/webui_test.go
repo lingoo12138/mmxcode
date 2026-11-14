@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1007,5 +1010,80 @@ func TestTheUploadAnswerIsJSONOnTheWire(t *testing.T) {
 	}
 	if out.ID == "" {
 		t.Fatal("the answer has no run id")
+	}
+}
+
+// TestARunThatFailedAsAWholeStillHasAnArrayOfResults says a run that
+// failed as a whole keeps a results that the page can read.
+//
+// 一整趟导入失败的时候（比如密钥配错了），没有一条结果。存下来的那
+// 一串以前是 "null"：页面上那个脚本 JSON.parse('null') 解析出来是
+// null，接着遍历就炸了，页面上写着「失败」，结果表也不出来。
+func TestARunThatFailedAsAWholeStillHasAnArrayOfResults(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return nil, errors.New("the key is not right")
+	}
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	if run.Results != "[]" {
+		t.Fatalf("results = %q, want an empty array", run.Results)
+	}
+	// The stored text has to be an array the page can walk through.
+	var results []map[string]any
+	if err := json.Unmarshal([]byte(run.Results), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %v, want none", results)
+	}
+}
+
+// TestTheImportResultsScriptSurvivesAResultsThatIsNotAnArray says the
+// page's script does not throw on a run whose results are not an array.
+//
+// 脚本那一半也守着：它拿到一个不是数组的东西时不许炸，也不许把结果表
+// 藏着。这一半是 node 跑的：这个仓库没有别的跑法，node 不在的时候
+// 这一条就跳过去——Go 那一半（存下来的结果得是 "[]"）还是照样守着。
+func TestTheImportResultsScriptSurvivesAResultsThatIsNotAnArray(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("no node in this environment")
+	}
+	p := exec.Command(node, filepath.Join("testdata", "import_results_guard.js"))
+	if out, err := p.CombinedOutput(); err != nil {
+		t.Fatalf("the script guard failed: %v\n%s", err, out)
 	}
 }

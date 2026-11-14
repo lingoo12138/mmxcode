@@ -331,7 +331,15 @@ func mask(text string) string {
 }
 
 // ResultsJSON turns the results into the text the database keeps.
+//
+// 没有结果的时候给的是 `[]`，不是 `null`：页面上那个脚本
+// `JSON.parse(run.results || '[]')` 解析 `null` 是成的，出来的是
+// `null`，接着 `for (const r of results)` 就炸了——一整趟导入失败的
+// 时候，页面上那张结果表反而打不开。
 func ResultsJSON(results []Result) string {
+	if len(results) == 0 {
+		return "[]"
+	}
 	raw, err := json.Marshal(results)
 	if err != nil {
 		return "[]"
