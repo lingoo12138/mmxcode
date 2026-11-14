@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
+	"mmxcode/internal/webui"
 )
 
 // TestIsLoopback says which listen addresses stay on this machine.
@@ -182,6 +185,50 @@ func serveEnv(t *testing.T, cfg config.Config) *env {
 		egr:   egr,
 		acc:   acc,
 		mgr:   manager.New(s, up, acc, egr, oauth.NewRenewer()),
+	}
+}
+
+// TestTheServePageSaysThePasswordsAreNotKept says the page the serve
+// command puts up says the passwords are not kept.
+//
+// 这句话是接线上的：serve 把那句提醒交给页面，页面把它显示出来。模板
+// 里有这句不算数——接线漏了这一句，页面上就没有了，人还是以为账号以
+// 后能自己登回去。
+func TestTheServePageSaysThePasswordsAreNotKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, "")
+	e := serveEnv(t, config.Default())
+	ui := webui.New(e.mgr, e.cfg, e.store)
+	e.wireImport(ui)
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	ui.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("the page does not say the passwords are not kept: %q", rec.Body.String())
+	}
+}
+
+// TestTheServePageSaysNothingWhenThePasswordsAreKept says the page says
+// nothing about the passwords when they are kept.
+//
+// 密码存着的时候，那句提醒是多余的：说过头了，人会以为密码没存。
+func TestTheServePageSaysNothingWhenThePasswordsAreKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	e := serveEnv(t, config.Default())
+	ui := webui.New(e.mgr, e.cfg, e.store)
+	e.wireImport(ui)
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	ui.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("the page says the passwords are not kept: %q", rec.Body.String())
 	}
 }
 

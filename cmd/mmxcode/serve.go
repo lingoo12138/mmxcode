@@ -44,27 +44,7 @@ func newServeCmd(e *env) *cobra.Command {
 			}
 
 			ui := webui.New(e.mgr, e.cfg, e.store)
-			// 页面上传和命令行导入走的是同一件事：批量入号和重登。
-			//
-			// 密钥有问题的时候导入要停下来：悄悄把密码丢掉，会留下
-			// 一库谁也登不回去的账号。
-			keeper, keeperErr := passwordKeeper(false)
-			// 没有密钥，密码就不入库。页面上得说清楚：账号掉线以后
-			// 没有人能自己登回去，人得知道这件事。
-			ui.PasswordNote = passwordNote(keeper, keeperErr)
-			ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
-				if keeperErr != nil {
-					return nil, keeperErr
-				}
-				runner, err := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
-				if err != nil {
-					return nil, err
-				}
-				return runner.Run(ctx, entries)
-			}
-			ui.Relogin = func(ctx context.Context) (int, int) {
-				return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
-			}
+			e.wireImport(ui)
 			gw := gateway.New(e.mgr, e.cfg, e.store, ui)
 			sc := scheduler.New(e.mgr, e.cfg)
 
@@ -98,6 +78,35 @@ func newServeCmd(e *env) *cobra.Command {
 			defer shutCancel()
 			return srv.Shutdown(shutCtx)
 		},
+	}
+}
+
+// wireImport puts the batch import and the re-login on the page.
+//
+// 页面上传和命令行导入走的是同一件事：批量入号和重登。
+//
+// 密钥有问题的时候导入要停下来：悄悄把密码丢掉，会留下一库谁也登不
+// 回去的账号。
+//
+// 没有密钥，密码就不入库。页面上得说清楚：账号掉线以后没有人能自己登
+// 回去，人得知道这件事。
+//
+// 这一段单独拿出来，是为了能测它：那句提醒是接线上的，不是模板里的。
+func (e *env) wireImport(ui *webui.WebUI) {
+	keeper, keeperErr := passwordKeeper(false)
+	ui.PasswordNote = passwordNote(keeper, keeperErr)
+	ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		if keeperErr != nil {
+			return nil, keeperErr
+		}
+		runner, err := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
+		if err != nil {
+			return nil, err
+		}
+		return runner.Run(ctx, entries)
+	}
+	ui.Relogin = func(ctx context.Context) (int, int) {
+		return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
 	}
 }
 
