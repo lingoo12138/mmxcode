@@ -1486,8 +1486,10 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 在 `internal/store/store_test.go` 末尾加：
 
 ```go
+// TestThePasswordGoesInAndComesBack says the encrypted password can be
+// written and read back.
 func TestThePasswordGoesInAndComesBack(t *testing.T) {
-	s := newTestStore(t)
+	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Second)
 	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -1505,8 +1507,10 @@ func TestThePasswordGoesInAndComesBack(t *testing.T) {
 	}
 }
 
+// TestAnAccountWithoutAPassword says an account that was not brought
+// in by a batch import has no password, and that is not an error.
 func TestAnAccountWithoutAPassword(t *testing.T) {
-	s := newTestStore(t)
+	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Second)
 	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -1521,8 +1525,10 @@ func TestAnAccountWithoutAPassword(t *testing.T) {
 	}
 }
 
+// TestTheImportRunIsKept says a batch import is written down with what
+// came of it.
 func TestTheImportRunIsKept(t *testing.T) {
-	s := newTestStore(t)
+	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Second)
 	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "cli", StartedAt: now, Total: 2}); err != nil {
@@ -1544,10 +1550,13 @@ func TestTheImportRunIsKept(t *testing.T) {
 	}
 }
 
+// TestAnImportRunCanBeAskedForByItsName says one batch import can be
+// taken out on its own.
+//
+// 页面上要看得见某一次导入走到哪儿了：光有"最近的几次"不够，
+// 得能按名字把这一次导入单独取出来。
 func TestAnImportRunCanBeAskedForByItsName(t *testing.T) {
-	// 页面上要看得见某一次导入走到哪儿了：光有"最近的几次"不够，
-	// 得能按名字把这一次导入单独取出来。
-	s := newTestStore(t)
+	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Second)
 	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "web", StartedAt: now, Total: 2}); err != nil {
@@ -1564,6 +1573,7 @@ func TestAnImportRunCanBeAskedForByItsName(t *testing.T) {
 		t.Fatalf("run = %+v", got)
 	}
 }
+
 ```
 
 （`newTestStore` 是这个包里现成的helper；名字不一样的话看 `store_test.go` 里已有的建库函数叫什么，用那个。）
@@ -1636,87 +1646,128 @@ type ImportRun struct {
 
 // SetPassword writes an account's encrypted password.
 //
-// The cipher text is written on its own, so that the other setters —
-// which write one column each — do not have to know about it.
+// The cipher text is written on its own, so that the other setters --
+// which write one column each -- do not have to know about it.
+//
+// An account that is not there is ErrNotFound: the caller believes it
+// wrote a password, and writing nothing is not writing one.
 func (s *Store) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
-	return s.exec(ctx, `UPDATE accounts SET password = ?, updated_at = ? WHERE id = ?`, cipher, s.stamp(updatedAt).UnixMilli(), id)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET password=?, updated_at=? WHERE id=?`,
+		cipher, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the password of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the password of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
 }
 
 // Password gives an account's encrypted password.
 //
 // An account that was not brought in by a batch import has none, and
 // that is not an error: the text is empty.
+//
+// An account that is not there at all has no password either, and that
+// is not an error either: the caller asked about a password, and there
+// is none. A caller that cares whether the account is there asks for
+// the account.
 func (s *Store) Password(ctx context.Context, id string) (string, error) {
-	var cipher string
-	err := s.db.QueryRowContext(ctx, `SELECT password FROM accounts WHERE id = ?`, id).Scan(&cipher)
+	var cipher sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT password FROM accounts WHERE id=?`, id).Scan(&cipher)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("get the password of the account %s: %w", id, err)
 	}
-	return cipher, nil
+	return cipher.String, nil
 }
 
 // CreateImportRun records the start of a batch import.
+//
+// The run is written down before the accounts are made, so that an
+// import that is still going can be seen.
 func (s *Store) CreateImportRun(ctx context.Context, r ImportRun) error {
-	return s.exec(ctx, `INSERT INTO import_runs (id, source, started_at, total, ok, failed) VALUES (?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Source, s.stamp(r.StartedAt).UnixMilli(), r.Total, r.OK, r.Failed)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO import_runs (id, source, started_at, total, ok, failed)
+		VALUES (?,?,?,?,?,?)`,
+		r.ID, r.Source, ms(s.stamp(r.StartedAt)), r.Total, r.OK, r.Failed)
+	if err != nil {
+		return fmt.Errorf("create import run %s: %w", r.ID, err)
+	}
+	return nil
 }
 
 // FinishImportRun records what a batch import came to.
+//
+// The results are kept as they were given: they are the reader's to
+// read, and the store does not have to know what is in them.
 func (s *Store) FinishImportRun(ctx context.Context, id string, finishedAt time.Time, ok, failed int, results string) error {
-	return s.exec(ctx, `UPDATE import_runs SET finished_at = ?, ok = ?, failed = ?, results = ? WHERE id = ?`,
-		s.stamp(finishedAt).UnixMilli(), ok, failed, results, id)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE import_runs SET finished_at=?, ok=?, failed=?, results=? WHERE id=?`,
+		ms(s.stamp(finishedAt)), ok, failed, results, id)
+	if err != nil {
+		return fmt.Errorf("finish import run %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("finish import run %s: %w", id, ErrNotFound)
+	}
+	return nil
 }
 
 // GetImportRun gives one batch import by its name.
 //
-// A name that is not there is an error: the caller asked about one
+// A name that is not there is ErrNotFound: the caller asked about one
 // particular import, and being handed a different one would be worse
 // than being told there is none.
 func (s *Store) GetImportRun(ctx context.Context, id string) (ImportRun, error) {
-	var r ImportRun
-	var started, finished int64
-	err := s.db.QueryRowContext(ctx, `SELECT id, source, started_at, finished_at, total, ok, failed, COALESCE(results, '')
-		FROM import_runs WHERE id = ?`, id).
-		Scan(&r.ID, &r.Source, &started, &finished, &r.Total, &r.OK, &r.Failed, &r.Results)
-	if err != nil {
-		return ImportRun{}, err
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs WHERE id=?`, id)
+	r, err := scanImportRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, ErrNotFound)
 	}
-	r.StartedAt = time.UnixMilli(started).UTC()
-	if finished > 0 {
-		r.FinishedAt = time.UnixMilli(finished).UTC()
+	if err != nil {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, err)
 	}
 	return r, nil
 }
 
 // ListImportRuns gives the most recent batch imports.
+//
+// A limit of zero or less means the usual twenty: a limit is a limit,
+// and a limit of zero is no limit at all, which is not what a reader
+// of the page wants.
 func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, source, started_at, finished_at, total, ok, failed, COALESCE(results, '')
-		FROM import_runs ORDER BY started_at DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list import runs: %w", err)
 	}
 	defer rows.Close()
 	var out []ImportRun
 	for rows.Next() {
-		var r ImportRun
-		var started, finished int64
-		if err := rows.Scan(&r.ID, &r.Source, &started, &finished, &r.Total, &r.OK, &r.Failed, &r.Results); err != nil {
-			return nil, err
-		}
-		r.StartedAt = time.UnixMilli(started).UTC()
-		if finished > 0 {
-			r.FinishedAt = time.UnixMilli(finished).UTC()
+		r, err := scanImportRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list import runs: %w", err)
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list import runs: %w", err)
+	}
+	return out, nil
 }
+
 ```
 
 （`s.exec` 是这个包里现成的写库helper；名字不一样就看 `store.go` 里别的 setter 怎么写的，照着来。`sql.ErrNoRows` 需要 `"database/sql"` 这个 import。）
@@ -3938,6 +3989,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -4019,6 +4071,36 @@ func TestImportSaysWhyAnAccountDidNotMakeIt(t *testing.T) {
 		t.Fatalf("out = %q", out.String())
 	}
 }
+
+func TestImportStopsAtItsTimeout(t *testing.T) {
+	// 整趟导入有个时限：清单很大的时候，人不想等到天亮才知道它卡住了。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.txt")
+	if err := os.WriteFile(path, []byte("a@example.com|pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := aFakeEnv(t)
+	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+		return &provision.Runner{
+			Importer: &provision.Importer{
+				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
+					// 站点那边没有回答：这一趟就卡在这里。
+					<-ctx.Done()
+					return provision.Result{Email: email}, ctx.Err()
+				},
+			},
+			Interval: interval,
+			Sleep:    func(context.Context, time.Duration) error { return nil },
+		}
+	}
+	cmd := newImportCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--file", path, "--timeout", "100ms"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("the import ran past its timeout")
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -4048,6 +4130,7 @@ Expected: FAIL
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -4061,6 +4144,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/provision"
 	"mmxcode/internal/secret"
@@ -4078,11 +4162,19 @@ import (
 // is no key at all.
 const PasswordKeyEnv = "MMXCODE_PASSWORD_KEY"
 
+// webTimeout is how long one request to the account site may take.
+//
+// The site answers in seconds: the device code, the sign-in and the
+// approval are all quick. A request that has not answered in half a
+// minute is not going to.
+const webTimeout = 30 * time.Second
+
 func newImportCmd(e *env) *cobra.Command {
 	var file string
 	var group string
 	var interval time.Duration
 	var noStore bool
+	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "按清单批量登录账号",
@@ -4090,13 +4182,22 @@ func newImportCmd(e *env) *cobra.Command {
 			"密码登录之后默认加密存进库里（密钥在 " + PasswordKeyEnv + "），\n" +
 			"没有这个环境变量就登录一次就丢。",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runImport(cmd.Context(), e, cmd.OutOrStdout(), file, group, interval, noStore)
+			ctx := cmd.Context()
+			if timeout > 0 {
+				// 整趟导入有个时限：清单很大的时候，人不愿意等到
+				// 天亮才知道它卡住了。
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			return runImport(ctx, e, cmd.OutOrStdout(), file, group, interval, noStore)
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "账号清单（每行 邮箱|密码）")
 	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "每个账号之间的间隔")
 	cmd.Flags().BoolVar(&noStore, "no-store-password", false, "登录成功就丢密码，不入库")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")
 	_ = cmd.MarkFlagRequired("file")
 	return cmd
 }
@@ -4110,8 +4211,11 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 	if err != nil {
 		return err
 	}
-	entries, bad := provision.Parse(strings.NewReader(string(raw)))
+	entries, bad := provision.Parse(bytes.NewReader(raw))
+	fmt.Fprintf(out, "读入 %d 个账号。\n", len(entries))
 	for _, b := range bad {
+		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了，
+		// 这一行是要写进数据库的导入留痕里的。
 		fmt.Fprintf(out, "第 %d 行：%s（%s）\n", b.Line, b.Reason, b.Text)
 	}
 	if len(entries) == 0 {
@@ -4122,9 +4226,12 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 	if err != nil {
 		return err
 	}
-	runner := e.runner(group, interval, keeper)
+	runner, err := e.runner(group, interval, keeper)
+	if err != nil {
+		return err
+	}
 
-	runID := fmt.Sprintf("run_%d", time.Now().UnixMilli())
+	runID := newRunID()
 	if e.store != nil {
 		if err := e.store.CreateImportRun(ctx, store.ImportRun{
 			ID: runID, Source: "cli", StartedAt: time.Now(), Total: len(entries),
@@ -4137,22 +4244,45 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 	if err != nil {
 		return err
 	}
+	// 清单里的第几行：出错的账号要能找回去。
+	lines := map[string]int{}
+	for _, en := range entries {
+		lines[strings.ToLower(en.Email)] = en.Line
+	}
 	ok := 0
 	for _, r := range results {
 		if r.OK {
 			ok++
-			fmt.Fprintf(out, "  ✔ %s\t入库成功\n", r.Email)
+			fmt.Fprintf(out, "  ✔ %s\t入库成功", r.Email)
+			// 账号进来了但密码没存下，也要说：不然下一次掉线时，
+			// 这个账号只能等人手工重新入号。
+			if r.Message != "" {
+				fmt.Fprintf(out, "（%s）", r.Message)
+			}
+			fmt.Fprintln(out)
 			continue
 		}
 		fmt.Fprintf(out, "  ✘ %s\t%s：%s", r.Email, r.Stage, r.Message)
-		if r.Code != 0 {
-			fmt.Fprintf(out, "（%d）", r.Code)
+		if line, known := lines[strings.ToLower(r.Email)]; known {
+			fmt.Fprintf(out, "（第 %d 行", line)
+		} else {
+			fmt.Fprint(out, "（")
 		}
-		fmt.Fprintln(out)
+		if r.Code != 0 {
+			fmt.Fprintf(out, "错误码 %d", r.Code)
+		}
+		fmt.Fprintln(out, "）")
 	}
 	fmt.Fprintf(out, "\n共 %d 个，成功 %d，失败 %d。\n", len(results), ok, len(results)-ok)
-	if keeper == nil {
-		fmt.Fprintln(out, "密码没有存进库里（没有 "+PasswordKeyEnv+"）。")
+	switch {
+	case keeper != nil:
+		fmt.Fprintf(out, "密码已加密入库（%s）。\n", PasswordKeyEnv)
+	case noStore:
+		fmt.Fprintln(out, "密码用完就丢（不入库）。")
+	default:
+		// 只有「没设密钥」才要说这件事：--no-store-password 是人自己
+		// 说的，说他「没有密钥」是冤枉他。
+		fmt.Fprintf(out, "密码没有存进库里（没有 %s）。\n", PasswordKeyEnv)
 	}
 	if e.store != nil {
 		if err := e.store.FinishImportRun(ctx, runID, time.Now(), ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
@@ -4166,7 +4296,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 // when the password is not to be kept.
 //
 // The key is not set: no key, no password kept. The key is set but
-// wrong: that is a mistake, and the import stops on it — quietly
+// wrong: that is a mistake, and the import stops on it -- quietly
 // throwing the password away would leave a database of accounts that
 // nobody can sign in again.
 func passwordKeeper(noStore bool) (func(string) (string, error), error) {
@@ -4183,10 +4313,59 @@ func passwordKeeper(noStore bool) (func(string) (string, error), error) {
 	return key.Seal, nil
 }
 
+// reloginFn makes the function that signs an account in again.
+//
+// The account is already in the database: only the token is new. The
+// way out is the account's own proxy group, so that the sign-in comes
+// from where the account usually comes from — unless the person
+// asked for another group.
+func (e *env) reloginFn(group string) manager.ReloginFunc {
+	return func(ctx context.Context, acc store.Account, password string) error {
+		if group != "" {
+			// 人指名的组得是真的：组名写错而默默走全局默认出口，
+			// 看着跑通了，其实请求根本没走要去的那条路。
+			if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+				return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+			}
+		}
+		g := group
+		if g == "" {
+			g = acc.ProxyGroup
+		}
+		chain := e.chain(g, nil)
+		tok, err := chain.SignIn(ctx, acc.Email, password)
+		if err != nil {
+			return err
+		}
+		return e.store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID,
+			Access:    tok.Access,
+			Refresh:   tok.Refresh,
+			ExpiresAt: tok.Expires,
+			Subject:   tok.Subject,
+			UpdatedAt: time.Now(),
+		})
+	}
+}
+
 // runner makes the batch driver.
-func (e *env) runner(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+//
+// The way out is settled once, here, and not once per account: an
+// address that does not work is a mistake in the configuration, and it
+// is said once rather than once per account.
+func (e *env) runner(group string, interval time.Duration, keeper func(string) (string, error)) (*provision.Runner, error) {
 	if e.makeRunner != nil {
-		return e.makeRunner(group, interval, keeper)
+		return e.makeRunner(group, interval, keeper), nil
+	}
+	// 出口组先查一遍：组名写错而默默走全局默认出口，是最坏的一种
+	// 错——看着跑通了，其实请求根本没走要去的那条路。
+	if group != "" {
+		if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+			return nil, fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+		}
+	}
+	if _, err := e.egress(group); err != nil {
+		return nil, err
 	}
 	return &provision.Runner{
 		Importer: &provision.Importer{
@@ -4196,54 +4375,90 @@ func (e *env) runner(group string, interval time.Duration, keeper func(string) (
 			},
 		},
 		Interval: interval,
-	}
+	}, nil
+}
+
+// egress settles the way out of a group.
+//
+// The group says which way the traffic goes: an empty group is the
+// global default.
+func (e *env) egress(group string) (http.RoundTripper, error) {
+	proxyURL := e.egr.Resolve(store.Account{ProxyGroup: group})
+	return e.egr.Transport(proxyURL)
 }
 
 // chain makes the thing that does the real work.
 //
-// The group says which way out the traffic goes: an empty group is the
-// global default. The keeper encrypts the password so that it can be
-// kept; a nil one throws the password away after the sign-in.
+// The keeper encrypts the password so that it can be kept; a nil one
+// throws the password away after the sign-in.
 //
 // Every call makes a new chain, and a new chain has a new web client:
 // the site keeps the session in a cookie, and two accounts sharing one
 // session would be signing in as each other.
 func (e *env) chain(group string, keeper func(string) (string, error)) *provision.Chain {
-	proxyURL := e.egr.Resolve(store.Account{ProxyGroup: group})
+	tr, trErr := e.egress(group)
 	up := e.up
-	hc := &http.Client{Timeout: 30 * time.Second}
-	if proxyURL != "" {
-		if tr, err := e.egr.Transport(proxyURL); err == nil {
-			up = upstream.New(upstream.Options{
-				Timeout:   e.cfg.Upstream.Timeout.Duration(),
-				Transport: tr,
-			})
-		}
-		if c, err := e.egr.Client(proxyURL); err == nil {
-			hc = c
-		}
+	hc := &http.Client{Timeout: webTimeout}
+	if trErr == nil {
+		// The sign-in, the device code and the token all go out the
+		// same way: the site sees one account from one address.
+		hc.Transport = tr
+		up = upstream.New(upstream.Options{Timeout: webTimeout, Transport: tr})
 	}
 	web := webauth.New(webauth.Options{
 		BaseURL: site.AccountHost,
 		HTTP:    hc,
 		Lang:    site.Lang,
+		// 网页那一套的公共 query 里有 timezone_offset：东八区是
+		// 28800 秒，正是浏览器给的那个数。
+		TZOffset: localTZOffset(),
 	})
-	return &provision.Chain{
-		Store: e.store,
-		Web:   web,
+	c := &provision.Chain{
+		Web: web,
 		Start: func(ctx context.Context) (*oauth.Device, error) {
+			if trErr != nil {
+				return nil, trErr
+			}
 			return oauth.StartDevice(ctx, up, site.AccountURL(site.DeviceCodePath))
 		},
 		Poll: func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
 			return d.Poll(ctx, up, site.AccountURL(site.TokenPath))
 		},
 		Identity: func(ctx context.Context, access, subject string) (account.Identity, error) {
-			return e.acc.Identity(ctx, access, subject)
+			// 账户信息也从这条路走：换了出口组却用旧出口读账户，
+			// 站点看到的是两个地方来的同一个号。
+			return e.acc.With(up).Identity(ctx, access, subject)
 		},
 		Keeper: keeper,
 		Now:    time.Now,
 		NewID:  newBatchAccountID,
 	}
+	if e.store != nil {
+		c.Store = e.store
+	}
+	return c
+}
+
+// localTZOffset gives the timezone offset in seconds east of UTC.
+//
+// It is the number the browser sends: the site's web query carries
+// -60 × getTimezoneOffset(), and JavaScript counts the minutes west
+// of UTC, so the sign is the other way round.
+func localTZOffset() int {
+	_, offset := time.Now().Zone()
+	return offset
+}
+
+// newRunID makes the name of one import run.
+//
+// The time alone is not enough: two runs that start in the same
+// millisecond would write the same row, and the second one would be
+// refused.
+func newRunID() string {
+	if r := randomHex(4); r != "" {
+		return fmt.Sprintf("run_%d_%s", time.Now().UnixMilli(), r)
+	}
+	return fmt.Sprintf("run_%d", time.Now().UnixMilli())
 }
 
 // newBatchAccountID makes an account id for a batch import.
@@ -4251,11 +4466,20 @@ func (e *env) chain(group string, keeper func(string) (string, error)) *provisio
 // The time alone is not enough: a batch signs in many accounts in a
 // row, and two of them can land in the same millisecond.
 func newBatchAccountID() string {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("acc_%d", time.Now().UnixMilli())
+	if r := randomHex(4); r != "" {
+		return fmt.Sprintf("acc_%d_%s", time.Now().UnixMilli(), r)
 	}
-	return fmt.Sprintf("acc_%d_%s", time.Now().UnixMilli(), hex.EncodeToString(b))
+	return fmt.Sprintf("acc_%d", time.Now().UnixMilli())
+}
+
+// randomHex gives a few random bytes as hex, or an empty string when
+// there are none to give.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 ```
 
@@ -4334,6 +4558,16 @@ func TestReloginSignsTheAccountInAgain(t *testing.T) {
 	if acc.Status != store.StatusActive {
 		t.Fatalf("status = %q", acc.Status)
 	}
+	if acc.LastError != "" {
+		t.Fatalf("last error = %q, want none", acc.LastError)
+	}
+	tok, err := m.Store.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "new-access" || tok.Refresh != "new-refresh" {
+		t.Fatalf("token = %+v, want the new one", tok)
+	}
 }
 
 func TestReloginWithoutAPasswordSaysSo(t *testing.T) {
@@ -4388,6 +4622,7 @@ func TestReloginAllOnlyTouchesTheAccountsThatHaveAPassword(t *testing.T) {
 		t.Fatalf("the account without a password was touched: %q", acc.Status)
 	}
 }
+
 ```
 
 在 `internal/scheduler/scheduler_test.go` 末尾加（并 import `"bytes"` 与 `"mmxcode/internal/secret"`）：
@@ -4440,6 +4675,7 @@ func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
 		t.Fatalf("status = %q", got.Status)
 	}
 }
+
 ```
 
 - [ ] **Step 2: 跑测试，确认它失败**
@@ -4453,15 +4689,44 @@ Expected: FAIL
 这一节这一步编不过。（Task 10 只剩那些 yaml 文件了。）
 
 ```go
-// Batch is how a batch import runs.
+// Batch is one batch of credits.
+//
+// The site writes the amounts as strings, sometimes with a thousands
+// separator, so they are kept as they come and read by ParseAmount.
 type Batch struct {
-	// Interval is the wait between two accounts.
-	Interval Duration `yaml:"interval" json:"interval"`
-	// Group is the egress group the logins go through. An empty one
-	// is the default proxy.
-	Group string `yaml:"group" json:"group"`
-	// Relogin is the automatic signing-in again.
-	Relogin Relogin `yaml:"relogin" json:"relogin"`
+	// CreditType is CreditTypePurchase or CreditTypeCheckin for the
+	// batches the plan counts. Another type is a bucket the plan does
+	// not count.
+	CreditType int `json:"credit_type"`
+	// GrantedAmount is what the batch gave.
+	GrantedAmount string `json:"granted_amount"`
+	// ConsumedAmount is what of it was used.
+	ConsumedAmount string `json:"consumed_amount"`
+	// RemainingAmount is what of it is left.
+	RemainingAmount string `json:"remaining_amount"`
+	// GrantedAtMS is when it was given, in milliseconds.
+	GrantedAtMS int64 `json:"granted_at_ms"`
+	// ExpiresAtMS is when it runs out, in milliseconds.
+	ExpiresAtMS int64 `json:"expire_at_ms"`
+
+	// Granted is what the batch gave, once read.
+	Granted float64 `json:"-"`
+	// Consumed is what of it was used, once read.
+	Consumed float64 `json:"-"`
+	// Remaining is what of it is left, once read.
+	Remaining float64 `json:"-"`
+	// GrantedAt is when it was given.
+	GrantedAt time.Time `json:"-"`
+	// ExpiresAt is when it runs out.
+	ExpiresAt time.Time `json:"-"`
+	// HasGrantedAt says the answer carried the time the batch was
+	// given. A batch without one has no GrantedAt, not one in 1970.
+	HasGrantedAt bool `json:"-"`
+	// HasExpiresAt says the answer carried the time the batch runs
+	// out. A batch without one cannot be read: the credits of a batch
+	// that never expires cannot be told from those of a spent one, and
+	// a wrong share is worse than none.
+	HasExpiresAt bool `json:"-"`
 }
 
 // Relogin is the automatic signing-in again.
@@ -4475,6 +4740,7 @@ type Relogin struct {
 	// MaxAccounts is how many accounts one round touches.
 	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
 }
+
 ```
 
 在 `Config` 里加 `Batch Batch \`yaml:"batch" json:"batch"\``，在 `Default()` 里给它默认值：
@@ -4489,12 +4755,13 @@ type Relogin struct {
 		},
 ```
 
-在 `internal/config/config_test.go` 末尾加一个测试（照着那个包里已有的测
-试写，临时配置文件怎么建就照着建）：
+在 `internal/config/config_test.go` 末尾加一个测试（这个包里已经有
+`writeFile(path, body)` 这个helper，照着 `TestLoadFile` 的样子写）：
 
 ```go
 func TestTheBatchSection(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `
 batch:
   interval: 5s
   group: clash
@@ -4502,7 +4769,11 @@ batch:
     enabled: true
     cooldown: 2h
     max_accounts: 30
-`))
+`
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4522,6 +4793,7 @@ batch:
 		t.Errorf("max accounts = %d", cfg.Batch.Relogin.MaxAccounts)
 	}
 }
+
 ```
 
 然后在 `internal/manager/manager.go` 的 `Manager` 结构里加两个字段：
@@ -4562,6 +4834,11 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	if cipher == "" {
 		return errors.New("这个账号没有存密码，没法自己登回去")
 	}
+	if len(m.Key) == 0 {
+		// 没有密钥，密文就开不了。密文在，说明当初是存过的，是密钥
+		// 现在没了——说清楚，别让人以为是账号的问题。
+		return errors.New("没有密码的密钥，存着的密文开不了")
+	}
 	password, err := m.Key.Open(cipher)
 	if err != nil {
 		return err
@@ -4575,6 +4852,9 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 		}
 		return err
 	}
+	// 旧的那条链就此作废：这次登录换来的令牌是新的链，旧的刷新令牌
+	// 再也不会被发出去了。
+	m.Renewer.Forget(accountID)
 	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusActive, "", time.Now())
 }
 
@@ -4583,6 +4863,10 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 //
 // It gives back how many it fixed and how many it did not. The limit
 // says how many one round touches; zero means all of them.
+//
+// An account without a password is skipped and is not a failure: it
+// was never brought in with one, so there is nothing to sign in with,
+// and that is not this round's fault.
 func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int) {
 	accounts, err := m.Store.ListAccounts(ctx)
 	if err != nil {
@@ -4607,6 +4891,7 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int)
 	}
 	return fixed, failed
 }
+
 ```
 
 （`errors`、`fmt`、`time` 这几个包 `manager.go` 里多半已经有了；没有就 import。`secret` 要新 import。）
@@ -4625,6 +4910,7 @@ func (s *Scheduler) Relogin(ctx context.Context) {
 		fmt.Printf("relogin: %d fixed, %d failed\n", fixed, failed)
 	}
 }
+
 ```
 
 并在 `Run` 里加一条（`Batch` 这一节是 Task 10 加的；这一步先按 Task 10 的形状写好）：
@@ -4646,10 +4932,22 @@ func (s *Scheduler) Relogin(ctx context.Context) {
 //
 // The account is already in the database: only the token is new. The
 // way out is the account's own proxy group, so that the sign-in comes
-// from where the account usually comes from.
-func (e *env) reloginFn() manager.ReloginFunc {
+// from where the account usually comes from — unless the person
+// asked for another group.
+func (e *env) reloginFn(group string) manager.ReloginFunc {
 	return func(ctx context.Context, acc store.Account, password string) error {
-		chain := e.chain(acc.ProxyGroup, nil)
+		if group != "" {
+			// 人指名的组得是真的：组名写错而默默走全局默认出口，
+			// 看着跑通了，其实请求根本没走要去的那条路。
+			if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+				return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+			}
+		}
+		g := group
+		if g == "" {
+			g = acc.ProxyGroup
+		}
+		chain := e.chain(g, nil)
 		tok, err := chain.SignIn(ctx, acc.Email, password)
 		if err != nil {
 			return err
@@ -4664,6 +4962,7 @@ func (e *env) reloginFn() manager.ReloginFunc {
 		})
 	}
 }
+
 ```
 
 在 `cmd/mmxcode/root.go` 的 `PersistentPreRunE` 里，manager 造好之后加：
@@ -4672,8 +4971,136 @@ func (e *env) reloginFn() manager.ReloginFunc {
 	// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
 	if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
 		e.mgr.Key = key
+	} else if strings.TrimSpace(os.Getenv(PasswordKeyEnv)) != "" {
+		// 密钥设了但是不对：说一声，别让人以为密码存下了。
+		fmt.Fprintf(os.Stderr, "warning: %s is set but unusable: %v\n", PasswordKeyEnv, err)
 	}
-	e.mgr.ReloginFn = e.reloginFn()
+	e.mgr.ReloginFn = e.reloginFn("")
+```
+
+设计文档 §7 里还有两样，计划里原先没有，一并做掉：
+
+**一、`import` 的 `--timeout`（整趟导入的时限）。**
+
+在 `cmd/mmxcode/import.go` 的 `newImportCmd` 里加一个 flag，并在 `RunE` 里
+用它把命令行的上下文掐断（`runImport` 的参数不要动，测试按那个签名调它）：
+
+```go
+	var timeout time.Duration
+	// ...
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")
+	// ...
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			return runImport(ctx, e, cmd.OutOrStdout(), file, group, interval, noStore)
+		},
+```
+
+**二、`mmxcode relogin` 命令**（设计文档 §7 里写着的那一条）：
+
+```go
+func newReloginCmd(e *env) *cobra.Command {
+	var all bool
+	var accountID string
+	var group string
+	cmd := &cobra.Command{
+		Use:   "relogin",
+		Short: "把签出的账号登回去",
+		Long: "用存着的密码，把签出（signed_out）的账号重新登一遍。\n" +
+			"没有存密码的账号登不回去——那个键没有就是没有。",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, group, all)
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "重登所有签出且有密码的账号")
+	cmd.Flags().StringVar(&accountID, "account", "", "只重登这一个账号")
+	cmd.Flags().StringVar(&group, "group", "", "走哪个出口组（空 = 各账号自己的组）")
+	return cmd
+}
+
+// runRelogin signs the signed-out accounts in again.
+//
+// Either one account or all of them: "all of them" without saying so
+// is a surprise waiting to happen, and a named account is not a
+// surprise at all.
+func runRelogin(ctx context.Context, e *env, out io.Writer, accountID, group string, all bool) error {
+	if accountID == "" && !all {
+		return fmt.Errorf("要么说 --all，要么给一个 --account")
+	}
+	if group != "" {
+		// 人说了走哪个出口组，就走那个：账号自己的组这时不算数。
+		e.mgr.ReloginFn = e.reloginFn(group)
+	}
+	if accountID != "" {
+		if err := e.mgr.Relogin(ctx, accountID); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "重登完成：%s\n", accountID)
+		return nil
+	}
+	fixed, failed := e.mgr.ReloginAll(ctx, 0)
+	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", fixed, failed)
+	if failed > 0 {
+		return fmt.Errorf("有 %d 个账号没登回去", failed)
+	}
+	return nil
+}
+
+```
+
+（`e.reloginFn` 要多一个参数：`e.reloginFn(group string)`。`group` 空的时候
+用账号自己的组，非空的时候用这个组——账号自己的组是它平时登录走的那个地
+方，重登也该从那里走。）
+
+`reloginFn` 改成：
+
+```go
+// reloginFn makes the function that signs an account in again.
+//
+// The account is already in the database: only the token is new. The
+// way out is the account's own proxy group, so that the sign-in comes
+// from where the account usually comes from — unless the person
+// asked for another group.
+func (e *env) reloginFn(group string) manager.ReloginFunc {
+	return func(ctx context.Context, acc store.Account, password string) error {
+		if group != "" {
+			// 人指名的组得是真的：组名写错而默默走全局默认出口，
+			// 看着跑通了，其实请求根本没走要去的那条路。
+			if _, ok := e.cfg.Proxy.Groups[group]; !ok {
+				return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
+			}
+		}
+		g := group
+		if g == "" {
+			g = acc.ProxyGroup
+		}
+		chain := e.chain(g, nil)
+		tok, err := chain.SignIn(ctx, acc.Email, password)
+		if err != nil {
+			return err
+		}
+		return e.store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID,
+			Access:    tok.Access,
+			Refresh:   tok.Refresh,
+			ExpiresAt: tok.Expires,
+			Subject:   tok.Subject,
+			UpdatedAt: time.Now(),
+		})
+	}
+}
+
+```
+
+并且在 `cmd/mmxcode/root.go` 里挂上命令：
+
+```go
+	root.AddCommand(newReloginCmd(e))
 ```
 
 - [ ] **Step 4: 跑测试，确认它过了**
@@ -4733,8 +5160,15 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 		ID: "acc_01", Name: "主号", Email: "a@example.com", Status: store.StatusActive,
 		CreatedAt: now, UpdatedAt: now,
 	})
+	s.SaveToken(context.Background(), store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	groups := map[string]string{"warp": "socks5h://warp:4000"}
+	// The account API is pointed at a stand-in server: the check-in
+	// route reaches the account API, and a test must never talk to
+	// MiniMax itself.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no upstream in the test", http.StatusNotFound)
 	}))
@@ -4742,8 +5176,16 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
 	mgr := manager.New(s, up, acc, egress.New(groups, ""), oauth.NewRenewer())
-	cfg.Proxy.Groups = groups
+	// The outlet groups are the configuration's; the resolver is built
+	// from the same map, so the page and the resolver agree on which
+	// groups there are.
+	if len(cfg.Proxy.Groups) == 0 {
+		cfg.Proxy.Groups = groups
+	}
 	w := New(mgr, cfg, s)
+	// The import and the relogin talk to the site, and a test must
+	// never talk to MiniMax itself: they are fields so that the test
+	// can stand in for the network.
 	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
 		out := make([]provision.Result, 0, len(entries))
 		for _, e := range entries {
@@ -4759,6 +5201,7 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 	t.Helper()
 	return newTestWebUIWithConfig(t, config.Default())
 }
+
 ```
 
 （把原来那个 `newTestWebUI` 的身子换成上面这个。`provision` 要 import。）
@@ -4766,6 +5209,10 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 然后加测试：
 
 ```go
+// TestTheImportPageIsThereWhenNoAPIKeysAreSet says the import page is
+// there when the gateway has no key.
+//
+// 没有 key 的网关只听本机，明文密码不出这台机器，所以上传是开的。
 func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
 	w, _ := newTestWebUIWithConfig(t, config.Default())
 	req := httptest.NewRequest(http.MethodGet, "/import", nil)
@@ -4779,6 +5226,10 @@ func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
 	}
 }
 
+// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
+// shut when the gateway has a key.
+//
+// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
 func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.APIKeys = []string{"sk-x"}
@@ -4791,6 +5242,10 @@ func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
 	}
 }
 
+// TestUploadingAFileAnswersWithAJobID says an upload gets an answer
+// that says which run to watch.
+//
+// 导入在后台跑，回答里给的是那一次的编号。
 func TestUploadingAFileAnswersWithAJobID(t *testing.T) {
 	w, _ := newTestWebUIWithConfig(t, config.Default())
 	body := &bytes.Buffer{}
@@ -4814,6 +5269,10 @@ func TestUploadingAFileAnswersWithAJobID(t *testing.T) {
 	}
 }
 
+// TestTheReloginIsAskedFor says the relogin can be asked for.
+//
+// 重登是页面上一个按钮点出来的。
+// 重登是页面上一个按钮点出来的。
 func TestTheReloginIsAskedFor(t *testing.T) {
 	w, _ := newTestWebUIWithConfig(t, config.Default())
 	req := httptest.NewRequest(http.MethodPost, "/api/relogin", nil)
@@ -4826,6 +5285,7 @@ func TestTheReloginIsAskedFor(t *testing.T) {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 }
+
 ```
 
 （`bytes`、`mime/multipart` 要 import。）
@@ -4893,6 +5353,9 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 //
 // The list is a file: every line is an account. The work goes on in
 // the background, and the answer says which run to watch.
+//
+// The file is read into memory and thrown away afterwards: it holds
+// passwords in the clear, and it must not land on the disk.
 func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 	if len(w.Cfg.Server.APIKeys) > 0 {
 		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
@@ -4902,7 +5365,16 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
 		return
 	}
-	if err := r.ParseMultipartForm(4 << 20); err != nil {
+	// The request has a size limit, and the memory that ParseMultipartForm
+	// is given is bigger than it: the list therefore never reaches a
+	// temporary file, it stays in memory.
+	r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
+	if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
 		return
 	}
@@ -4914,13 +5386,14 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 	entries, bad := provision.Parse(file)
 	for _, b := range bad {
+		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了。
 		log.Printf("import: 第 %d 行：%s", b.Line, b.Reason)
 	}
 	if len(entries) == 0 {
 		http.Error(rw, "清单里没有能用的账号", http.StatusBadRequest)
 		return
 	}
-	runID := fmt.Sprintf("run_%d", time.Now().UnixMilli())
+	runID := newImportRunID()
 	now := time.Now()
 	if err := w.Store.CreateImportRun(r.Context(), store.ImportRun{
 		ID: runID, Source: "web", StartedAt: now, Total: len(entries),
@@ -4962,11 +5435,19 @@ func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 	fixed, failed := w.Relogin(r.Context())
 	writeJSON(rw, map[string]any{"fixed": fixed, "failed": failed})
 }
+
 ```
 
 （`writeJSON` 这个包里多半已经有了；没有就照着别的 API 处理器的样子写一个。`log` 要 import `"log"`。）
 
 4. 页面的模板 `internal/webui/templates/import.html`：
+
+先在 `internal/webui/templates/layout.html` 的导航里加一个入口——配了 API
+key 的网关不开上传，那边就不该有这个链接：
+
+```html
+    {{if not .HasKeys}}<a href="/import">导入</a>{{end}}
+```
 
 ```html
 {{define "content"}}
@@ -5094,7 +5575,7 @@ func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "没有这一次导入", http.StatusNotFound)
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{
+	writeJSON(rw, map[string]any{
 		"id":          run.ID,
 		"source":      run.Source,
 		"total":       run.Total,
@@ -5104,6 +5585,134 @@ func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 		"finished_at": !run.FinishedAt.IsZero(),
 	})
 }
+
+```
+
+8. **重登那一页**（设计文档 §8.1 里写着 `/accounts/relogin`：列出签出且有
+   密码的账号，一键重登）。重登页**不受上传那个闸限制**——它不碰明文密码。
+
+   路由，在页面那一段里加：
+
+```go
+	case "/relogin":
+		// 重登页不受上传那个闸限制：它不接触明文密码。
+		w.page(rw, r, "relogin.html", w.reloginData)
+```
+
+   页面要的数据，和一个处理函数：
+
+```go
+// reloginData is the relogin page's data.
+//
+// Only the accounts that are signed out and still have a password are
+// listed: the others cannot be signed in again, and saying so is
+// better than a button that cannot work.
+func (w *WebUI) reloginData(ctx context.Context) (map[string]any, error) {
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0)
+	for _, a := range accounts {
+		if a.Status != store.StatusSignedOut {
+			continue
+		}
+		cipher, err := w.Store.Password(ctx, a.ID)
+		if err != nil || cipher == "" {
+			continue
+		}
+		// 存着的密码是加密的，可它也不该到页面上：这里只说这个账号
+		// 还能登回去。
+		out = append(out, map[string]any{
+			"ID": a.ID, "Name": a.Name, "Email": a.Email, "Error": a.LastError,
+		})
+	}
+	return map[string]any{"SignedOut": out}, nil
+}
+
+```
+
+   模板 `internal/webui/templates/relogin.html`：
+
+```html
+{{define "content"}}
+<section>
+  <h1>重登</h1>
+  <p class="muted">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
+  <p><button id="relogin-all">全部重登</button> <span class="muted" id="relogin-status"></span></p>
+  <table>
+    <thead><tr><th>账号</th><th>邮箱</th><th>上次为什么掉的</th></tr></thead>
+    <tbody>
+      {{range .SignedOut}}
+      <tr>
+        <td>{{.Name}}</td>
+        <td>{{.Email}}</td>
+        <td class="err">{{.Error}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}
+```
+
+   `internal/webui/static/app.js` 里加一段（放在 `poll` 那个函数后面）：
+
+```js
+// 重登：把签出的账号重新登一遍。
+document.addEventListener('click', async (ev) => {
+  const button = ev.target.closest('#relogin-all');
+  if (!button) return;
+  const status = document.getElementById('relogin-status');
+  status.textContent = '重登中……';
+  try {
+    const res = await fetch('/api/relogin', { method: 'POST' });
+    const answer = await readAnswer(res);
+    if (!answer.ok) throw new Error(messageOf(answer));
+    status.textContent = '成功 ' + answer.json.fixed + '，失败 ' + answer.json.failed;
+  } catch (e) {
+    status.textContent = '失败：' + e.message;
+  }
+});
+```
+
+   导航里也加一条（重登页不受闸限制，所以一直显示）：
+
+```html
+    <a href="/relogin">重登</a>
+```
+
+   再加一个测试：
+
+```go
+// TestTheReloginPageListsTheSignedOutAccounts says the relogin page
+// says which accounts are signed out.
+//
+// 签出了的账号要看得见，才知道该重登谁。
+func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_09", Name: "掉了的", Email: "b@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 没有密码就登不回去：这样的账号才拿得出手。
+	if err := s.SetPassword(context.Background(), "acc_09", "cipher", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "b@example.com") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
 ```
 
 7. `cmd/mmxcode/serve.go` 里接线：
@@ -5159,46 +5768,11 @@ Expected: 看得见现在的样子。仓库里还没有 `.env.example`，这一�
 
 - [ ] **Step 2: 写实现**
 
-在 `internal/config/config.go` 里加：
+（`internal/config/config.go` 里的 `Batch` 与 `Relogin` 已经在 Task 8 加好了，
+调度器要读它，那一步没有它编不过。这一步不碰 Go 代码，只管 yaml 和部署。）
 
-```go
-// Batch is how a batch import runs.
-type Batch struct {
-	// Interval is the wait between two accounts.
-	Interval Duration `yaml:"interval" json:"interval"`
-	// Group is the egress group the logins go through. An empty one
-	// is the default proxy.
-	Group string `yaml:"group" json:"group"`
-	// Relogin is the automatic signing-in again.
-	Relogin Relogin `yaml:"relogin" json:"relogin"`
-}
-
-// Relogin is the automatic signing-in again.
-type Relogin struct {
-	// Enabled says whether it runs at all. It is off by default:
-	// signing in again is the site's business, and a person should
-	// say so.
-	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Cooldown is how long the scheduler waits between two rounds.
-	Cooldown Duration `yaml:"cooldown" json:"cooldown"`
-	// MaxAccounts is how many accounts one round touches.
-	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
-}
-```
-
-在 `Config` 里加 `Batch Batch \`yaml:"batch" json:"batch"\``，在 `Default()` 里给它默认值：
-
-```go
-		Batch: Batch{
-			Interval: Duration(3 * time.Second),
-			Relogin: Relogin{
-				Cooldown:    Duration(time.Hour),
-				MaxAccounts: 20,
-			},
-		},
-```
-
-在 `config.example.yaml` 里加：
+在 `config.example.yaml` 和 `config.docker.yaml` 里各加同样的一节（两个文件
+的其它内容一样，节也该一样）：
 
 ```yaml
 batch:
@@ -5293,11 +5867,16 @@ batch:
 改过代码之后，计划的整文件代码块要跟仓库里的文件逐字节相同。用：
 
 ```bash
-python -I .tmp-review/sync_plan.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md internal/webauth/webauth.go internal/webauth/rsa.go internal/provision/provision.go internal/provision/chain.go internal/secret/secret.go
-python -I .tmp-review/check_plan_files.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md
+python -I docs/superpowers/tools/sync_plan.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md internal/webauth/webauth.go internal/webauth/rsa.go internal/provision/provision.go internal/provision/chain.go internal/secret/secret.go internal/sign/sign.go internal/store/store.go cmd/mmxcode/import.go
+python -I docs/superpowers/tools/check_plan_files.py docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md .
 ```
 
-（`.tmp-review/` 是这个项目里用来对计划的工具目录，不进仓库。）
+第一个脚本把仓库里的文件填回计划里带着它们的那几个整文件代码块——靠顶层
+声明认哪个块是哪个文件，所以只动整文件的块。第二个脚本查两件事：整文件
+的代码块是不是都还能过 `gofmt`，以及计划里带的那些文件是不是逐字节相同
+（不相同会列出来）。
+
+工具在 `docs/superpowers/tools/` 里，是这个项目用来对计划的脚本。
 
 - [ ] **Step 4: 最后的检查**
 
