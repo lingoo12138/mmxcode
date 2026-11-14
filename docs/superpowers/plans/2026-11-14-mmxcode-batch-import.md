@@ -1,5 +1,11 @@
 # 批量导入（邮箱|密码 → mcode 账号）实施计划
 
+> **这份计划已经做完了。** 十一个任务都落地了（`git log` 里从 `86db5e1` 到
+> `feature/batch-import` 的 HEAD），代码块跟仓库里的代码逐字对齐：
+> `docs/superpowers/tools/` 里的四个脚本管这件事，`check_plan_files.py` 报
+> `stale declarations: 0` 就是对齐了。设计文档末尾的 §16 记着实现时跟设计
+> 不一样的地方。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 mmxcode 能读一份 `邮箱|密码` 的清单，自动走完「网页密码登录 → 批准设备码 → 换出 mcode 凭据」这条链，把账号灌进库；密码加密入库，账号掉线后由调度器自动重登。
@@ -17,7 +23,14 @@
 1. **测试绝不打真站点。** `api.minimax.io` / `account.minimax.io` 都不许出现在测试里——那会真的用掉一个 refresh token，或者真的登一次号。网页登录这一层用 `httptest` 起一台假的服务端，按真站点的报文形状回话。
 2. **参考实现是契约。** 上游行为以 `@magpie-community/opencode-minimax-auth` 的 `packages/minimax/index.mjs` 为准；网页登录那几步以 MiniMax 网页版前端（`account.minimax.io` 的 `prod-web-va-0.1.45` bundle）和用户自己的抓包笔记为准。spec §15 列了每个结论的出处。
 3. **每个任务都以「写失败的测试 → 看它失败 → 写实现 → 看它过 → 提交」走。** 提交信息用中文，说清楚做了什么和为什么。
-4. **计划里的整文件代码块跟仓库里的文件逐字节相同。** 改完代码要用 `.tmp-review/sync_plan.py` 把文件同步回计划（本计划在 `docs/superpowers/plans/2026-11-14-mmxcode-batch-import.md`）。
+4. **计划里的代码跟仓库里的代码逐字对齐。** 这个功能自己写的那些文件
+   （`sign`、`secret`、`webauth`、`provision`、`import` 及其测试）在计划里是
+   **整文件**带过来的，逐字节相同；只是改过的那些（`store`、`webui`、`serve`、
+   `config`、`manager`）在计划里是**改的那一部分**，一个声明一个声明地对。
+   改完代码用 `docs/superpowers/tools/` 里的脚本对一遍：
+   `refresh_plan_blocks.py`（片段）、`sync_plan.py`（整文件）、
+   `check_plan_files.py`（查）、`check_plan_fences.py`（查代码块里有没有混进
+   散文）。
 5. **所有测试都不能碰真站点。** 写测试时确认一下 `httptest.NewServer` 用的是本地地址。
 
 ---
