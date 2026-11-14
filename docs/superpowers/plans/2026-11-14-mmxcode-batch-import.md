@@ -307,14 +307,14 @@ func testKey() Key {
 
 func TestSealAndOpen(t *testing.T) {
 	k := testKey()
-	cipher, err := k.SealString("hunter2")
+	cipher, err := k.Seal("hunter2")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(cipher, "hunter2") {
 		t.Fatalf("the password is in the cipher text: %s", cipher)
 	}
-	plain, err := k.OpenString(cipher)
+	plain, err := k.Open(cipher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,19 +325,19 @@ func TestSealAndOpen(t *testing.T) {
 
 func TestTwoCiphersOfTheSamePasswordAreDifferent(t *testing.T) {
 	k := testKey()
-	a, _ := k.SealString("hunter2")
-	b, _ := k.SealString("hunter2")
+	a, _ := k.Seal("hunter2")
+	b, _ := k.Seal("hunter2")
 	if a == b {
 		t.Fatal("the same password gave the same cipher text")
 	}
 }
 
 func TestTheWrongKeyDoesNotOpenIt(t *testing.T) {
-	cipher, err := testKey().SealString("hunter2")
+	cipher, err := testKey().Seal("hunter2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Key("fedcba9876543210fedcba9876543210").OpenString(cipher); err == nil {
+	if _, err := Key("fedcba9876543210fedcba9876543210").Open(cipher); err == nil {
 		t.Fatal("the wrong key opened it")
 	}
 }
@@ -399,6 +399,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // KeySize is how long a key is.
@@ -478,7 +479,7 @@ func (k Key) Open(text string) (string, error) {
 }
 ```
 
-（`strings` 忘了 import 的话加上：`"strings"`。）
+（`strings` 已经在 import 里了。）
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
