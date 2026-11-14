@@ -308,8 +308,11 @@ func (e *env) chain(group string, keeper func(string) (string, error)) *provisio
 			return e.acc.With(up).Identity(ctx, access, subject)
 		},
 		Keeper: keeper,
-		Now:    time.Now,
-		NewID:  newBatchAccountID,
+		// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的
+		// 是同一个账号从同一个地方来，而不是两个地方。
+		ProxyGroup: group,
+		Now:        time.Now,
+		NewID:      newBatchAccountID,
 	}
 	if e.store != nil {
 		c.Store = e.store

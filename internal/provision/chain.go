@@ -28,6 +28,8 @@ type Store interface {
 	AccountByEmail(ctx context.Context, email string) (store.Account, error)
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
+	// SetAccountProxy writes the account's outlet.
+	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
 	// UpdateAccountStatus writes the account's state and its last
 	// error.
 	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
@@ -75,6 +77,11 @@ type Chain struct {
 	// Keeper encrypts the password so that it can be kept. A nil one
 	// means the password is not kept: it is used once and thrown away.
 	Keeper func(password string) (string, error)
+	// ProxyGroup is the outlet group the accounts go out through.
+	//
+	// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的是同一个
+	// 账号从同一个地方来。空的是全局默认出口。
+	ProxyGroup string
 	// Now is the clock.
 	Now func() time.Time
 	// NewID makes an account id.
@@ -185,13 +192,14 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	}
 
 	acc := store.Account{
-		ID:        c.newID(),
-		Name:      mail,
-		UserID:    userID,
-		Email:     mail,
-		Status:    store.StatusActive,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         c.newID(),
+		Name:       mail,
+		UserID:     userID,
+		Email:      mail,
+		Status:     store.StatusActive,
+		ProxyGroup: c.ProxyGroup,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if err := c.Store.CreateAccount(ctx, acc); err != nil {
 		return Result{Email: email}, &Error{Stage: StageStore, Message: err.Error()}
@@ -273,6 +281,13 @@ func (c *Chain) update(ctx context.Context, email, password string, acc store.Ac
 	if knownName != "" && knownName != acc.Name {
 		if err := c.Store.SetAccountName(ctx, acc.ID, knownName, now); err != nil {
 			notes = append(notes, "名字没能更新："+err.Error())
+		}
+	}
+	// 出口组：导入是从哪个口登的，账号以后就走哪个口。没带组的导入不动
+	// 原来那一行的组——那是人自己设的，不能因为一次没带组的导入就没了。
+	if c.ProxyGroup != "" && c.ProxyGroup != acc.ProxyGroup {
+		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, acc.ProxyURL, now); err != nil {
+			notes = append(notes, "出口组没能更新："+err.Error())
 		}
 	}
 	notes, _ = c.keep(ctx, acc.ID, password, now, notes)

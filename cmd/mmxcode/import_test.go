@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
 	"mmxcode/internal/provision"
 )
 
@@ -169,5 +171,18 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 	}
 	if !strings.Contains(runs[0].Results, "a@example.com") {
 		t.Fatalf("results = %q", runs[0].Results)
+	}
+}
+
+func TestTheImportGivesTheAccountTheGroupItUsed(t *testing.T) {
+	// --group 只管登录是不够的：账号自己的活也得从那个口出去，不然站点
+	// 看到的是同一个账号从两个地方来。
+	e := &env{
+		cfg: config.Default(),
+		egr: egress.New(map[string]string{"hk": egress.Direct}, ""),
+	}
+	c := e.chain("hk", nil)
+	if c.ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk", c.ProxyGroup)
 	}
 }

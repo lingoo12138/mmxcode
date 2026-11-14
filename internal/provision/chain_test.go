@@ -67,6 +67,17 @@ func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastErr
 	return nil
 }
 
+// SetAccountProxy writes the account's outlet.
+func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].ProxyGroup = group
+			s.rows[i].ProxyURL = url
+		}
+	}
+	return nil
+}
+
 func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
 	if s.failToken {
 		return errors.New("the disk is full")
@@ -474,5 +485,35 @@ func TestAFailedUpdateKeepsTheRowThatIsThere(t *testing.T) {
 	}
 	if len(st.accounts) != 1 {
 		t.Fatalf("accounts = %v, want the row still there", st.accounts)
+	}
+}
+
+func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
+	// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的应该是
+	// 同一个账号从同一个地方来，而不是两个地方。
+	st := &fakeStore{}
+	c := aChain(st)
+	c.ProxyGroup = "hk"
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v", st.rows)
+	}
+	if st.rows[0].ProxyGroup != "hk" {
+		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
+	}
+}
+
+func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyGroup != "" {
+		t.Fatalf("group = %q, want the default one", st.rows[0].ProxyGroup)
 	}
 }
