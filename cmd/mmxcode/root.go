@@ -105,33 +105,6 @@ func newRoot() *cobra.Command {
 	return root
 }
 
-// accFor gives the account API client an account's calls go out with.
-//
-// Every fetch an account makes goes through the account's own way out,
-// or the global one. The transport is cached by the resolver, so making
-// a client for it is cheap.
-func (e *env) accFor(a store.Account) (*account.Client, error) {
-	tr, err := e.egr.Transport(e.egr.Resolve(a))
-	if err != nil {
-		return nil, err
-	}
-	return e.acc.With(upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})), nil
-}
-
-// tokenFor gives an account's token, or says it is not signed in.
-func (e *env) tokenFor(ctx context.Context, accountID string) (*oauth.Token, error) {
-	t, err := e.store.GetToken(ctx, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("account %s is not signed in", accountID)
-	}
-	return &oauth.Token{
-		Access:  t.Access,
-		Refresh: t.Refresh,
-		Expires: t.ExpiresAt,
-		Subject: t.Subject,
-	}, nil
-}
-
 func nowUTC() time.Time { return time.Now().UTC() }
 
 // groupNames lists the outlet groups, for an error message.

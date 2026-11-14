@@ -13,17 +13,33 @@ import (
 	"mmxcode/internal/manager"
 )
 
+// egressTarget is the address the outlets are checked against.
+//
+// It is MiniMax's own agent host: a proxy that cannot reach it cannot
+// carry a request to MiniMax either.
+const egressTarget = "https://agent.minimax.io/"
+
+// egressWriteTimeout is how long the health row may take to be
+// written.
+//
+// The write is a small one, and it must not hold the scheduler up.
+const egressWriteTimeout = 5 * time.Second
+
 // Scheduler runs the recurring work.
 type Scheduler struct {
 	// Mgr holds the accounts.
 	Mgr *manager.Manager
 	// Cfg is the configuration.
 	Cfg config.Config
+	// target is the address the outlets are checked against. A test
+	// points it at a stand-in, so that the check never leaves the
+	// machine.
+	target string
 }
 
 // New makes a scheduler.
 func New(mgr *manager.Manager, cfg config.Config) *Scheduler {
-	return &Scheduler{Mgr: mgr, Cfg: cfg}
+	return &Scheduler{Mgr: mgr, Cfg: cfg, target: egressTarget}
 }
 
 // CheckinResult is one account's check-in.
@@ -111,17 +127,30 @@ func (s *Scheduler) RenewTokens(ctx context.Context) {
 }
 
 // CheckEgress tests every outlet and records the result.
+//
+// The probe and the write have a context each. The probe's timeout is
+// over when the answer is in, and a write under that context would be
+// thrown away before it reaches the database: the health table would
+// stay empty and the WebUI would say "not checked" for ever.
 func (s *Scheduler) CheckEgress(ctx context.Context) {
-	groups := s.Cfg.Proxy.Groups
-	for name, url := range groups {
-		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := s.Mgr.Egress.Check(ctx, url, "https://agent.minimax.io/")
+	target := s.target
+	if target == "" {
+		target = egressTarget
+	}
+	for name, url := range s.Cfg.Proxy.Groups {
+		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := s.Mgr.Egress.Check(probeCtx, url, target)
 		cancel()
 		msg := ""
 		if err != nil {
 			msg = err.Error()
 		}
-		_ = s.Mgr.Store.SetEgressHealth(ctx, url, err == nil, msg)
+		// The write runs under a context of its own: the caller's may
+		// be over already, and the health of the outlet has to be
+		// written down all the same.
+		writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), egressWriteTimeout)
+		_ = s.Mgr.Store.SetEgressHealth(writeCtx, url, err == nil, msg)
+		writeCancel()
 		_ = name
 	}
 }

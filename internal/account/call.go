@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -192,10 +193,16 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			if x.status != nil {
 				status = *x.status
 			}
+			// The window is named after its own length. A window of
+			// three hours is "3 hours" and not "5 hours": the length is
+			// the window's own, and the site does not always give
+			// five.
+			span := windowSpan(x.start, x.end, x.weekly)
+			own := windowName(x.weekly, span)
 			if status == 3 {
 				// An unlimited window is said so on the general model.
 				if general {
-					out = append(out, Window{Name: windowName(x.weekly), ModelName: name, Unlimited: true})
+					out = append(out, Window{Name: own, ModelName: name, Unlimited: true})
 				}
 				continue
 			}
@@ -215,7 +222,7 @@ func parsePlanWindows(raw []byte) ([]Window, error) {
 			case x.remaining != nil:
 				used = clampPercent(100 - *x.remaining)
 			}
-			w := Window{Name: windowName(x.weekly), ModelName: name, Used: used}
+			w := Window{Name: own, ModelName: name, Used: used}
 			if x.end > 0 {
 				w.ResetsAt = time.UnixMilli(x.end)
 			}
@@ -259,11 +266,65 @@ func isThree(v *float64) bool { return v != nil && *v == 3 }
 // isZeroCount says whether a count is missing or zero.
 func isZeroCount(v *float64) bool { return v == nil || *v == 0 }
 
-func windowName(weekly bool) string {
+// windowSpan is how long a plan window is.
+//
+// The site writes the two ends of a window in seconds or in
+// milliseconds, and the reference reads them the same way: a number
+// that is too long to be a time in seconds is in milliseconds.
+//
+// A weekly window without times of its own is a week long. Every other
+// window without times is of no length at all, and says so.
+func windowSpan(start, end int64, weekly bool) time.Duration {
+	ms := int64(0)
+	switch {
+	case start > 0 && end > start:
+		ms = planMS(end) - planMS(start)
+	case weekly:
+		ms = 7 * 86400_000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// planMS reads a time the site wrote.
+//
+// A time in seconds is shorter than a time in milliseconds by a
+// thousand, and the site does not say which it wrote. The reference
+// tells them apart by their length: a number below a trillion is in
+// seconds.
+func planMS(v int64) int64 {
+	if v < 1e12 {
+		return v * 1000
+	}
+	return v
+}
+
+// windowName is the name of a plan window.
+//
+// The name says how long the window is, and the length is the
+// window's own: a window of three hours is "3 hours", and a window
+// that is a day long is "24 hours" and not "1 days", the way the
+// reference reads it.
+//
+// A weekly window is "7 days" whatever its times say, and a window
+// without a length is "Allowance".
+func windowName(weekly bool, span time.Duration) string {
 	if weekly {
 		return "7 days"
 	}
-	return "5 hours"
+	ms := span.Milliseconds()
+	switch {
+	case ms > 86400_000 && ms%86400_000 == 0:
+		return fmt.Sprintf("%d days", ms/86400_000)
+	case ms >= 3600_000 && ms%3600_000 == 0:
+		return fmt.Sprintf("%d hours", ms/3600_000)
+	case ms > 0:
+		// The reference floors the minutes, and Go's division rounds
+		// towards zero. The span is never negative here, but the
+		// floor is what the reference does.
+		return fmt.Sprintf("%d minutes", int64(math.Floor(float64(ms)/60_000)))
+	default:
+		return "Allowance"
+	}
 }
 
 func clampPercent(f float64) float64 {

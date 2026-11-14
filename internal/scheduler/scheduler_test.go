@@ -158,3 +158,96 @@ func TestCheckinAll(t *testing.T) {
 		t.Fatalf("outcome = %q", results[0].Outcome)
 	}
 }
+
+// TestCheckEgressWritesTheHealth says the result of the outlet check
+// reaches the database.
+//
+// 出口的健康检查写不进数据库，WebUI 的出口页就永远是"没查过"：
+// 控制台说两个出口都是好的，表里一行也没有。
+func TestCheckEgressWritesTheHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`ok`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	// "direct" 不走代理，请求直接到那台假服务器上。
+	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	sc := New(mgr, cfg)
+	sc.target = srv.URL
+
+	sc.CheckEgress(ctx)
+
+	rows, err := s.EgressHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the health table has %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].URL != "direct" {
+		t.Errorf("the row is for %q, want %q", rows[0].URL, "direct")
+	}
+	if !rows[0].OK {
+		t.Errorf("the row says the outlet is not usable: %+v", rows[0])
+	}
+	if rows[0].Error != "" {
+		t.Errorf("the row carries an error: %q", rows[0].Error)
+	}
+}
+
+// TestCheckEgressWritesAFailedHealth says a broken outlet is written
+// down as broken.
+//
+// 出口不通的时候，表里要有那一行，而且要写清楚为什么不通。
+func TestCheckEgressWritesAFailedHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	sc := New(mgr, cfg)
+	sc.target = srv.URL
+
+	sc.CheckEgress(ctx)
+
+	rows, err := s.EgressHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the health table has %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].OK {
+		t.Errorf("the row says the outlet is usable: %+v", rows[0])
+	}
+	if rows[0].Error == "" {
+		t.Error("the row does not say why the outlet is broken")
+	}
+}

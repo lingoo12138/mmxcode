@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"mmxcode/internal/egress"
 	"mmxcode/internal/store"
 )
 
@@ -40,12 +41,15 @@ func newAccountsListCmd(e *env) *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t出口组\t代理")
 			for _, a := range list {
-				proxy := a.ProxyURL
+				// 代理地址里的账号和密码是秘密，而这份输出会进到终端的
+				// 回滚里，也会进到 CI 的日志里。egress.Redacted 就是
+				// 为了这个。组名不是秘密，照原样打印。
+				proxy := egress.Redacted(a.ProxyURL)
 				if proxy == "" {
 					proxy = a.ProxyGroup
 				}
 				if proxy == "" {
-					proxy = e.cfg.Proxy.Default
+					proxy = egress.Redacted(e.cfg.Proxy.Default)
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 					a.ID, a.Name, a.Email, a.Status, a.ProxyGroup, proxy)

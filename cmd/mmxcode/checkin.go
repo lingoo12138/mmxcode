@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/checkin"
-	"mmxcode/internal/store"
 )
 
 func newCheckinCmd(e *env) *cobra.Command {
@@ -27,33 +25,28 @@ func newCheckinCmd(e *env) *cobra.Command {
 				if accountID != "" && a.ID != accountID {
 					continue
 				}
-				tok, err := e.tokenFor(ctx, a.ID)
-				if err != nil {
-					fmt.Printf("%s\t%s\n", a.Name, err)
-					failed = true
-					continue
-				}
-				// 每个账号走自己的出口
-				acc, err := e.accFor(a)
-				if err != nil {
-					fmt.Printf("%s\t失败：%v\n", a.Name, err)
-					failed = true
-					continue
-				}
-				out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
+				// 走 manager 那条路：它先续期，再用账号自己的出口，
+				// 签到记录也由它写（日子是站点的那一天）。
+				//
+				// 命令自己读库里的令牌是不续期的。一个 90 分钟没续过
+				// 的令牌发过去，站点回 401，签到根本没发生，而命令
+				// 还会说成功。
+				out, err := e.mgr.Checkin(ctx, a.ID)
 				if err != nil {
 					fmt.Printf("%s\t失败：%v\n", a.Name, err)
 					failed = true
 					continue
 				}
 				fmt.Printf("%s\t%s\t积分 %g\t连续 %d 天\n", a.Name, out.Outcome, out.Credit, out.Streak)
-				day := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
-				if err := e.store.SaveCheckin(ctx, store.Checkin{
-					AccountID: a.ID, Day: day, Outcome: out.Outcome,
-					Credit: out.Credit, Streak: out.Streak, Message: out.Message,
-					CreatedAt: time.Now(),
-				}); err != nil {
-					return err
+				if out.Outcome == checkin.OutcomeFailed {
+					// 被拒的签到不是签到成功。命令要失败，cron 才
+					// 知道今天什么都没领到。
+					msg := out.Message
+					if msg == "" {
+						msg = "the sign-in was refused"
+					}
+					fmt.Printf("%s\t失败：%s\n", a.Name, msg)
+					failed = true
 				}
 			}
 			if failed {

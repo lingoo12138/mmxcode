@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"mmxcode/internal/site"
 	"mmxcode/internal/upstream"
 )
 
@@ -272,8 +273,65 @@ func TestPlanWindows(t *testing.T) {
 	}
 }
 
-func TestPlanWindowsEmpty(t *testing.T) {
+// TestPlanWindowsFallsBackToTheOpenPlatform says the open platform's
+// answer is used when the console's own answer has no windows in it.
+//
+// 控制台自己的 remains_percent 在国际站上可能回一个空的 model_remains。
+// 参考实现这时候去问 coding_plan/remains，Go 代码原来直接说"没有窗口"：
+// 账号的额度用完了却看不出来，故障转移一直挑它。
+func TestPlanWindowsFallsBackToTheOpenPlatform(t *testing.T) {
+	var asked []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		case site.CodingPlanPath:
+			w.Write([]byte(`{"model_remains":[
+				{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+				 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+				 "start_time":1763000000000,"end_time":1763010000000,
+				 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+				 "current_weekly_total_percent":100,"weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if ws[0].Amount != 150 || ws[0].Limit != 150 {
+		t.Fatalf("window = %+v", ws[0])
+	}
+	want := []string{site.PlanRemainsPath, site.CodingPlanPath}
+	if len(asked) != len(want) {
+		t.Fatalf("asked %v, want %v", asked, want)
+	}
+	for i := range want {
+		if asked[i] != want[i] {
+			t.Fatalf("asked %v, want %v", asked, want)
+		}
+	}
+}
+
+// TestPlanWindowsEmpty says a plan with no windows at all is no
+// windows, and not an error.
+//
+// 两个端点都没有窗口的时候，答案是"没有窗口"，不是"读不出来"。
+func TestPlanWindowsEmpty(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
 		w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
 	}))
 	defer srv.Close()
@@ -286,6 +344,84 @@ func TestPlanWindowsEmpty(t *testing.T) {
 	}
 	if len(ws) != 0 {
 		t.Fatalf("got %+v", ws)
+	}
+	want := []string{site.PlanRemainsPath, site.CodingPlanPath}
+	if len(asked) != len(want) {
+		t.Fatalf("asked %v, want %v", asked, want)
+	}
+	for i := range want {
+		if asked[i] != want[i] {
+			t.Fatalf("asked %v, want %v", asked, want)
+		}
+	}
+}
+
+// TestWindowName says a window is named after its own length.
+//
+// 窗口的名字是它自己的长度：三小时的窗口叫 "3 hours"，不是写死的
+// "5 hours"。一周的窗口叫 "7 days"，没有长度的窗口叫 "Allowance"。
+func TestWindowName(t *testing.T) {
+	cases := []struct {
+		name   string
+		weekly bool
+		span   time.Duration
+		want   string
+	}{
+		{"three hours", false, 3 * time.Hour, "3 hours"},
+		{"five hours", false, 5 * time.Hour, "5 hours"},
+		{"one hour", false, time.Hour, "1 hours"},
+		{"a day", false, 24 * time.Hour, "24 hours"},
+		{"two days", false, 48 * time.Hour, "2 days"},
+		{"forty five minutes", false, 45 * time.Minute, "45 minutes"},
+		{"a week", true, 7 * 24 * time.Hour, "7 days"},
+		{"a week without a span", true, 0, "7 days"},
+		{"no span", false, 0, "Allowance"},
+	}
+	for _, c := range cases {
+		got := windowName(c.weekly, c.span)
+		if got != c.want {
+			t.Errorf("windowName(%v, %v) = %q, want %q", c.weekly, c.span, got, c.want)
+		}
+	}
+}
+
+// TestPlanWindowsNameTheWindowByItsLength says the name of a window
+// comes from the answer.
+//
+// 站点给三小时的窗口，名字就该是 "3 hours"。
+func TestPlanWindowsNameTheWindowByItsLength(t *testing.T) {
+	// 三小时：开始 1763000000000，结束 1763010800000。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":2,"current_interval_remaining_percent":10,
+				 "current_interval_total_percent":100,"current_interval_total_count":150,"current_interval_used_count":24,
+				 "start_time":1763000000000,"end_time":1763010800000,
+				 "current_weekly_status":2,"current_weekly_remaining_percent":80,
+				 "current_weekly_total_percent":100,"weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	if ws[0].Name != "3 hours" {
+		t.Errorf("the window is called %q, want %q", ws[0].Name, "3 hours")
+	}
+	if ws[1].Name != "7 days" {
+		t.Errorf("the weekly window is called %q, want %q", ws[1].Name, "7 days")
 	}
 }
 

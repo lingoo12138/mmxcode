@@ -522,9 +522,20 @@ func (c *Client) Ledger(ctx context.Context, access, userID string) ([]Batch, er
 //
 // The console's own answer comes first; the open platform's is the
 // fallback.
+//
+// The console's answer is used only when it has windows in it. The
+// reference uses it only when the answer is a list that is not empty,
+// and asks the open platform otherwise: the international site's
+// remains_percent answers 200 with an empty list, and the windows are
+// at the other endpoint.
+//
+// An answer the console could not give is not thrown away when the
+// open platform has the windows: the two endpoints are two ways of
+// asking the same question, and the one that answered is the one that
+// counts.
 func (c *Client) PlanWindows(ctx context.Context, access, groupID string) ([]Window, error) {
 	ws, err := c.planWindowsOnce(ctx, access, groupID, site.PlanRemainsPath)
-	if err == nil {
+	if err == nil && len(ws) > 0 {
 		return ws, nil
 	}
 	ws2, err2 := c.planWindowsOnce(ctx, access, groupID, site.CodingPlanPath)

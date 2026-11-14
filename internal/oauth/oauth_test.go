@@ -529,7 +529,9 @@ func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
 }
 
 func TestRefreshSignOutInA200Body(t *testing.T) {
-	// MiniMax 把业务错误放在 200 的 body 里。签出也是这么来的。
+	// MiniMax 把业务错误放在 200 的 body 里。签出不是这么来的：
+	// 参考实现读的是 invalid_grant 加 400。200 body 里的
+	// invalid_grant 是别的事，不能拿来把账号登出。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
 	}))
@@ -544,8 +546,87 @@ func TestRefreshSignOutInA200Body(t *testing.T) {
 	if oe.HTTPStatus != 200 {
 		t.Fatalf("error = %+v", oe)
 	}
-	if !oe.IsSignedOut() {
-		t.Fatal("a sign-out in a 200 body was not a sign-out")
+	if oe.IsSignedOut() {
+		t.Fatal("a sign-out in a 200 body was a sign-out")
+	}
+}
+
+// TestSignedOutNeedsTheStatus says only invalid_grant with a 400 signs
+// an account out.
+//
+// 登出是贵的事：账号的续期链断了，只能人再登一次。401 或者 500 带着
+// 同样的 code 不是登出，是路过。
+func TestSignedOutNeedsTheStatus(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusBadRequest, true},
+		{http.StatusUnauthorized, false},
+		{http.StatusInternalServerError, false},
+		{http.StatusOK, false},
+	}
+	for _, c := range cases {
+		e := &Error{Code: "invalid_grant", HTTPStatus: c.status}
+		if got := e.IsSignedOut(); got != c.want {
+			t.Errorf("invalid_grant with %d is a sign-out = %v, want %v", c.status, got, c.want)
+		}
+	}
+	// 别的 code 不是登出，400 也不行。
+	if (&Error{Code: "invalid_request", HTTPStatus: http.StatusBadRequest}).IsSignedOut() {
+		t.Error("invalid_request with a 400 was a sign-out")
+	}
+}
+
+// TestStartDeviceUserCodeWithAZeroExpiredIn says a zero in the
+// expired_in field is a field that is there.
+//
+// expired_in 是 0 也是"有这个字段"，不是"没有这个字段"。没有这个
+// 字段和有这个字段是两件事：一个 plain int 分不出来。
+func TestStartDeviceUserCodeWithAZeroExpiredIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+			"expired_in":       0,
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	d, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.pollField != "user_code" || d.pollValue != "WXYZ-1234" {
+		t.Fatalf("poll = %s/%s", d.pollField, d.pollValue)
+	}
+}
+
+// TestStartDeviceWithoutExpiredIn says an answer without the
+// expired_in field is not a user-code poll.
+//
+// 没有 expired_in 这个字段，就不是拿 user code 去轮询的那种答案。
+func TestStartDeviceWithoutExpiredIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"user_code":        "WXYZ-1234",
+			"verification_uri": "https://example.invalid/activate",
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t)
+	_, err := StartDevice(context.Background(), c, srv.URL+"/oauth2/device/code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	oe, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err = %T, want *Error", err)
+	}
+	if oe.Code != "invalid_device_authorization_response" {
+		t.Fatalf("error = %+v", oe)
 	}
 }
 

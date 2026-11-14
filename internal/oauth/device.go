@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -164,12 +165,15 @@ func (e *Error) Error() string {
 
 // IsSignedOut says the answer is the one that signs an account out.
 //
-// The sign-out is invalid_grant. The site sends it with a 400, but it
-// also puts its business errors in the body of a 200, so the code is
-// what is looked at and not the status: a sign-out is a sign-out
-// however it arrives.
+// The sign-out is invalid_grant with a 400, the way MiniMax Code
+// reads it. The status is part of the answer and not a detail: a 401
+// or a 500 that carries the same code is passing, and the sign-in is
+// kept.
+//
+// A sign-out is expensive to get wrong — the account loses its refresh
+// token chain — so the answer has to be the one the site means.
 func (e *Error) IsSignedOut() bool {
-	return e.Code == "invalid_grant"
+	return e.Code == "invalid_grant" && e.HTTPStatus == http.StatusBadRequest
 }
 
 // Token is an account's sign-in.
@@ -276,8 +280,12 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 		VerificationURL         string `json:"verification_url"`
 		VerificationURIComplete string `json:"verification_uri_complete"`
 		ExpiresIn               int64  `json:"expires_in"`
-		ExpiredIn               int64  `json:"expired_in"`
-		Interval                int64  `json:"interval"`
+		// ExpiredIn is a pointer, so that an answer without the field
+		// is told from an answer whose field is zero. The two are not
+		// the same: the field says the site is polling for the user
+		// code, and a zero is a field that is there.
+		ExpiredIn *int64 `json:"expired_in"`
+		Interval  int64  `json:"interval"`
 	}
 	if err := json.Unmarshal(body, &b); err != nil {
 		return nil, &Error{Code: "invalid_json_response", HTTPStatus: resp.StatusCode, What: WhatSignIn}
@@ -295,7 +303,11 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	d := &Device{UserCode: userCode, verifier: verifier, slowDown: slowDownWait}
 	// MiniMax's own variant has no device_code: the user code is polled
 	// for, and the end may be an absolute time in milliseconds.
-	byUser := deviceCode == "" && b.ExpiredIn != 0
+	//
+	// The field being there is what says so, and the user code has to
+	// be there to be polled for. A field that is not there at all is
+	// not a user-code poll, however the answer looks.
+	byUser := deviceCode == "" && userCode != "" && b.ExpiredIn != nil
 	switch {
 	case byUser:
 		d.pollField, d.pollValue = "user_code", userCode
@@ -314,8 +326,8 @@ func StartDevice(ctx context.Context, c *upstream.Client, endpoint string) (*Dev
 	switch {
 	case b.ExpiresIn > 0:
 		deadline = time.Now().Add(expiresDuration(b.ExpiresIn))
-	case b.ExpiredIn > 0:
-		deadline, _ = siteDeadline(b.ExpiredIn)
+	case b.ExpiredIn != nil && *b.ExpiredIn > 0:
+		deadline, _ = siteDeadline(*b.ExpiredIn)
 	}
 	if deadline.IsZero() {
 		deadline = time.Now().Add(signInTimeout)
