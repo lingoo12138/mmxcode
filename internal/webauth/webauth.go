@@ -126,8 +126,10 @@ func (c *Client) RegisterDevice(ctx context.Context) (string, error) {
 		return "", err
 	}
 	// The device registration is the one call whose own query is the
-	// uuid (design document 3.2). The web client puts the caller's
-	// query first, so the url starts with it.
+	// uuid (design document 3.2). The web client appends the common
+	// parameters first and its own afterwards, so the uuid comes last
+	// -- and it is in the query twice, because the common block has
+	// one of its own.
 	s := c.sign(DeviceRegisterPath, body, []sign.KV{{K: "uuid", V: c.uuid}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
 	if err != nil {
@@ -378,8 +380,9 @@ func findGroups(v any) []map[string]any {
 
 // sign makes a signed request for the web flavour.
 //
-// The query is the caller's own query, which the web client puts in
-// front of the common one.
+// The query is the caller's own query. The web flavour puts the common
+// parameters first and the caller's after them, so a key that is in
+// both halves is in the query twice.
 func (c *Client) sign(path string, body []byte, query []sign.KV) sign.Signed {
 	return sign.Sign(c.base, path, sign.Options{
 		Flavor:   sign.FlavorWeb,
