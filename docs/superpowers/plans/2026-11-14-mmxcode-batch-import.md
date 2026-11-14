@@ -1789,6 +1789,11 @@ func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, err
 行找出来更新，而不是给同一个站点账号再来一行。不改表的结构，也不加
 索引——表才几百行。
 
+还要一个按令牌里的那个 sub 找账号的方法：那个 sub 是站点账号自己的
+id，一个站点账号一个，重登多少次都是它。清单上写的地址可能是别名，站
+点那边报的地址又可能一时问不出来，只有它是一直在的——去重靠它，才不会
+在地址对不上的时候给同一个站点账号建出第二行。它顺着令牌那一行找。
+
 ```go
 // AccountByEmail gives the account with that email.
 //
@@ -1807,11 +1812,11 @@ func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, erro
 
 ```
 
-还要一个写事务：按邮箱找一行、没有就建一行，这种「查了再做」的事要
-在一个事务里做完，不然两个并发的导入会各建一行（同一个站点账号两行都
-是活的）。数据源名字里已经有 `_txlock=immediate`：事务一开始就拿着写
-锁，第二个进来的那个看见的是第一个建好的那一行。不改表的结构，也不加
-索引。
+还要一个写事务：按令牌里的那个 sub 找一行、按邮箱找一行、没有就建一
+行，这种「查了再做」的事要在一个事务里做完，不然两个并发的导入会各建一
+行（同一个站点账号两行都是活的）。数据源名字里已经有
+`_txlock=immediate`：事务一开始就拿着写锁，第二个进来的那个看见的是第
+一个建好的那一行。不改表的结构，也不加索引。
 
 ```go
 // Tx is what one transaction can do.
@@ -1822,10 +1827,16 @@ type Tx interface {
 	// AccountByEmail gives the account with that email, when there is
 	// one. It says ErrNotFound when there is none.
 	AccountByEmail(ctx context.Context, email string) (Account, error)
+	// AccountBySubject gives the account whose token carries that
+	// subject, when there is one. It says ErrNotFound when there is
+	// none.
+	AccountBySubject(ctx context.Context, subject string) (Account, error)
 	// CreateAccount inserts an account.
 	CreateAccount(ctx context.Context, a Account) error
 	// SaveToken writes an account's token.
 	SaveToken(ctx context.Context, t Token) error
+	// SetAccountIdentity writes an account's address and user id.
+	SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
 	// SetAccountProxy writes the account's outlet.
@@ -3339,6 +3350,12 @@ type Result struct {
 	Message string `json:"message"`
 	// AccountID is the account's id, when it made it in.
 	AccountID string `json:"account_id,omitempty"`
+	// Whole says this row is not one account but the run itself.
+	//
+	// 整趟导入没能完成的时候，页面上要有一行说这件事。那一行不是账号，
+	// 所以它不算进「失败了几个账号」里——一个账号都没处理的这一趟，失败
+	// 的账号数就是零。
+	Whole bool `json:"whole,omitempty"`
 }
 
 // Error is an import failure and what to do about it.
@@ -3629,6 +3646,8 @@ type fakeStore struct {
 	mu       sync.Mutex
 	accounts []string
 	tokens   []string
+	// subjects are the token subjects that were written.
+	subjects []string
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
@@ -3686,6 +3705,7 @@ func (b *barrier) wait() {
 type snapshot struct {
 	accounts []string
 	tokens   []string
+	subjects []string
 	password []string
 	rows     []store.Account
 	names    []string
@@ -3698,6 +3718,7 @@ func (s *fakeStore) snapshot() snapshot {
 	return snapshot{
 		accounts: append([]string(nil), s.accounts...),
 		tokens:   append([]string(nil), s.tokens...),
+		subjects: append([]string(nil), s.subjects...),
 		password: append([]string(nil), s.password...),
 		rows:     append([]store.Account(nil), s.rows...),
 		names:    append([]string(nil), s.names...),
@@ -3712,6 +3733,7 @@ func (s *fakeStore) snapshot() snapshot {
 func (s *fakeStore) restore(before snapshot) {
 	s.accounts = before.accounts
 	s.tokens = before.tokens
+	s.subjects = before.subjects
 	s.password = before.password
 	s.rows = before.rows
 	s.names = before.names
@@ -3746,6 +3768,10 @@ func (t fakeTx) AccountByEmail(ctx context.Context, email string) (store.Account
 	return t.s.lookup(email)
 }
 
+func (t fakeTx) AccountBySubject(ctx context.Context, subject string) (store.Account, error) {
+	return t.s.lookupSubject(subject)
+}
+
 func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 	t.s.waitMake()
 	return t.s.createAccount(a)
@@ -3753,6 +3779,10 @@ func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 
 func (t fakeTx) SaveToken(ctx context.Context, tok store.Token) error {
 	return t.s.saveToken(tok)
+}
+
+func (t fakeTx) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return t.s.setAccountIdentity(id, email, userID)
 }
 
 func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
@@ -3792,6 +3822,18 @@ func (s *fakeStore) saveToken(tok store.Token) error {
 		return errors.New("the disk is full")
 	}
 	s.tokens = append(s.tokens, tok.AccountID+":"+tok.Refresh)
+	s.subjects = append(s.subjects, tok.AccountID+":"+tok.Subject)
+	return nil
+}
+
+// setAccountIdentity writes the address and the user id.
+func (s *fakeStore) setAccountIdentity(id, email, userID string) error {
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Email = email
+			s.rows[i].UserID = userID
+		}
+	}
 	return nil
 }
 
@@ -3837,6 +3879,25 @@ func (s *fakeStore) lookup(email string) (store.Account, error) {
 		}
 	}
 	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+// lookupSubject gives the account whose token carries that subject.
+//
+// 真的库里是顺着令牌那一行找的：令牌里的那个 sub 是站点账号自己的 id。
+func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
+	for _, t := range s.subjects {
+		at := strings.LastIndex(t, ":")
+		if at < 0 || t[at+1:] != subject {
+			continue
+		}
+		id := t[:at]
+		for _, r := range s.rows {
+			if r.ID == id {
+				return r, nil
+			}
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
@@ -4024,7 +4085,7 @@ func TestTheChainDoesNotKeepThePasswordWithoutAKey(t *testing.T) {
 
 func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200046})
+	err := c.webError(context.Background(), StagePassword, &webauth.SiteError{Code: 1200046})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -4040,7 +4101,7 @@ func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
 
 func TestARefusalWithoutACodeIsStillExplained(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StageApprove, &webauth.SiteError{Reason: "login_required"})
+	err := c.webError(context.Background(), StageApprove, &webauth.SiteError{Reason: "login_required"})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -4073,7 +4134,7 @@ func TestAMissingDefaultGroupIsNotTriedAgain(t *testing.T) {
 
 func TestAStaleLoginIsTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200007})
+	err := c.webError(context.Background(), StagePassword, &webauth.SiteError{Code: 1200007})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -4086,7 +4147,7 @@ func TestAStaleLoginIsTriedAgain(t *testing.T) {
 
 func TestALostConnectionIsTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StageProbe, errors.New("connection reset"))
+	err := c.webError(context.Background(), StageProbe, errors.New("connection reset"))
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -4478,6 +4539,11 @@ func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing
 	if !strings.Contains(res.Message, "地址") {
 		t.Fatalf("message = %q, want it to say the address was cleared", res.Message)
 	}
+	// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，没了就得能
+	// 照着填回去。
+	if !strings.Contains(res.Message, "socks5h://127.0.0.1:1080") {
+		t.Fatalf("message = %q, want it to name the address that was cleared", res.Message)
+	}
 }
 
 // TestAnImportWithoutAGroupKeepsTheGroupThatIsThere says an import
@@ -4536,6 +4602,144 @@ func TestTheBrokenAccountIsTakenBackOutWhenTheRunWasCutShort(t *testing.T) {
 	}
 	if len(st.accounts) != 0 {
 		t.Fatalf("the broken account was left behind: %v", st.accounts)
+	}
+}
+
+// TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent says
+// the token's subject is the key, not the address.
+//
+// 清单上写的地址可能是别名，站点那边报的地址又可能一时问不出来（站点
+// 503 了）。靠地址去重就会漏：同一个站点账号在库里会有两行都是活的，
+// 两个都在轮转池里，其中一个的令牌迟早被另一个的重登作废。
+//
+// 令牌里带的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少
+// 次都是它。
+func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v", st.rows)
+	}
+
+	// 第二趟：站点那边问不出身份了（503），清单上的地址也换了。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{}, errors.New("the site is busy")
+	}
+	res, err := c.Import(context.Background(), "other@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row for one site account", st.rows)
+	}
+	if res.AccountID != "acc_1" {
+		t.Fatalf("account id = %q, want the row that was already there", res.AccountID)
+	}
+}
+
+// TestTheRowIsBroughtInLineWithWhatTheSiteSays says the address and
+// the user id on the row are the ones the site says.
+//
+// 去重的时候邮箱是键之一：键停在旧的地方，下一次导入就会把这个账号
+// 当成新账号，再插一行。站点那边报出来的真地址知道了，就得写上去。
+func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 第一趟：身份没问，邮箱只能拿清单上的。
+	c.Identity = nil
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "alias@example.com" {
+		t.Fatalf("email = %q, want the one from the list", st.rows[0].Email)
+	}
+
+	// 第二趟：站点那边说了它是谁。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "real@example.com", RealUserID: "u9"}, nil
+	}
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row", st.rows)
+	}
+	if st.rows[0].Email != "real@example.com" {
+		t.Fatalf("email = %q, want the one the site says", st.rows[0].Email)
+	}
+	if st.rows[0].UserID != "u9" {
+		t.Fatalf("user id = %q, want the one the site says", st.rows[0].UserID)
+	}
+}
+
+// TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing says a
+// row that is already there keeps its address when the site does not
+// say one.
+//
+// 站点那边一时问不出身份，手里的地址就只剩原来那一行的：那是站点自己
+// 认过的，比清单上的更靠得住。
+func TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	c.Identity = nil
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one that was already there", st.rows[0].Email)
+	}
+}
+
+// TestTwoRowsForOneSiteAccountAreSaidOut says the import says so when
+// the library already has two rows for one site account.
+//
+// 那不是这次导入造成的，但两行都在轮转池里，页面把它列两遍，重登一次
+// 会把另一个的令牌作废。人得知道这件事。
+func TestTwoRowsForOneSiteAccountAreSaidOut(t *testing.T) {
+	st := &fakeStore{}
+	// 库里已经有同一个站点账号的两行（老数据）。
+	st.rows = append(st.rows,
+		store.Account{ID: "acc_1", Email: "a@example.com", UserID: "u1", Status: store.StatusActive},
+		store.Account{ID: "acc_2", Email: "b@example.com", UserID: "u2", Status: store.StatusActive})
+	st.subjects = append(st.subjects, "acc_1:sub", "acc_2:sub")
+	c := aChain(st)
+
+	res, err := c.Import(context.Background(), "b@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Message, "两行") {
+		t.Fatalf("message = %q, want it to say the library has two rows", res.Message)
+	}
+}
+
+// TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver says a finished
+// run does not get a failure that says "try again".
+//
+// 这一趟已经结束了：再试也是白试，等的那一下也是白等。说了「值得再试」
+// 只是让结果表上的那一行写着它做不到的事。
+func TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver(t *testing.T) {
+	c := &Chain{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := c.webError(ctx, StageProbe, errors.New("connection reset"))
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Retry {
+		t.Fatalf("err = %+v, want it not to be tried again", pe)
+	}
+	if pe.Message != "connection reset" {
+		t.Fatalf("message = %q, want what went wrong", pe.Message)
 	}
 }
 ```
@@ -4673,17 +4877,17 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 		"&user_code=" + url.QueryEscape(d.UserCode)
 
 	if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
-		return nil, c.webError(StageProbe, err)
+		return nil, c.webError(ctx, StageProbe, err)
 	}
 	if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
-		return nil, c.webError(StagePassword, err)
+		return nil, c.webError(ctx, StagePassword, err)
 	}
 	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
 		if errors.Is(err, webauth.ErrNoDefaultGroup) {
 			// 站点没有默认组可批准，重试多少次都一样。
 			return nil, &Error{Stage: StageApprove, Message: err.Error()}
 		}
-		return nil, c.webError(StageApprove, err)
+		return nil, c.webError(ctx, StageApprove, err)
 	}
 	if c.Poll == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有地方等这个令牌"}
@@ -4729,10 +4933,6 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	if mail == "" {
 		mail = email
 	}
-	userID := id.RealUserID
-	if userID == "" {
-		userID = tok.Subject
-	}
 
 	// 这个账号是不是已经在库里了？重跑一次导入是常事：上一批有一部分
 	// 失败了，重来一遍是补救的办法。库里已经有这一行的时候再建一行，
@@ -4745,13 +4945,41 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	var existed bool
 	var row store.Account
 	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, err := findIn(ctx, tx, mail, email)
+		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject)
 		if err != nil {
 			return err
+		}
+		notes = append(notes, found...)
+		// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
+		// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
+		// 地址更靠得住：那个地址是站点自己认的。
+		wantMail := id.Email
+		if wantMail == "" {
+			wantMail = email
+			if existing.ID != "" {
+				wantMail = existing.Email
+			}
+		}
+		wantUserID := id.RealUserID
+		if wantUserID == "" {
+			wantUserID = tok.Subject
+			if existing.ID != "" && existing.UserID != "" {
+				wantUserID = existing.UserID
+			}
 		}
 		if existing.ID != "" {
 			existed = true
 			row = existing
+			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
+			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
+			// 账号当成新账号，再插一行。
+			if wantMail != row.Email || wantUserID != row.UserID {
+				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
+					return err
+				}
+				row.Email = wantMail
+				row.UserID = wantUserID
+			}
 			return tx.SaveToken(ctx, store.Token{
 				AccountID: row.ID,
 				Access:    tok.Access,
@@ -4764,8 +4992,8 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		acc := store.Account{
 			ID:         c.newID(),
 			Name:       mail,
-			UserID:     userID,
-			Email:      mail,
+			UserID:     wantUserID,
+			Email:      wantMail,
 			Status:     store.StatusActive,
 			ProxyGroup: c.ProxyGroup,
 			CreatedAt:  now,
@@ -4840,37 +5068,69 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, "", now); err != nil {
 			notes = append(notes, "出口组没能更新："+err.Error())
 		} else if acc.ProxyURL != "" {
-			notes = append(notes, "账号自己那个出口地址清掉了，改走导入带的出口组")
+			// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，
+			// 没了就得能照着填回去。
+			notes = append(notes, "账号自己那个出口地址（"+acc.ProxyURL+
+				"）清掉了，改走导入带的出口组 "+c.ProxyGroup)
 		}
 	}
 	return notes
 }
 
-// findIn gives the account row with that email, when there is one.
+// findIn gives the account row that belongs to this site account.
 //
-// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
-// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+// 三样都问一遍，先问最靠得住的那一样：
+//
+//   - subject：令牌里带的那个用户 id。一个站点账号一个，重登多少次都是
+//     它。清单上的邮箱可能是别名，站点那边报的邮箱又可能一时问不出来，
+//     只有它是一直在的。
+//   - 站点那边报的邮箱
+//   - 清单上写的邮箱
+//
+// 找到两样却指向两个不一样的行，说明库里本来就有同一个站点账号的两行：
+// 那不是这次导入造成的，但要说出来——两行都在轮转池里，页面把它列两遍。
 //
 // 找不到不是错：那就是一个新账号。
-func findIn(ctx context.Context, tx store.Tx, mail, email string) (store.Account, error) {
-	acc, err := tx.AccountByEmail(ctx, mail)
-	if err == nil {
-		return acc, nil
+func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (store.Account, []string, error) {
+	var notes []string
+	var found store.Account
+	have := false
+	add := func(acc store.Account) {
+		if !have {
+			found, have = acc, true
+			return
+		}
+		if acc.ID != found.ID {
+			notes = append(notes, "库里已经有同一个站点账号的两行了（"+
+				found.ID+" 和 "+acc.ID+"）")
+		}
 	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, err
+	if subject != "" {
+		acc, err := tx.AccountBySubject(ctx, subject)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
 	}
-	if mail == email {
-		return store.Account{}, nil
+	asked := map[string]bool{}
+	for _, key := range []string{mail, email} {
+		if key == "" || asked[strings.ToLower(key)] {
+			continue
+		}
+		asked[strings.ToLower(key)] = true
+		acc, err := tx.AccountByEmail(ctx, key)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
 	}
-	acc, err = tx.AccountByEmail(ctx, email)
-	if errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, nil
-	}
-	if err != nil {
-		return store.Account{}, err
-	}
-	return acc, nil
+	return found, notes, nil
 }
 
 // keep encrypts the password and writes it down, when there is a
@@ -4897,7 +5157,11 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 // work.
 //
 // A wrong password is not worth trying again. A dropped connection is.
-func (c *Chain) webError(stage Stage, err error) error {
+//
+// ctx 是这一趟导入的上下文：它没了的时候这一趟就结束了，再试也是白试，
+// 那一条不该再说「值得再试一次」。
+func (c *Chain) webError(ctx context.Context, stage Stage, err error) error {
+	dead := ctx.Err() != nil
 	var se *webauth.SiteError
 	if errors.As(err, &se) {
 		pe := &Error{
@@ -4907,12 +5171,12 @@ func (c *Chain) webError(stage Stage, err error) error {
 			// 就用站点自己那个词（login_required 那种）。
 			Message: se.ExplainText(),
 		}
-		if retryableCode(se.Code) {
+		if retryableCode(se.Code) && !dead {
 			pe.Retry = true
 		}
 		return pe
 	}
-	return &Error{Stage: stage, Message: err.Error(), Retry: true}
+	return &Error{Stage: stage, Message: err.Error(), Retry: !dead}
 }
 
 // pollError turns what the token endpoint said into what the runner
@@ -6045,8 +6309,19 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 		// 登不回去说的是这次登录失败，不是手里那条链的事。所以令牌
 		// 不动：清空它只能毁掉一个还能用的凭据，什么也救不回来。
 		// 这里写下的只是失败的原因，账号还是签出的。
-		if mErr := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, err.Error(), time.Now()); mErr != nil {
+		//
+		// 写是**有条件**的：另一个进程可能刚把这个账号登回去了，那一
+		// 行现在是 active 了，这时候把它写回 signed_out，就是把别人刚
+		// 换好的令牌作废掉，还让这个账号显示成登出的状态——手里却握着
+		// 一份能用的凭据，轮转池不用它，下一轮又要登一次。
+		written, mErr := m.Store.MarkSignedOut(ctx, accountID, err.Error(), time.Now())
+		if mErr != nil {
 			return errors.Join(err, fmt.Errorf("the failure could not be saved: %w", mErr))
+		}
+		if !written {
+			// 别人已经把它登回去了：原因照样要说给听着的人，但状态
+			// 是别人的，不能由这一边改回去。
+			return errors.Join(err, ErrNotSignedOut)
 		}
 		return err
 	}
@@ -6629,25 +6904,32 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 // it, so the reason goes in as a row of its own — otherwise the page
 // says only "failed 1" and the operator never learns that the key was
 // wrong.
+//
+// 那一行不是账号，所以它不算进失败的账号数里：一个账号都没处理的这一趟，
+// 失败的账号数是零。整趟为什么没成，由那一行自己说。
 func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 	ctx := context.Background()
 	results, err := w.Import(ctx, entries)
-	ok := 0
-	for _, r := range results {
-		if r.OK {
-			ok++
-		}
-	}
-	failed := len(results) - ok
 	if err != nil {
 		log.Printf("import %s: %v", runID, err)
 		results = append(results, provision.Result{
 			Email:   "（整趟）",
 			OK:      false,
+			Whole:   true,
 			Stage:   stageOf(err),
 			Message: "整趟导入没能完成：" + err.Error(),
 		})
-		failed++
+	}
+	ok := 0
+	failed := 0
+	for _, r := range results {
+		switch {
+		case r.OK:
+			ok++
+		case !r.Whole:
+			// 整趟没成的那一行不是账号：它不算进失败的账号数里。
+			failed++
+		}
 	}
 	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
 		log.Printf("import %s: %v", runID, err)

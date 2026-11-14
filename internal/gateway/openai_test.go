@@ -41,7 +41,7 @@ func (u *upstreamRecorder) seen() ([]string, [][]byte) {
 // that the site cannot answer itself is answered in the OpenAI shape.
 //
 // 参考实现只走 Anthropic 的 /messages，站点多半没有 /chat/completions。
-// 那条路是本地转的：请求转成 Anthropic 的，��答再转回 OpenAI 的样子。
+// 那条路是本地转的：请求转成 Anthropic 的，回答再转回 OpenAI 的样子。
 // 客户端认的是 OpenAI 的形状，不能给它一段 Anthropic 的。
 func TestTheOpenAIAnswerComesBackInTheOpenAIShape(t *testing.T) {
 	rec := &upstreamRecorder{}

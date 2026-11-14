@@ -119,17 +119,17 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 		"&user_code=" + url.QueryEscape(d.UserCode)
 
 	if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
-		return nil, c.webError(StageProbe, err)
+		return nil, c.webError(ctx, StageProbe, err)
 	}
 	if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
-		return nil, c.webError(StagePassword, err)
+		return nil, c.webError(ctx, StagePassword, err)
 	}
 	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
 		if errors.Is(err, webauth.ErrNoDefaultGroup) {
 			// 站点没有默认组可批准，重试多少次都一样。
 			return nil, &Error{Stage: StageApprove, Message: err.Error()}
 		}
-		return nil, c.webError(StageApprove, err)
+		return nil, c.webError(ctx, StageApprove, err)
 	}
 	if c.Poll == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有地方等这个令牌"}
@@ -175,10 +175,6 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	if mail == "" {
 		mail = email
 	}
-	userID := id.RealUserID
-	if userID == "" {
-		userID = tok.Subject
-	}
 
 	// 这个账号是不是已经在库里了？重跑一次导入是常事：上一批有一部分
 	// 失败了，重来一遍是补救的办法。库里已经有这一行的时候再建一行，
@@ -191,13 +187,41 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	var existed bool
 	var row store.Account
 	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, err := findIn(ctx, tx, mail, email)
+		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject)
 		if err != nil {
 			return err
+		}
+		notes = append(notes, found...)
+		// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
+		// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
+		// 地址更靠得住：那个地址是站点自己认的。
+		wantMail := id.Email
+		if wantMail == "" {
+			wantMail = email
+			if existing.ID != "" {
+				wantMail = existing.Email
+			}
+		}
+		wantUserID := id.RealUserID
+		if wantUserID == "" {
+			wantUserID = tok.Subject
+			if existing.ID != "" && existing.UserID != "" {
+				wantUserID = existing.UserID
+			}
 		}
 		if existing.ID != "" {
 			existed = true
 			row = existing
+			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
+			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
+			// 账号当成新账号，再插一行。
+			if wantMail != row.Email || wantUserID != row.UserID {
+				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
+					return err
+				}
+				row.Email = wantMail
+				row.UserID = wantUserID
+			}
 			return tx.SaveToken(ctx, store.Token{
 				AccountID: row.ID,
 				Access:    tok.Access,
@@ -210,8 +234,8 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 		acc := store.Account{
 			ID:         c.newID(),
 			Name:       mail,
-			UserID:     userID,
-			Email:      mail,
+			UserID:     wantUserID,
+			Email:      wantMail,
 			Status:     store.StatusActive,
 			ProxyGroup: c.ProxyGroup,
 			CreatedAt:  now,
@@ -286,37 +310,69 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, "", now); err != nil {
 			notes = append(notes, "出口组没能更新："+err.Error())
 		} else if acc.ProxyURL != "" {
-			notes = append(notes, "账号自己那个出口地址清掉了，改走导入带的出口组")
+			// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，
+			// 没了就得能照着填回去。
+			notes = append(notes, "账号自己那个出口地址（"+acc.ProxyURL+
+				"）清掉了，改走导入带的出口组 "+c.ProxyGroup)
 		}
 	}
 	return notes
 }
 
-// findIn gives the account row with that email, when there is one.
+// findIn gives the account row that belongs to this site account.
 //
-// 两个邮箱都问一遍：站点那边认的邮箱和清单上写的不一定一样（清单上
-// 写的可能是别名），哪一栏写着这个号，就按哪一栏找。
+// 三样都问一遍，先问最靠得住的那一样：
+//
+//   - subject：令牌里带的那个用户 id。一个站点账号一个，重登多少次都是
+//     它。清单上的邮箱可能是别名，站点那边报的邮箱又可能一时问不出来，
+//     只有它是一直在的。
+//   - 站点那边报的邮箱
+//   - 清单上写的邮箱
+//
+// 找到两样却指向两个不一样的行，说明库里本来就有同一个站点账号的两行：
+// 那不是这次导入造成的，但要说出来——两行都在轮转池里，页面把它列两遍。
 //
 // 找不到不是错：那就是一个新账号。
-func findIn(ctx context.Context, tx store.Tx, mail, email string) (store.Account, error) {
-	acc, err := tx.AccountByEmail(ctx, mail)
-	if err == nil {
-		return acc, nil
+func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (store.Account, []string, error) {
+	var notes []string
+	var found store.Account
+	have := false
+	add := func(acc store.Account) {
+		if !have {
+			found, have = acc, true
+			return
+		}
+		if acc.ID != found.ID {
+			notes = append(notes, "库里已经有同一个站点账号的两行了（"+
+				found.ID+" 和 "+acc.ID+"）")
+		}
 	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, err
+	if subject != "" {
+		acc, err := tx.AccountBySubject(ctx, subject)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
 	}
-	if mail == email {
-		return store.Account{}, nil
+	asked := map[string]bool{}
+	for _, key := range []string{mail, email} {
+		if key == "" || asked[strings.ToLower(key)] {
+			continue
+		}
+		asked[strings.ToLower(key)] = true
+		acc, err := tx.AccountByEmail(ctx, key)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
 	}
-	acc, err = tx.AccountByEmail(ctx, email)
-	if errors.Is(err, store.ErrNotFound) {
-		return store.Account{}, nil
-	}
-	if err != nil {
-		return store.Account{}, err
-	}
-	return acc, nil
+	return found, notes, nil
 }
 
 // keep encrypts the password and writes it down, when there is a
@@ -343,7 +399,11 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 // work.
 //
 // A wrong password is not worth trying again. A dropped connection is.
-func (c *Chain) webError(stage Stage, err error) error {
+//
+// ctx 是这一趟导入的上下文：它没了的时候这一趟就结束了，再试也是白试，
+// 那一条不该再说「值得再试一次」。
+func (c *Chain) webError(ctx context.Context, stage Stage, err error) error {
+	dead := ctx.Err() != nil
 	var se *webauth.SiteError
 	if errors.As(err, &se) {
 		pe := &Error{
@@ -353,12 +413,12 @@ func (c *Chain) webError(stage Stage, err error) error {
 			// 就用站点自己那个词（login_required 那种）。
 			Message: se.ExplainText(),
 		}
-		if retryableCode(se.Code) {
+		if retryableCode(se.Code) && !dead {
 			pe.Retry = true
 		}
 		return pe
 	}
-	return &Error{Stage: stage, Message: err.Error(), Retry: true}
+	return &Error{Stage: stage, Message: err.Error(), Retry: !dead}
 }
 
 // pollError turns what the token endpoint said into what the runner

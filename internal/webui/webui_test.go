@@ -1127,8 +1127,14 @@ func TestTheReasonARunFailedAsAWholeIsNotLost(t *testing.T) {
 	if !strings.Contains(run.Results, "the key is not right") {
 		t.Fatalf("results = %q, want the reason in them", run.Results)
 	}
-	if run.Failed != 1 {
-		t.Fatalf("run = %+v, want the failure counted", run)
+	// 那一行不是账号：这一趟一个账号都没处理成，失败的账号数是零。
+	// 把整趟的失败算成账号的失败，页面上就会说「失败 1」，而清单上有
+	// 一个账号——那一个其实不是失败在这一趟上的。
+	if run.Failed != 0 {
+		t.Fatalf("run = %+v, want no account counted as failed", run)
+	}
+	if run.OK != 0 {
+		t.Fatalf("run = %+v, want no account counted as done", run)
 	}
 	// And in the log: the run has no column of its own for the reason.
 	if !strings.Contains(logged.String(), "the key is not right") {

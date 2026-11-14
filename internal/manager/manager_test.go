@@ -2104,3 +2104,53 @@ func TestTwoReloginsOfOneAccountAreOneSignIn(t *testing.T) {
 		t.Fatalf("token = %+v", tok)
 	}
 }
+
+// TestAFailedReloginDoesNotUndoTheOneThatWorked says a sign-in that
+// failed does not put the account back to signed out when somebody else
+// has already signed it in.
+//
+// 两个进程各跑一次重登（命令行一次、serve 里一次）：一个成了，另一个
+// 失败了。失败的那一个要是把状态写回 signed_out，就是把赢家刚换好的
+// 令牌作废掉，还让这个账号显示成登出的状态——手里却握着一份能用的
+// 凭据：轮转池不用它，下一轮又要登一次。
+//
+// 那个锁是每个进程自己的一份（同一个进程里两个 Manager 也是各拿各的），
+// 所以这件事挡不住，只能靠写的时候有条件。
+func TestAFailedReloginDoesNotUndoTheOneThatWorked(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	// 这一次的登录没成，而另一个进程刚把这个账号登回去了。
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		if err := m.Store.UpdateAccountStatus(ctx, "acc_1", store.StatusActive, "", time.Now()); err != nil {
+			return err
+		}
+		return errors.New("the site refused the password")
+	}
+
+	if err := m.Relogin(ctx, "acc_1"); err == nil {
+		t.Fatal("no error for a sign-in that failed")
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusActive {
+		t.Fatalf("status = %q, want active: the one that worked must not be undone", acc.Status)
+	}
+}

@@ -810,6 +810,48 @@ func (s *Store) setAccountName(ctx context.Context, db execer, id, name string, 
 	return nil
 }
 
+// SetAccountIdentity writes an account's address and user id.
+//
+// 它是窄的：只写这两样。站点那边报出来的真邮箱和真用户 id 知道了就写
+// 上去——不去重的时候邮箱是键之一，键停在旧的地方，下一次导入就会把
+// 这个账号当成新账号，再插一行。
+func (s *Store) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return s.setAccountIdentity(ctx, s.db, id, email, userID, updatedAt)
+}
+
+func (s *Store) setAccountIdentity(ctx context.Context, db execer, id, email, userID string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE accounts SET email=?, user_id=?, updated_at=? WHERE id=?`,
+		email, userID, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the identity of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the identity of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// MarkSignedOut writes the reason a sign-in failed, but only while the
+// account is still signed out.
+//
+// 它是有条件的：另一个进程可能刚把这个账号登回去了，那一行现在是
+// active 了，这时候把它写回 signed_out，就是把别人刚换好的令牌作废掉，
+// 还让这个账号显示成登出的状态——手里却握着一份能用的凭据。轮转池不
+// 会用它，下一轮又要登一次，白白多登一次。
+//
+// 它说有没有写下去：没有写，说明这一行的状态已经不是签出的了。
+func (s *Store) MarkSignedOut(ctx context.Context, id, lastError string, updatedAt time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=? AND status=?`,
+		StatusSignedOut, lastError, ms(s.stamp(updatedAt)), id, StatusSignedOut)
+	if err != nil {
+		return false, fmt.Errorf("mark the account %s as signed out: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // SetAccountLastError writes the account's last error.
 //
 // It writes the error and nothing else. It does not write the status
@@ -1001,10 +1043,16 @@ type Tx interface {
 	// AccountByEmail gives the account with that email, when there is
 	// one. It says ErrNotFound when there is none.
 	AccountByEmail(ctx context.Context, email string) (Account, error)
+	// AccountBySubject gives the account whose token carries that
+	// subject, when there is one. It says ErrNotFound when there is
+	// none.
+	AccountBySubject(ctx context.Context, subject string) (Account, error)
 	// CreateAccount inserts an account.
 	CreateAccount(ctx context.Context, a Account) error
 	// SaveToken writes an account's token.
 	SaveToken(ctx context.Context, t Token) error
+	// SetAccountIdentity writes an account's address and user id.
+	SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
 	// SetAccountProxy writes the account's outlet.
@@ -1059,12 +1107,20 @@ func (t *sqlTx) AccountByEmail(ctx context.Context, email string) (Account, erro
 	return t.s.accountByEmail(ctx, t.tx, email)
 }
 
+func (t *sqlTx) AccountBySubject(ctx context.Context, subject string) (Account, error) {
+	return t.s.accountBySubject(ctx, t.tx, subject)
+}
+
 func (t *sqlTx) CreateAccount(ctx context.Context, a Account) error {
 	return t.s.createAccount(ctx, t.tx, a)
 }
 
 func (t *sqlTx) SaveToken(ctx context.Context, tok Token) error {
 	return t.s.saveToken(ctx, t.tx, tok)
+}
+
+func (t *sqlTx) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return t.s.setAccountIdentity(ctx, t.tx, id, email, userID, updatedAt)
 }
 
 func (t *sqlTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
@@ -1172,6 +1228,41 @@ func (s *Store) accountByEmail(ctx context.Context, db execer, email string) (Ac
 	}
 	if err != nil {
 		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
+	}
+	return a, nil
+}
+
+// AccountBySubject gives the account whose token carries that subject.
+//
+// 令牌里的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少次
+// 都是它。它比邮箱靠得住——清单上写的邮箱可能是别名，站点那边报的邮箱
+// 又可能一时问不出来，只有它是一直在的。
+//
+// 表不大——几百行——一次全表扫就够了，不值得为它改表的结构或者加个
+// 索引。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountBySubject(ctx context.Context, subject string) (Account, error) {
+	return s.accountBySubject(ctx, s.db, subject)
+}
+
+func (s *Store) accountBySubject(ctx context.Context, db execer, subject string) (Account, error) {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return Account{}, fmt.Errorf("get the account by subject: %w", ErrNotFound)
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group, a.proxy_url,
+			a.last_error, a.created_at, a.updated_at
+		FROM accounts a JOIN tokens t ON t.account_id = a.id
+		WHERE t.subject = ?
+		ORDER BY a.created_at, a.id LIMIT 1`, subject)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by subject %s: %w", subject, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by subject %s: %w", subject, err)
 	}
 	return a, nil
 }

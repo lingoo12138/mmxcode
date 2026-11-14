@@ -133,6 +133,12 @@ type Batch struct {
 	Interval Duration `yaml:"interval" json:"interval"`
 	// Group is the egress group the logins go through. An empty one
 	// is the default proxy.
+	//
+	// 它是常驻的：网页上传和命令行没有另外指定的时候，导入都走这个组。
+	// 导入带了组的时候，账号自己那个出口地址要让位——出口是按「先看地
+	// 址、再看组」找的，地址留着就还是从那个地方出去。所以配了这个组
+	// 之后，清单里那些账号自己手填的地址会被清掉，导入结果里会写明
+	// 清掉的是哪个地址。
 	Group string `yaml:"group" json:"group"`
 	// Relogin is the automatic signing-in again.
 	Relogin Relogin `yaml:"relogin" json:"relogin"`

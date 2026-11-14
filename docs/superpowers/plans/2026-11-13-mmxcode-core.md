@@ -10734,7 +10734,7 @@ func TestTheSiteSaysHowMuchOfTheWeekIsUsed(t *testing.T) {
 }
 
 func TestAMissingCountIsNoCount(t *testing.T) {
-	// 站点没写"用掉了几个"，那就没有这个数 —— 参考实现读到的���
+	// 站点没写"用掉了几个"，那就没有这个数 —— 参考实现读到的那个数是
 	// undefined，而 undefined 不是"大于等于零"，所以这个窗口走的是
 	// 百分比那一支，不是"0 个 / 150 个"。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

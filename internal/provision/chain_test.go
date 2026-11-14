@@ -26,6 +26,8 @@ type fakeStore struct {
 	mu       sync.Mutex
 	accounts []string
 	tokens   []string
+	// subjects are the token subjects that were written.
+	subjects []string
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
@@ -83,6 +85,7 @@ func (b *barrier) wait() {
 type snapshot struct {
 	accounts []string
 	tokens   []string
+	subjects []string
 	password []string
 	rows     []store.Account
 	names    []string
@@ -95,6 +98,7 @@ func (s *fakeStore) snapshot() snapshot {
 	return snapshot{
 		accounts: append([]string(nil), s.accounts...),
 		tokens:   append([]string(nil), s.tokens...),
+		subjects: append([]string(nil), s.subjects...),
 		password: append([]string(nil), s.password...),
 		rows:     append([]store.Account(nil), s.rows...),
 		names:    append([]string(nil), s.names...),
@@ -109,6 +113,7 @@ func (s *fakeStore) snapshot() snapshot {
 func (s *fakeStore) restore(before snapshot) {
 	s.accounts = before.accounts
 	s.tokens = before.tokens
+	s.subjects = before.subjects
 	s.password = before.password
 	s.rows = before.rows
 	s.names = before.names
@@ -143,6 +148,10 @@ func (t fakeTx) AccountByEmail(ctx context.Context, email string) (store.Account
 	return t.s.lookup(email)
 }
 
+func (t fakeTx) AccountBySubject(ctx context.Context, subject string) (store.Account, error) {
+	return t.s.lookupSubject(subject)
+}
+
 func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 	t.s.waitMake()
 	return t.s.createAccount(a)
@@ -150,6 +159,10 @@ func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 
 func (t fakeTx) SaveToken(ctx context.Context, tok store.Token) error {
 	return t.s.saveToken(tok)
+}
+
+func (t fakeTx) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return t.s.setAccountIdentity(id, email, userID)
 }
 
 func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
@@ -189,6 +202,18 @@ func (s *fakeStore) saveToken(tok store.Token) error {
 		return errors.New("the disk is full")
 	}
 	s.tokens = append(s.tokens, tok.AccountID+":"+tok.Refresh)
+	s.subjects = append(s.subjects, tok.AccountID+":"+tok.Subject)
+	return nil
+}
+
+// setAccountIdentity writes the address and the user id.
+func (s *fakeStore) setAccountIdentity(id, email, userID string) error {
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Email = email
+			s.rows[i].UserID = userID
+		}
+	}
 	return nil
 }
 
@@ -234,6 +259,25 @@ func (s *fakeStore) lookup(email string) (store.Account, error) {
 		}
 	}
 	return store.Account{}, fmt.Errorf("get the account by email %s: %w", email, store.ErrNotFound)
+}
+
+// lookupSubject gives the account whose token carries that subject.
+//
+// 真的库里是顺着令牌那一行找的：令牌里的那个 sub 是站点账号自己的 id。
+func (s *fakeStore) lookupSubject(subject string) (store.Account, error) {
+	for _, t := range s.subjects {
+		at := strings.LastIndex(t, ":")
+		if at < 0 || t[at+1:] != subject {
+			continue
+		}
+		id := t[:at]
+		for _, r := range s.rows {
+			if r.ID == id {
+				return r, nil
+			}
+		}
+	}
+	return store.Account{}, fmt.Errorf("get the account by subject %s: %w", subject, store.ErrNotFound)
 }
 
 func (s *fakeStore) CreateAccount(ctx context.Context, a store.Account) error {
@@ -421,7 +465,7 @@ func TestTheChainDoesNotKeepThePasswordWithoutAKey(t *testing.T) {
 
 func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200046})
+	err := c.webError(context.Background(), StagePassword, &webauth.SiteError{Code: 1200046})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -437,7 +481,7 @@ func TestAWrongPasswordSaysSoAndIsNotTriedAgain(t *testing.T) {
 
 func TestARefusalWithoutACodeIsStillExplained(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StageApprove, &webauth.SiteError{Reason: "login_required"})
+	err := c.webError(context.Background(), StageApprove, &webauth.SiteError{Reason: "login_required"})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -470,7 +514,7 @@ func TestAMissingDefaultGroupIsNotTriedAgain(t *testing.T) {
 
 func TestAStaleLoginIsTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StagePassword, &webauth.SiteError{Code: 1200007})
+	err := c.webError(context.Background(), StagePassword, &webauth.SiteError{Code: 1200007})
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -483,7 +527,7 @@ func TestAStaleLoginIsTriedAgain(t *testing.T) {
 
 func TestALostConnectionIsTriedAgain(t *testing.T) {
 	c := &Chain{}
-	err := c.webError(StageProbe, errors.New("connection reset"))
+	err := c.webError(context.Background(), StageProbe, errors.New("connection reset"))
 
 	var pe *Error
 	if !errors.As(err, &pe) {
@@ -875,6 +919,11 @@ func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing
 	if !strings.Contains(res.Message, "地址") {
 		t.Fatalf("message = %q, want it to say the address was cleared", res.Message)
 	}
+	// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，没了就得能
+	// 照着填回去。
+	if !strings.Contains(res.Message, "socks5h://127.0.0.1:1080") {
+		t.Fatalf("message = %q, want it to name the address that was cleared", res.Message)
+	}
 }
 
 // TestAnImportWithoutAGroupKeepsTheGroupThatIsThere says an import
@@ -933,5 +982,143 @@ func TestTheBrokenAccountIsTakenBackOutWhenTheRunWasCutShort(t *testing.T) {
 	}
 	if len(st.accounts) != 0 {
 		t.Fatalf("the broken account was left behind: %v", st.accounts)
+	}
+}
+
+// TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent says
+// the token's subject is the key, not the address.
+//
+// 清单上写的地址可能是别名，站点那边报的地址又可能一时问不出来（站点
+// 503 了）。靠地址去重就会漏：同一个站点账号在库里会有两行都是活的，
+// 两个都在轮转池里，其中一个的令牌迟早被另一个的重登作废。
+//
+// 令牌里带的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少
+// 次都是它。
+func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v", st.rows)
+	}
+
+	// 第二趟：站点那边问不出身份了（503），清单上的地址也换了。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{}, errors.New("the site is busy")
+	}
+	res, err := c.Import(context.Background(), "other@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row for one site account", st.rows)
+	}
+	if res.AccountID != "acc_1" {
+		t.Fatalf("account id = %q, want the row that was already there", res.AccountID)
+	}
+}
+
+// TestTheRowIsBroughtInLineWithWhatTheSiteSays says the address and
+// the user id on the row are the ones the site says.
+//
+// 去重的时候邮箱是键之一：键停在旧的地方，下一次导入就会把这个账号
+// 当成新账号，再插一行。站点那边报出来的真地址知道了，就得写上去。
+func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 第一趟：身份没问，邮箱只能拿清单上的。
+	c.Identity = nil
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "alias@example.com" {
+		t.Fatalf("email = %q, want the one from the list", st.rows[0].Email)
+	}
+
+	// 第二趟：站点那边说了它是谁。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "real@example.com", RealUserID: "u9"}, nil
+	}
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row", st.rows)
+	}
+	if st.rows[0].Email != "real@example.com" {
+		t.Fatalf("email = %q, want the one the site says", st.rows[0].Email)
+	}
+	if st.rows[0].UserID != "u9" {
+		t.Fatalf("user id = %q, want the one the site says", st.rows[0].UserID)
+	}
+}
+
+// TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing says a
+// row that is already there keeps its address when the site does not
+// say one.
+//
+// 站点那边一时问不出身份，手里的地址就只剩原来那一行的：那是站点自己
+// 认过的，比清单上的更靠得住。
+func TestTheAddressOnTheRowIsNotThrownAwayWhenTheSiteSaysNothing(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	c.Identity = nil
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "a@example.com" {
+		t.Fatalf("email = %q, want the one that was already there", st.rows[0].Email)
+	}
+}
+
+// TestTwoRowsForOneSiteAccountAreSaidOut says the import says so when
+// the library already has two rows for one site account.
+//
+// 那不是这次导入造成的，但两行都在轮转池里，页面把它列两遍，重登一次
+// 会把另一个的令牌作废。人得知道这件事。
+func TestTwoRowsForOneSiteAccountAreSaidOut(t *testing.T) {
+	st := &fakeStore{}
+	// 库里已经有同一个站点账号的两行（老数据）。
+	st.rows = append(st.rows,
+		store.Account{ID: "acc_1", Email: "a@example.com", UserID: "u1", Status: store.StatusActive},
+		store.Account{ID: "acc_2", Email: "b@example.com", UserID: "u2", Status: store.StatusActive})
+	st.subjects = append(st.subjects, "acc_1:sub", "acc_2:sub")
+	c := aChain(st)
+
+	res, err := c.Import(context.Background(), "b@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Message, "两行") {
+		t.Fatalf("message = %q, want it to say the library has two rows", res.Message)
+	}
+}
+
+// TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver says a finished
+// run does not get a failure that says "try again".
+//
+// 这一趟已经结束了：再试也是白试，等的那一下也是白等。说了「值得再试」
+// 只是让结果表上的那一行写着它做不到的事。
+func TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver(t *testing.T) {
+	c := &Chain{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := c.webError(ctx, StageProbe, errors.New("connection reset"))
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Retry {
+		t.Fatalf("err = %+v, want it not to be tried again", pe)
+	}
+	if pe.Message != "connection reset" {
+		t.Fatalf("message = %q, want what went wrong", pe.Message)
 	}
 }

@@ -301,6 +301,17 @@ function showImportResults(run) {
     body.appendChild(tr);
   }
   table.hidden = false;
+  // 整趟没成的那一行不是账号，它说的是这一趟出了什么事。写在那句
+  // 「成功几个失败几个」的后面：失败了几个账号是账号的事，整趟为什么
+  // 没成是另一回事，两句话得都在。
+  const whole = results.find((r) => r && r.whole);
+  if (whole) {
+    const status = document.getElementById('import-status');
+    if (status) {
+      status.textContent = '成功 ' + (run.ok || 0) + '，失败 ' + (run.failed || 0) +
+        '。' + (whole.message || '整趟导入没能完成');
+    }
+  }
 }
 
 // 重登：把签出的账号重新登一遍。

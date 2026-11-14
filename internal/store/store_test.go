@@ -47,50 +47,95 @@ func makeAccount(t *testing.T, s *Store, id string) {
 // and an insert inside one transaction are one thing to everybody.
 //
 // 两个并发的导入：都按邮箱找，都没有就建一行。真库的事务一开始就把
-// 写锁拿着，所以第二个进来的那个看见的是第一个建好的那一行——不然同
-// 一个站点账号会有两行都是活的。
+// 写锁拿着，所以第二个进来的那个根本进不来——它等第一个提交完，才看得见
+// 第一个建好的那一行。不然同一个站点账号会有两行都是活的。
+//
+// 这一条是**掐着时间**的：第一个事务查完邮箱之后先把事务开着不放，第
+// 二个事务这时候要么进不来（对），要么自己查到「没有」然后建了第二行
+// （错）。靠碰运气的写法看不出写锁有没有生效：两个线程谁先跑到哪一步
+// 是碰运气的事。
 func TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now()
 
+	// holding：第一个事务查完邮箱了。release：第一个事务可以提交了。
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseIt := func() { releaseOnce.Do(func() { close(release) }) }
+	// made：第二个事务自己建了一行（那就是错的那一种）。
+	made := make(chan string, 1)
+
 	var wg sync.WaitGroup
-	ids := make([]string, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			err := s.Tx(ctx, func(tx Tx) error {
-				acc, err := tx.AccountByEmail(ctx, "a@example.com")
-				if errors.Is(err, ErrNotFound) {
-					acc = Account{
-						ID: fmt.Sprintf("acc_%d", i), Name: "a@example.com",
-						Email: "a@example.com", Status: StatusActive,
-						CreatedAt: now, UpdatedAt: now,
-					}
-					if err := tx.CreateAccount(ctx, acc); err != nil {
-						return err
-					}
-					if err := tx.SaveToken(ctx, Token{
-						AccountID: acc.ID, Access: "tok", Refresh: "ref",
-						ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
-					}); err != nil {
-						return err
-					}
-					ids[i] = acc.ID
-					return nil
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.Tx(ctx, func(tx Tx) error {
+			_, err := tx.AccountByEmail(ctx, "a@example.com")
+			if !errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("the account is already there: %v", err)
+			}
+			close(holding)
+			<-release
+			acc := Account{
+				ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+				Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			return tx.SaveToken(ctx, Token{
+				AccountID: acc.ID, Access: "tok", Refresh: "ref",
+				ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+			})
+		})
+		if err != nil {
+			t.Errorf("the first transaction: %v", err)
+		}
+	}()
+	<-holding
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.Tx(ctx, func(tx Tx) error {
+			acc, err := tx.AccountByEmail(ctx, "a@example.com")
+			if errors.Is(err, ErrNotFound) {
+				acc = Account{
+					ID: "acc_2", Name: "a@example.com", Email: "a@example.com",
+					Status: StatusActive, CreatedAt: now, UpdatedAt: now,
 				}
-				if err != nil {
+				if err := tx.CreateAccount(ctx, acc); err != nil {
 					return err
 				}
-				ids[i] = acc.ID
+				if err := tx.SaveToken(ctx, Token{
+					AccountID: acc.ID, Access: "tok", Refresh: "ref",
+					ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+				}); err != nil {
+					return err
+				}
+				made <- acc.ID
 				return nil
-			})
-			if err != nil {
-				t.Errorf("transaction %d: %v", i, err)
 			}
-		}(i)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("the second transaction: %v", err)
+		}
+	}()
+
+	// 第二个事务要么在等第一个提交（对），要么它自己已经查到「没有」
+	// 并且建了第二行（错）。
+	select {
+	case id := <-made:
+		t.Errorf("the second transaction made a row of its own: %s", id)
+	case <-time.After(500 * time.Millisecond):
 	}
+	releaseIt()
 	wg.Wait()
 
 	rows, err := s.ListAccounts(ctx)
@@ -100,8 +145,98 @@ func TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("accounts = %d, want one row", len(rows))
 	}
-	if ids[0] != ids[1] {
-		t.Fatalf("ids = %q and %q, want the same row", ids[0], ids[1])
+	if rows[0].ID != "acc_1" {
+		t.Fatalf("the row is %q, want the one the first transaction made", rows[0].ID)
+	}
+}
+
+// TestAnAccountIsFoundByItsSubject says the token's subject is a key.
+//
+// 令牌里带的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少次
+// 都是它。去重靠它，才不会在清单上的地址和站点那边报的地址不一样的时候
+// 建出第二行。
+func TestAnAccountIsFoundByItsSubject(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.AccountBySubject(ctx, "sub-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want acc_1", acc.ID)
+	}
+	if _, err := s.AccountBySubject(ctx, "sub-2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.AccountBySubject(ctx, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestAMarkedSignedOutAccountIsNotMarkedAgain says the reason for a
+// failed sign-in is only written while the account is still signed out.
+//
+// 另一个进程可能刚把这个账号登回去了，那一行现在是 active 了：这时候
+// 把它写回 signed_out，就是把别人刚换好的令牌作废掉，还让这个账号显示
+// 成登出的状态——手里却握着一份能用的凭据。
+func TestAMarkedSignedOutAccountIsNotMarkedAgain(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusSignedOut,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	written, err := s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !written {
+		t.Fatal("the reason was not written down")
+	}
+	acc, err := s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != StatusSignedOut || !strings.Contains(acc.LastError, "refused") {
+		t.Fatalf("account = %+v", acc)
+	}
+
+	// 别人把它登回去了。
+	if err := s.UpdateAccountStatus(ctx, "acc_1", StatusActive, "", now); err != nil {
+		t.Fatal(err)
+	}
+	written, err = s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written {
+		t.Fatal("the account that is active was marked as signed out")
+	}
+	acc, err = s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != StatusActive {
+		t.Fatalf("status = %q, want active", acc.Status)
 	}
 }
 

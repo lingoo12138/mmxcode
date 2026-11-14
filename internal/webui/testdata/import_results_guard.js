@@ -24,12 +24,16 @@ function makePage() {
     },
     querySelector: function () { return table.tbody; },
   };
+  const status = { textContent: '' };
   return {
     table: table,
+    status: status,
     document: {
       addEventListener: function () {},
       getElementById: function (id) {
-        return id === 'import-results' ? table : null;
+        if (id === 'import-results') return table;
+        if (id === 'import-status') return status;
+        return null;
       },
       createElement: function () {
         return { textContent: '', appendChild: function () {} };
@@ -67,6 +71,23 @@ for (const stored of ['null', '[]', '']) {
     console.error('the results table stayed hidden for ' + JSON.stringify(stored));
     process.exit(1);
   }
+}
+
+// 整趟没成的那一行：它不是账号，但它得把整趟为什么没成说出来。
+// 说了的那句话要落在页面上那一句「成功几个失败几个」的后面。
+page.status.textContent = '';
+context.showImportResults({
+  ok: 0,
+  failed: 0,
+  results: '[{"email":"（整趟）","ok":false,"whole":true,"message":"整趟导入没能完成：the key is not right"}]',
+});
+if (!page.status.textContent.includes('the key is not right')) {
+  console.error('the page does not say why the run failed: ' + page.status.textContent);
+  process.exit(1);
+}
+if (!page.status.textContent.includes('失败 0')) {
+  console.error('the page counts a whole-run failure as an account: ' + page.status.textContent);
+  process.exit(1);
 }
 
 console.log('ok');

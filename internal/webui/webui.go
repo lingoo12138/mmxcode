@@ -859,25 +859,32 @@ func newImportRunID() string {
 // it, so the reason goes in as a row of its own — otherwise the page
 // says only "failed 1" and the operator never learns that the key was
 // wrong.
+//
+// 那一行不是账号，所以它不算进失败的账号数里：一个账号都没处理的这一趟，
+// 失败的账号数是零。整趟为什么没成，由那一行自己说。
 func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 	ctx := context.Background()
 	results, err := w.Import(ctx, entries)
-	ok := 0
-	for _, r := range results {
-		if r.OK {
-			ok++
-		}
-	}
-	failed := len(results) - ok
 	if err != nil {
 		log.Printf("import %s: %v", runID, err)
 		results = append(results, provision.Result{
 			Email:   "（整趟）",
 			OK:      false,
+			Whole:   true,
 			Stage:   stageOf(err),
 			Message: "整趟导入没能完成：" + err.Error(),
 		})
-		failed++
+	}
+	ok := 0
+	failed := 0
+	for _, r := range results {
+		switch {
+		case r.OK:
+			ok++
+		case !r.Whole:
+			// 整趟没成的那一行不是账号：它不算进失败的账号数里。
+			failed++
+		}
 	}
 	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
 		log.Printf("import %s: %v", runID, err)

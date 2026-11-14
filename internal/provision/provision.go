@@ -119,6 +119,12 @@ type Result struct {
 	Message string `json:"message"`
 	// AccountID is the account's id, when it made it in.
 	AccountID string `json:"account_id,omitempty"`
+	// Whole says this row is not one account but the run itself.
+	//
+	// 整趟导入没能完成的时候，页面上要有一行说这件事。那一行不是账号，
+	// 所以它不算进「失败了几个账号」里——一个账号都没处理的这一趟，失败
+	// 的账号数就是零。
+	Whole bool `json:"whole,omitempty"`
 }
 
 // Error is an import failure and what to do about it.

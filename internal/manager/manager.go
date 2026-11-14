@@ -611,8 +611,19 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 		// 登不回去说的是这次登录失败，不是手里那条链的事。所以令牌
 		// 不动：清空它只能毁掉一个还能用的凭据，什么也救不回来。
 		// 这里写下的只是失败的原因，账号还是签出的。
-		if mErr := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, err.Error(), time.Now()); mErr != nil {
+		//
+		// 写是**有条件**的：另一个进程可能刚把这个账号登回去了，那一
+		// 行现在是 active 了，这时候把它写回 signed_out，就是把别人刚
+		// 换好的令牌作废掉，还让这个账号显示成登出的状态——手里却握着
+		// 一份能用的凭据，轮转池不用它，下一轮又要登一次。
+		written, mErr := m.Store.MarkSignedOut(ctx, accountID, err.Error(), time.Now())
+		if mErr != nil {
 			return errors.Join(err, fmt.Errorf("the failure could not be saved: %w", mErr))
+		}
+		if !written {
+			// 别人已经把它登回去了：原因照样要说给听着的人，但状态
+			// 是别人的，不能由这一边改回去。
+			return errors.Join(err, ErrNotSignedOut)
 		}
 		return err
 	}
