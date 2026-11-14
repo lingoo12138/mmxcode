@@ -4662,7 +4662,8 @@ func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
 	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
 		return account.Identity{Email: "real@example.com", RealUserID: "u9"}, nil
 	}
-	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+	res, err := c.Import(context.Background(), "alias@example.com", "hunter2")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(st.rows) != 1 {
@@ -4673,6 +4674,10 @@ func TestTheRowIsBroughtInLineWithWhatTheSiteSays(t *testing.T) {
 	}
 	if st.rows[0].UserID != "u9" {
 		t.Fatalf("user id = %q, want the one the site says", st.rows[0].UserID)
+	}
+	// 换了地址要说：掉线以后重登用的是这一栏。
+	if !strings.Contains(res.Message, "real@example.com") {
+		t.Fatalf("message = %q, want it to say the address changed", res.Message)
 	}
 }
 
@@ -4976,6 +4981,12 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 			if wantMail != row.Email || wantUserID != row.UserID {
 				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
 					return err
+				}
+				if wantMail != row.Email {
+					// 换了地址要说：那是从清单上写的那个，换成了站点自己
+					// 认的那个。掉线以后重登用的是这一栏，地址换了人得
+					// 知道。
+					notes = append(notes, "这个账号的邮箱换成了站点那边的："+wantMail)
 				}
 				row.Email = wantMail
 				row.UserID = wantUserID

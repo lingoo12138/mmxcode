@@ -219,6 +219,12 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
 					return err
 				}
+				if wantMail != row.Email {
+					// 换了地址要说：那是从清单上写的那个，换成了站点自己
+					// 认的那个。掉线以后重登用的是这一栏，地址换了人得
+					// 知道。
+					notes = append(notes, "这个账号的邮箱换成了站点那边的："+wantMail)
+				}
 				row.Email = wantMail
 				row.UserID = wantUserID
 			}
