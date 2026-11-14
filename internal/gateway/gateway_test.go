@@ -136,7 +136,10 @@ func TestCodexUsesAnthropicFallback(t *testing.T) {
 		if r.URL.Path != "/mavis/api/v1/llm/v1/messages" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
-		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"ok"}]}`))
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[` +
+			`{"type":"text","text":"ok"},` +
+			`{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Beijing"}}` +
+			`]}`))
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
 	w := httptest.NewRecorder()
@@ -147,6 +150,97 @@ func TestCodexUsesAnthropicFallback(t *testing.T) {
 	// 回退路径非流式时返回 Responses 的形状
 	if !strings.Contains(w.Body.String(), `"object":"response"`) {
 		t.Fatalf("body = %s", w.Body.String())
+	}
+	var resp struct {
+		Object     string `json:"object"`
+		Status     string `json:"status"`
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Type      string `json:"type"`
+			ID        string `json:"id"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Status    string `json:"status"`
+			Content   []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if resp.Object != "response" || resp.Status != "completed" {
+		t.Fatalf("the answer = %s", w.Body.String())
+	}
+	if resp.OutputText != "ok" {
+		t.Fatalf("output_text = %q", resp.OutputText)
+	}
+	// 工具调用不能被丢掉：模型要调工具，客户端得看得见它调的是哪个
+	// 工具、拿什么参数去调。非流式这条路以前只留 text 块，tool_use
+	// 块一个都没有，模型永远调不了工具。
+	var call *struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Status    string `json:"status"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	for i := range resp.Output {
+		if resp.Output[i].Type == "function_call" {
+			call = &resp.Output[i]
+		}
+	}
+	if call == nil {
+		t.Fatalf("the tool call was thrown away: %s", w.Body.String())
+	}
+	if call.CallID != "toolu_1" {
+		t.Fatalf("call_id = %q, want the tool_use block's id", call.CallID)
+	}
+	if call.Name != "get_weather" {
+		t.Fatalf("name = %q", call.Name)
+	}
+	if call.Arguments != `{"city":"Beijing"}` {
+		t.Fatalf("arguments = %q", call.Arguments)
+	}
+	if call.Status != "completed" {
+		t.Fatalf("status = %q", call.Status)
+	}
+	if call.ID == "" {
+		t.Fatal("the tool call has no id of its own")
+	}
+	// 文字块还是那一个文字块：两条路对同一个上游答案要一样。
+	var text *struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+		Status    string `json:"status"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	for i := range resp.Output {
+		if resp.Output[i].Type == "message" {
+			text = &resp.Output[i]
+		}
+	}
+	if text == nil {
+		t.Fatalf("the text block was thrown away: %s", w.Body.String())
+	}
+	if len(text.Content) != 1 || text.Content[0].Text != "ok" {
+		t.Fatalf("the message item = %+v", text.Content)
+	}
+	if text.ID == "" {
+		t.Fatal("the message item has no id of its own")
 	}
 }
 

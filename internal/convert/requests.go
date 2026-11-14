@@ -59,6 +59,10 @@ type anthropicRequest struct {
 	Tools      []anthropicTool      `json:"tools,omitempty"`
 	ToolChoice *anthropicToolChoice `json:"tool_choice,omitempty"`
 	Thinking   *thinking            `json:"thinking,omitempty"`
+	// StopSequences are the sequences that end the answer. The
+	// Responses protocol has no such field, so it is only filled in
+	// when the request came from the OpenAI protocol.
+	StopSequences []string `json:"stop_sequences,omitempty"`
 }
 
 // anthropicMessage is one message.

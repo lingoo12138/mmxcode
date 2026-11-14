@@ -71,6 +71,14 @@ type Server struct {
 	// 每个请求都读它，而第一个 404 会把它写掉：一个字段被一个请求写、
 	// 被别的请求读，就是数据竞争。所以它是 atomic 的。
 	NativeResponses atomic.Bool
+	// NativeChatCompletions says the upstream speaks the OpenAI chat
+	// completions protocol itself. It is tried and turned off when the
+	// upstream says no.
+	//
+	// 参考实现只走 Anthropic 的 /messages，这条路是照着同目录下的
+	// /messages 推的：站点也许有，也许没有。它和 NativeResponses 是
+	// 同一根杆，同一个理由才用 atomic。
+	NativeChatCompletions atomic.Bool
 	// WebUI serves the management pages, when there is one.
 	WebUI http.Handler
 }
@@ -86,6 +94,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	}
 	// 原生路径先开着：上游说它没有 /responses 的时候再关。
 	g.NativeResponses.Store(true)
+	g.NativeChatCompletions.Store(true)
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -203,7 +212,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.auth(r) {
 		if isAPIPath(r.URL.Path) {
-			writeError(w, http.StatusUnauthorized, "the key was refused")
+			writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
 			return
 		}
 		// 浏览器来的是页面：给它登录页，不是一段 JSON。
@@ -232,7 +241,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.WebUI.ServeHTTP(w, r)
 		return
 	}
-	writeError(w, http.StatusNotFound, "no such endpoint")
+	writeError(w, protocolOf(r.URL.Path), http.StatusNotFound, "no such endpoint")
 }
 
 // protocol is the protocol the client speaks.
@@ -244,11 +253,41 @@ const (
 	protocolCodex
 )
 
+// protocolOf says which protocol a path speaks.
+//
+// 一个路径一个协议：错误的样子也跟着协议走，所以路由和错误都要问
+// 同一句。
+func protocolOf(path string) protocol {
+	switch path {
+	case "/v1/chat/completions":
+		return protocolOpenAI
+	case "/v1/responses":
+		return protocolCodex
+	default:
+		return protocolAnthropic
+	}
+}
+
+// maxBodyBytes is how large a request body may be.
+//
+// 一段对话的长上下文是几兆，32 MiB 已经很宽裕。再大的请求不是对话，
+// 是要把它这个网关的内存吃光的东西：没有上限的时候，一个请求就能
+// 让网关没有内存可用。
+const maxBodyBytes = 32 << 20
+
 // handleChat serves a chat request.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
+	// 请求体有个上限：不然一个客户端发来一大块东西，网关就把它整个
+	// 读进内存里，然后就没有内存了。
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "the request body could not be read")
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, proto, http.StatusRequestEntityTooLarge, "the request body is too large")
+			return
+		}
+		writeError(w, proto, http.StatusBadRequest, "the request body could not be read")
 		return
 	}
 	// 上游请求的时限就是配的那一个。流式对话也吃这份预算：想要更长的
@@ -267,7 +306,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 那个上游没见过，会把这段对话当成新的一段。
 	upstreamID, err := s.Rot.UpstreamID(ctx, sess)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
@@ -277,6 +316,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 客户端最后看到的是上游的话，不是网关自己编的一句。
 	var quota bool
 	var quotaMsg string
+	// lastStatus 是上游最后一次给的状态，lastMsg 是它自己说的那句。
+	// 客户端最后看到的是上游的状态，不是网关编出来的一个 429：上游说
+	// 503 就是 503，客户端才知道是上游坏了，而不是自己被限流了。
+	var lastStatus int
+	var lastMsg string
 	attempts := s.Cfg.Rotation.MaxAttempts
 	if attempts <= 0 {
 		attempts = 3
@@ -286,10 +330,10 @@ accountLoop:
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
 			if lastErr != nil {
-				s.writeFailure(w, quota, quotaMsg, lastErr)
+				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 				return
 			}
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		used[plan.AccountID] = true
@@ -305,7 +349,11 @@ accountLoop:
 			continue
 		}
 
-		upBody, upPath, convertBack := s.upstreamShape(body, proto)
+		upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
+		if err != nil {
+			writeError(w, proto, http.StatusBadRequest, err.Error())
+			return
+		}
 		chatReq := upstream.ChatRequest{
 			BaseURL:   s.UpstreamBase,
 			Path:      upPath,
@@ -332,32 +380,43 @@ accountLoop:
 				var oe *upstream.OtherSiteError
 				if errors.As(err, &oe) {
 					// 跨站：不换号、不消耗 refresh token
-					writeError(w, http.StatusBadGateway, oe.Error())
+					writeError(w, proto, http.StatusBadGateway, oe.Error())
 					return
 				}
-				// 网络没通：还是这个账号，等一等再来。
+				// 网络没通：还是这个账号，等一等再来。上游没有给出
+				// 状态：这是网关自己的问题。
 				lastErr = err
-				time.Sleep(backoff(try))
+				lastStatus = 0
+				lastMsg = ""
+				if !sleepCtx(ctx, backoff(try)) {
+					break accountLoop
+				}
 				continue
 			}
 
-			// 上游没有 /responses：改用本地转换，同一个账号再来一次
-			if resp.StatusCode == http.StatusNotFound && proto == protocolCodex && s.NativeResponses.Load() {
-				s.NativeResponses.Store(false)
-				upBody, upPath, convertBack = s.upstreamShape(body, proto)
-				chatReq.Body = upBody
-				chatReq.Path = upPath
-				chatReq.Anthropic = upPath == site.MessagesPath
-				resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
-				if err != nil {
-					var oe *upstream.OtherSiteError
-					if errors.As(err, &oe) {
-						writeError(w, http.StatusBadGateway, oe.Error())
-						return
+			// 上游没有这条路：改用本地转换，同一个账号再来一次
+			if resp.StatusCode == http.StatusNotFound {
+				fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
+				if ok {
+					upBody, upPath, convertBack = fb, fp, fback
+					chatReq.Body = upBody
+					chatReq.Path = upPath
+					chatReq.Anthropic = upPath == site.MessagesPath
+					resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+					if err != nil {
+						var oe *upstream.OtherSiteError
+						if errors.As(err, &oe) {
+							writeError(w, proto, http.StatusBadGateway, oe.Error())
+							return
+						}
+						lastErr = err
+						lastStatus = 0
+						lastMsg = ""
+						if !sleepCtx(ctx, backoff(try)) {
+							break accountLoop
+						}
+						continue
 					}
-					lastErr = err
-					time.Sleep(backoff(try))
-					continue
 				}
 			}
 
@@ -370,12 +429,19 @@ accountLoop:
 			// 200 但身体里有业务错误
 			if resp.StatusCode == http.StatusOK {
 				if err := upstream.CheckEnvelope("chat", raw); err == nil {
-					s.writeJSON(w, resp, raw, proto, convertBack)
+					s.writeJSON(w, resp, raw, proto, convertBack, model)
 					return
 				}
 			}
 
 			failure := s.failure(resp.StatusCode, raw)
+			lastStatus = resp.StatusCode
+			lastMsg = failure.Message
+			if lastMsg == "" {
+				// 上游自己说的话要给客户端和运维看：只知道一个状态码，
+				// 谁也说不清到底是哪一件事坏了。
+				lastMsg = upstreamMessage(raw)
+			}
 			switch s.action(failure) {
 			case rotator.ActionFailover:
 				// 额度用完了：这个账号的窗口记成用完，换一个账号。
@@ -397,8 +463,10 @@ accountLoop:
 				if rerr != nil {
 					// 跨站：不换号、不消耗 refresh token
 					var oe *upstream.OtherSiteError
+					// 续签自己的错要看 rerr：err 是上一次尝试的，
+					// 那时候它是空的，看它永远看不出来。
 					if errors.As(rerr, &oe) {
-						writeError(w, http.StatusBadGateway, oe.Error())
+						writeError(w, proto, http.StatusBadGateway, oe.Error())
 						return
 					}
 					lastErr = rerr
@@ -417,13 +485,13 @@ accountLoop:
 				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 				quota = false
 				quotaMsg = ""
-				time.Sleep(backoff(try))
+				if !sleepCtx(ctx, backoff(try)) {
+					break accountLoop
+				}
 				continue
 			default:
-				// 给不出别的说法：上游的答案原样给客户端。
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(resp.StatusCode)
-				w.Write(raw)
+				// 给不出别的说法：上游的状态原样给客户端。
+				s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
 				return
 			}
 		}
@@ -431,7 +499,7 @@ accountLoop:
 	if lastErr == nil {
 		lastErr = fmt.Errorf("the request could not be served")
 	}
-	s.writeFailure(w, quota, quotaMsg, lastErr)
+	s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 }
 
 // failure says what went wrong upstream.
@@ -458,6 +526,37 @@ func (s *Server) failure(status int, raw []byte) rotator.Failure {
 	return f
 }
 
+// upstreamMessage reads the message out of an upstream body.
+//
+// 上游的话要看得见：客户端和运维都要知道上游说了什么，而不是只知道
+// 一个状态码。这和 rotator 读消息的办法是一样的，但那是它做决定要
+// 用的，这里只是把它说出来。
+func upstreamMessage(raw []byte) string {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	for _, key := range []string{"message", "msg"} {
+		var s string
+		if json.Unmarshal(obj[key], &s) == nil && s != "" {
+			return s
+		}
+	}
+	for _, key := range []string{"error", "err"} {
+		var sub map[string]json.RawMessage
+		if json.Unmarshal(obj[key], &sub) != nil {
+			continue
+		}
+		for _, k := range []string{"message", "msg"} {
+			var s string
+			if json.Unmarshal(sub[k], &s) == nil && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // action says what to do about the answer.
 //
 // The rotator owns the rule. The one thing it cannot know is that the
@@ -482,19 +581,40 @@ func (s *Server) action(failure rotator.Failure) rotator.Action {
 
 // writeFailure writes the answer of a request that could not be served.
 //
+// The status is the upstream's own, when the upstream gave one: a 503
+// is a 503 and a 400 is a 400. Calling both of them a 429 tells the
+// client it was sent too fast, and it backs off from a gateway that is
+// not the problem. The one that stays a 429 is the refusal about the
+// credits: that is the one the client can do something about.
+//
+// A failure with no upstream status at all is the gateway's own: the
+// request never got through, and that is a 502.
+//
 // The words the client is given are the upstream's own when it said the
 // credits are gone: "usage limit reached: …" tells the client to wait
 // and try again, which a plain error does not.
-func (s *Server) writeFailure(w http.ResponseWriter, quota bool, quotaMsg string, err error) {
+func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool, quotaMsg string, status int, message string, err error) {
 	if quota {
-		message := quotaMsg
-		if message == "" {
-			message = "the account's credits or plan are used up"
+		msg := quotaMsg
+		if msg == "" {
+			msg = "the account's credits or plan are used up"
 		}
-		writeRateLimit(w, message)
+		writeRateLimit(w, proto, msg)
 		return
 	}
-	writeError(w, http.StatusTooManyRequests, err.Error())
+	if status == 0 {
+		// 上游没有给出状态：网络没通。这是网关自己的问题。
+		msg := "the request did not get through"
+		if err != nil {
+			msg = err.Error()
+		}
+		writeError(w, proto, http.StatusBadGateway, msg)
+		return
+	}
+	if message == "" {
+		message = fmt.Sprintf("the upstream answered with HTTP %d", status)
+	}
+	writeError(w, proto, status, message)
 }
 
 // attempt sends the request upstream and gives the answer back.
@@ -602,25 +722,70 @@ func sseHasError(head []byte) bool {
 
 // upstreamShape gives the request the upstream is to get.
 //
-// Anthropic and OpenAI go through untouched: the site speaks both. The
-// Responses protocol is turned into the Anthropic one, unless the site
-// has shown it speaks Responses itself.
-func (s *Server) upstreamShape(body []byte, proto protocol) (out []byte, path string, convertBack bool) {
+// Anthropic goes through untouched: the site speaks it. The OpenAI and
+// the Responses protocols go through untouched as long as the site is
+// thought to speak them; when the site says it does not have them (a
+// 404), the request is turned into an Anthropic one and the answer is
+// turned back afterwards.
+func (s *Server) upstreamShape(body []byte, proto protocol) (out []byte, path string, convertBack bool, err error) {
 	switch proto {
 	case protocolAnthropic:
-		return body, site.MessagesPath, false
+		return body, site.MessagesPath, false, nil
 	case protocolOpenAI:
-		return body, site.ChatCompletionsPath, false
+		if s.NativeChatCompletions.Load() {
+			return body, site.ChatCompletionsPath, false, nil
+		}
+		b, cerr := convert.ToAnthropicOpenAI(body)
+		if cerr != nil {
+			return nil, "", false, fmt.Errorf("the request could not be turned into the upstream's format: %w", cerr)
+		}
+		return b, site.MessagesPath, true, nil
 	default:
 		if s.NativeResponses.Load() {
-			return body, site.ResponsesPath, false
+			return body, site.ResponsesPath, false, nil
 		}
-		b, err := convert.ToAnthropic(body)
-		if err != nil {
-			return body, site.ResponsesPath, false
+		b, cerr := convert.ToAnthropic(body)
+		if cerr != nil {
+			return nil, "", false, fmt.Errorf("the request could not be turned into the upstream's format: %w", cerr)
 		}
-		return b, site.MessagesPath, true
+		return b, site.MessagesPath, true, nil
 	}
+}
+
+// fallbackShape gives the shape to use when the upstream does not have
+// the path the request went out to.
+//
+// The site may well serve /chat/completions and /responses itself, and
+// that is the better way: nothing is converted and nothing is lost.
+// When it answers a 404 instead, the path is closed for everybody and
+// the request is turned into an Anthropic one; the answer is turned
+// back afterwards.
+//
+// The path the request went out to is what decides: a request that
+// already went out as an Anthropic one has no fallback left, and its
+// 404 is the upstream's own answer.
+func (s *Server) fallbackShape(body []byte, proto protocol, path string) (out []byte, newPath string, convertBack bool, ok bool) {
+	switch proto {
+	case protocolCodex:
+		if path != site.ResponsesPath {
+			return nil, "", false, false
+		}
+		// 上游说它没有 /responses：这条路就关掉了。
+		s.NativeResponses.Store(false)
+	case protocolOpenAI:
+		if path != site.ChatCompletionsPath {
+			return nil, "", false, false
+		}
+		// 上游说它没有 /chat/completions：这条路就关掉了。
+		s.NativeChatCompletions.Store(false)
+	default:
+		return nil, "", false, false
+	}
+	b, p, back, err := s.upstreamShape(body, proto)
+	if err != nil {
+		return nil, "", false, false
+	}
+	return b, p, back, true
 }
 
 // copyHeaders gives the client's the upstream's headers.
@@ -657,9 +822,14 @@ func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto p
 
 	var err error
 	if convertBack {
-		// 转换器自己收尾：它失败的时候已经写了一个 response.failed，
+		// 转换器自己收尾：它失败的时候已经写了一个失败事件，
 		// 网关再写一个就是第二次失败，形状还不一样。
-		err = convert.StreamResponses(resp.Body, w, model)
+		switch proto {
+		case protocolCodex:
+			err = convert.StreamResponses(resp.Body, w, model)
+		case protocolOpenAI:
+			err = convert.StreamChatCompletions(resp.Body, w, model)
+		}
 	} else {
 		sniffer := &idSniffer{w: w}
 		_, err = io.Copy(sniffer, resp.Body)
@@ -747,11 +917,11 @@ func (s *idSniffer) responseID() string {
 var responseIDPattern = regexp.MustCompile(`"id"\s*:\s*"(resp[^"]*)"`)
 
 // writeJSON writes a whole answer to the client.
-func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []byte, proto protocol, convertBack bool) {
+func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []byte, proto protocol, convertBack bool, model string) {
 	if convertBack {
-		out, err := convertResponses(body, proto)
+		out, err := backConvert(body, proto, model)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, proto, http.StatusBadGateway, err.Error())
 			return
 		}
 		body = out
@@ -764,70 +934,42 @@ func (s *Server) writeJSON(w http.ResponseWriter, resp *http.Response, body []by
 	w.Write(body)
 }
 
-// convertResponses turns an Anthropic answer into a Responses answer.
-func convertResponses(body []byte, proto protocol) ([]byte, error) {
-	if proto != protocolCodex {
+// backConvert turns the upstream's Anthropic answer into the shape the
+// client speaks.
+//
+// The upstream answered in Anthropic because the site has no endpoint
+// of the client's own: the Codex protocol gets a Responses answer, the
+// OpenAI protocol a chat completion.
+func backConvert(body []byte, proto protocol, model string) ([]byte, error) {
+	switch proto {
+	case protocolCodex:
+		return convert.ToResponses(body, model)
+	case protocolOpenAI:
+		return convert.ToChatCompletion(body, model)
+	default:
 		return body, nil
 	}
-	var msg struct {
-		ID      string `json:"id"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(body, &msg); err != nil {
-		return nil, fmt.Errorf("the upstream's answer could not be read")
-	}
-	text := ""
-	for _, c := range msg.Content {
-		if c.Type == "text" {
-			text += c.Text
-		}
-	}
-	out := map[string]any{
-		"id":     msg.ID,
-		"object": "response",
-		"status": "completed",
-		"output": []any{map[string]any{
-			"type": "message", "role": "assistant",
-			"content": []any{map[string]any{"type": "output_text", "text": text}},
-		}},
-		"output_text": text,
-	}
-	return json.Marshal(out)
 }
 
 // handleModels serves the model list.
+//
+// The list is the built-in one. The site's own model endpoint answers
+// the shape of the provider config and not the shape of a model list,
+// so the live list was never read: it was fetched on every call and
+// thrown away, and it could even renew a token on the way.
+//
+// 现场的模型列表不在这个网关的活儿里：网关给的是它自己知道的那一份。
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	var access string
-	accounts, err := s.Store.ListAccounts(r.Context())
-	if err == nil && len(accounts) > 0 {
-		if tok, err := s.Mgr.Token(r.Context(), accounts[0].ID); err == nil {
-			access = tok.Access
-		}
-	}
-	raw, err := s.Mgr.Up.Models(r.Context(), s.UpstreamBase, access)
-	if err != nil || len(raw) == 0 {
-		raw = nil
-	}
-	var out struct {
-		Data []map[string]any `json:"data"`
-	}
-	if raw != nil {
-		json.Unmarshal(raw, &out)
-	}
-	if len(out.Data) == 0 {
-		for _, m := range site.FallbackModels() {
-			out.Data = append(out.Data, map[string]any{
-				"id": m.ID, "object": "model", "owned_by": "minimax",
-			})
-		}
+	data := []map[string]any{}
+	for _, m := range site.FallbackModels() {
+		data = append(data, map[string]any{
+			"id": m.ID, "object": "model", "owned_by": "minimax",
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
-		"data":   out.Data,
+		"data":   data,
 	})
 }
 
@@ -858,6 +1000,24 @@ func backoff(attempt int) time.Duration {
 		d = 4 * time.Second
 	}
 	return d
+}
+
+// sleepCtx waits, unless the request is over.
+//
+// 客户端走了就不必再等：等着只是白占着上游的次数和时间，一个请求能
+// 让九次上游调用和三十秒的睡觉一起吊着。
+//
+// It says whether the wait was over: false means the request is over
+// and nothing more should be asked upstream.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // clientHeaders gives the headers the client set that are worth

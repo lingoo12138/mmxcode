@@ -122,7 +122,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	keys := s.Cfg.Server.APIKeys
 	if len(keys) == 0 {
-		writeError(w, http.StatusBadRequest, "this gateway has no api key configured")
+		writeError(w, protocolOf(r.URL.Path), http.StatusBadRequest, "this gateway has no api key configured")
 		return
 	}
 	key := submittedKey(r)
