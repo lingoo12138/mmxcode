@@ -168,9 +168,12 @@ func Sign(origin, path string, o Options) Signed {
 	}
 	// The rest are what the web client claims about itself. The CLI
 	// sends none of them.
+	//
+	// The browser language is the one the client claims to have: the
+	// site says English and the browser behind it says English too.
 	browserLanguage := o.BrowserLanguage
 	if browserLanguage == "" {
-		browserLanguage = "en"
+		browserLanguage = "en-US"
 	}
 	browserPlatform := o.BrowserPlatform
 	if browserPlatform == "" {

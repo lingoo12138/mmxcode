@@ -482,7 +482,7 @@ func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
 		"&unix=1763000000000&timezone_offset=28800&sys_language=en&lang=en" +
 		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
 		"&os_name=Windows&browser_name=chrome&device_memory=16&cpu_core_num=16" +
-		"&browser_language=en&browser_platform=Win32&user_id=0&op_ticket=undefined" +
+		"&browser_language=en-US&browser_platform=Win32&user_id=0&op_ticket=undefined" +
 		"&screen_width=1280&screen_height=800&client=web"
 	if s.URL != want {
 		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)

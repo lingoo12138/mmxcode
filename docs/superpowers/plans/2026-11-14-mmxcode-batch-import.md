@@ -38,12 +38,12 @@ func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
 	// 是这样展开的），而 CLI 是放在中间。两边的键序不一样，签名就不一样。
 	now := int64(1763000000000)
 	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
-		Flavor:    FlavorWeb,
-		Now:       now,
-		TZOffset:  28800,
-		Query:     []KV{{K: "uuid", V: "0f8fad5b-d9cb-469f-a165-70867728950e"}},
-		UUID:      "0f8fad5b-d9cb-469f-a165-70867728950e",
-		DeviceID:  "574786429807779842",
+		Flavor:   FlavorWeb,
+		Now:      now,
+		TZOffset: 28800,
+		Query:    []KV{{K: "uuid", V: "0f8fad5b-d9cb-469f-a165-70867728950e"}},
+		UUID:     "0f8fad5b-d9cb-469f-a165-70867728950e",
+		DeviceID: "574786429807779842",
 	})
 	want := "https://account.minimax.io/oauth2/login" +
 		"?uuid=0f8fad5b-d9cb-469f-a165-70867728950e" +
@@ -51,7 +51,7 @@ func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
 		"&unix=1763000000000&timezone_offset=28800&sys_language=en&lang=en" +
 		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
 		"&os_name=Windows&browser_name=chrome&device_memory=16&cpu_core_num=16" +
-		"&browser_language=en&browser_platform=Win32&user_id=0&op_ticket=undefined" +
+		"&browser_language=en-US&browser_platform=Win32&user_id=0&op_ticket=undefined" +
 		"&screen_width=1280&screen_height=800&client=web"
 	if s.URL != want {
 		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
@@ -74,6 +74,8 @@ func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
 	if s.YY != yy {
 		t.Errorf("yy = %q, want %q", s.YY, yy)
 	}
+	// x-signature = md5(x-timestamp + secret + body), and the timestamp
+	// is in seconds — the same one the header carries.
 	sig := md5Hex("1763000000" + Secret + string(body))
 	if s.Signature != sig {
 		t.Errorf("signature = %q, want %q", s.Signature, sig)
@@ -98,6 +100,10 @@ func TestTheMCodeFlavourIsUnchanged(t *testing.T) {
 	}
 }
 ```
+
+（`x-signature` 算的是**秒**那个时间戳，不是毫秒：抓包笔记里
+`x-timestamp = floor(unix_ms / 1000)`，签名里用的是这个秒数。写成
+毫秒的话，站点会验不过。）
 
 - [ ] **Step 2: 跑测试，确认它失败**
 
@@ -138,11 +144,11 @@ const (
 	DeviceID string
 	// ScreenWidth and ScreenHeight are the screen the web client
 	// claims to have.
-	ScreenWidth int
+	ScreenWidth  int
 	ScreenHeight int
 	// DeviceMemory and CPUCores are the machine the web client claims.
 	DeviceMemory int
-	CPUCores int
+	CPUCores     int
 	// BrowserLanguage and BrowserPlatform are what the web client
 	// claims about itself.
 	BrowserLanguage string
@@ -152,80 +158,75 @@ const (
 	OpTicket string
 ```
 
-把 `Sign` 里拼 query 的那段改成两个分支：
+`params` 要多一个 `append`：网页那边是"接上去"的，同一个键可以出现两次
+（调用方的在前面，公共的在后面），而 CLI 那边是 `set`——改值但不改位置。
+把 `params` 改成一张有序的表：
 
 ```go
-	p := newParams()
-	switch o.Flavor {
-	case FlavorWeb:
-		// The web client sends the caller's own parameters first and
-		// the defaults after them. The browser's object spread is
-		// {...params, ...common}: a key that is in both keeps the
-		// caller's place and takes the common value.
-		for _, kv := range o.Query {
-			p.set(kv.K, kv.V)
-		}
-		p.set("device_platform", "web")
-		p.set("biz_id", "3")
-		p.set("app_id", "3001")
-		p.set("version_code", "22201")
-		p.set("unix", strconv.FormatInt(o.Now, 10))
-		p.set("timezone_offset", strconv.Itoa(o.TZOffset))
-		p.set("sys_language", lang)
-		p.set("lang", lang)
-		p.set("uuid", o.UUID)
-		p.set("device_id", o.DeviceID)
-		p.set("os_name", osName)
-		p.set("browser_name", "chrome")
-		p.set("device_memory", strconv.Itoa(o.DeviceMemory))
-		p.set("cpu_core_num", strconv.Itoa(o.CPUCores))
-		p.set("browser_language", browserLanguage)
-		p.set("browser_platform", browserPlatform)
-		p.set("user_id", jsTrim(o.UserID))
-		p.set("op_ticket", o.OpTicket)
-		p.set("screen_width", strconv.Itoa(o.ScreenWidth))
-		p.set("screen_height", strconv.Itoa(o.ScreenHeight))
-		p.set("client", "web")
-	default:
-		// The CLI puts the caller's parameters in the middle and the
-		// defaults around them. That is what the reference does, and
-		// the order is part of the signature.
-		p.set("device_platform", "mcode")
-		p.set("biz_id", "3")
-		p.set("app_id", "3001")
-		p.set("version_code", "22201")
-		for _, kv := range o.Query {
-			p.set(kv.K, kv.V)
-		}
-		p.set("unix", strconv.FormatInt(o.Now, 10))
-		p.set("timezone_offset", strconv.Itoa(o.TZOffset))
-		p.set("sys_language", lang)
-		p.set("lang", lang)
-		p.set("device_id", "0")
-		p.set("os_name", osName)
-		p.set("browser_name", "mcode")
-		p.set("user_id", jsTrim(o.UserID))
-		if p.get("user_id") == "" {
-			p.set("user_id", "0")
-		}
-		p.set("client", "mcode")
+// params is an ordered query parameter set: setting a key that is
+// already there changes its value and keeps its place, and appending a
+// key puts it there a second time, further down.
+type params struct {
+	entries []KV
+	// index is where a key's value is set, so that setting a key again
+	// changes its value and keeps its place.
+	index map[string]int
+}
+
+func newParams() *params {
+	return &params{index: map[string]int{}}
+}
+
+func (p *params) set(k, v string) {
+	if i, ok := p.index[k]; ok {
+		p.entries[i].V = v
+		return
 	}
+	p.index[k] = len(p.entries)
+	p.entries = append(p.entries, KV{K: k, V: v})
+}
+
+// append puts the key at the end, even when it is already there.
+//
+// The web client builds its query by appending: the caller's own
+// parameters first and the common ones after them, so a key that is in
+// both is in the query twice.
+func (p *params) append(k, v string) {
+	p.entries = append(p.entries, KV{K: k, V: v})
+}
+
+func (p *params) get(k string) string {
+	if i, ok := p.index[k]; ok {
+		return p.entries[i].V
+	}
+	return ""
+}
+
+func (p *params) encode() string {
+	var b strings.Builder
+	for i, e := range p.entries {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(formEncode(e.K))
+		b.WriteByte('=')
+		b.WriteString(formEncode(e.V))
+	}
+	return b.String()
+}
 ```
 
-在 `Sign` 的开头（`lang` / `osName` 那几行旁边）加网页那套默认值：
+在 `Sign` 的开头（`lang` 那几行旁边）加网页那套默认值：
 
 ```go
-	lang := o.Lang
-	if lang == "" {
-		lang = site.Lang
-	}
-	osName := o.OSName
-	if osName == "" {
-		osName = "linux"
-	}
+	// The rest are what the web client claims about itself. The CLI
+	// sends none of them.
+	//
+	// The browser language is the one the client claims to have: the
+	// site says English and the browser behind it says English too.
 	browserLanguage := o.BrowserLanguage
 	if browserLanguage == "" {
-		browserLanguage = "en"
+		browserLanguage = "en-US"
 	}
 	browserPlatform := o.BrowserPlatform
 	if browserPlatform == "" {
@@ -248,14 +249,86 @@ const (
 		screenHeight = 800
 	}
 	opTicket := o.OpTicket
-	if o.Flavor == FlavorWeb && opTicket == "" {
+	if opTicket == "" {
 		// The browser sends the word "undefined" before signing in:
 		// the ticket is not in the session yet.
 		opTicket = "undefined"
 	}
 ```
 
-（网页那一支里 `os_name` 的默认值也要跟着走：`if osName == "" { osName = "Windows" }`——只在网页那一支改，CLI 那边还是 "linux"。写的时候把 `osName` 的默认值挪进分支里，CLI 分支保持 "linux"。）
+把 `Sign` 里拼 query 的那段改成两个分支：
+
+```go
+	p := newParams()
+	switch o.Flavor {
+	case FlavorWeb:
+		// The web client sends the caller's own parameters first and
+		// the common ones after them, so a key that is in both is in
+		// the query twice.
+		osName := o.OSName
+		if osName == "" {
+			osName = "Windows"
+		}
+		userID := jsTrim(o.UserID)
+		if userID == "" {
+			userID = "0"
+		}
+		for _, kv := range o.Query {
+			p.append(kv.K, kv.V)
+		}
+		p.append("device_platform", "web")
+		p.append("biz_id", "3")
+		p.append("app_id", "3001")
+		p.append("version_code", "22201")
+		p.append("unix", strconv.FormatInt(o.Now, 10))
+		p.append("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.append("sys_language", lang)
+		p.append("lang", lang)
+		p.append("uuid", o.UUID)
+		p.append("device_id", o.DeviceID)
+		p.append("os_name", osName)
+		p.append("browser_name", "chrome")
+		p.append("device_memory", strconv.Itoa(deviceMemory))
+		p.append("cpu_core_num", strconv.Itoa(cpuCores))
+		p.append("browser_language", browserLanguage)
+		p.append("browser_platform", browserPlatform)
+		p.append("user_id", userID)
+		p.append("op_ticket", opTicket)
+		p.append("screen_width", strconv.Itoa(screenWidth))
+		p.append("screen_height", strconv.Itoa(screenHeight))
+		p.append("client", "web")
+	default:
+		// The CLI puts the caller's parameters in the middle and the
+		// defaults around them. That is what the reference does, and
+		// the order is part of the signature.
+		osName := o.OSName
+		if osName == "" {
+			osName = "linux"
+		}
+		p.set("device_platform", "mcode")
+		p.set("biz_id", "3")
+		p.set("app_id", "3001")
+		p.set("version_code", "22201")
+		for _, kv := range o.Query {
+			p.set(kv.K, kv.V)
+		}
+		p.set("unix", strconv.FormatInt(o.Now, 10))
+		p.set("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.set("sys_language", lang)
+		p.set("lang", lang)
+		p.set("device_id", "0")
+		p.set("os_name", osName)
+		p.set("browser_name", "mcode")
+		p.set("user_id", jsTrim(o.UserID))
+		if p.get("user_id") == "" {
+			p.set("user_id", "0")
+		}
+		p.set("client", "mcode")
+	}
+```
+
+（`os_name` 的默认值分在两个分支里：网页是 "Windows"，CLI 还是
+"linux"。CLI 那一支一个字都不能变——原有的向量测试是它的契约。）
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
