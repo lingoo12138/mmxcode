@@ -49,6 +49,9 @@ func newServeCmd(e *env) *cobra.Command {
 			// 密钥有问题的时候导入要停下来：悄悄把密码丢掉，会留下
 			// 一库谁也登不回去的账号。
 			keeper, keeperErr := passwordKeeper(false)
+			// 没有密钥，密码就不入库。页面上得说清楚：账号掉线以后
+			// 没有人能自己登回去，人得知道这件事。
+			ui.PasswordNote = passwordNote(keeper, keeperErr)
 			ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
 				if keeperErr != nil {
 					return nil, keeperErr
@@ -96,6 +99,18 @@ func newServeCmd(e *env) *cobra.Command {
 			return srv.Shutdown(shutCtx)
 		},
 	}
+}
+
+// passwordNote says what happens to the passwords, when they are not
+// kept.
+//
+// 没有密钥的时候密码就不入库，页面上得说清楚：账号掉线以后没有人能
+// 自己登回去。密钥有问题的时候导入自己就停了，页面不用多说。
+func passwordNote(keeper func(string) (string, error), keeperErr error) string {
+	if keeperErr != nil || keeper != nil {
+		return ""
+	}
+	return "密码没有存进库里（没有 " + PasswordKeyEnv + "）：账号掉线以后没有人能自己登回去。"
 }
 
 // isLoopback says a listen address is only on this machine.

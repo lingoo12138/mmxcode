@@ -945,3 +945,22 @@ func TestTheReloginPageHasNoCipherText(t *testing.T) {
 		t.Fatalf("the stored password is on the page: %q", rec.Body.String())
 	}
 }
+
+// TestTheImportPageSaysThePasswordsAreNotKept says the import page
+// says so when the passwords are not kept.
+//
+// 没有密钥的时候密码不入库。页面上一个字都不说，人就以为每个账号以
+// 后都能自己登回去——账号掉线的时候才知道，那时已经晚了。
+func TestTheImportPageSaysThePasswordsAreNotKept(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	w.PasswordNote = "密码没有存进库里（没有 MMXCODE_PASSWORD_KEY）。"
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}

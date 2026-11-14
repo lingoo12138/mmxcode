@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
 	"path/filepath"
@@ -180,5 +182,33 @@ func serveEnv(t *testing.T, cfg config.Config) *env {
 		egr:   egr,
 		acc:   acc,
 		mgr:   manager.New(s, up, acc, egr, oauth.NewRenewer()),
+	}
+}
+
+func TestTheWebPathSaysThePasswordsAreNotKept(t *testing.T) {
+	// 没有密钥的时候，页面上得说密码没有存下来：不然人以为账号以后能
+	// 自己登回去。
+	t.Setenv(PasswordKeyEnv, "")
+	keeper, err := passwordKeeper(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := passwordNote(keeper, err)
+	if note == "" {
+		t.Fatal("no note about the passwords")
+	}
+	if !strings.Contains(note, PasswordKeyEnv) {
+		t.Fatalf("note = %q, want it to name the key", note)
+	}
+}
+
+func TestTheWebPathSaysNothingWhenThePasswordsAreKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	keeper, err := passwordKeeper(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note := passwordNote(keeper, err); note != "" {
+		t.Fatalf("note = %q, want none", note)
 	}
 }

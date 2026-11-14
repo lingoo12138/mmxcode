@@ -1,6 +1,9 @@
 {{define "content"}}
 <section>
   <h1>批量导入</h1>
+  {{if .PasswordNote}}
+    <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
+  {{end}}
   {{if .UploadOpen}}
     <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
     <form id="import-form" enctype="multipart/form-data">

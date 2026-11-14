@@ -6003,6 +6003,14 @@ Expected: FAIL
 	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
 	// Relogin signs the accounts that are signed out in again.
 	Relogin func(ctx context.Context) (fixed, failed int)
+	// PasswordNote says what happens to the passwords of the accounts
+	// that are brought in.
+	//
+	// It is empty when the passwords are kept. When they are not, the
+	// page has to say so: an account whose password was thrown away
+	// cannot sign itself back in, and the person has to know that
+	// before the account drops out.
+	PasswordNote string
 ```
 
 2. 路由。在 `ServeHTTP` 的页面那一段里加：
@@ -6039,8 +6047,9 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	return map[string]any{
-		"UploadOpen": len(w.Cfg.Server.APIKeys) == 0,
-		"Runs":       runs,
+		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
+		"Runs":         runs,
+		"PasswordNote": w.PasswordNote,
 	}, nil
 }
 
@@ -6148,6 +6157,9 @@ key 的网关不开上传，那边就不该有这个链接：
 {{define "content"}}
 <section>
   <h1>批量导入</h1>
+  {{if .PasswordNote}}
+    <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
+  {{end}}
   {{if .UploadOpen}}
     <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
     <form id="import-form" enctype="multipart/form-data">
@@ -6414,7 +6426,10 @@ func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
 
 ```go
 			ui := webui.New(e.mgr, e.cfg, e.store)
-			keeper, _ := passwordKeeper(false)
+			keeper, keeperErr := passwordKeeper(false)
+			// 没有密钥，密码就不入库。页面上得说清楚：账号掉线以后
+			// 没有人能自己登回去，人得知道这件事。
+			ui.PasswordNote = passwordNote(keeper, keeperErr)
 			ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
 				runner := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
 				return runner.Run(ctx, entries)
@@ -6425,6 +6440,22 @@ func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
 ```
 
 （`provision` 要 import。）
+
+再加一个函数，说清楚密码的去处：
+
+```go
+// passwordNote says what happens to the passwords, when they are not
+// kept.
+//
+// 没有密钥的时候密码就不入库，页面上得说清楚：账号掉线以后没有人能
+// 自己登回去。密钥有问题的时候导入自己就停了，页面不用多说。
+func passwordNote(keeper func(string) (string, error), keeperErr error) string {
+	if keeperErr != nil || keeper != nil {
+		return ""
+	}
+	return "密码没有存进库里（没有 " + PasswordKeyEnv + "）：账号掉线以后没有人能自己登回去。"
+}
+```
 
 - [ ] **Step 4: 跑测试，确认它过了**
 

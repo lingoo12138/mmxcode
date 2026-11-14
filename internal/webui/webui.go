@@ -79,6 +79,14 @@ type WebUI struct {
 	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
 	// Relogin signs the accounts that are signed out in again.
 	Relogin func(ctx context.Context) (fixed, failed int)
+	// PasswordNote says what happens to the passwords of the accounts
+	// that are brought in.
+	//
+	// It is empty when the passwords are kept. When they are not, the
+	// page has to say so: an account whose password was thrown away
+	// cannot sign itself back in, and the person has to know that
+	// before the account drops out.
+	PasswordNote string
 
 	tmpl    *template.Template
 	mu      sync.Mutex
@@ -758,8 +766,9 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	return map[string]any{
-		"UploadOpen": len(w.Cfg.Server.APIKeys) == 0,
-		"Runs":       runs,
+		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
+		"Runs":         runs,
+		"PasswordNote": w.PasswordNote,
 	}, nil
 }
 
