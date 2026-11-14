@@ -77,9 +77,9 @@ type Options struct {
 	Body []byte
 	// Query holds the caller's extra query parameters, in order.
 	//
-	// The reference builds its query as an object literal with the
-	// caller's query spread into the middle of it, and the two halves
-	// do not treat a repeated key the same way:
+	// The CLI builds its query as an object literal with the caller's
+	// query spread into the middle of it, and the two halves do not
+	// treat a repeated key the same way:
 	//
 	//   - the four leading defaults — device_platform, biz_id, app_id
 	//     and version_code — come before the spread, so a repeated key
@@ -90,9 +90,13 @@ type Options struct {
 	//     takes the reference's value. "lang" and "client" are the
 	//     reference's, "user_id" is the option's.
 	//
-	// The web client builds its query the other way round: the caller's
-	// query comes first and the common ones after it, so a key that is
-	// in both is in the query twice.
+	// The web client builds its query the other way round. It fills a
+	// URLSearchParams: the common parameters go in first and the
+	// caller's own parameter is appended after them. A key that is in
+	// both halves is therefore in the query twice, and the parsers the
+	// site uses — url.Values.Get, URLSearchParams.get, Java's
+	// getParameter — take the first one they see, so for the web
+	// flavour it is the common block's value that counts.
 	Query []KV
 	// Now is the request's time in Unix milliseconds.
 	//
@@ -166,48 +170,19 @@ func Sign(origin, path string, o Options) Signed {
 	if lang == "" {
 		lang = site.Lang
 	}
-	// The rest are what the web client claims about itself. The CLI
-	// sends none of them.
-	//
-	// The browser language is the one the client claims to have: the
-	// site says English and the browser behind it says English too.
-	browserLanguage := o.BrowserLanguage
-	if browserLanguage == "" {
-		browserLanguage = "en-US"
-	}
-	browserPlatform := o.BrowserPlatform
-	if browserPlatform == "" {
-		browserPlatform = "Win32"
-	}
-	deviceMemory := o.DeviceMemory
-	if deviceMemory == 0 {
-		deviceMemory = 16
-	}
-	cpuCores := o.CPUCores
-	if cpuCores == 0 {
-		cpuCores = 16
-	}
-	screenWidth := o.ScreenWidth
-	if screenWidth == 0 {
-		screenWidth = 1280
-	}
-	screenHeight := o.ScreenHeight
-	if screenHeight == 0 {
-		screenHeight = 800
-	}
-	opTicket := o.OpTicket
-	if opTicket == "" {
-		// The browser sends the word "undefined" before signing in:
-		// the ticket is not in the session yet.
-		opTicket = "undefined"
-	}
 
 	p := newParams()
 	switch o.Flavor {
 	case FlavorWeb:
-		// The web client sends the caller's own parameters first and
-		// the common ones after them, so a key that is in both is in
-		// the query twice.
+		// The web client fills a URLSearchParams: the common parameters
+		// go in first and the caller's own parameter is appended after
+		// them. A key that is in both halves is in the query twice, and
+		// the usual parsers — url.Values.Get, URLSearchParams.get,
+		// Java's getParameter — take the first one they see, so it is
+		// the common block's value that counts here.
+		//
+		// The rest are what the web client claims about itself. The CLI
+		// sends none of them.
 		osName := o.OSName
 		if osName == "" {
 			osName = "Windows"
@@ -216,8 +191,38 @@ func Sign(origin, path string, o Options) Signed {
 		if userID == "" {
 			userID = "0"
 		}
-		for _, kv := range o.Query {
-			p.append(kv.K, kv.V)
+		// The browser language is the one the client claims to have:
+		// the site says English and the browser behind it says English
+		// too.
+		browserLanguage := o.BrowserLanguage
+		if browserLanguage == "" {
+			browserLanguage = "en-US"
+		}
+		browserPlatform := o.BrowserPlatform
+		if browserPlatform == "" {
+			browserPlatform = "Win32"
+		}
+		deviceMemory := o.DeviceMemory
+		if deviceMemory == 0 {
+			deviceMemory = 16
+		}
+		cpuCores := o.CPUCores
+		if cpuCores == 0 {
+			cpuCores = 16
+		}
+		screenWidth := o.ScreenWidth
+		if screenWidth == 0 {
+			screenWidth = 1280
+		}
+		screenHeight := o.ScreenHeight
+		if screenHeight == 0 {
+			screenHeight = 800
+		}
+		opTicket := o.OpTicket
+		if opTicket == "" {
+			// The browser sends the word "undefined" before signing in:
+			// the ticket is not in the session yet.
+			opTicket = "undefined"
 		}
 		p.append("device_platform", "web")
 		p.append("biz_id", "3")
@@ -240,6 +245,9 @@ func Sign(origin, path string, o Options) Signed {
 		p.append("screen_width", strconv.Itoa(screenWidth))
 		p.append("screen_height", strconv.Itoa(screenHeight))
 		p.append("client", "web")
+		for _, kv := range o.Query {
+			p.append(kv.K, kv.V)
+		}
 	default:
 		// The CLI puts the caller's parameters in the middle and the
 		// defaults around them. That is what the reference does, and
@@ -386,11 +394,17 @@ func (p *params) set(k, v string) {
 
 // append puts the key at the end, even when it is already there.
 //
-// The web client builds its query by appending: the caller's own
-// parameters first and the common ones after them, so a key that is in
-// both is in the query twice.
+// The web client builds its query by filling a URLSearchParams: the
+// common parameters go in first and the caller's own parameter is
+// appended after them, so a key that is in both halves is in the query
+// twice.
+//
+// The key is registered in the index as well, so that get sees the most
+// recent value and set changes the appended entry in place instead of
+// appending a third copy of it.
 func (p *params) append(k, v string) {
 	p.entries = append(p.entries, KV{K: k, V: v})
+	p.index[k] = len(p.entries) - 1
 }
 
 func (p *params) get(k string) string {

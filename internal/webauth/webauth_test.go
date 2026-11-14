@@ -32,10 +32,17 @@ func newFakeSite(t *testing.T) *fakeSite {
 				t.Errorf("the device registration is not signed")
 			}
 			// The device registration is the one call whose own query
-			// is the uuid, and the web client puts the caller's query
-			// in front (design document 3.2).
-			if !strings.HasPrefix(r.URL.RawQuery, "uuid=") {
-				t.Errorf("the device registration query = %q, want it to start with the uuid", r.URL.RawQuery)
+			// is the uuid. The web client puts the common parameters
+			// first and the caller's own parameter after them, so the
+			// query ends with the uuid — which is in the common block
+			// as well, mid-list (design document 3.2).
+			parts := strings.Split(r.URL.RawQuery, "&")
+			last := parts[len(parts)-1]
+			if !strings.HasPrefix(last, "uuid=") {
+				t.Errorf("the device registration query = %q, want it to end with the uuid", r.URL.RawQuery)
+			}
+			if n := strings.Count(r.URL.RawQuery, "uuid="); n != 2 {
+				t.Errorf("the device registration query has %d uuid parameters, want 2: %q", n, r.URL.RawQuery)
 			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"deviceIDStr": f.deviceID},

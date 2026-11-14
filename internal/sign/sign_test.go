@@ -464,9 +464,11 @@ func TestFormEncodeMatchesJS(t *testing.T) {
 	}
 }
 
-func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
-	// 网页把公共 query 放在调用方的 query 后面（JS 的 {...params, ...common}
-	// 是这样展开的），而 CLI 是放在中间。两边的键序不一样，签名就不一样。
+// The web flavour puts the common parameters first and the caller's own
+// parameter after them, the way the browser fills a URLSearchParams.
+// A key that is in both halves is in the query twice, and the parsers
+// take the first one they see, so the common block's value counts.
+func TestTheWebFlavorSignsItsOwnQuery(t *testing.T) {
 	now := int64(1763000000000)
 	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
 		Flavor:   FlavorWeb,
@@ -477,20 +479,57 @@ func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
 		DeviceID: "574786429807779842",
 	})
 	want := "https://account.minimax.io/oauth2/login" +
-		"?uuid=0f8fad5b-d9cb-469f-a165-70867728950e" +
-		"&device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+		"?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
 		"&unix=1763000000000&timezone_offset=28800&sys_language=en&lang=en" +
 		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
 		"&os_name=Windows&browser_name=chrome&device_memory=16&cpu_core_num=16" +
 		"&browser_language=en-US&browser_platform=Win32&user_id=0&op_ticket=undefined" +
-		"&screen_width=1280&screen_height=800&client=web"
+		"&screen_width=1280&screen_height=800&client=web" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e"
 	if s.URL != want {
 		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
 	}
 }
 
-func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
-	// 签的就是发的：把 URL 拿来重算一遍 yy 和 x-signature，两个都要对得上。
+// Every option the web flavour has, set to something other than its
+// default, so that a field that is wired up wrong — the screen's width
+// and height swapped, say — cannot hide behind a default.
+func TestTheWebFlavorSignsEveryOption(t *testing.T) {
+	now := int64(1763000000000)
+	s := Sign("https://account.minimax.io", "/v1/api/user/device/register", Options{
+		Flavor:          FlavorWeb,
+		Now:             now,
+		TZOffset:        -18000,
+		Lang:            "zh",
+		OSName:          "macOS",
+		BrowserLanguage: "zh-CN",
+		BrowserPlatform: "MacIntel",
+		ScreenWidth:     2560,
+		ScreenHeight:    1440,
+		DeviceMemory:    32,
+		CPUCores:        10,
+		OpTicket:        "ticket-1",
+		UUID:            "0f8fad5b-d9cb-469f-a165-70867728950e",
+		DeviceID:        "574786429807779842",
+		UserID:          "9876543210",
+		Query:           []KV{{K: "uuid", V: "0f8fad5b-d9cb-469f-a165-70867728950e"}},
+	})
+	want := "https://account.minimax.io/v1/api/user/device/register" +
+		"?device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+		"&unix=1763000000000&timezone_offset=-18000&sys_language=zh&lang=zh" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
+		"&os_name=macOS&browser_name=chrome&device_memory=32&cpu_core_num=10" +
+		"&browser_language=zh-CN&browser_platform=MacIntel&user_id=9876543210&op_ticket=ticket-1" +
+		"&screen_width=2560&screen_height=1440&client=web" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e"
+	if s.URL != want {
+		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
+	}
+}
+
+func TestTheWebFlavorSignsWhatItSends(t *testing.T) {
+	// The signature is over what is sent: take the URL and work the two
+	// hashes out of it again, and both have to come out the same.
 	now := int64(1763000000000)
 	body := []byte(`{"loginType":"20","email":"a@example.com"}`)
 	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
@@ -513,20 +552,110 @@ func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
 	}
 }
 
-func TestTheMCodeFlavourIsUnchanged(t *testing.T) {
-	// CLI 那套不能动：调用方的 query 在中间，device_platform 是 mcode。
-	now := int64(1763000000000)
-	s := Sign("https://account.minimax.io", "/v1/api/user/identity", Options{
-		Now:      now,
-		TZOffset: 0,
-		Query:    []KV{{K: "group_id", V: "g1"}},
-	})
-	if !strings.Contains(s.URL, "device_platform=mcode") ||
-		!strings.Contains(s.URL, "browser_name=mcode") ||
-		!strings.Contains(s.URL, "client=mcode") {
-		t.Fatalf("url = %s", s.URL)
+// The CLI branch is the contract the six golden vectors depend on, so
+// it has to stay exactly as it was: the same output as when the flavor
+// is left unset, and none of the web's parameters.
+func TestTheMCodeFlavorIsUnchanged(t *testing.T) {
+	opts := Options{
+		Access: "tok_1", UserID: "1234567890",
+		Now: 1763000000000, TZOffset: -480, OSName: "linux",
+		Query: []KV{{K: "group_id", V: "g1"}},
 	}
-	if strings.Contains(s.URL, "device_platform=web") {
-		t.Fatalf("url = %s", s.URL)
+	unset := Sign("https://account.minimax.io", "/v1/api/user/identity", opts)
+	opts.Flavor = FlavorMCode
+	explicit := Sign("https://account.minimax.io", "/v1/api/user/identity", opts)
+	if explicit.URL != unset.URL {
+		t.Errorf("url =\n%s\nwant\n%s", explicit.URL, unset.URL)
+	}
+	if explicit.YY != unset.YY {
+		t.Errorf("yy = %s, want %s", explicit.YY, unset.YY)
+	}
+	if explicit.Signature != unset.Signature {
+		t.Errorf("signature = %s, want %s", explicit.Signature, unset.Signature)
+	}
+	// The CLI sends none of the web client's own parameters.
+	for _, key := range []string{
+		"browser_language=", "browser_platform=", "screen_width=",
+		"screen_height=", "device_memory=", "cpu_core_num=", "op_ticket=",
+	} {
+		if strings.Contains(explicit.URL, key) {
+			t.Errorf("the CLI's query carries the web's %s: %s", key, explicit.URL)
+		}
+	}
+}
+
+// The parameter set is ordered: setting a key that is already there
+// changes its value and keeps its place, and appending a key puts it
+// there a second time, further down.
+func TestParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		steps      []func(p *params)
+		wantEncode string
+		wantGet    map[string]string
+	}{
+		{
+			name: "setting a key twice leaves one entry in its place",
+			steps: []func(p *params){
+				func(p *params) { p.set("a", "1") },
+				func(p *params) { p.set("b", "2") },
+				func(p *params) { p.set("a", "3") },
+			},
+			wantEncode: "a=3&b=2",
+			wantGet:    map[string]string{"a": "3", "b": "2"},
+		},
+		{
+			name: "appending a key twice leaves two entries",
+			steps: []func(p *params){
+				func(p *params) { p.append("a", "1") },
+				func(p *params) { p.append("a", "2") },
+			},
+			wantEncode: "a=1&a=2",
+			wantGet:    map[string]string{"a": "2"},
+		},
+		{
+			name: "setting an appended key changes the appended one",
+			steps: []func(p *params){
+				func(p *params) { p.append("a", "1") },
+				func(p *params) { p.append("b", "2") },
+				func(p *params) { p.set("a", "3") },
+			},
+			wantEncode: "a=3&b=2",
+			wantGet:    map[string]string{"a": "3"},
+		},
+		{
+			name: "the entries come out in the order they went in",
+			steps: []func(p *params){
+				func(p *params) { p.set("z", "1") },
+				func(p *params) { p.set("a", "2") },
+				func(p *params) { p.append("m", "3") },
+			},
+			wantEncode: "z=1&a=2&m=3",
+			wantGet:    map[string]string{"z": "1", "a": "2", "m": "3"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := newParams()
+			for _, step := range c.steps {
+				step(p)
+			}
+			if got := p.encode(); got != c.wantEncode {
+				t.Errorf("encode = %q, want %q", got, c.wantEncode)
+			}
+			for k, want := range c.wantGet {
+				if got := p.get(k); got != want {
+					t.Errorf("get(%q) = %q, want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// A key that was never set has no value.
+func TestParamsGetOfAMissingKey(t *testing.T) {
+	p := newParams()
+	if got := p.get("nothing"); got != "" {
+		t.Errorf("get = %q, want an empty string", got)
 	}
 }
