@@ -17,7 +17,8 @@ async function readAnswer(res) {
   const text = await res.text();
   const type = (res.headers.get('Content-Type') || '').toLowerCase();
   let json = null;
-  if (type.indexOf('json') >= 0) {
+  // 没有 Content-Type 的回答也试一下：中间的一层代理可能把它拿掉了。
+  if (type.indexOf('json') >= 0 || type === '') {
     try {
       json = JSON.parse(text);
     } catch (e) {
