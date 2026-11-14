@@ -276,8 +276,102 @@ func TestALostConnectionIsTriedAgain(t *testing.T) {
 	if !errors.As(err, &pe) {
 		t.Fatalf("err = %v", err)
 	}
-	if !pe.Retry || pe.Wait <= 0 {
+	if !pe.Retry {
 		t.Fatalf("err = %+v", pe)
+	}
+	// 等多久是标准退避的事（1s、4s），不是这一处说了算。
+	if pe.Wait != 0 {
+		t.Fatalf("wait = %v, want the standard backoff", pe.Wait)
+	}
+}
+
+func TestALostConnectionWhilePollingIsTriedAgain(t *testing.T) {
+	// 轮询的时候连接断了，跟前面几步的连接断了是一回事：再来一次。
+	c := &Chain{}
+	err := c.pollError(errors.New("device token: connection reset"))
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if !pe.Retry {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestARefusedDeviceCodeIsNotTriedAgain(t *testing.T) {
+	// 设备码过期了，或者站点不让这个码进来：再来一次也是这个答案。
+	for _, code := range []string{"expired_token", "access_denied"} {
+		c := &Chain{}
+		err := c.pollError(&oauth.Error{Code: code, What: oauth.WhatSignIn})
+
+		var pe *Error
+		if !errors.As(err, &pe) {
+			t.Fatalf("err = %v", err)
+		}
+		if pe.Retry {
+			t.Fatalf("%s: err = %+v, want it not to be tried again", code, pe)
+		}
+	}
+}
+
+func TestASiteThatIsLimitingIsWaitedFor(t *testing.T) {
+	// 429：等久一点再来一次，试一次就够。
+	c := &Chain{}
+	err := c.pollError(&oauth.Error{Code: "too_many_requests", HTTPStatus: 429, What: oauth.WhatSignIn})
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if !pe.Retry || pe.Wait != 30*time.Second || pe.Tries != 2 {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestACancelledPollIsNotTriedAgain(t *testing.T) {
+	// 上下文没了：再试也是白试。
+	c := &Chain{}
+	err := c.pollError(context.Canceled)
+
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if pe.Retry {
+		t.Fatalf("err = %+v", pe)
+	}
+}
+
+func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
+	// 轮询时的一次连接断了，整个链要重来一次：这个账号最后是进来了的。
+	st := &fakeStore{}
+	c := aChain(st)
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		if polls == 1 {
+			return nil, errors.New("device token: connection reset")
+		}
+		return &oauth.Token{Access: "acc", Refresh: "ref", Subject: "sub"}, nil
+	}
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return c.Import(ctx, email, password)
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || !out[0].OK {
+		t.Fatalf("out = %+v", out)
+	}
+	if polls != 2 {
+		t.Fatalf("polled %d times, want 2", polls)
 	}
 }
 

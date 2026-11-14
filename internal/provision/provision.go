@@ -132,7 +132,14 @@ type Error struct {
 	// Retry says whether trying again could work.
 	Retry bool
 	// Wait is how long to wait before trying again.
+	//
+	// Zero means the standard backoff: one second, then four.
 	Wait time.Duration
+	// Tries is how many tries at most.
+	//
+	// Zero means the standard number of tries. A site that is limiting
+	// how much it answers is not worth three goes: the design says one.
+	Tries int
 }
 
 func (e *Error) Error() string {
@@ -172,6 +179,26 @@ type Runner struct {
 // two apart without hammering the site.
 const tries = 3
 
+// backoff is how long to wait before the second and the third try.
+//
+// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
+var backoff = []time.Duration{time.Second, 4 * time.Second}
+
+// backoffWait gives how long to wait before the next try.
+//
+// The standard backoff: one second before the second try, four before
+// the third. A failure that says what it wants to wait for says so, and
+// this is what the others get.
+func backoffWait(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(backoff) {
+		return backoff[len(backoff)-1]
+	}
+	return backoff[attempt]
+}
+
 // Run brings in every entry and gives back what happened to each.
 //
 // One account does not stop the rest: a wrong password says nothing
@@ -208,7 +235,9 @@ func (r *Runner) Run(ctx context.Context, entries []Entry) ([]Result, error) {
 // one brings one account in, trying again when it is worth it.
 func (r *Runner) one(ctx context.Context, e Entry) Result {
 	var last *Error
+	attempts := 0
 	for attempt := 0; attempt < tries; attempt++ {
+		attempts++
 		res, err := r.Importer.Import(ctx, e.Email, e.Password)
 		if err == nil {
 			if res.Email == "" {
@@ -226,16 +255,21 @@ func (r *Runner) one(ctx context.Context, e Entry) Result {
 			// makes the answer come later.
 			break
 		}
+		if pe.Tries > 0 && pe.Tries <= attempt+1 {
+			// 有些错值不值得试三次：站点在限流的时候，试一次就够，
+			// 再去问只是让它更烦。
+			break
+		}
 		wait := pe.Wait
 		if wait <= 0 {
-			wait = time.Duration(1<<attempt) * time.Second
+			wait = backoffWait(attempt)
 		}
 		if err := r.wait(ctx, wait); err != nil {
 			return resultOf(e, err)
 		}
 	}
 	res := resultOf(e, last)
-	res.Message = fmt.Sprintf("试了 %d 次都不成：%s", tries, res.Message)
+	res.Message = fmt.Sprintf("试了 %d 次都不成：%s", attempts, res.Message)
 	return res
 }
 

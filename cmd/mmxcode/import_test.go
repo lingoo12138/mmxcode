@@ -125,6 +125,8 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := testEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
 		return &provision.Runner{
 			Importer: &provision.Importer{
@@ -132,8 +134,8 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 					if email == "a@example.com" {
 						return provision.Result{Email: email, OK: true, AccountID: "acc_1"}, nil
 					}
-					// 站点那边没有回答：时限到了，这一趟就卡在这里。
-					<-ctx.Done()
+					// 时限到了：这一趟就掐在这里。
+					cancel()
 					return provision.Result{Email: email}, ctx.Err()
 				},
 			},
@@ -141,8 +143,6 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 			Sleep:    func(context.Context, time.Duration) error { return nil },
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
 	var out bytes.Buffer
 	if err := runImport(ctx, e, &out, path, "", time.Millisecond, false); err == nil {
 		t.Fatal("the import ran past its deadline")

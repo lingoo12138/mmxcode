@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -97,11 +98,11 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	d, err := c.Start(ctx)
 	if err != nil {
-		return nil, &Error{Stage: StageToken, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
+		return nil, &Error{Stage: StageToken, Message: err.Error(), Retry: true}
 	}
 	deviceID, err := c.Web.RegisterDevice(ctx)
 	if err != nil {
-		return nil, &Error{Stage: StageProbe, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
+		return nil, &Error{Stage: StageProbe, Message: err.Error(), Retry: true}
 	}
 	// The page the sign-in sends the browser back to is the page that
 	// shows the code. The site builds this path itself when it says a
@@ -127,7 +128,7 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	tok, err := c.Poll(ctx, d)
 	if err != nil {
-		return nil, &Error{Stage: StageToken, Message: err.Error()}
+		return nil, c.pollError(err)
 	}
 	return tok, nil
 }
@@ -337,12 +338,57 @@ func (c *Chain) webError(stage Stage, err error) error {
 		}
 		if retryableCode(se.Code) {
 			pe.Retry = true
-			pe.Wait = 5 * time.Second
 		}
 		return pe
 	}
-	return &Error{Stage: stage, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
+	return &Error{Stage: stage, Message: err.Error(), Retry: true}
 }
+
+// pollError turns what the token endpoint said into what the runner
+// needs to know.
+//
+// The refusal and the transport failure are told apart: a device code
+// that is used up or refused will be refused again, and a dropped
+// connection is worth another go. The same goes for a failure one step
+// earlier in the chain, and the two are told apart the same way.
+//
+// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）；429 退避
+// 30s 重试 1 次；设备码过期不重试。
+func (c *Chain) pollError(err error) error {
+	// 上下文没了：再试也是白试，等的那一下也是白等。
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &Error{Stage: StageToken, Message: err.Error()}
+	}
+	var oe *oauth.Error
+	if errors.As(err, &oe) {
+		switch oe.Code {
+		case "expired_token", "access_denied":
+			// 设备码过期了，或者站点不让这个码进来：再来一次也是这个
+			// 答案，下一个账号重新开一个设备码就是了。
+			return &Error{Stage: StageToken, Message: oe.Error()}
+		case "missing_refresh_token":
+			// 没有刷新令牌的账号活不过一小时：这是账号的事，不是连接
+			// 的事，再来一次也是没有。
+			return &Error{Stage: StageToken, Message: oe.Error()}
+		}
+		if oe.HTTPStatus == http.StatusTooManyRequests {
+			// 站点在限流：等久一点再来一次。这样的错试三次没有意义，
+			// 去了只是让它更烦。
+			return &Error{Stage: StageToken, Message: oe.Error(), Retry: true,
+				Wait: rateLimitWait, Tries: 2}
+		}
+		// 5xx 和别的站点自己的错：再来一次可能就成了。
+		return &Error{Stage: StageToken, Message: oe.Error(), Retry: true}
+	}
+	// 传输上的问题：连接断了、读超时了。
+	return &Error{Stage: StageToken, Message: err.Error(), Retry: true}
+}
+
+// rateLimitWait is how long to wait when the site says it is limiting
+// how much it answers.
+//
+// 设计文档 §5.3：429、站点风控退避更久（30s）重试 1 次。
+const rateLimitWait = 30 * time.Second
 
 // retryableCode says whether the site's own code is worth trying again.
 //

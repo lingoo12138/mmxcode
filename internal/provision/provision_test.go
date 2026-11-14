@@ -251,3 +251,50 @@ func TestTheResultsAreTheTextTheDatabaseKeeps(t *testing.T) {
 		}
 	}
 }
+
+func TestTheWaitsAreTheOnesTheDesignSays(t *testing.T) {
+	// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
+	var waits []time.Duration
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true}
+			},
+		},
+		Sleep: func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		},
+	}
+	if _, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 4*time.Second {
+		t.Fatalf("waits = %v, want 1s then 4s", waits)
+	}
+}
+
+func TestASiteThatIsLimitingIsTriedOnlyOnceMore(t *testing.T) {
+	// 429：退避 30s 重试 1 次。
+	var tries int
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				tries++
+				return Result{Email: email}, &Error{Stage: StageToken, Message: "too many requests",
+					Retry: true, Wait: time.Millisecond, Tries: 2}
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tries != 2 {
+		t.Fatalf("tried %d times, want 2", tries)
+	}
+	if out[0].OK {
+		t.Fatalf("out = %+v", out[0])
+	}
+}
