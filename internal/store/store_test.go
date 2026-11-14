@@ -1420,3 +1420,196 @@ func TestTheFileAtVersionTwoGetsThePlanErrorColumn(t *testing.T) {
 		t.Fatalf("the plan error is %q", snaps[0].PlanError)
 	}
 }
+
+// TestThePasswordGoesInAndComesBack says the encrypted password can be
+// written and read back.
+func TestThePasswordGoesInAndComesBack(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(ctx, "acc_1", "Y2lwaGVy", now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Password(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Y2lwaGVy" {
+		t.Fatalf("password = %q", got)
+	}
+}
+
+// TestAnAccountWithoutAPassword says an account that was not brought
+// in by a batch import has no password, and that is not an error.
+func TestAnAccountWithoutAPassword(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Password(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("password = %q, want none", got)
+	}
+}
+
+// TestTheImportRunIsKept says a batch import is written down with what
+// came of it.
+func TestTheImportRunIsKept(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "cli", StartedAt: now, Total: 2}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.FinishImportRun(ctx, "run_1", now, 1, 1, `[{"email":"a@example.com","ok":true}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.ListImportRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs", len(runs))
+	}
+	if runs[0].OK != 1 || runs[0].Failed != 1 || runs[0].Results == "" {
+		t.Fatalf("run = %+v", runs[0])
+	}
+}
+
+// TestAnImportRunCanBeAskedForByItsName says one batch import can be
+// taken out on its own.
+//
+// 页面上要看得见某一次导入走到哪儿了：光有"最近的几次"不够，
+// 得能按名字把这一次导入单独取出来。
+func TestAnImportRunCanBeAskedForByItsName(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "web", StartedAt: now, Total: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishImportRun(ctx, "run_1", now, 1, 1, "[]"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetImportRun(ctx, "run_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "run_1" || got.Source != "web" || got.OK != 1 || got.Failed != 1 {
+		t.Fatalf("run = %+v", got)
+	}
+}
+
+// TestAnImportRunThatIsNotThere says a name that is not there is an
+// error, and not a quiet empty run.
+func TestAnImportRunThatIsNotThere(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.GetImportRun(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get import run: %v, want ErrNotFound", err)
+	}
+}
+
+// TestTheOldFileGetsThePasswordColumn says a file that was made before
+// the password column is brought forward: the column is there, the
+// rows are still in it, and the accounts that had no password have
+// none.
+//
+// 老库要有 password 那一列，行还要在，没有密码的账号还是 NULL。
+func TestTheOldFileGetsThePasswordColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	makeAccount(t, s, "acc_01")
+	if err := s.SaveToken(ctx, Token{AccountID: "acc_01", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE accounts DROP COLUMN password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "DROP TABLE import_runs"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再打开就该被补上。
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := s2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("the file is at version %d, want %d", version, schemaVersion)
+	}
+	cols, err := columnsOf(ctx, s2.db, "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cols["password"]; !ok {
+		t.Fatal("accounts has no column password")
+	}
+	// 行还在
+	if _, err := s2.GetAccount(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	// 账本也还在
+	tok, err := s2.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "a" {
+		t.Fatalf("got %+v", tok)
+	}
+	// 没有密码的账号，那一格是空的，不是空字符串
+	var isNull bool
+	if err := s2.db.QueryRowContext(ctx,
+		"SELECT password IS NULL FROM accounts WHERE id = ?", "acc_01").Scan(&isNull); err != nil {
+		t.Fatal(err)
+	}
+	if !isNull {
+		t.Fatal("the password of an account that never had one is not NULL")
+	}
+	got, err := s2.Password(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("password = %q, want none", got)
+	}
+	// 导入留痕的表也有了
+	if err := s2.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "cli",
+		StartedAt: time.Now(), Total: 1}); err != nil {
+		t.Fatal(err)
+	}
+}

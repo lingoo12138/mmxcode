@@ -168,6 +168,18 @@ type EgressHealth struct {
 	CheckedAt time.Time
 }
 
+// ImportRun is one batch import and what came of it.
+type ImportRun struct {
+	ID         string
+	Source     string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Total      int
+	OK         int
+	Failed     int
+	Results    string
+}
+
 // Open opens the database at path, creating it and its directory if
 // they are not there.
 //
@@ -343,7 +355,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // migrations are the steps, in order.
 //
@@ -352,6 +364,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateMake,
 	migrateConform,
 	migratePlanError,
+	migrateBatchImport,
 }
 
 // migrateMake makes the tables that are not there.
@@ -433,6 +446,53 @@ func migratePlanError(ctx context.Context, conn *sql.Conn) error {
 		for _, t := range tables {
 			if t.name == "usage_snapshots" {
 				return rebuildTable(ctx, tx, t)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateBatchImport gives the accounts their password column and the
+// file its table of batch imports.
+//
+// Both were added after the file's shape was settled, so a file that
+// was made before them does not have them. The accounts table is
+// rebuilt when the column is not there, and the table of imports is
+// made when it is not there.
+//
+// The accounts that were already there keep their rows, and their
+// password is left empty: an account that was not brought in by a
+// batch import has no password, and saying so with an empty string
+// would make it look like there is a password that is not there.
+func migrateBatchImport(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 4, func(tx *sql.Tx) error {
+		cols, err := columnsOf(ctx, tx, "accounts")
+		if err != nil {
+			return err
+		}
+		if _, ok := cols["password"]; !ok {
+			for _, t := range tables {
+				if t.name == "accounts" {
+					if err := rebuildTable(ctx, tx, t); err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		for _, t := range tables {
+			if t.name != "import_runs" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got != "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
 			}
 		}
 		return nil
@@ -746,6 +806,148 @@ func (s *Store) SetAccountLastError(ctx context.Context, id, lastError string, u
 		return fmt.Errorf("set the last error of the account %s: %w", id, ErrNotFound)
 	}
 	return nil
+}
+
+// SetPassword writes an account's encrypted password.
+//
+// The cipher text is written on its own, so that the other setters --
+// which write one column each -- do not have to know about it.
+//
+// An account that is not there is ErrNotFound: the caller believes it
+// wrote a password, and writing nothing is not writing one.
+func (s *Store) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET password=?, updated_at=? WHERE id=?`,
+		cipher, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the password of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the password of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// Password gives an account's encrypted password.
+//
+// An account that was not brought in by a batch import has none, and
+// that is not an error: the text is empty.
+//
+// An account that is not there at all has no password either, and that
+// is not an error either: the caller asked about a password, and there
+// is none. A caller that cares whether the account is there asks for
+// the account.
+func (s *Store) Password(ctx context.Context, id string) (string, error) {
+	var cipher sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT password FROM accounts WHERE id=?`, id).Scan(&cipher)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get the password of the account %s: %w", id, err)
+	}
+	return cipher.String, nil
+}
+
+// CreateImportRun records the start of a batch import.
+//
+// The run is written down before the accounts are made, so that an
+// import that is still going can be seen.
+func (s *Store) CreateImportRun(ctx context.Context, r ImportRun) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO import_runs (id, source, started_at, total, ok, failed)
+		VALUES (?,?,?,?,?,?)`,
+		r.ID, r.Source, ms(s.stamp(r.StartedAt)), r.Total, r.OK, r.Failed)
+	if err != nil {
+		return fmt.Errorf("create import run %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// FinishImportRun records what a batch import came to.
+//
+// The results are kept as they were given: they are the reader's to
+// read, and the store does not have to know what is in them.
+func (s *Store) FinishImportRun(ctx context.Context, id string, finishedAt time.Time, ok, failed int, results string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE import_runs SET finished_at=?, ok=?, failed=?, results=? WHERE id=?`,
+		ms(s.stamp(finishedAt)), ok, failed, results, id)
+	if err != nil {
+		return fmt.Errorf("finish import run %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("finish import run %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// GetImportRun gives one batch import by its name.
+//
+// A name that is not there is ErrNotFound: the caller asked about one
+// particular import, and being handed a different one would be worse
+// than being told there is none.
+func (s *Store) GetImportRun(ctx context.Context, id string) (ImportRun, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs WHERE id=?`, id)
+	r, err := scanImportRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, err)
+	}
+	return r, nil
+}
+
+// ListImportRuns gives the most recent batch imports.
+//
+// A limit of zero or less means the usual twenty: a limit is a limit,
+// and a limit of zero is no limit at all, which is not what a reader
+// of the page wants.
+func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list import runs: %w", err)
+	}
+	defer rows.Close()
+	var out []ImportRun
+	for rows.Next() {
+		r, err := scanImportRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list import runs: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list import runs: %w", err)
+	}
+	return out, nil
+}
+
+// scanImportRun reads one batch import.
+func scanImportRun(sc scanner) (ImportRun, error) {
+	var (
+		r        ImportRun
+		started  int64
+		finished sql.NullInt64
+		results  sql.NullString
+	)
+	if err := sc.Scan(&r.ID, &r.Source, &started, &finished, &r.Total, &r.OK,
+		&r.Failed, &results); err != nil {
+		return ImportRun{}, err
+	}
+	r.StartedAt = fromMS(started)
+	r.FinishedAt = fromMS(finished.Int64)
+	r.Results = results.String
+	return r, nil
 }
 
 // checkStatus says whether a status is one of ours.

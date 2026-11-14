@@ -63,7 +63,8 @@ var tables = []table{
   proxy_url    TEXT,
   last_error   TEXT,
   created_at   INTEGER NOT NULL,
-  updated_at   INTEGER NOT NULL
+  updated_at   INTEGER NOT NULL,
+  password    TEXT
 )`,
 		copy: []copyColumn{
 			notNull("id", "''"),
@@ -76,6 +77,30 @@ var tables = []table{
 			nullable("last_error"),
 			notNull("created_at", "0"),
 			notNull("updated_at", "0"),
+			nullable("password"),
+		},
+	},
+	{
+		name: "import_runs",
+		body: `(
+  id          TEXT PRIMARY KEY,
+  source      TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  finished_at INTEGER,
+  total       INTEGER NOT NULL DEFAULT 0,
+  ok          INTEGER NOT NULL DEFAULT 0,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  results     TEXT
+)`,
+		copy: []copyColumn{
+			notNull("id", "''"),
+			notNull("source", "''"),
+			notNull("started_at", "0"),
+			nullable("finished_at"),
+			notNull("total", "0"),
+			notNull("ok", "0"),
+			notNull("failed", "0"),
+			nullable("results"),
 		},
 	},
 	{
