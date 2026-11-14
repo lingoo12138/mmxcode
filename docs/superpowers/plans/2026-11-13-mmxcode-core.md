@@ -7409,7 +7409,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `internal/oauth/oauth_test.go`（先只放设备流的测试，刷新测试在 Task 7 追加）：
+创建 `internal/oauth/oauth_test.go`（整文件：设备流和刷新的测试都在里面）：
 
 ```go
 package oauth
@@ -8706,6 +8706,38 @@ func TestNoSecretIsInAnyErrorOrURL(t *testing.T) {
 		}
 	}
 }
+
+func TestTheWaitDoesNotOutlastTheCode(t *testing.T) {
+	// 站点说这个码十分钟有效，却让人五十分钟再来问一次。参考实现是
+	// 睡到"间隔"和"剩下的时间"里短的那个，然后发现码过期了就说
+	// 过期 —— 不是把整个间隔睡完，才发现自己等了一个小时。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"authorization_pending"}`))
+	}))
+	defer srv.Close()
+
+	d := &Device{
+		UserCode:  "ABCD",
+		verifier:  "v",
+		pollField: "device_code",
+		pollValue: "dev-1",
+		deadline:  time.Now().Add(2 * time.Second),
+		interval:  50 * time.Minute,
+	}
+
+	start := time.Now()
+	_, err := d.Poll(context.Background(), testClient(t), srv.URL+"/oauth2/token")
+	took := time.Since(start)
+
+	var e *Error
+	if !errors.As(err, &e) || e.Code != "expired_token" {
+		t.Fatalf("err = %v, want an expired token", err)
+	}
+	if took > 10*time.Second {
+		t.Fatalf("waited %v, want the code's own end", took)
+	}
+}
 ```
 
 测试文件顶部还需要这个助手：
@@ -9114,7 +9146,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(clampToDeadline(wait, d.deadline)):
 		}
 		if time.Now().After(d.deadline) {
 			return nil, &Error{Code: "expired_token", What: WhatSignIn}
@@ -9193,6 +9225,32 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		tok.Subject, tok.AccountID, tok.HasClaims = claims(b.AccessToken)
 		return tok, nil
 	}
+}
+
+// clampToDeadline cuts a wait down to the time the sign-in code has
+// left.
+//
+// The reference sleeps for the shorter of the interval and the time
+// left, and then gives up if the code is over:
+//
+//	await sleep(Math.min(delay, Math.max(0, d.deadline - Date.now())))
+//	if (Date.now() >= d.deadline) break
+//
+// So a code that says "this one is good for ten minutes" but "come
+// back in fifty" is told at ten minutes that it is over. Sleeping the
+// whole interval would keep a caller waiting long past the point
+// where the code could still be approved — with a background context
+// that is fifty minutes of nothing, and with a shorter context a
+// cancellation instead of the "expired" the reference reports.
+func clampToDeadline(wait time.Duration, deadline time.Time) time.Duration {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return 0
+	}
+	if wait > left {
+		return left
+	}
+	return wait
 }
 
 // slowDownWait is how much longer to wait when the site says slow
@@ -9306,708 +9364,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 追加失败的测试**
 
-在 `internal/oauth/oauth_test.go` 末尾追加（import 补上 `"mmxcode/internal/upstream"`、`"sync"` 与 `"sync/atomic"`）：
-
-```go
-func TestRefreshToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if got := r.Form.Get("grant_type"); got != "refresh_token" {
-			t.Errorf("grant_type = %q", got)
-		}
-		if got := r.Form.Get("refresh_token"); got != "old-refresh" {
-			t.Errorf("refresh_token = %q", got)
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"access_token":  "new-access",
-			"refresh_token": "new-refresh",
-			"expires_in":    3600,
-		})
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok.Access != "new-access" || tok.Refresh != "new-refresh" {
-		t.Fatalf("token = %+v", tok)
-	}
-}
-
-func TestRefreshKeepsOldTokenWhenNoNewOneGiven(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "new-access",
-			"expires_in":   3600,
-		})
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	tok, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok.Refresh != "old-refresh" {
-		t.Fatalf("refresh = %q, want the old one", tok.Refresh)
-	}
-}
-
-func TestRefreshInvalidGrantIsSignedOut(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"invalid_grant"}`))
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	oe, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("err = %T, want *Error", err)
-	}
-	if !oe.IsSignedOut() {
-		t.Fatal("expected the error to be a sign-out")
-	}
-}
-
-func TestRefreshSignOutInA200Body(t *testing.T) {
-	// MiniMax 把业务错误放在 200 的 body 里。签出也是这么来的。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	oe, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("err = %T, want *Error", err)
-	}
-	if oe.HTTPStatus != 200 {
-		t.Fatalf("error = %+v", oe)
-	}
-	if !oe.IsSignedOut() {
-		t.Fatal("a sign-out in a 200 body was not a sign-out")
-	}
-}
-
-func TestRefreshKeepsTheMessage(t *testing.T) {
-	// 有的 4xx 只带 message：这个说明是账号的 last error。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"invalid_request","message":"the code is wrong"}`))
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if !strings.Contains(err.Error(), "the code is wrong") {
-		t.Fatalf("err = %v, want the message", err)
-	}
-	// 刷新的错误说的是 token 端点，不是登录服务器。
-	if !strings.Contains(err.Error(), "token endpoint") {
-		t.Fatalf("err = %v, want it to name the token endpoint", err)
-	}
-}
-
-func TestRefreshWithALostAnswer(t *testing.T) {
-	// 请求到了站点，答案没了：站点可能已经把 refresh token 用了。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.ParseForm()
-		panic(http.ErrAbortHandler)
-	}))
-	defer srv.Close()
-
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", "old-refresh")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
-		t.Fatalf("err = %v, want an unknown outcome", err)
-	}
-}
-
-func TestRefreshWithARefusedConnection(t *testing.T) {
-	// 连都没连上：请求肯定没到站点，同一个 token 再来一次是安全的。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	endpoint := srv.URL + "/oauth2/token"
-	srv.Close()
-
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, endpoint, "old-refresh")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if errors.Is(err, ErrRefreshOutcomeUnknown) {
-		t.Fatalf("err = %v, want a plain failure", err)
-	}
-}
-
-func TestRenewerSpendsOnceUnderConcurrency(t *testing.T) {
-	var calls int32
-	release := make(chan struct{})
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		<-release
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	current := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	var wg sync.WaitGroup
-	var started sync.WaitGroup
-	started.Add(8)
-	results := make([]*Token, 8)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			started.Done()
-			tok, err := r.Renew(context.Background(), "acc_01", current, spend)
-			if err != nil {
-				t.Errorf("Renew: %v", err)
-				return
-			}
-			results[i] = tok
-		}(i)
-	}
-	started.Wait()
-	// 让每个 goroutine 都进到 Renew 里去：它们都得等同一个刷新。
-	time.Sleep(200 * time.Millisecond)
-	close(release)
-	wg.Wait()
-
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("the refresh token was spent %d times, want 1", got)
-	}
-	for i, tok := range results {
-		if tok == nil || tok.Access != "new-access" {
-			t.Fatalf("result %d = %+v", i, tok)
-		}
-	}
-}
-
-func TestRenewerWalksTheChainOnAfterALostStoreWrite(t *testing.T) {
-	// 站点给了新 token，存库失败，库里还是那个已经用过的。
-	// renewer 手上有新的：它得把它用掉，链才走得下去。
-	var calls int32
-	var mu sync.Mutex
-	var spent []string
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		mu.Lock()
-		spent = append(spent, refresh)
-		mu.Unlock()
-		return &Token{
-			Access:  "acc-for-" + refresh,
-			Refresh: "new-" + refresh,
-			Expires: time.Now().Add(time.Hour),
-		}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	first, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 存库失败：调用方手上还是那个旧 token。
-	second, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("the chain was walked %d times, want 2", got)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if spent[1] != "new-old-refresh" {
-		t.Fatalf("the second spend used %q, want the token the renewer held", spent[1])
-	}
-	if second.Refresh == first.Refresh {
-		t.Fatalf("the chain did not move on: %+v", second)
-	}
-}
-
-func TestRenewerSpendsAgainWhenTheSiteDoesNotRotate(t *testing.T) {
-	// 站点不给新的 refresh token：它没有把旧的用掉，
-	// 所以下一次刷新还得再发一次。
-	var calls int32
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		return &Token{
-			Access:  fmt.Sprintf("acc-%d", atomic.LoadInt32(&calls)),
-			Refresh: refresh,
-			Expires: time.Now().Add(time.Hour),
-		}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "same-refresh", Expires: time.Now().Add(time.Hour)}
-
-	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
-		t.Fatal(err)
-	}
-	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("the refresh token was spent %d times, want 2", got)
-	}
-	if tok.Access == "old-access" {
-		t.Fatalf("the token = %+v, want a new one", tok)
-	}
-}
-
-func TestRenewerFollowsTheCallersNewerToken(t *testing.T) {
-	// renewer 手上的 token 调用方不知道：调用方拿的是新的
-	// （刚登录的，或者别的进程写进去的）。调用方说了算。
-	var calls int32
-	var mu sync.Mutex
-	var spent []string
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		mu.Lock()
-		spent = append(spent, refresh)
-		mu.Unlock()
-		return &Token{
-			Access:  "acc-for-" + refresh,
-			Refresh: "new-" + refresh,
-			Expires: time.Now().Add(time.Hour),
-		}, nil
-	}
-	if _, err := r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
-		t.Fatal(err)
-	}
-	newer := &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
-	tok, err := r.Renew(context.Background(), "acc_01", newer, spend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(spent) != 2 || spent[1] != "r2" {
-		t.Fatalf("spent = %v, want the caller's token", spent)
-	}
-	if tok.Access != "acc-for-r2" {
-		t.Fatalf("token = %+v, want the answer of the caller's own renewal", tok)
-	}
-}
-
-func TestRenewerDoesNotMarkAFailedRefreshSpent(t *testing.T) {
-	// 这个包的全部承诺：失败的刷新不把 token 记成用掉了。
-	var calls int32
-	var fail atomic.Bool
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		if fail.Load() {
-			return nil, errors.New("the network is down")
-		}
-		return &Token{
-			Access:  "new-access",
-			Refresh: "new-refresh",
-			Expires: time.Now().Add(time.Hour),
-		}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	fail.Store(true)
-	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err == nil {
-		t.Fatal("expected an error")
-	}
-	fail.Store(false)
-	// 失败过的 token 还能再发：它多半没有到站点。
-	tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("the refresh token was sent %d times, want 2", got)
-	}
-	if tok.Access != "new-access" {
-		t.Fatalf("token = %+v", tok)
-	}
-}
-
-func TestRenewerDoesNotSendATokenOfUnknownOutcomeAgain(t *testing.T) {
-	var calls int32
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		return nil, fmt.Errorf("the answer was lost: %w", ErrRefreshOutcomeUnknown)
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
-		t.Fatalf("err = %v, want an unknown outcome", err)
-	}
-	// 再来一次：答案不知道的 token 不再发。
-	_, err = r.Renew(context.Background(), "acc_01", stored, spend)
-	if !errors.Is(err, ErrRefreshOutcomeUnknown) {
-		t.Fatalf("err = %v, want an unknown outcome", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("the refresh token was sent %d times, want 1", got)
-	}
-}
-
-func TestRenewerGivesEveryCallerItsOwnToken(t *testing.T) {
-	// 两个调用方各拿一个 refresh token：各发各的，
-	// 谁也不能拿别人的答案。
-	var calls int32
-	release := make(chan struct{})
-	var mu sync.Mutex
-	seen := map[string]bool{}
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		mu.Lock()
-		seen[refresh] = true
-		mu.Unlock()
-		<-release
-		return &Token{
-			Access:  "acc-for-" + refresh,
-			Refresh: "new-" + refresh,
-			Expires: time.Now().Add(time.Hour),
-		}, nil
-	}
-	tokens := map[string]*Token{
-		"r1": {Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)},
-		"r2": {Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)},
-	}
-	results := map[string]*Token{}
-	var wg sync.WaitGroup
-	var mu2 sync.Mutex
-	for name, tok := range tokens {
-		wg.Add(1)
-		go func(name string, tok *Token) {
-			defer wg.Done()
-			got, err := r.Renew(context.Background(), "acc_01", tok, spend)
-			if err != nil {
-				t.Errorf("Renew: %v", err)
-				return
-			}
-			mu2.Lock()
-			results[name] = got
-			mu2.Unlock()
-		}(name, tok)
-	}
-	// 等两个刷新都开始了。
-	for i := 0; i < 200 && atomic.LoadInt32(&calls) < 2; i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
-	close(release)
-	wg.Wait()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if !seen["r1"] || !seen["r2"] {
-		t.Fatalf("spent = %v, want both tokens", seen)
-	}
-	for name, tok := range results {
-		if tok == nil {
-			t.Fatalf("%s got nothing", name)
-		}
-		if want := "acc-for-" + name; tok.Access != want {
-			t.Fatalf("%s got %+v, want the answer of its own renewal", name, tok)
-		}
-	}
-}
-
-func TestRenewerLeaderCancellationDoesNotKillTheFollowers(t *testing.T) {
-	// 第一个来的调用方断线了，别的调用方还在等：
-	// 刷新不该跟着死。
-	var calls int32
-	release := make(chan struct{})
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	leaderCtx, cancel := context.WithCancel(context.Background())
-	leaderErr := make(chan error, 1)
-	go func() {
-		_, err := r.Renew(leaderCtx, "acc_01", stored, spend)
-		leaderErr <- err
-	}()
-	// 等刷新真的开始了。
-	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
-	followerErr := make(chan error, 1)
-	followerTok := make(chan *Token, 1)
-	go func() {
-		tok, err := r.Renew(context.Background(), "acc_01", stored, spend)
-		followerTok <- tok
-		followerErr <- err
-	}()
-	time.Sleep(100 * time.Millisecond)
-	// 第一个来的调用方走了。
-	cancel()
-	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the leader got %v, want the cancellation", err)
-	}
-	close(release)
-	if err := <-followerErr; err != nil {
-		t.Fatalf("the follower got %v", err)
-	}
-	if tok := <-followerTok; tok == nil || tok.Access != "new-access" {
-		t.Fatalf("the follower got %+v", tok)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("the refresh token was spent %d times, want 1", got)
-	}
-}
-
-func TestRenewerForget(t *testing.T) {
-	r := NewRenewer()
-	var calls int32
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := r.Newest("acc_01"); !ok {
-		t.Fatal("the renewer holds nothing")
-	}
-	r.Forget("acc_01")
-	if _, ok := r.Newest("acc_01"); ok {
-		t.Fatal("the token is still held after Forget")
-	}
-	// 已经用掉的记录也没了：这个账号签出了，它的东西都不作数了。
-	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
-		t.Fatalf("Renew after Forget: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("the refresh token was spent %d times, want 2", got)
-	}
-}
-
-func TestRenewerForgetLeavesARunningRenewalAlone(t *testing.T) {
-	// 账号正在签出时在跑的刷新，完了不能把 token 放回来。
-	var calls int32
-	release := make(chan struct{})
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		<-release
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		r.Renew(context.Background(), "acc_01", stored, spend)
-	}()
-	for i := 0; i < 200 && atomic.LoadInt32(&calls) == 0; i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
-	r.Forget("acc_01")
-	close(release)
-	<-done
-	if _, ok := r.Newest("acc_01"); ok {
-		t.Fatal("the token came back from the dead")
-	}
-}
-
-func TestRenewerReset(t *testing.T) {
-	// Reset 把链忘掉，"用掉了"的记录还在。
-	var calls int32
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	stored := &Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}
-
-	if _, err := r.Renew(context.Background(), "acc_01", stored, spend); err != nil {
-		t.Fatal(err)
-	}
-	r.Reset("acc_01")
-	if _, ok := r.Newest("acc_01"); ok {
-		t.Fatal("the token is still held after Reset")
-	}
-	// 用掉的 token 不能再发：链断了，账号得重新登录。
-	_, err := r.Renew(context.Background(), "acc_01", stored, spend)
-	if !errors.Is(err, ErrRefreshChainBroken) {
-		t.Fatalf("err = %v, want a broken chain", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("the refresh token was spent %d times, want 1", got)
-	}
-}
-
-func TestRenewerChainBroken(t *testing.T) {
-	// renewer 手上的 token 也用掉了：链断了，没有能走的路了。
-	var calls int32
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		atomic.AddInt32(&calls, 1)
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	r.mu.Lock()
-	r.latest["acc_01"] = &Token{Access: "a2", Refresh: "r2", Expires: time.Now().Add(time.Hour)}
-	r.spent["acc_01"] = map[string]bool{
-		tokenHash("r1"): true,
-		tokenHash("r2"): true,
-	}
-	r.mu.Unlock()
-
-	_, err := r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a1", Refresh: "r1", Expires: time.Now().Add(time.Hour)}, spend)
-	if !errors.Is(err, ErrRefreshChainBroken) {
-		t.Fatalf("err = %v, want a broken chain", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 0 {
-		t.Fatalf("a spent token was sent %d times", got)
-	}
-}
-
-func TestRenewerRefusesAnotherAccountsToken(t *testing.T) {
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		return &Token{
-			Access:  "new-access",
-			Refresh: "new-refresh",
-			Expires: time.Now().Add(time.Hour),
-			Subject: "user-1",
-		}, nil
-	}
-	if _, err := r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a1", Refresh: "r1", Subject: "user-1", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
-		t.Fatal(err)
-	}
-	_, err := r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a9", Refresh: "r9", Subject: "user-2", Expires: time.Now().Add(time.Hour)}, spend)
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if !strings.Contains(err.Error(), "another account") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestRenewerNewestGivesACopy(t *testing.T) {
-	r := NewRenewer()
-	spend := func(ctx context.Context, refresh string) (*Token, error) {
-		return &Token{Access: "new-access", Refresh: "new-refresh", Expires: time.Now().Add(time.Hour)}, nil
-	}
-	if _, err := r.Renew(context.Background(), "acc_01",
-		&Token{Access: "old-access", Refresh: "old-refresh", Expires: time.Now().Add(time.Hour)}, spend); err != nil {
-		t.Fatal(err)
-	}
-	got, ok := r.Newest("acc_01")
-	if !ok || got.Access != "new-access" {
-		t.Fatalf("newest = %+v, ok = %v", got, ok)
-	}
-	got.Access = "changed"
-	again, _ := r.Newest("acc_01")
-	if again.Access == "changed" {
-		t.Fatal("the caller changed what the renewer holds")
-	}
-	// 没有 token 时 Latest 给的是调用方自己的。
-	empty := NewRenewer()
-	cur := &Token{Access: "mine"}
-	if got := empty.Latest("acc_02", cur); got != cur {
-		t.Fatalf("latest = %+v, want the caller's own token", got)
-	}
-	if _, ok := empty.Newest("acc_02"); ok {
-		t.Fatal("the renewer holds a token it does not have")
-	}
-}
-
-func TestNoSecretIsInAnyErrorOrURL(t *testing.T) {
-	const secret = "the-secret-refresh-token"
-	const verifier = "the-secret-pkce-verifier"
-
-	// 刷新的错误。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"invalid_grant","message":"no"}`))
-	}))
-	defer srv.Close()
-	c := testClient(t)
-	_, err := Refresh(context.Background(), c, srv.URL+"/oauth2/token", secret)
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("the refresh token is in the error: %v", err)
-	}
-
-	// renewer 的错误。
-	r := NewRenewer()
-	_, err = r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a", Refresh: secret},
-		func(ctx context.Context, refresh string) (*Token, error) {
-			return nil, errors.New("nope")
-		})
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("the refresh token is in the error: %v", err)
-	}
-	// 链断了的错误也不带 token。
-	// 先成功一次：那个 token 就用掉了。
-	if _, err = r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a", Refresh: secret},
-		func(ctx context.Context, refresh string) (*Token, error) {
-			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
-		}); err != nil {
-		t.Fatalf("Renew: %v", err)
-	}
-	r.Reset("acc_01")
-	_, err = r.Renew(context.Background(), "acc_01",
-		&Token{Access: "a", Refresh: secret},
-		func(ctx context.Context, refresh string) (*Token, error) {
-			return &Token{Access: "b", Refresh: "other", Expires: time.Now().Add(time.Hour)}, nil
-		})
-	if !errors.Is(err, ErrRefreshChainBroken) {
-		t.Fatalf("err = %v, want a broken chain", err)
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("the refresh token is in the error: %v", err)
-	}
-
-	// 设备码的错误和地址。
-	d := &Device{
-		UserCode: "ABCD",
-		URL:      "https://example.invalid/activate?code=ABCD",
-		verifier: verifier,
-	}
-	for _, text := range []string{d.String(), fmt.Sprintf("%+v", d), d.URL} {
-		if strings.Contains(text, verifier) {
-			t.Fatalf("the verifier is in %q", text)
-		}
-	}
-}
-```
+这一步的测试已经在 Task 6 那份 `internal/oauth/oauth_test.go` 的整文件里——那份文件是最后的样子，刷新测试也在里面。照着 Task 6 的整文件写一次即可，不用在这里再追加一遍。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -11334,6 +10691,155 @@ func TestModelsLive(t *testing.T) {
 		t.Fatalf("efforts = %v, want two", ms[0].Efforts)
 	}
 }
+
+func TestTheSiteSaysHowMuchOfTheWeekIsUsed(t *testing.T) {
+	// 站点自己说"用掉了百分之三十七"，那就是三十七。参考实现用的是
+	// 它写的那个数，不是我们自己算出来的那个 —— 自己算会得到
+	// 37.00000000000001 这种东西。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,
+				 "current_weekly_status":1,"current_weekly_used_percent":37,"weekly_boost_permille":1200,
+				 "weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 37 {
+		t.Errorf("the week used %v, want 37", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+	if week.Unit != "%" {
+		t.Errorf("the week's unit is %q, want %%", week.Unit)
+	}
+}
+
+func TestAMissingCountIsNoCount(t *testing.T) {
+	// 站点没写"用掉了几个"，那就没有这个数 —— 参考实现读到的���
+	// undefined，而 undefined 不是"大于等于零"，所以这个窗口走的是
+	// 百分比那一支，不是"0 个 / 150 个"。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,
+				 "current_weekly_status":1,"current_weekly_used_percent":72,
+				 "current_weekly_total_count":150,"weekly_boost_permille":1200,
+				 "weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 72 {
+		t.Errorf("the week used %v, want 72", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+	if week.Unit != "%" {
+		t.Errorf("the week's unit is %q, want %%", week.Unit)
+	}
+}
+
+func TestAWindowWithNothingInItIsNotAWindow(t *testing.T) {
+	// 既没有"还剩多少"，也没有"用掉多少"，这个窗口就不存在 —— 除非
+	// 状态说它用完了（2）或者不限量（3）。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":1,
+				 "current_weekly_status":1,"weekly_boost_permille":1200}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 0 {
+		t.Fatalf("got %d windows, want none: %+v", len(ws), ws)
+	}
+}
+
+func TestThePlanNumbersMayBeStrings(t *testing.T) {
+	// 站点有时把数字写成字符串。参考实现两种都收（num() 和 pct()），
+	// 所以 "1200" 是 1200，不是"这份回答里没有套餐"。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":"3",
+				 "current_weekly_status":"1","current_weekly_used_percent":"72",
+				 "weekly_boost_permille":"1200",
+				 "weekly_start_time":"1762800000000","weekly_end_time":"1763400000000"}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 72 {
+		t.Errorf("the week used %v, want 72", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+}
 ```
 
 测试文件的 import 补上 `"mmxcode/internal/upstream"`，并加助手：
@@ -12435,28 +11941,28 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 			StatusMsg  string `json:"status_msg"`
 		} `json:"base_resp"`
 		ModelRemains []struct {
-			ModelName                string   `json:"model_name"`
-			CurrentIntervalStatus    *float64 `json:"current_interval_status"`
-			CurrentIntervalRemaining *float64 `json:"current_interval_remaining_percent"`
-			CurrentIntervalUsed      *float64 `json:"current_interval_used_percent"`
-			CurrentIntervalTotal     *float64 `json:"current_interval_total_percent"`
-			CurrentIntervalUsedCount *float64 `json:"current_interval_used_count"`
-			CurrentIntervalTotalCnt  *float64 `json:"current_interval_total_count"`
-			StartTime                int64    `json:"start_time"`
-			EndTime                  int64    `json:"end_time"`
-			CurrentWeeklyStatus      *float64 `json:"current_weekly_status"`
-			CurrentWeeklyRemaining   *float64 `json:"current_weekly_remaining_percent"`
-			CurrentWeeklyUsed        *float64 `json:"current_weekly_used_percent"`
-			CurrentWeeklyTotal       *float64 `json:"current_weekly_total_percent"`
-			CurrentWeeklyUsedCount   *float64 `json:"current_weekly_used_count"`
-			CurrentWeeklyTotalCnt    *float64 `json:"current_weekly_total_count"`
-			WeeklyStartTime          int64    `json:"weekly_start_time"`
-			WeeklyEndTime            int64    `json:"weekly_end_time"`
+			ModelName                string     `json:"model_name"`
+			CurrentIntervalStatus    planNumber `json:"current_interval_status"`
+			CurrentIntervalRemaining planNumber `json:"current_interval_remaining_percent"`
+			CurrentIntervalUsed      planNumber `json:"current_interval_used_percent"`
+			CurrentIntervalTotal     planNumber `json:"current_interval_total_percent"`
+			CurrentIntervalUsedCount planNumber `json:"current_interval_used_count"`
+			CurrentIntervalTotalCnt  planNumber `json:"current_interval_total_count"`
+			StartTime                planNumber `json:"start_time"`
+			EndTime                  planNumber `json:"end_time"`
+			CurrentWeeklyStatus      planNumber `json:"current_weekly_status"`
+			CurrentWeeklyRemaining   planNumber `json:"current_weekly_remaining_percent"`
+			CurrentWeeklyUsed        planNumber `json:"current_weekly_used_percent"`
+			CurrentWeeklyTotal       planNumber `json:"current_weekly_total_percent"`
+			CurrentWeeklyUsedCount   planNumber `json:"current_weekly_used_count"`
+			CurrentWeeklyTotalCnt    planNumber `json:"current_weekly_total_count"`
+			WeeklyStartTime          planNumber `json:"weekly_start_time"`
+			WeeklyEndTime            planNumber `json:"weekly_end_time"`
 			// WeeklyBoostPermille is the boost an older plan or a
 			// tier's own allowance gives the week. The site writes it
 			// in permille, and it is the week's total when the site
 			// does not write a total of its own.
-			WeeklyBoostPermille *float64 `json:"weekly_boost_permille"`
+			WeeklyBoostPermille planNumber `json:"weekly_boost_permille"`
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -12485,31 +11991,28 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 		}
 		general := strings.EqualFold(name, "general")
 		for _, x := range []struct {
-			status    *float64
-			remaining *float64
-			used      *float64
-			total     *float64
-			usedCnt   *float64
-			totalCnt  *float64
-			start     int64
-			end       int64
+			status    planNumber
+			remaining planNumber
+			used      planNumber
+			total     planNumber
+			usedCnt   planNumber
+			totalCnt  planNumber
+			start     planNumber
+			end       planNumber
 			weekly    bool
-			boost     *float64
+			boost     planNumber
 		}{
 			{m.CurrentIntervalStatus, m.CurrentIntervalRemaining, m.CurrentIntervalUsed, m.CurrentIntervalTotal,
-				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false, nil},
+				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false, planNumber{}},
 			{m.CurrentWeeklyStatus, m.CurrentWeeklyRemaining, m.CurrentWeeklyUsed, m.CurrentWeeklyTotal,
 				m.CurrentWeeklyUsedCount, m.CurrentWeeklyTotalCnt, m.WeeklyStartTime, m.WeeklyEndTime, true, m.WeeklyBoostPermille},
 		} {
-			status := 0.0
-			if x.status != nil {
-				status = *x.status
-			}
+			status := x.status.num()
 			// The window is named after its own length. A window of
 			// three hours is "3 hours" and not "5 hours": the length is
 			// the window's own, and the site does not always give
 			// five.
-			span := windowSpan(x.start, x.end, x.weekly)
+			span := windowSpan(x.start.whole(), x.end.whole(), x.weekly)
 			own := windowName(x.weekly, span)
 			if status == 3 {
 				// An unlimited window is said so on the general model.
@@ -12518,67 +12021,75 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 				}
 				continue
 			}
-			if x.status == nil && x.remaining == nil && x.used == nil {
+			// A window with neither a share left nor a share used is
+			// not a window: the reference skips it, and so does this.
+			// A window that is spent (status 2) or unlimited (status 3)
+			// is kept whatever it says.
+			if status != 2 && !x.remaining.present() && !x.used.present() {
 				continue
 			}
 			total := 100.0
 			switch {
-			case x.total != nil:
+			case x.total.present():
 				// A total the site wrote. A zero is not a total.
-				if *x.total > 0 {
-					total = *x.total
+				if x.total.Value > 0 {
+					total = x.total.Value
 				}
-			case x.boost != nil && *x.boost > 1000:
+			case x.boost.present() && x.boost.Value > 1000:
 				// The week has no total of its own: the boost is the
 				// total. The site writes it in permille, and the
 				// reference reads it the same way.
-				total = *x.boost / 10
+				total = x.boost.Value / 10
 			}
 			used := 0.0
 			switch {
 			case status == 2:
 				used = 100
-			case x.used != nil:
-				used = clampPercent(*x.used / total * 100)
-			case x.remaining != nil:
-				used = clampPercent(100 - *x.remaining)
+			case x.used.present():
+				used = clampPercent(x.used.Value / total * 100)
+			case x.remaining.present():
+				used = clampPercent(100 - x.remaining.Value)
 			}
 			w := Window{Name: own, ModelName: name, Used: used}
-			if x.end > 0 {
+			if x.end.Value > 0 {
 				// The end of the window is a time the site wrote, and
 				// the site does not say in which unit: a number
 				// below a trillion is seconds. The reference reads it
 				// the same way, and the window's own length is read
 				// that way too — so the two agree on how long the
 				// window is.
-				w.ResetsAt = time.UnixMilli(planMS(x.end))
+				w.ResetsAt = time.UnixMilli(planMS(x.end.whole()))
 			}
-			// The site counts the items a window has. A count that is
-			// not there is zero, the way the reference reads it, so a
-			// window with a limit and no count yet is "0 of 150" and
-			// not "unknown". A count that is negative is not a count
-			// at all: the reference wants the count to be at least
-			// zero, or the window has no limit to show.
-			items, of := 0.0, 0.0
-			if x.usedCnt != nil {
-				items = *x.usedCnt
-			}
-			if x.totalCnt != nil {
-				of = *x.totalCnt
-			}
-			if items >= 0 && of > 0 && items <= of {
-				w.Amount = items
+			// The site counts the items a window has. A count the site
+			// did not write is no count at all: the reference reads it
+			// as undefined, and undefined is not ">= 0", so such a
+			// window falls through to the share below instead of
+			// showing "0 of 150". A count that is negative is not a
+			// count either.
+			if x.usedCnt.present() && x.usedCnt.Value >= 0 && x.totalCnt.num() > 0 && x.usedCnt.Value <= x.totalCnt.Value {
+				w.Amount = x.usedCnt.Value
 				if status == 2 {
 					// A spent window counts its whole limit.
-					w.Amount = of
+					w.Amount = x.totalCnt.Value
 				}
-				w.Limit = of
+				w.Limit = x.totalCnt.Value
 				if strings.EqualFold(name, "video") {
 					w.Unit = "videos"
 				}
 			} else if total != 100 {
 				w.Limit = total
-				w.Amount = used * total / 100
+				switch {
+				case status == 2:
+					w.Amount = total
+				case x.used.present():
+					// The share the site itself wrote, as it wrote
+					// it. The reference uses that number and not the
+					// one worked out from the total, so a site that
+					// says 37 shows 37 and not 37.00000000000001.
+					w.Amount = x.used.Value
+				default:
+					w.Amount = used * total / 100
+				}
 				w.Unit = "%"
 			}
 			out = append(out, w)
@@ -12587,11 +12098,80 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 	return out, len(env.ModelRemains) > 0, nil
 }
 
+// planNumber is a number the plan's answer may hold.
+//
+// The site writes these fields as JSON numbers, but it has been seen
+// writing them as strings, and the reference reads both: its num()
+// takes a string that is a number and its pct() takes the number off
+// the front of a string. So "1200" is 1200 and not a broken reply.
+//
+// Set says whether the site wrote the field at all. A field the site
+// did not write is not the same as a field it wrote as zero: the
+// reference reads a missing count as undefined, and undefined is
+// neither ">= 0" nor a number to divide by.
+type planNumber struct {
+	// Value is the number, when there is one.
+	Value float64
+	// Set says whether the site wrote a number here.
+	Set bool
+}
+
+// UnmarshalJSON reads a number the site wrote, or notes that there is
+// none.
+func (n *planNumber) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if strings.HasPrefix(s, `"`) {
+		var text string
+		if err := json.Unmarshal(b, &text); err != nil {
+			return nil
+		}
+		s = strings.TrimSpace(text)
+		if s == "" {
+			return nil
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		// Not a number, so not there. The reference's pct() would take
+		// the number off the front of a string like "12abc"; a value
+		// like that is not one the site writes, and reading it as no
+		// number is the safer of the two.
+		return nil
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	n.Value, n.Set = f, true
+	return nil
+}
+
+// present says whether the site wrote a number here.
+func (n planNumber) present() bool { return n.Set }
+
+// num is the number, or zero when there is none.
+func (n planNumber) num() float64 {
+	if !n.Set {
+		return 0
+	}
+	return n.Value
+}
+
+// whole is the number as a whole number, or zero when there is none.
+func (n planNumber) whole() int64 {
+	if !n.Set {
+		return 0
+	}
+	return int64(n.Value)
+}
+
 // isThree says whether a number is 3.
-func isThree(v *float64) bool { return v != nil && *v == 3 }
+func isThree(v planNumber) bool { return v.Set && v.Value == 3 }
 
 // isZeroCount says whether a count is missing or zero.
-func isZeroCount(v *float64) bool { return v == nil || *v == 0 }
+func isZeroCount(v planNumber) bool { return !v.Set || v.Value == 0 }
 
 // windowSpan is how long a plan window is.
 //

@@ -380,7 +380,7 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(clampToDeadline(wait, d.deadline)):
 		}
 		if time.Now().After(d.deadline) {
 			return nil, &Error{Code: "expired_token", What: WhatSignIn}
@@ -459,6 +459,32 @@ func (d *Device) Poll(ctx context.Context, c *upstream.Client, endpoint string) 
 		tok.Subject, tok.AccountID, tok.HasClaims = claims(b.AccessToken)
 		return tok, nil
 	}
+}
+
+// clampToDeadline cuts a wait down to the time the sign-in code has
+// left.
+//
+// The reference sleeps for the shorter of the interval and the time
+// left, and then gives up if the code is over:
+//
+//	await sleep(Math.min(delay, Math.max(0, d.deadline - Date.now())))
+//	if (Date.now() >= d.deadline) break
+//
+// So a code that says "this one is good for ten minutes" but "come
+// back in fifty" is told at ten minutes that it is over. Sleeping the
+// whole interval would keep a caller waiting long past the point
+// where the code could still be approved — with a background context
+// that is fifty minutes of nothing, and with a shorter context a
+// cancellation instead of the "expired" the reference reports.
+func clampToDeadline(wait time.Duration, deadline time.Time) time.Duration {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return 0
+	}
+	if wait > left {
+		return left
+	}
+	return wait
 }
 
 // slowDownWait is how much longer to wait when the site says slow

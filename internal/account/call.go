@@ -134,28 +134,28 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 			StatusMsg  string `json:"status_msg"`
 		} `json:"base_resp"`
 		ModelRemains []struct {
-			ModelName                string   `json:"model_name"`
-			CurrentIntervalStatus    *float64 `json:"current_interval_status"`
-			CurrentIntervalRemaining *float64 `json:"current_interval_remaining_percent"`
-			CurrentIntervalUsed      *float64 `json:"current_interval_used_percent"`
-			CurrentIntervalTotal     *float64 `json:"current_interval_total_percent"`
-			CurrentIntervalUsedCount *float64 `json:"current_interval_used_count"`
-			CurrentIntervalTotalCnt  *float64 `json:"current_interval_total_count"`
-			StartTime                int64    `json:"start_time"`
-			EndTime                  int64    `json:"end_time"`
-			CurrentWeeklyStatus      *float64 `json:"current_weekly_status"`
-			CurrentWeeklyRemaining   *float64 `json:"current_weekly_remaining_percent"`
-			CurrentWeeklyUsed        *float64 `json:"current_weekly_used_percent"`
-			CurrentWeeklyTotal       *float64 `json:"current_weekly_total_percent"`
-			CurrentWeeklyUsedCount   *float64 `json:"current_weekly_used_count"`
-			CurrentWeeklyTotalCnt    *float64 `json:"current_weekly_total_count"`
-			WeeklyStartTime          int64    `json:"weekly_start_time"`
-			WeeklyEndTime            int64    `json:"weekly_end_time"`
+			ModelName                string     `json:"model_name"`
+			CurrentIntervalStatus    planNumber `json:"current_interval_status"`
+			CurrentIntervalRemaining planNumber `json:"current_interval_remaining_percent"`
+			CurrentIntervalUsed      planNumber `json:"current_interval_used_percent"`
+			CurrentIntervalTotal     planNumber `json:"current_interval_total_percent"`
+			CurrentIntervalUsedCount planNumber `json:"current_interval_used_count"`
+			CurrentIntervalTotalCnt  planNumber `json:"current_interval_total_count"`
+			StartTime                planNumber `json:"start_time"`
+			EndTime                  planNumber `json:"end_time"`
+			CurrentWeeklyStatus      planNumber `json:"current_weekly_status"`
+			CurrentWeeklyRemaining   planNumber `json:"current_weekly_remaining_percent"`
+			CurrentWeeklyUsed        planNumber `json:"current_weekly_used_percent"`
+			CurrentWeeklyTotal       planNumber `json:"current_weekly_total_percent"`
+			CurrentWeeklyUsedCount   planNumber `json:"current_weekly_used_count"`
+			CurrentWeeklyTotalCnt    planNumber `json:"current_weekly_total_count"`
+			WeeklyStartTime          planNumber `json:"weekly_start_time"`
+			WeeklyEndTime            planNumber `json:"weekly_end_time"`
 			// WeeklyBoostPermille is the boost an older plan or a
 			// tier's own allowance gives the week. The site writes it
 			// in permille, and it is the week's total when the site
 			// does not write a total of its own.
-			WeeklyBoostPermille *float64 `json:"weekly_boost_permille"`
+			WeeklyBoostPermille planNumber `json:"weekly_boost_permille"`
 		} `json:"model_remains"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -184,31 +184,28 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 		}
 		general := strings.EqualFold(name, "general")
 		for _, x := range []struct {
-			status    *float64
-			remaining *float64
-			used      *float64
-			total     *float64
-			usedCnt   *float64
-			totalCnt  *float64
-			start     int64
-			end       int64
+			status    planNumber
+			remaining planNumber
+			used      planNumber
+			total     planNumber
+			usedCnt   planNumber
+			totalCnt  planNumber
+			start     planNumber
+			end       planNumber
 			weekly    bool
-			boost     *float64
+			boost     planNumber
 		}{
 			{m.CurrentIntervalStatus, m.CurrentIntervalRemaining, m.CurrentIntervalUsed, m.CurrentIntervalTotal,
-				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false, nil},
+				m.CurrentIntervalUsedCount, m.CurrentIntervalTotalCnt, m.StartTime, m.EndTime, false, planNumber{}},
 			{m.CurrentWeeklyStatus, m.CurrentWeeklyRemaining, m.CurrentWeeklyUsed, m.CurrentWeeklyTotal,
 				m.CurrentWeeklyUsedCount, m.CurrentWeeklyTotalCnt, m.WeeklyStartTime, m.WeeklyEndTime, true, m.WeeklyBoostPermille},
 		} {
-			status := 0.0
-			if x.status != nil {
-				status = *x.status
-			}
+			status := x.status.num()
 			// The window is named after its own length. A window of
 			// three hours is "3 hours" and not "5 hours": the length is
 			// the window's own, and the site does not always give
 			// five.
-			span := windowSpan(x.start, x.end, x.weekly)
+			span := windowSpan(x.start.whole(), x.end.whole(), x.weekly)
 			own := windowName(x.weekly, span)
 			if status == 3 {
 				// An unlimited window is said so on the general model.
@@ -217,67 +214,75 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 				}
 				continue
 			}
-			if x.status == nil && x.remaining == nil && x.used == nil {
+			// A window with neither a share left nor a share used is
+			// not a window: the reference skips it, and so does this.
+			// A window that is spent (status 2) or unlimited (status 3)
+			// is kept whatever it says.
+			if status != 2 && !x.remaining.present() && !x.used.present() {
 				continue
 			}
 			total := 100.0
 			switch {
-			case x.total != nil:
+			case x.total.present():
 				// A total the site wrote. A zero is not a total.
-				if *x.total > 0 {
-					total = *x.total
+				if x.total.Value > 0 {
+					total = x.total.Value
 				}
-			case x.boost != nil && *x.boost > 1000:
+			case x.boost.present() && x.boost.Value > 1000:
 				// The week has no total of its own: the boost is the
 				// total. The site writes it in permille, and the
 				// reference reads it the same way.
-				total = *x.boost / 10
+				total = x.boost.Value / 10
 			}
 			used := 0.0
 			switch {
 			case status == 2:
 				used = 100
-			case x.used != nil:
-				used = clampPercent(*x.used / total * 100)
-			case x.remaining != nil:
-				used = clampPercent(100 - *x.remaining)
+			case x.used.present():
+				used = clampPercent(x.used.Value / total * 100)
+			case x.remaining.present():
+				used = clampPercent(100 - x.remaining.Value)
 			}
 			w := Window{Name: own, ModelName: name, Used: used}
-			if x.end > 0 {
+			if x.end.Value > 0 {
 				// The end of the window is a time the site wrote, and
 				// the site does not say in which unit: a number
 				// below a trillion is seconds. The reference reads it
 				// the same way, and the window's own length is read
 				// that way too — so the two agree on how long the
 				// window is.
-				w.ResetsAt = time.UnixMilli(planMS(x.end))
+				w.ResetsAt = time.UnixMilli(planMS(x.end.whole()))
 			}
-			// The site counts the items a window has. A count that is
-			// not there is zero, the way the reference reads it, so a
-			// window with a limit and no count yet is "0 of 150" and
-			// not "unknown". A count that is negative is not a count
-			// at all: the reference wants the count to be at least
-			// zero, or the window has no limit to show.
-			items, of := 0.0, 0.0
-			if x.usedCnt != nil {
-				items = *x.usedCnt
-			}
-			if x.totalCnt != nil {
-				of = *x.totalCnt
-			}
-			if items >= 0 && of > 0 && items <= of {
-				w.Amount = items
+			// The site counts the items a window has. A count the site
+			// did not write is no count at all: the reference reads it
+			// as undefined, and undefined is not ">= 0", so such a
+			// window falls through to the share below instead of
+			// showing "0 of 150". A count that is negative is not a
+			// count either.
+			if x.usedCnt.present() && x.usedCnt.Value >= 0 && x.totalCnt.num() > 0 && x.usedCnt.Value <= x.totalCnt.Value {
+				w.Amount = x.usedCnt.Value
 				if status == 2 {
 					// A spent window counts its whole limit.
-					w.Amount = of
+					w.Amount = x.totalCnt.Value
 				}
-				w.Limit = of
+				w.Limit = x.totalCnt.Value
 				if strings.EqualFold(name, "video") {
 					w.Unit = "videos"
 				}
 			} else if total != 100 {
 				w.Limit = total
-				w.Amount = used * total / 100
+				switch {
+				case status == 2:
+					w.Amount = total
+				case x.used.present():
+					// The share the site itself wrote, as it wrote
+					// it. The reference uses that number and not the
+					// one worked out from the total, so a site that
+					// says 37 shows 37 and not 37.00000000000001.
+					w.Amount = x.used.Value
+				default:
+					w.Amount = used * total / 100
+				}
 				w.Unit = "%"
 			}
 			out = append(out, w)
@@ -286,11 +291,80 @@ func parsePlanWindows(raw []byte) (windows []Window, listed bool, err error) {
 	return out, len(env.ModelRemains) > 0, nil
 }
 
+// planNumber is a number the plan's answer may hold.
+//
+// The site writes these fields as JSON numbers, but it has been seen
+// writing them as strings, and the reference reads both: its num()
+// takes a string that is a number and its pct() takes the number off
+// the front of a string. So "1200" is 1200 and not a broken reply.
+//
+// Set says whether the site wrote the field at all. A field the site
+// did not write is not the same as a field it wrote as zero: the
+// reference reads a missing count as undefined, and undefined is
+// neither ">= 0" nor a number to divide by.
+type planNumber struct {
+	// Value is the number, when there is one.
+	Value float64
+	// Set says whether the site wrote a number here.
+	Set bool
+}
+
+// UnmarshalJSON reads a number the site wrote, or notes that there is
+// none.
+func (n *planNumber) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if strings.HasPrefix(s, `"`) {
+		var text string
+		if err := json.Unmarshal(b, &text); err != nil {
+			return nil
+		}
+		s = strings.TrimSpace(text)
+		if s == "" {
+			return nil
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		// Not a number, so not there. The reference's pct() would take
+		// the number off the front of a string like "12abc"; a value
+		// like that is not one the site writes, and reading it as no
+		// number is the safer of the two.
+		return nil
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	n.Value, n.Set = f, true
+	return nil
+}
+
+// present says whether the site wrote a number here.
+func (n planNumber) present() bool { return n.Set }
+
+// num is the number, or zero when there is none.
+func (n planNumber) num() float64 {
+	if !n.Set {
+		return 0
+	}
+	return n.Value
+}
+
+// whole is the number as a whole number, or zero when there is none.
+func (n planNumber) whole() int64 {
+	if !n.Set {
+		return 0
+	}
+	return int64(n.Value)
+}
+
 // isThree says whether a number is 3.
-func isThree(v *float64) bool { return v != nil && *v == 3 }
+func isThree(v planNumber) bool { return v.Set && v.Value == 3 }
 
 // isZeroCount says whether a count is missing or zero.
-func isZeroCount(v *float64) bool { return v == nil || *v == 0 }
+func isZeroCount(v planNumber) bool { return !v.Set || v.Value == 0 }
 
 // windowSpan is how long a plan window is.
 //

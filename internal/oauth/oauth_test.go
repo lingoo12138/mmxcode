@@ -1292,3 +1292,35 @@ func TestNoSecretIsInAnyErrorOrURL(t *testing.T) {
 		}
 	}
 }
+
+func TestTheWaitDoesNotOutlastTheCode(t *testing.T) {
+	// 站点说这个码十分钟有效，却让人五十分钟再来问一次。参考实现是
+	// 睡到"间隔"和"剩下的时间"里短的那个，然后发现码过期了就说
+	// 过期 —— 不是把整个间隔睡完，才发现自己等了一个小时。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"authorization_pending"}`))
+	}))
+	defer srv.Close()
+
+	d := &Device{
+		UserCode:  "ABCD",
+		verifier:  "v",
+		pollField: "device_code",
+		pollValue: "dev-1",
+		deadline:  time.Now().Add(2 * time.Second),
+		interval:  50 * time.Minute,
+	}
+
+	start := time.Now()
+	_, err := d.Poll(context.Background(), testClient(t), srv.URL+"/oauth2/token")
+	took := time.Since(start)
+
+	var e *Error
+	if !errors.As(err, &e) || e.Code != "expired_token" {
+		t.Fatalf("err = %v, want an expired token", err)
+	}
+	if took > 10*time.Second {
+		t.Fatalf("waited %v, want the code's own end", took)
+	}
+}

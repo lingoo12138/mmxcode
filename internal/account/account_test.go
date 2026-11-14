@@ -803,3 +803,152 @@ func TestModelsLive(t *testing.T) {
 		t.Fatalf("efforts = %v, want two", ms[0].Efforts)
 	}
 }
+
+func TestTheSiteSaysHowMuchOfTheWeekIsUsed(t *testing.T) {
+	// 站点自己说"用掉了百分之三十七"，那就是三十七。参考实现用的是
+	// 它写的那个数，不是我们自己算出来的那个 —— 自己算会得到
+	// 37.00000000000001 这种东西。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,
+				 "current_weekly_status":1,"current_weekly_used_percent":37,"weekly_boost_permille":1200,
+				 "weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 37 {
+		t.Errorf("the week used %v, want 37", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+	if week.Unit != "%" {
+		t.Errorf("the week's unit is %q, want %%", week.Unit)
+	}
+}
+
+func TestAMissingCountIsNoCount(t *testing.T) {
+	// 站点没写"用掉了几个"，那就没有这个数 —— 参考实现读到的���
+	// undefined，而 undefined 不是"大于等于零"，所以这个窗口走的是
+	// 百分比那一支，不是"0 个 / 150 个"。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":3,
+				 "current_weekly_status":1,"current_weekly_used_percent":72,
+				 "current_weekly_total_count":150,"weekly_boost_permille":1200,
+				 "weekly_start_time":1762800000000,"weekly_end_time":1763400000000}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 72 {
+		t.Errorf("the week used %v, want 72", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+	if week.Unit != "%" {
+		t.Errorf("the week's unit is %q, want %%", week.Unit)
+	}
+}
+
+func TestAWindowWithNothingInItIsNotAWindow(t *testing.T) {
+	// 既没有"还剩多少"，也没有"用掉多少"，这个窗口就不存在 —— 除非
+	// 状态说它用完了（2）或者不限量（3）。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":1,
+				 "current_weekly_status":1,"weekly_boost_permille":1200}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 0 {
+		t.Fatalf("got %d windows, want none: %+v", len(ws), ws)
+	}
+}
+
+func TestThePlanNumbersMayBeStrings(t *testing.T) {
+	// 站点有时把数字写成字符串。参考实现两种都收（num() 和 pct()），
+	// 所以 "1200" 是 1200，不是"这份回答里没有套餐"。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case site.PlanRemainsPath:
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[
+				{"model_name":"general","current_interval_status":"3",
+				 "current_weekly_status":"1","current_weekly_used_percent":"72",
+				 "weekly_boost_permille":"1200",
+				 "weekly_start_time":"1762800000000","weekly_end_time":"1763400000000"}
+			]}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(testClient(t))
+	c.SetBase(srv.URL, srv.URL)
+	ws, err := c.PlanWindows(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("got %d windows: %+v", len(ws), ws)
+	}
+	// 第一个窗口是那个不限量的（状态 3），周窗口是第二个。
+	week := ws[1]
+	if week.Amount != 72 {
+		t.Errorf("the week used %v, want 72", week.Amount)
+	}
+	if week.Limit != 120 {
+		t.Errorf("the week's total is %v, want 120", week.Limit)
+	}
+}
