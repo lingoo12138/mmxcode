@@ -1911,9 +1911,18 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func openTest(t *testing.T) *Store {
@@ -1927,6 +1936,20 @@ func openTest(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// makeAccount puts an account in the store.
+//
+// The children say which account they belong to, so a child without an
+// account is refused.
+func makeAccount(t *testing.T, s *Store, id string) {
+	t.Helper()
+	err := s.CreateAccount(context.Background(), Account{
+		ID: id, Name: id, Status: StatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAccountRoundTrip(t *testing.T) {
@@ -1960,7 +1983,10 @@ func TestAccountRoundTrip(t *testing.T) {
 	if err := s.UpdateAccount(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.GetAccount(ctx, "acc_01")
+	got, err = s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Name != "改名了" || got.ProxyURL != "http://127.0.0.1:1080" {
 		t.Fatalf("after update got %+v", got)
 	}
@@ -1981,9 +2007,116 @@ func TestAccountRoundTrip(t *testing.T) {
 	}
 }
 
+// TestNotFoundIsOneSentinel says every way of saying "there is no
+// such row" says it the same way.
+//
+// 找不到就是找不到，一种说法就够。
+func TestNotFoundIsOneSentinel(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	if _, err := s.GetAccount(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get account: %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetToken(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get token: %v, want ErrNotFound", err)
+	}
+	err := s.UpdateAccount(ctx, Account{ID: "nope", Name: "x", Status: StatusActive})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update account: %v, want ErrNotFound", err)
+	}
+	err = s.DeleteAccount(ctx, "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete account: %v, want ErrNotFound", err)
+	}
+	// 哨兵不能是 database/sql 那个
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("the error is the database's own sentinel")
+	}
+}
+
+// TestDeleteAccountTakesTheChildrenWithIt says an account's children
+// go with the account.
+//
+// 删除账号要带着它的账本、签到、用量和会话一起走。
+func TestDeleteAccountTakesTheChildrenWithIt(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if err := s.SaveToken(ctx, Token{AccountID: "acc_01", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetExhausted(ctx, "acc_01", "general", time.Now().Add(time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckin(ctx, Checkin{AccountID: "acc_01", Day: "2026-11-13",
+		Outcome: "claimed", Credit: 25, Streak: 3, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Remaining: 100, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindSession(ctx, "sess-1", "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteAccount(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, table := range []string{
+		"tokens", "exhausted_windows", "checkins", "usage_snapshots", "sessions",
+	} {
+		var n int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s has %d rows left, want none", table, n)
+		}
+	}
+}
+
+// TestChildRowWithoutAnAccountIsRefused says a child row of an
+// account that is not there is not accepted.
+//
+// 没有账号的孩子不算数。
+func TestChildRowWithoutAnAccountIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	err := s.SaveToken(ctx, Token{AccountID: "nope", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("the token of an account that is not there was accepted")
+	}
+	err = s.SaveUsageSnapshot(ctx, UsageSnapshot{AccountID: "nope", HasAmounts: true,
+		Granted: 1, Remaining: 1, CreatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("the reading of an account that is not there was accepted")
+	}
+	err = s.BindSession(ctx, "sess-1", "nope")
+	if err == nil {
+		t.Fatal("the session of an account that is not there was accepted")
+	}
+	err = s.SaveCheckin(ctx, Checkin{AccountID: "nope", Day: "2026-11-13",
+		Outcome: "claimed", CreatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("the check-in of an account that is not there was accepted")
+	}
+	err = s.SetExhausted(ctx, "nope", "general", time.Now().Add(time.Hour), "quota")
+	if err == nil {
+		t.Fatal("the window of an account that is not there was accepted")
+	}
+}
+
 func TestTokenRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	exp := time.Now().Add(time.Hour)
 	if err := s.SaveToken(ctx, Token{
 		AccountID: "acc_01", Access: "a", Refresh: "r",
@@ -2003,9 +2136,40 @@ func TestTokenRoundTrip(t *testing.T) {
 	}
 }
 
+// TestANullSubjectIsReadable says a token whose subject was never
+// written can still be read.
+//
+// 老库里的 subject 可以是空的，空的也要读得出来。
+func TestANullSubjectIsReadable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+	makeOldFile(t, path)
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Subject != "" {
+		t.Fatalf("subject = %q, want nothing", got.Subject)
+	}
+	if got.Access != "a" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestCheckinUniquePerDay(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	c := Checkin{AccountID: "acc_01", Day: "2026-11-13", Outcome: "claimed", Credit: 25, Streak: 3}
 	if err := s.SaveCheckin(ctx, c); err != nil {
 		t.Fatal(err)
@@ -2024,9 +2188,65 @@ func TestCheckinUniquePerDay(t *testing.T) {
 	}
 }
 
+// TestANullCreditIsReadable says a check-in whose credit was never
+// written can still be read.
+func TestANullCreditIsReadable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+	makeOldFile(t, path)
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListCheckins(ctx, "acc_01", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("got %+v", list)
+	}
+	if list[0].Credit != 0 || list[0].Streak != 0 {
+		t.Fatalf("got %+v", list[0])
+	}
+}
+
+// TestListCheckinsLimit says a limit of zero is no limit.
+func TestListCheckinsLimit(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+	for _, day := range []string{"2026-11-11", "2026-11-12", "2026-11-13"} {
+		if err := s.SaveCheckin(ctx, Checkin{AccountID: "acc_01", Day: day,
+			Outcome: "claimed", CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := s.ListCheckins(ctx, "acc_01", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("got %d check-ins, want all three", len(list))
+	}
+	list, err = s.ListCheckins(ctx, "acc_01", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("got %d check-ins, want two", len(list))
+	}
+}
+
 func TestExhaustedWindows(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	until := time.Now().Add(time.Hour)
 	if err := s.SetExhausted(ctx, "acc_01", "general", until, "quota"); err != nil {
 		t.Fatal(err)
@@ -2041,15 +2261,97 @@ func TestExhaustedWindows(t *testing.T) {
 	if err := s.ClearExhausted(ctx, "acc_01", "general"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.ListExhausted(ctx)
+	got, err = s.ListExhausted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 0 {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestTheWindowsThatHaveComeBackAreStillThere says ListExhausted
+// gives the windows that have run out as well.
+//
+// 到期的窗口还在表里，谁在用自己看着办。
+func TestTheWindowsThatHaveComeBackAreStillThere(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	now := time.Now()
+	if err := s.SetExhausted(ctx, "acc_01", "general", now.Add(-time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListExhausted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %+v, want the expired window too", got)
+	}
+	if err := s.PruneExpiredWindows(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.ListExhausted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want the expired window gone", got)
+	}
+}
+
+// TestPruneUsageSnapshots says the old readings are thrown away and
+// the newest ones are kept.
+//
+// 旧读数扔掉，新的留下。
+func TestPruneUsageSnapshots(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	old := time.Now().Add(-48 * time.Hour)
+	for i := 0; i < 5; i++ {
+		if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{AccountID: "acc_01", HasAmounts: true,
+			Granted: float64(i), Remaining: float64(i), CreatedAt: old.Add(time.Duration(i) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 一条新的
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{AccountID: "acc_01", HasAmounts: true,
+		Granted: 9, Remaining: 9, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PruneUsageSnapshots(ctx, time.Now().Add(-24*time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	// 每个账号留最新的一条
+	if n != 1 {
+		t.Fatalf("got %d readings, want the newest one", n)
+	}
+	// 一条都不留的时候就没有了
+	if err := s.PruneUsageSnapshots(ctx, time.Now().Add(time.Hour), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("got %d readings, want none", n)
 	}
 }
 
 func TestSessionBinding(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+	makeAccount(t, s, "acc_02")
 	if err := s.BindSession(ctx, "sess-1", "acc_01"); err != nil {
 		t.Fatal(err)
 	}
@@ -2067,9 +2369,76 @@ func TestSessionBinding(t *testing.T) {
 	}
 }
 
+// TestUpstreamIDIsRandomAndKept says every session has an upstream id
+// of its own, and keeps it.
+//
+// 两段一样的开场白不能共用一个上游会话。
+func TestUpstreamIDIsRandomAndKept(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	first, err := s.UpstreamID(ctx, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" {
+		t.Fatal("the session has no upstream id")
+	}
+	again, err := s.UpstreamID(ctx, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Fatalf("got %q and %q, want the same id", again, first)
+	}
+	other, err := s.UpstreamID(ctx, "sess-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == first {
+		t.Fatal("two sessions got the same upstream id")
+	}
+	// 同一个 key 再问还是那个 id
+	third, err := s.UpstreamID(ctx, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third != first {
+		t.Fatalf("got %q, want %q", third, first)
+	}
+}
+
+// TestTheUpstreamIDSurvivesTheBinding says the upstream id belongs
+// to the conversation and not to the account.
+func TestTheUpstreamIDSurvivesTheBinding(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	id, err := s.UpstreamID(ctx, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindSession(ctx, "sess-1", "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.UpstreamID(ctx, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != id {
+		t.Fatalf("got %q, want %q", again, id)
+	}
+	acc, ok, err := s.SessionAccount(ctx, "sess-1")
+	if err != nil || !ok || acc != "acc_01" {
+		t.Fatalf("got %q %v %v", acc, ok, err)
+	}
+}
+
 func TestUsageSnapshot(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
 		AccountID: "acc_01", Granted: 600, Consumed: 120.5, Remaining: 479.5,
 		HasAmounts: true,
@@ -2094,6 +2463,7 @@ func TestUsageSnapshotWithoutAmounts(t *testing.T) {
 	// 读不到账本和读到 0 是两回事：读不到就没有数
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_02")
 	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
 		AccountID: "acc_02", Plan: "M Plan", CreatedAt: time.Now(),
 	}); err != nil {
@@ -2111,6 +2481,33 @@ func TestUsageSnapshotWithoutAmounts(t *testing.T) {
 	}
 }
 
+// TestTheAmountsAreKeptWithoutTheFlag says a caller that forgets to
+// say that a reading has amounts does not lose the numbers.
+//
+// 忘了说有没有数，数还在。
+func TestTheAmountsAreKeptWithoutTheFlag(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", Granted: 100, Consumed: 10, Remaining: 90,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasAmounts {
+		t.Fatalf("the numbers were lost: %+v", got)
+	}
+	if got.Granted != 100 || got.Consumed != 10 || got.Remaining != 90 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 // TestLatestUsageSnapshotIsOneRowPerAccount says two readings of one
 // account in the same millisecond come back as one row.
 //
@@ -2118,6 +2515,7 @@ func TestUsageSnapshotWithoutAmounts(t *testing.T) {
 func TestLatestUsageSnapshotIsOneRowPerAccount(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	// 同一毫秒里的两次刷新
 	at := time.UnixMilli(1763000000000)
 	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
@@ -2153,6 +2551,7 @@ func TestLatestUsageSnapshotGivesOneAccount(t *testing.T) {
 	s := openTest(t)
 	now := time.Now()
 	for _, id := range []string{"acc_01", "acc_02"} {
+		makeAccount(t, s, id)
 		if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
 			AccountID: id, HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: now,
 		}); err != nil {
@@ -2183,6 +2582,7 @@ func TestLatestUsageSnapshotGivesOneAccount(t *testing.T) {
 func TestUsageSnapshotKeepsTheReadErrors(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
+	makeAccount(t, s, "acc_01")
 	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
 		AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10,
 		MembershipError: "the membership is not there",
@@ -2214,6 +2614,516 @@ func TestDayKeyIsTheSitesDay(t *testing.T) {
 		t.Fatalf("day = %q, want 2026-11-14", got)
 	}
 }
+
+// TestTheTimesComeBackInUTC says a time that was written in UTC comes
+// back in UTC.
+//
+// 写进去是 UTC，读出来也得是 UTC。
+func TestTheTimesComeBackInUTC(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	at := time.Date(2026, 11, 13, 20, 0, 0, 0, time.UTC)
+	makeAccount(t, s, "acc_01")
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 1, Remaining: 1, CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CreatedAt.Location() != time.UTC {
+		t.Fatalf("created_at is in %v, want UTC", got.CreatedAt.Location())
+	}
+	if !got.CreatedAt.Equal(at) {
+		t.Fatalf("created_at = %v, want %v", got.CreatedAt, at)
+	}
+}
+
+// TestTheStoreHasAClock says the store's clock is what a row is
+// written at when the caller does not say.
+//
+// 调用方不说是几点，存储层自己说。
+func TestTheStoreHasAClock(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	at := time.Date(2026, 11, 13, 20, 0, 0, 0, time.UTC)
+	s.Clock = func() time.Time { return at }
+	makeAccount(t, s, "acc_01")
+
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true, Granted: 1, Remaining: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CreatedAt.Equal(at) {
+		t.Fatalf("created_at = %v, want %v", got.CreatedAt, at)
+	}
+}
+
+// TestAnUnknownStatusIsRefused says an account cannot have a status
+// nobody wrote.
+//
+// 写错的状态会让账号悄悄不能用。
+func TestAnUnknownStatusIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	err := s.CreateAccount(ctx, Account{ID: "acc_01", Name: "a", Status: "actve"})
+	if err == nil {
+		t.Fatal("the account with the misspelled status was accepted")
+	}
+	makeAccount(t, s, "acc_02")
+	err = s.UpdateAccount(ctx, Account{ID: "acc_02", Name: "a", Status: "actve"})
+	if err == nil {
+		t.Fatal("the account with the misspelled status was accepted")
+	}
+	err = s.UpdateAccountStatus(ctx, "acc_02", "actve", "", time.Now())
+	if err == nil {
+		t.Fatal("the account with the misspelled status was accepted")
+	}
+}
+
+// TestTheNarrowSetters says the state and the outlet are written
+// without reading the account first.
+func TestTheNarrowSetters(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if err := s.UpdateAccountStatus(ctx, "acc_01", StatusSignedOut, "the sign-in was refused", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusSignedOut || got.LastError != "the sign-in was refused" {
+		t.Fatalf("got %+v", got)
+	}
+	if err := s.SetAccountProxy(ctx, "acc_01", "warp", "http://127.0.0.1:1080", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyGroup != "warp" || got.ProxyURL != "http://127.0.0.1:1080" {
+		t.Fatalf("got %+v", got)
+	}
+	// 没有的账号还是找不到
+	if err := s.UpdateAccountStatus(ctx, "nope", StatusActive, "", time.Now()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update the status: %v, want ErrNotFound", err)
+	}
+	if err := s.SetAccountProxy(ctx, "nope", "warp", "", time.Now()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("set the outlet: %v, want ErrNotFound", err)
+	}
+}
+
+// TestThePragmasAreOnEveryConnection says every connection of the
+// pool has the pragmas, and not only the first one.
+//
+// 每个连接都得带着 pragma，不能只有第一个。
+func TestThePragmasAreOnEveryConnection(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	conns := make([]*sql.Conn, 0, maxConns)
+	for i := 0; i < maxConns; i++ {
+		c, err := s.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for i, c := range conns {
+		var fk int
+		if err := c.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
+			t.Fatal(err)
+		}
+		if fk != 1 {
+			t.Fatalf("connection %d has foreign_keys = %d, want 1", i, fk)
+		}
+		var busy int
+		if err := c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
+			t.Fatal(err)
+		}
+		if busy != 5000 {
+			t.Fatalf("connection %d has busy_timeout = %d, want 5000", i, busy)
+		}
+		var mode string
+		if err := c.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
+			t.Fatal(err)
+		}
+		if mode != "wal" {
+			t.Fatalf("connection %d has journal_mode = %q, want wal", i, mode)
+		}
+	}
+}
+
+// TestOneStoreIsUsedFromSeveralGoroutines says the store can be used
+// by several goroutines at once.
+//
+// 几个线程一起用也不该打架。
+func TestOneStoreIsUsedFromSeveralGoroutines(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("acc_%02d", i)
+			if err := s.CreateAccount(ctx, Account{ID: id, Name: id, Status: StatusActive}); err != nil {
+				errs <- err
+				return
+			}
+			for j := 0; j < 5; j++ {
+				if _, err := s.GetAccount(ctx, id); err != nil {
+					errs <- err
+					return
+				}
+				if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+					AccountID: id, HasAmounts: true, Granted: 1, Remaining: 1,
+					CreatedAt: time.Now(),
+				}); err != nil {
+					errs <- err
+					return
+				}
+				if _, err := s.LatestUsageSnapshots(ctx); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("the store was used from several goroutines: %v", err)
+	}
+}
+
+// TestThePathWithAQuestionMarkIsThePath says a path with a question
+// mark in it is the path and not the end of the file name.
+//
+// 路径里有问号，问号不能把文件名截断。
+func TestThePathWithAQuestionMarkIsThePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a?b&c#d%e.db")
+
+	d := dsn(path)
+	if !strings.HasPrefix(d, "file:") {
+		t.Fatalf("dsn = %q, want a file: URI", d)
+	}
+	if !strings.Contains(d, "%3F") {
+		t.Fatalf("dsn = %q, want the question mark escaped", d)
+	}
+	if !strings.Contains(d, "%26") || !strings.Contains(d, "%23") || !strings.Contains(d, "%25") {
+		t.Fatalf("dsn = %q, want the other marks escaped", d)
+	}
+	if !strings.Contains(d, "_pragma=foreign_keys(1)") {
+		t.Fatalf("dsn = %q, want the pragmas", d)
+	}
+
+	if runtime.GOOS == "windows" {
+		// Windows does not allow a question mark in a file name, so
+		// the file itself cannot be made there.
+		t.Skip("windows does not allow a question mark in a file name")
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the database is not at the path: %v", err)
+	}
+	var fk int
+	if err := s.db.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Fatalf("foreign_keys = %d, want 1", fk)
+	}
+}
+
+// TestTheFileIsOnlyForItsOwner says the database file is not for
+// everybody.
+//
+// 数据库里有明文的 refresh token，别人不能读。
+func TestTheFileIsOnlyForItsOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows has no such a mode")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("the file's mode is %o, want 600", mode)
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := di.Mode().Perm(); mode != 0o700 {
+		t.Fatalf("the directory's mode is %o, want 700", mode)
+	}
+}
+
+// oldSchema is the schema of a file that was made before the
+// versions were kept.
+const oldSchema = `
+CREATE TABLE accounts (
+  id               TEXT PRIMARY KEY,
+  name             TEXT NOT NULL,
+  user_id          TEXT,
+  email            TEXT,
+  status           TEXT NOT NULL,
+  proxy_group      TEXT,
+  proxy_url        TEXT,
+  pending_persist  INTEGER NOT NULL DEFAULT 0,
+  exhausted_until  INTEGER,
+  last_error       TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE TABLE tokens (
+  account_id  TEXT PRIMARY KEY,
+  access      TEXT NOT NULL,
+  refresh     TEXT NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  subject     TEXT,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE exhausted_windows (
+  account_id TEXT NOT NULL,
+  window_key TEXT NOT NULL,
+  until      INTEGER NOT NULL,
+  reason     TEXT,
+  PRIMARY KEY (account_id, window_key)
+);
+CREATE TABLE sessions (
+  session_key TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE checkins (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  day        TEXT NOT NULL,
+  outcome    TEXT NOT NULL,
+  credit     REAL,
+  streak     INTEGER,
+  message    TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE (account_id, day)
+);
+CREATE TABLE usage_snapshots (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id  TEXT NOT NULL,
+  granted     REAL,
+  consumed    REAL,
+  remaining   REAL,
+  expires_at  INTEGER,
+  plan        TEXT,
+  plan_until  INTEGER,
+  windows_json TEXT,
+  balance     TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE TABLE settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE egress_health (
+  url        TEXT PRIMARY KEY,
+  ok         INTEGER NOT NULL,
+  error      TEXT,
+  checked_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkins_account ON checkins(account_id, day DESC);
+`
+
+// makeOldFile writes a file in the shape the code used to make.
+func makeOldFile(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO accounts (id,name,user_id,email,status,proxy_group,proxy_url,pending_persist,exhausted_until,last_error,created_at,updated_at)
+		  VALUES ('acc_01','old','123','a@example.com','active','warp','',1,NULL,'',?,?)`, []any{now, now}},
+		{`INSERT INTO tokens (account_id,access,refresh,expires_at,subject,updated_at) VALUES ('acc_01','a','r',?,NULL,?)`, []any{now, now}},
+		{`INSERT INTO checkins (account_id,day,outcome,credit,streak,message,created_at) VALUES ('acc_01','2026-11-13','claimed',NULL,NULL,'',?)`, []any{now}},
+		{`INSERT INTO usage_snapshots (account_id,granted,consumed,remaining,created_at) VALUES ('acc_01',600,100,500,?)`, []any{now}},
+		{`INSERT INTO sessions (session_key,account_id,updated_at) VALUES ('sess-1','acc_01',?)`, []any{now}},
+	} {
+		if _, err := db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("%s: %v", q.sql, err)
+		}
+	}
+}
+
+// TestTheOldFileIsBroughtForward says a file that was made by an
+// older version is brought to the shape the code wants, with its
+// rows still in it.
+//
+// 老库要能打开，行还要在。
+func TestTheOldFileIsBroughtForward(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+	makeOldFile(t, path)
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("the file is at version %d, want %d", version, schemaVersion)
+	}
+
+	// 行还在
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Name != "old" || a.ProxyGroup != "warp" {
+		t.Fatalf("got %+v", a)
+	}
+	tok, err := s.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "a" || tok.Subject != "" {
+		t.Fatalf("got %+v", tok)
+	}
+	list, err := s.ListCheckins(ctx, "acc_01", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Credit != 0 {
+		t.Fatalf("got %+v", list)
+	}
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 || snaps[0].Remaining != 500 {
+		t.Fatalf("got %+v", snaps)
+	}
+	acc, ok, err := s.SessionAccount(ctx, "sess-1")
+	if err != nil || !ok || acc != "acc_01" {
+		t.Fatalf("got %q %v %v", acc, ok, err)
+	}
+
+	// 新列有了
+	for _, c := range []struct{ table, column string }{
+		{"usage_snapshots", "membership_error"},
+		{"usage_snapshots", "windows_error"},
+		{"sessions", "upstream_id"},
+	} {
+		cols, err := columnsOf(ctx, s.db, c.table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cols[c.column]; !ok {
+			t.Fatalf("%s has no column %s", c.table, c.column)
+		}
+	}
+
+	// 外键在
+	err = s.SaveToken(ctx, Token{AccountID: "nope", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("a token of an account that is not there was accepted")
+	}
+
+	// 自增的号接着走
+	if err := s.SaveCheckin(ctx, Checkin{AccountID: "acc_01", Day: "2026-11-14",
+		Outcome: "claimed", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.ListCheckins(ctx, "acc_01", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range list {
+		if c.Day == "2026-11-14" && c.ID <= 1 {
+			t.Fatalf("the new check-in has the id %d, want one after the old ones", c.ID)
+		}
+	}
+}
+
+// TestMigrateIsIdempotent says the migration can be done twice, and
+// the second time changes nothing.
+//
+// 迁移做两遍也没关系。
+func TestMigrateIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("the file is at version %d, want %d", version, schemaVersion)
+	}
+	if _, err := s.GetAccount(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2231,62 +3141,163 @@ Expected: FAIL —— `undefined: Open`
 ```go
 package store
 
-// schema is the whole database. It is applied in one go, so a fresh
-// file and an existing one end up the same.
-const schema = `
-CREATE TABLE IF NOT EXISTS accounts (
-  id               TEXT PRIMARY KEY,
-  name             TEXT NOT NULL,
-  user_id          TEXT,
-  email            TEXT,
-  status           TEXT NOT NULL,
-  proxy_group      TEXT,
-  proxy_url        TEXT,
-  pending_persist  INTEGER NOT NULL DEFAULT 0,
-  exhausted_until  INTEGER,
-  last_error       TEXT,
-  created_at       INTEGER NOT NULL,
-  updated_at       INTEGER NOT NULL
-);
+// The database's tables.
+//
+// A table is given as a name and a body, so that the migration can
+// both make the table and tell whether the one in the file is the one
+// it wants.
+//
+// The bodies are the shape a file ends up with. A file that was made
+// by an older version is brought to this shape by the steps in
+// store.go, so that a fresh file and an old one are the same.
+//
+// The children say which account they belong to, and the account is
+// taken with them when it goes: the database does the cascade, so
+// there is no list of children anywhere that can fall out of step
+// with the schema.
+type table struct {
+	// name is the table's name.
+	name string
+	// body is the table: its columns, its constraints and the
+	// accounts it belongs to.
+	body string
+	// copy says how the columns of the new table are filled from
+	// the old one.
+	copy []copyColumn
+}
 
-CREATE TABLE IF NOT EXISTS tokens (
-  account_id  TEXT PRIMARY KEY,
+// copyColumn says how one column of a new table is filled from the
+// old one.
+type copyColumn struct {
+	// name is the column's name.
+	name string
+	// notNull says the new column cannot be NULL, so a NULL in the
+	// old one is replaced by the default.
+	notNull bool
+	// def is the value a column the old table does not have gets.
+	def string
+}
+
+// notNull is a column that cannot be NULL.
+func notNull(name, def string) copyColumn {
+	return copyColumn{name: name, notNull: true, def: def}
+}
+
+// nullable is a column that may be NULL.
+func nullable(name string) copyColumn {
+	return copyColumn{name: name, def: "NULL"}
+}
+
+// The tables, in the order they are made.
+//
+// The accounts come first: the other tables point at them.
+var tables = []table{
+	{
+		name: "accounts",
+		body: `(
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  user_id      TEXT,
+  email        TEXT,
+  status       TEXT NOT NULL CHECK (status IN ('active','signed_out','error')),
+  proxy_group  TEXT,
+  proxy_url    TEXT,
+  last_error   TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+)`,
+		copy: []copyColumn{
+			notNull("id", "''"),
+			notNull("name", "''"),
+			nullable("user_id"),
+			nullable("email"),
+			notNull("status", "'active'"),
+			nullable("proxy_group"),
+			nullable("proxy_url"),
+			nullable("last_error"),
+			notNull("created_at", "0"),
+			notNull("updated_at", "0"),
+		},
+	},
+	{
+		name: "tokens",
+		body: `(
+  account_id  TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   access      TEXT NOT NULL,
   refresh     TEXT NOT NULL,
   expires_at  INTEGER NOT NULL,
-  subject     TEXT,
+  subject     TEXT NOT NULL DEFAULT '',
   updated_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS exhausted_windows (
-  account_id TEXT NOT NULL,
+)`,
+		copy: []copyColumn{
+			notNull("account_id", "''"),
+			notNull("access", "''"),
+			notNull("refresh", "''"),
+			notNull("expires_at", "0"),
+			notNull("subject", "''"),
+			notNull("updated_at", "0"),
+		},
+	},
+	{
+		name: "exhausted_windows",
+		body: `(
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   window_key TEXT NOT NULL,
   until      INTEGER NOT NULL,
   reason     TEXT,
   PRIMARY KEY (account_id, window_key)
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
+)`,
+		copy: []copyColumn{
+			notNull("account_id", "''"),
+			notNull("window_key", "''"),
+			notNull("until", "0"),
+			nullable("reason"),
+		},
+	},
+	{
+		name: "sessions",
+		body: `(
   session_key TEXT PRIMARY KEY,
-  account_id  TEXT NOT NULL,
+  account_id  TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+  upstream_id TEXT UNIQUE,
   updated_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS checkins (
+)`,
+		copy: []copyColumn{
+			notNull("session_key", "''"),
+			nullable("account_id"),
+			nullable("upstream_id"),
+			notNull("updated_at", "0"),
+		},
+	},
+	{
+		name: "checkins",
+		body: `(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id TEXT NOT NULL,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   day        TEXT NOT NULL,
   outcome    TEXT NOT NULL,
-  credit     REAL,
-  streak     INTEGER,
+  credit     REAL NOT NULL DEFAULT 0,
+  streak     INTEGER NOT NULL DEFAULT 0,
   message    TEXT,
   created_at INTEGER NOT NULL,
   UNIQUE (account_id, day)
-);
-
-CREATE TABLE IF NOT EXISTS usage_snapshots (
+)`,
+		copy: []copyColumn{
+			notNull("id", "0"),
+			notNull("account_id", "''"),
+			notNull("day", "''"),
+			notNull("outcome", "''"),
+			notNull("credit", "0"),
+			notNull("streak", "0"),
+			nullable("message"),
+			notNull("created_at", "0"),
+		},
+	},
+	{
+		name: "usage_snapshots",
+		body: `(
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id  TEXT NOT NULL,
+  account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   granted     REAL,
   consumed    REAL,
   remaining   REAL,
@@ -2298,23 +3309,65 @@ CREATE TABLE IF NOT EXISTS usage_snapshots (
   membership_error TEXT,
   windows_error TEXT,
   created_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS egress_health (
+)`,
+		copy: []copyColumn{
+			notNull("id", "0"),
+			notNull("account_id", "''"),
+			nullable("granted"),
+			nullable("consumed"),
+			nullable("remaining"),
+			nullable("expires_at"),
+			nullable("plan"),
+			nullable("plan_until"),
+			nullable("windows_json"),
+			nullable("balance"),
+			nullable("membership_error"),
+			nullable("windows_error"),
+			notNull("created_at", "0"),
+		},
+	},
+	{
+		name: "egress_health",
+		body: `(
   url        TEXT PRIMARY KEY,
   ok         INTEGER NOT NULL,
   error      TEXT,
   checked_at INTEGER NOT NULL
-);
+)`,
+		copy: []copyColumn{
+			notNull("url", "''"),
+			notNull("ok", "0"),
+			nullable("error"),
+			notNull("checked_at", "0"),
+		},
+	},
+}
 
-CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_checkins_account ON checkins(account_id, day DESC);
-`
+// The indexes.
+//
+// The check-ins need none of their own: the unique (account_id, day)
+// is already an index over the account and the day.
+var indexStatements = []string{
+	"CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
+	"DROP INDEX IF EXISTS idx_checkins_account",
+}
+
+// The children, with the column that says which account they belong
+// to.
+//
+// A row whose account is not there is refused, and the row goes when
+// the account goes.
+var childTables = []struct {
+	name    string
+	account string
+}{
+	{"tokens", "account_id"},
+	{"exhausted_windows", "account_id"},
+	{"sessions", "account_id"},
+	{"checkins", "account_id"},
+	{"usage_snapshots", "account_id"},
+}
 ```
 
 创建 `internal/store/store.go`：
@@ -2323,17 +3376,30 @@ CREATE INDEX IF NOT EXISTS idx_checkins_account ON checkins(account_id, day DESC
 // Package store keeps the accounts, their tokens, the check-in history
 // and the usage snapshots in one SQLite file.
 //
-// The file is opened with WAL on, so a reader (the WebUI) and a writer
-// (the scheduler) do not block each other.
+// The file is opened with WAL on and with more than one connection, so
+// a reader (the WebUI) and a writer (the scheduler) do not block each
+// other. The pragmas are in the data source name, and a pragma is per
+// connection, so every connection of the pool has them.
+//
+// The file holds the accounts' refresh tokens in clear, so the
+// directory it is in is made for its owner only, and the file in it
+// is made for its owner only as well.
+//
+// The sessions table grows by one row for every session key that is
+// seen. Nothing prunes it: the rows are small, but they are not
+// nothing.
 package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
-	"encoding/json"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -2347,25 +3413,63 @@ const (
 	StatusError     = "error"
 )
 
+// ErrNotFound says the row is not there.
+//
+// It is the one way of saying so: a caller asks with errors.Is and
+// never has to know that the database has a sentinel of its own.
+var ErrNotFound = errors.New("store: not found")
+
+// maxConns is how many connections the pool has.
+//
+// One connection would mean one statement at a time in the whole
+// process, and the reader and the writer would take turns. A few
+// connections let them work at the same time, which is what the WAL
+// journal is for.
+const maxConns = 4
+
 // Store is the database.
 type Store struct {
 	db *sql.DB
+
+	// Clock is the store's clock.
+	//
+	// It is there so that a test can say what time it is. A store
+	// with no clock uses the wall clock.
+	Clock func() time.Time
+}
+
+// now gives the store's time.
+func (s *Store) now() time.Time {
+	if s.Clock != nil {
+		return s.Clock()
+	}
+	return time.Now()
+}
+
+// stamp gives the time a row is written at.
+//
+// A caller that does not say when it is writing gets the store's
+// clock. A row with no time in it says 1970, and 1970 is not a time
+// anybody asked for.
+func (s *Store) stamp(t time.Time) time.Time {
+	if t.IsZero() {
+		return s.now()
+	}
+	return t
 }
 
 // Account is one MiniMax account.
 type Account struct {
-	ID             string
-	Name           string
-	UserID         string
-	Email          string
-	Status         string
-	ProxyGroup     string
-	ProxyURL       string
-	PendingPersist bool
-	ExhaustedUntil time.Time
-	LastError      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID         string
+	Name       string
+	UserID     string
+	Email      string
+	Status     string
+	ProxyGroup string
+	ProxyURL   string
+	LastError  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // Token is an account's sign-in.
@@ -2392,15 +3496,16 @@ type Checkin struct {
 
 // UsageSnapshot is one account's credits and plan at a moment.
 type UsageSnapshot struct {
-	ID          int64
-	AccountID   string
-	Granted     float64
-	Consumed    float64
-	Remaining   float64
-	HasAmounts  bool
-	ExpiresAt   time.Time
-	Plan        string
-	PlanUntil   time.Time
+	ID         int64
+	AccountID  string
+	Granted    float64
+	Consumed   float64
+	Remaining  float64
+	HasAmounts bool
+	ExpiresAt  time.Time
+	Plan       string
+	PlanUntil  time.Time
+	// WindowsJSON is the plan's windows as they were read.
 	WindowsJSON string
 	Balance     string
 	// MembershipError says the membership could not be read.
@@ -2434,20 +3539,22 @@ type EgressHealth struct {
 
 // Open opens the database at path, creating it and its directory if
 // they are not there.
+//
+// The directory and the file are made for their owner only: the file
+// holds the refresh tokens of every account in clear. Windows has no
+// such a mode, and there the file is left as Windows made it.
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create data dir: %w", err)
 		}
 	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// One writer at a time; SQLite serializes them anyway and this keeps
-	// the Go side from piling up.
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	// The database is opened lazily, so a path that cannot be used
 	// would only show up at the first query. Open it now: the caller
 	// wants to know now.
@@ -2455,54 +3562,328 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	return &Store{db: db}, nil
+	if err := protectFile(path); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, Clock: time.Now}, nil
 }
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Migrate applies the schema.
+// dsn gives the data source name of a database file.
+//
+// The path is made a file: URI, so that a path with a question mark
+// in it is the path and not the end of the file name. The pragmas
+// come after the question mark; a pragma is per connection, so every
+// connection of the pool gets them.
+//
+// The write lock is taken when a transaction starts and not in the
+// middle of it. A transaction that finds the lock taken fails at once
+// instead of failing at the end, after it has done its work.
+func dsn(path string) string {
+	p := filepath.ToSlash(path)
+	prefix := "file:"
+	if strings.HasPrefix(p, "//") {
+		// A path that begins with two slashes is a network path, and
+		// the two slashes after "file:" are the empty authority that
+		// says so.
+		prefix = "file://"
+	}
+	return prefix + escapePath(p) +
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
+		"&_pragma=foreign_keys(1)&_txlock=immediate"
+}
+
+// escapePath makes a path safe to put in a file: URI.
+//
+// Every character that is not an unreserved one is escaped, so that a
+// path with a space, a question mark, an ampersand, a hash or a
+// percent sign in it is the path and not the URI's syntax. The
+// slashes are left: they separate the parts of the path.
+func escapePath(p string) string {
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '/' || unreserved(c) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteString(strings.ToUpper(hex.EncodeToString([]byte{c})))
+	}
+	return b.String()
+}
+
+// unreserved says whether a character may stand for itself in a URI.
+//
+// It is the set of RFC 3986: the letters, the digits, and the four
+// marks that have no meaning of their own.
+func unreserved(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-', c == '_', c == '.', c == '~':
+		return true
+	}
+	return false
+}
+
+// protectFile makes the database file readable by its owner only.
+//
+// The file holds the refresh tokens of every account in clear, so any
+// other user on the machine could take the accounts over. Windows has
+// no such a mode, and there the file is left as Windows made it.
+func protectFile(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("protect the database file: %w", err)
+	}
+	return nil
+}
+
+// Migrate brings the database to the shape the code expects.
+//
+// The steps are numbered, and the file says which one it is at with
+// PRAGMA user_version. A file that was made before the steps were
+// numbered says 0, and the steps below bring it forward. A fresh file
+// and an old one end up at the same version, with the same tables.
+//
+// Every step is one transaction: a step that fails leaves the file as
+// it was, and the version is written in that same transaction, so a
+// file never says it is at a version it did not reach.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	// One connection for the whole migration: the pragmas are per
+	// connection, and the steps must all see the same database.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	// A file that was made before these columns were added does not
-	// get them from CREATE TABLE IF NOT EXISTS, so they are added
-	// here.
-	for _, col := range []struct{ table, name, decl string }{
-		{"usage_snapshots", "membership_error", "TEXT"},
-		{"usage_snapshots", "windows_error", "TEXT"},
-	} {
-		if err := s.addColumn(ctx, col.table, col.name, col.decl); err != nil {
+	defer conn.Close()
+
+	// A table is rebuilt by making a new one and copying the rows
+	// over, and the old table's rows are still there while the copy
+	// runs. The foreign keys would say that those rows belong to an
+	// account that is not there, so they are turned off for the
+	// steps and turned back on after.
+	//
+	// The pragmas are put back with a context that is not the caller's:
+	// a caller's context that was cancelled would leave the
+	// connection without its foreign keys.
+	clean := context.WithoutCancel(ctx)
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=off"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer conn.ExecContext(clean, "PRAGMA foreign_keys=on")
+
+	// The old table is renamed out of the way before the new one
+	// takes its name, and a rename writes the new name into the
+	// tables that point at it. The old way of renaming is asked for
+	// here, so that the other tables' names are left alone.
+	if _, err := conn.ExecContext(ctx, "PRAGMA legacy_alter_table=on"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer conn.ExecContext(clean, "PRAGMA legacy_alter_table=off")
+
+	version, err := userVersion(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("migrate: the database is at version %d and this program knows %d",
+			version, schemaVersion)
+	}
+	for _, step := range migrations[version:] {
+		if err := step(ctx, conn); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// addColumn adds a column to a table, unless the table already has it.
-func (s *Store) addColumn(ctx context.Context, table, name, decl string) error {
-	have, err := s.columnExists(ctx, table, name)
+// schemaVersion is the version a file is at when the steps are done.
+const schemaVersion = 2
+
+// migrations are the steps, in order.
+//
+// The step at index n brings a file at version n to version n+1.
+var migrations = []func(ctx context.Context, conn *sql.Conn) error{
+	migrateMake,
+	migrateConform,
+}
+
+// migrateMake makes the tables that are not there.
+//
+// A file that was made by an older version has most of them already,
+// and they are left as they are: the next step says what shape they
+// should be.
+func migrateMake(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 1, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateConform gives the tables the shape the code wants.
+//
+// A table that is not the one the code has is made again: the rows
+// are copied into a new table and the old one is taken away. A file
+// that was made by an older version is brought to this shape here.
+func migrateConform(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 2, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got == "" {
+				// The table is not there at all.
+				if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+					return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
+				}
+				continue
+			}
+			if sameSQL(got, "CREATE TABLE "+t.name+t.body) {
+				continue
+			}
+			if err := rebuildTable(ctx, tx, t); err != nil {
+				return err
+			}
+		}
+		for _, q := range indexStatements {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
+		}
+		// A row whose account is not there is not allowed any more,
+		// so the ones that are there are taken away.
+		for _, c := range childTables {
+			q := fmt.Sprintf("DELETE FROM %s WHERE %s NOT IN (SELECT id FROM accounts)",
+				c.name, c.account)
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("migrate: take away the rows of %s without an account: %w",
+					c.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// runStep does one step, in one transaction.
+//
+// The version is written at the end, in the same transaction, so that
+// a file never says it is at a version it did not reach.
+func runStep(ctx context.Context, conn *sql.Conn, version int, fn func(tx *sql.Tx) error) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
 		return err
 	}
-	if have {
-		return nil
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("migrate: write the version: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx,
-		fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl)); err != nil {
-		return fmt.Errorf("migrate: add column %s.%s: %w", table, name, err)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 	return nil
 }
 
-// columnExists says whether a table has a column.
-func (s *Store) columnExists(ctx context.Context, table, name string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+// rebuildTable makes the table again, with the rows of the old one.
+//
+// The rows are copied into a new table of the wanted shape, and the
+// old table is taken away. A column the old table does not have gets
+// its default, and a column that could be NULL and cannot any more
+// gets the default instead of the NULL.
+func rebuildTable(ctx context.Context, tx *sql.Tx, t table) error {
+	exprs, err := copyExprs(ctx, tx, t)
 	if err != nil {
-		return false, fmt.Errorf("migrate: %w", err)
+		return err
+	}
+	cols := make([]string, 0, len(t.copy))
+	for _, c := range t.copy {
+		cols = append(cols, c.name)
+	}
+	old := t.name + "_old"
+	for _, q := range []string{
+		"CREATE TABLE " + t.name + "_new" + t.body,
+		"INSERT INTO " + t.name + "_new (" + strings.Join(cols, ", ") + ") SELECT " +
+			strings.Join(exprs, ", ") + " FROM " + t.name,
+		"ALTER TABLE " + t.name + " RENAME TO " + old,
+		"ALTER TABLE " + t.name + "_new RENAME TO " + t.name,
+		"DROP TABLE " + old,
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("migrate: rebuild the table %s: %w", t.name, err)
+		}
+	}
+	return nil
+}
+
+// copyExprs gives the expressions the rows of the old table are read
+// with.
+func copyExprs(ctx context.Context, tx *sql.Tx, t table) ([]string, error) {
+	old, err := columnsOf(ctx, tx, t.name)
+	if err != nil {
+		return nil, err
+	}
+	exprs := make([]string, 0, len(t.copy))
+	for _, c := range t.copy {
+		prev, ok := old[c.name]
+		switch {
+		case !ok:
+			// The old table does not have the column.
+			exprs = append(exprs, c.def)
+		case !c.notNull:
+			// The new column may be NULL, so a NULL is kept: a
+			// reading that could not be made is not a reading of
+			// zero.
+			exprs = append(exprs, c.name)
+		case prev.notNull:
+			exprs = append(exprs, c.name)
+		default:
+			exprs = append(exprs, fmt.Sprintf("COALESCE(%s, %s)", c.name, c.def))
+		}
+	}
+	return exprs, nil
+}
+
+// columnInfo says what is known about one column.
+type columnInfo struct {
+	// notNull says the column cannot be NULL.
+	notNull bool
+}
+
+// querier is what can ask the database a question.
+//
+// The migration asks inside a transaction and the tests ask outside of
+// one, so both have to do.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// columnsOf gives the columns of a table.
+func columnsOf(ctx context.Context, q querier, name string) (map[string]columnInfo, error) {
+	rows, err := q.QueryContext(ctx, "PRAGMA table_info("+name+")")
+	if err != nil {
+		return nil, fmt.Errorf("migrate: read the columns of %s: %w", name, err)
 	}
 	defer rows.Close()
+	out := map[string]columnInfo{}
 	for rows.Next() {
 		var (
 			cid     int
@@ -2513,13 +3894,59 @@ func (s *Store) columnExists(ctx context.Context, table, name string) (bool, err
 			pk      int
 		)
 		if err := rows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk); err != nil {
-			return false, fmt.Errorf("migrate: %w", err)
+			return nil, fmt.Errorf("migrate: read the columns of %s: %w", name, err)
 		}
-		if strings.EqualFold(colName, name) {
-			return true, nil
-		}
+		out[colName] = columnInfo{notNull: notNull != 0}
 	}
-	return false, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("migrate: read the columns of %s: %w", name, err)
+	}
+	return out, nil
+}
+
+// storedSQL gives the statement the table in the file was made with.
+//
+// It is empty when the table is not there.
+func storedSQL(ctx context.Context, q querier, name string) (string, error) {
+	var sqlText string
+	err := q.QueryRowContext(ctx,
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&sqlText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("migrate: read the table %s: %w", name, err)
+	}
+	return sqlText, nil
+}
+
+// sameSQL says whether two statements are the same table.
+//
+// The statement in the file is not the one the code has: SQLite
+// writes the table's name in quotes when the table is renamed, and
+// the spacing is whatever the file was made with. So the two are
+// compared with the whitespace put to one space and the quotes taken
+// away.
+func sameSQL(got, want string) bool {
+	return normalizeSQL(got) == normalizeSQL(want)
+}
+
+// normalizeSQL puts a statement into the one shape two statements are
+// compared in.
+func normalizeSQL(s string) string {
+	s = strings.ReplaceAll(s, `"`, "")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// userVersion gives the version the file is at.
+//
+// It is 0 in a file that was made before the versions were kept.
+func userVersion(ctx context.Context, conn *sql.Conn) (int, error) {
+	var v int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return 0, fmt.Errorf("migrate: read the version: %w", err)
+	}
+	return v, nil
 }
 
 func ms(t time.Time) int64 {
@@ -2529,21 +3956,29 @@ func ms(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
+// fromMS gives the time a millisecond count says.
+//
+// The time is in UTC: everything that is written in is in UTC, and a
+// time that comes back in the machine's own zone is a time that says
+// two different things depending on who reads it.
 func fromMS(v int64) time.Time {
 	if v == 0 {
 		return time.Time{}
 	}
-	return time.UnixMilli(v)
+	return time.UnixMilli(v).UTC()
 }
 
 // CreateAccount inserts an account.
 func (s *Store) CreateAccount(ctx context.Context, a Account) error {
+	if err := checkStatus(a.Status); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO accounts (id, name, user_id, email, status, proxy_group, proxy_url,
-			pending_persist, exhausted_until, last_error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			last_error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.UserID, a.Email, a.Status, a.ProxyGroup, a.ProxyURL,
-		boolInt(a.PendingPersist), ms(a.ExhaustedUntil), a.LastError, ms(a.CreatedAt), ms(a.UpdatedAt))
+		a.LastError, ms(s.stamp(a.CreatedAt)), ms(s.stamp(a.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("create account: %w", err)
 	}
@@ -2554,47 +3989,97 @@ func (s *Store) CreateAccount(ctx context.Context, a Account) error {
 //
 // An account that is not there is an error, not a quiet success: the
 // caller believes it wrote something.
+//
+// It writes every field, so a caller that wants to change one of them
+// has to read the account first. The setters below change one field
+// without that, and are the ones to use.
 func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
+	if err := checkStatus(a.Status); err != nil {
+		return err
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE accounts SET name=?, user_id=?, email=?, status=?, proxy_group=?, proxy_url=?,
-			pending_persist=?, exhausted_until=?, last_error=?, updated_at=?
+			last_error=?, updated_at=?
 		WHERE id=?`,
 		a.Name, a.UserID, a.Email, a.Status, a.ProxyGroup, a.ProxyURL,
-		boolInt(a.PendingPersist), ms(a.ExhaustedUntil), a.LastError, ms(a.UpdatedAt), a.ID)
+		a.LastError, ms(s.stamp(a.UpdatedAt)), a.ID)
 	if err != nil {
 		return fmt.Errorf("update account: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("update account %s: no such account", a.ID)
+		return fmt.Errorf("update account %s: %w", a.ID, ErrNotFound)
 	}
 	return nil
 }
 
+// UpdateAccountStatus writes an account's state and its last error.
+//
+// It is narrower than UpdateAccount on purpose: the caller does not
+// have to read the account first, and a change that touches the state
+// cannot lose a change that touched something else.
+func (s *Store) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	if err := checkStatus(status); err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=?`,
+		status, lastError, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("update the status of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("update the status of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// SetAccountProxy writes an account's outlet.
+//
+// It is narrow like UpdateAccountStatus: the group and the address
+// are the only things it writes, so a caller that changes the outlet
+// does not have to read the account first.
+func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET proxy_group=?, proxy_url=?, updated_at=? WHERE id=?`,
+		group, url, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the outlet of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the outlet of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// checkStatus says whether a status is one of ours.
+//
+// The rotator looks for the active accounts, so an account with a
+// status nobody wrote is an account that is quietly never used.
+func checkStatus(status string) error {
+	switch status {
+	case StatusActive, StatusSignedOut, StatusError:
+		return nil
+	}
+	return fmt.Errorf("unknown account status %q: it is %q, %q or %q",
+		status, StatusActive, StatusSignedOut, StatusError)
+}
+
 // DeleteAccount removes an account and everything under it.
 //
-// The deletes belong together: half of them done is an account with
-// its tokens gone and its history still there. So they are one
-// transaction.
+// The children are taken away by the database: the tables say what
+// belongs to an account, and ON DELETE CASCADE takes it away with the
+// account. So there is no list of children here that can fall out of
+// step with the schema.
+//
+// An account that is not there is an error: the caller believes
+// something was removed.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	res, err := s.db.ExecContext(ctx, "DELETE FROM accounts WHERE id=?", id)
 	if err != nil {
-		return fmt.Errorf("delete account: %w", err)
+		return fmt.Errorf("delete account %s: %w", id, err)
 	}
-	for _, q := range []string{
-		"DELETE FROM tokens WHERE account_id=?",
-		"DELETE FROM exhausted_windows WHERE account_id=?",
-		"DELETE FROM checkins WHERE account_id=?",
-		"DELETE FROM usage_snapshots WHERE account_id=?",
-		"DELETE FROM sessions WHERE account_id=?",
-		"DELETE FROM accounts WHERE id=?",
-	} {
-		if _, err := tx.ExecContext(ctx, q, id); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("delete account: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("delete account: %w", err)
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("delete account %s: %w", id, ErrNotFound)
 	}
 	return nil
 }
@@ -2603,7 +4088,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
-			pending_persist, exhausted_until, last_error, created_at, updated_at
+			last_error, created_at, updated_at
 		FROM accounts ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list accounts: %w", err)
@@ -2617,16 +4102,24 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 		}
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list accounts: %w", err)
+	}
+	return out, nil
 }
 
 // GetAccount gives one account.
+//
+// An account that is not there is ErrNotFound.
 func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
-			pending_persist, exhausted_until, last_error, created_at, updated_at
+			last_error, created_at, updated_at
 		FROM accounts WHERE id=?`, id)
 	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get account %s: %w", id, ErrNotFound)
+	}
 	if err != nil {
 		return Account{}, fmt.Errorf("get account %s: %w", id, err)
 	}
@@ -2640,12 +4133,10 @@ func scanAccount(sc scanner) (Account, error) {
 		a                     Account
 		userID, email, pg, pu sql.NullString
 		lastErr               sql.NullString
-		exhausted             sql.NullInt64
-		pending               int
 		createdAt, updatedAt  int64
 	)
 	if err := sc.Scan(&a.ID, &a.Name, &userID, &email, &a.Status, &pg, &pu,
-		&pending, &exhausted, &lastErr, &createdAt, &updatedAt); err != nil {
+		&lastErr, &createdAt, &updatedAt); err != nil {
 		return Account{}, err
 	}
 	a.UserID = userID.String
@@ -2653,8 +4144,6 @@ func scanAccount(sc scanner) (Account, error) {
 	a.ProxyGroup = pg.String
 	a.ProxyURL = pu.String
 	a.LastError = lastErr.String
-	a.PendingPersist = pending != 0
-	a.ExhaustedUntil = fromMS(exhausted.Int64)
 	a.CreatedAt = fromMS(createdAt)
 	a.UpdatedAt = fromMS(updatedAt)
 	return a, nil
@@ -2669,7 +4158,7 @@ func (s *Store) SaveToken(ctx context.Context, t Token) error {
 			access=excluded.access, refresh=excluded.refresh,
 			expires_at=excluded.expires_at, subject=excluded.subject,
 			updated_at=excluded.updated_at`,
-		t.AccountID, t.Access, t.Refresh, ms(t.ExpiresAt), t.Subject, ms(t.UpdatedAt))
+		t.AccountID, t.Access, t.Refresh, ms(t.ExpiresAt), t.Subject, ms(s.stamp(t.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("save token: %w", err)
 	}
@@ -2677,19 +4166,26 @@ func (s *Store) SaveToken(ctx context.Context, t Token) error {
 }
 
 // GetToken gives an account's token.
+//
+// A token that is not there is ErrNotFound.
 func (s *Store) GetToken(ctx context.Context, accountID string) (Token, error) {
 	var (
 		t         Token
 		expiresAt int64
 		updatedAt int64
+		subject   sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT account_id, access, refresh, expires_at, subject, updated_at
 		FROM tokens WHERE account_id=?`, accountID).
-		Scan(&t.AccountID, &t.Access, &t.Refresh, &expiresAt, &t.Subject, &updatedAt)
+		Scan(&t.AccountID, &t.Access, &t.Refresh, &expiresAt, &subject, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Token{}, fmt.Errorf("get token %s: %w", accountID, ErrNotFound)
+	}
 	if err != nil {
 		return Token{}, fmt.Errorf("get token %s: %w", accountID, err)
 	}
+	t.Subject = subject.String
 	t.ExpiresAt = fromMS(expiresAt)
 	t.UpdatedAt = fromMS(updatedAt)
 	return t, nil
@@ -2704,7 +4200,7 @@ func (s *Store) SaveCheckin(ctx context.Context, c Checkin) error {
 		ON CONFLICT(account_id, day) DO UPDATE SET
 			outcome=excluded.outcome, credit=excluded.credit, streak=excluded.streak,
 			message=excluded.message, created_at=excluded.created_at`,
-		c.AccountID, c.Day, c.Outcome, c.Credit, c.Streak, c.Message, ms(c.CreatedAt))
+		c.AccountID, c.Day, c.Outcome, c.Credit, c.Streak, c.Message, ms(s.stamp(c.CreatedAt)))
 	if err != nil {
 		return fmt.Errorf("save checkin: %w", err)
 	}
@@ -2712,10 +4208,19 @@ func (s *Store) SaveCheckin(ctx context.Context, c Checkin) error {
 }
 
 // ListCheckins gives an account's check-ins, newest first.
+//
+// A limit of zero or less means every check-in: a limit is a limit,
+// and a limit of zero is no limit at all.
 func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) ([]Checkin, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	q := `
 		SELECT id, account_id, day, outcome, credit, streak, message, created_at
-		FROM checkins WHERE account_id=? ORDER BY day DESC LIMIT ?`, accountID, limit)
+		FROM checkins WHERE account_id=? ORDER BY day DESC`
+	args := []any{accountID}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list checkins: %w", err)
 	}
@@ -2730,7 +4235,7 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 			createdAt int64
 		)
 		if err := rows.Scan(&c.ID, &c.AccountID, &c.Day, &c.Outcome, &credit, &streak, &message, &createdAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list checkins: %w", err)
 		}
 		c.Credit = credit.Float64
 		c.Streak = int(streak.Int64)
@@ -2738,7 +4243,10 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 		c.CreatedAt = fromMS(createdAt)
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list checkins: %w", err)
+	}
+	return out, nil
 }
 
 // SaveUsageSnapshot writes a usage reading.
@@ -2751,9 +4259,21 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 // The errors of the parts that could not be read are written down with
 // it: a plan whose windows could not be read is not a plan without
 // windows, and the reader has to be able to tell them apart.
+//
+// The amounts and the flag that says there are amounts are two ways
+// of saying one thing, and a caller that forgets the flag would lose
+// the numbers without a word. So the flag is worked out from the
+// numbers: a reading with a number in it has amounts.
 func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
+	has := u.HasAmounts
+	if !has && (u.Granted != 0 || u.Consumed != 0 || u.Remaining != 0) {
+		// There are numbers and nobody said so. The numbers are the
+		// truth here: throwing them away would lose them without a
+		// word.
+		has = true
+	}
 	var granted, consumed, remaining any
-	if u.HasAmounts {
+	if has {
 		granted, consumed, remaining = u.Granted, u.Consumed, u.Remaining
 	}
 	_, err := s.db.ExecContext(ctx, `
@@ -2763,7 +4283,7 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, u UsageSnapshot) error {
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		u.AccountID, granted, consumed, remaining, ms(u.ExpiresAt),
 		u.Plan, ms(u.PlanUntil), u.WindowsJSON, u.Balance,
-		u.MembershipError, u.WindowsError, ms(u.CreatedAt))
+		u.MembershipError, u.WindowsError, ms(s.stamp(u.CreatedAt)))
 	if err != nil {
 		return fmt.Errorf("save usage snapshot: %w", err)
 	}
@@ -2811,11 +4331,14 @@ func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, erro
 	for rows.Next() {
 		u, err := scanUsageSnapshot(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("latest usage snapshots: %w", err)
 		}
 		out = append(out, u)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("latest usage snapshots: %w", err)
+	}
+	return out, nil
 }
 
 // LatestUsageSnapshot gives one account's newest usage reading.
@@ -2830,7 +4353,7 @@ func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (Usag
 		SELECT `+usageSnapshotColumns("")+`
 		FROM usage_snapshots WHERE account_id=? ORDER BY id DESC LIMIT 1`, accountID)
 	u, err := scanUsageSnapshot(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return UsageSnapshot{}, nil
 	}
 	if err != nil {
@@ -2870,6 +4393,33 @@ func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
 	return u, nil
 }
 
+// PruneUsageSnapshots throws away the readings that are not needed.
+//
+// The readings that are older than olderThan are thrown away, but the
+// newest keepPerAccount readings of every account are kept whatever
+// their age: the newest reading is the account's reading, and it is
+// what the totals are made of.
+//
+// A keepPerAccount of zero or less keeps nothing: every reading that
+// is older than olderThan goes.
+func (s *Store) PruneUsageSnapshots(ctx context.Context, olderThan time.Time, keepPerAccount int) error {
+	if keepPerAccount < 0 {
+		keepPerAccount = 0
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM usage_snapshots WHERE id IN (
+			SELECT id FROM (
+				SELECT id, created_at,
+					ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS rn
+				FROM usage_snapshots
+			) WHERE rn > ? AND created_at < ?)`,
+		keepPerAccount, ms(olderThan))
+	if err != nil {
+		return fmt.Errorf("prune the usage snapshots: %w", err)
+	}
+	return nil
+}
+
 // SetExhausted marks an account's window as spent until a time.
 func (s *Store) SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
 	_, err := s.db.ExecContext(ctx, `
@@ -2895,6 +4445,10 @@ func (s *Store) ClearExhausted(ctx context.Context, accountID, windowKey string)
 }
 
 // ListExhausted gives every window that is spent.
+//
+// The windows that have come back are in here as well: a row is there
+// until it is pruned, and the row says when the window comes back.
+// The reader decides which of them still count.
 func (s *Store) ListExhausted(ctx context.Context) ([]Exhausted, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT account_id, window_key, until, reason FROM exhausted_windows ORDER BY account_id`)
@@ -2910,22 +4464,40 @@ func (s *Store) ListExhausted(ctx context.Context) ([]Exhausted, error) {
 			reason sql.NullString
 		)
 		if err := rows.Scan(&e.AccountID, &e.WindowKey, &until, &reason); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list exhausted: %w", err)
 		}
 		e.Until = fromMS(until)
 		e.Reason = reason.String
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list exhausted: %w", err)
+	}
+	return out, nil
+}
+
+// PruneExpiredWindows throws away the windows that have come back.
+//
+// A window that has run out is not a window that is spent, and it is
+// of no use to anybody.
+func (s *Store) PruneExpiredWindows(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM exhausted_windows WHERE until <= ?", ms(now))
+	if err != nil {
+		return fmt.Errorf("prune the expired windows: %w", err)
+	}
+	return nil
 }
 
 // BindSession points a session at an account.
+//
+// The session's upstream id is left alone: it belongs to the
+// conversation and not to the account it is bound to.
 func (s *Store) BindSession(ctx context.Context, sessionKey, accountID string) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO sessions (session_key, account_id, updated_at) VALUES (?,?,?)
 		ON CONFLICT(session_key) DO UPDATE SET
 			account_id=excluded.account_id, updated_at=excluded.updated_at`,
-		sessionKey, accountID, time.Now().UnixMilli())
+		sessionKey, accountID, ms(s.now()))
 	if err != nil {
 		return fmt.Errorf("bind session: %w", err)
 	}
@@ -2933,17 +4505,119 @@ func (s *Store) BindSession(ctx context.Context, sessionKey, accountID string) e
 }
 
 // SessionAccount gives the account a session is bound to.
+//
+// A session that was never bound has no account and no error.
 func (s *Store) SessionAccount(ctx context.Context, sessionKey string) (string, bool, error) {
-	var id string
+	var id sql.NullString
 	err := s.db.QueryRowContext(ctx,
 		"SELECT account_id FROM sessions WHERE session_key=?", sessionKey).Scan(&id)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("session account: %w", err)
 	}
-	return id, true, nil
+	if !id.Valid || id.String == "" {
+		return "", false, nil
+	}
+	return id.String, true, nil
+}
+
+// UpstreamID gives the session's upstream id, making one if the
+// session has none.
+//
+// The id is random: two conversations that begin with the same words
+// are two conversations, and the upstream must not be told they are
+// one. It is also kept: the same session has the same upstream id
+// every time it is asked for.
+//
+// The session does not have to be bound to an account yet: a
+// conversation has an upstream id before it has an account.
+func (s *Store) UpstreamID(ctx context.Context, key string) (string, error) {
+	id, ok, err := s.upstreamIDOf(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		if id != "" {
+			return id, nil
+		}
+		// The session is there but has no id yet: make one and write
+		// it down.
+		newID, err := randomID()
+		if err != nil {
+			return "", err
+		}
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE sessions SET upstream_id=?
+			WHERE session_key=? AND (upstream_id IS NULL OR upstream_id='')`, newID, key)
+		if err != nil {
+			return "", fmt.Errorf("set the upstream id of the session %s: %w", key, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			return newID, nil
+		}
+		// Somebody else wrote one first, and theirs is the one.
+		id, _, err := s.upstreamIDOf(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		if id == "" {
+			return "", fmt.Errorf("the session %s has no upstream id", key)
+		}
+		return id, nil
+	}
+	// The session is not there yet: make it with an id of its own.
+	newID, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sessions (session_key, account_id, upstream_id, updated_at)
+		VALUES (?, NULL, ?, ?)
+		ON CONFLICT(session_key) DO UPDATE SET
+			upstream_id=COALESCE(sessions.upstream_id, excluded.upstream_id)`,
+		key, newID, ms(s.now()))
+	if err != nil {
+		return "", fmt.Errorf("make the session %s: %w", key, err)
+	}
+	id, _, err = s.upstreamIDOf(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if id == "" {
+		return "", fmt.Errorf("the session %s has no upstream id", key)
+	}
+	return id, nil
+}
+
+// upstreamIDOf gives the upstream id of a session.
+//
+// The second value says whether the session is there at all.
+func (s *Store) upstreamIDOf(ctx context.Context, key string) (string, bool, error) {
+	var id sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT upstream_id FROM sessions WHERE session_key=?", key).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read the upstream id of the session %s: %w", key, err)
+	}
+	return id.String, true, nil
+}
+
+// randomID gives an id that is not like any other.
+//
+// The id is random and not made from the session's key: two
+// conversations that begin with the same words must not end up with
+// the same upstream id.
+func randomID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("make an id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // SetEgressHealth writes a proxy's last check.
@@ -2952,7 +4626,7 @@ func (s *Store) SetEgressHealth(ctx context.Context, url string, ok bool, errMsg
 		INSERT INTO egress_health (url, ok, error, checked_at) VALUES (?,?,?,?)
 		ON CONFLICT(url) DO UPDATE SET
 			ok=excluded.ok, error=excluded.error, checked_at=excluded.checked_at`,
-		url, boolInt(ok), errMsg, time.Now().UnixMilli())
+		url, boolInt(ok), errMsg, ms(s.now()))
 	if err != nil {
 		return fmt.Errorf("set egress health: %w", err)
 	}
@@ -2976,47 +4650,17 @@ func (s *Store) EgressHealth(ctx context.Context) ([]EgressHealth, error) {
 			checkedAt int64
 		)
 		if err := rows.Scan(&h.URL, &ok, &errMsg, &checkedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("egress health: %w", err)
 		}
 		h.OK = ok != 0
 		h.Error = errMsg.String
 		h.CheckedAt = fromMS(checkedAt)
 		out = append(out, h)
 	}
-	return out, rows.Err()
-}
-
-// SetSetting writes a setting.
-func (s *Store) SetSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO settings (key, value) VALUES (?,?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
-	if err != nil {
-		return fmt.Errorf("set setting: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("egress health: %w", err)
 	}
-	return nil
-}
-
-// Setting reads a setting.
-func (s *Store) Setting(ctx context.Context, key string) (string, bool, error) {
-	var v string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE key=?", key).Scan(&v)
-	if err == sql.ErrNoRows {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("setting: %w", err)
-	}
-	return v, true, nil
-}
-
-// MarshalWindows saves a window list as JSON.
-func MarshalWindows(v any) (string, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
+	return out, nil
 }
 
 // checkinZone is the timezone a check-in day is counted in.
