@@ -38,6 +38,41 @@
 
 协议细节（端点、签名、请求头、错误语义）以参考插件的 `packages/minimax/index.mjs` 为准，本文档逐条记录。
 
+### 1.5 媒体能力：明确推迟，留好接口
+
+参考插件除了聊天，还注册了图片生成、视频生成和 web search。本项目**当前不做**（见 §1.3），但那不是"做不到"，是还没排到。2026-11-14 调研的结论记在这里，以后要做时从这里开始：
+
+**两条不同的上游路线，站点上都有：**
+
+| 路线 | 端点 | 参考插件用它做什么 |
+|---|---|---|
+| Matrix 连接器网关 | `POST /minimax-cloud/api/v1/connectors/connected-tools/list`<br>`POST /minimax-cloud/api/v1/connectors/tools/call` | `packages/minimax/connector-tools.mjs` 的全部工具 |
+| MCP 媒体网关 | `POST /mavis/api/v1/mcp/{tool}` | web search；媒体工具在别的实现里也走这条 |
+
+连接器网关那两条端点在 `/minimax-cloud/api/v1/*` 下，**和签到、积分账本同族**：用账号的 OAuth token，和现有 `internal/account` 那套 `yy` + `x-signature` 签名机制是同一套。也就是说媒体能力天然带我们已有的按账号分出口、轮转、耗尽记账，不需要另起炉灶。
+
+**参考插件的十六个 Matrix 工具**（`matrix-tools.json` 是 2026-11-03 抄下的真实 schema 副本；真调用时读实时 schema 并按它校验参数）：
+
+```
+generate_image            submit_video_generation     query_video_generation
+synthesize_speech         batch_text_to_audio         get_voice_list
+batch_text_to_music       describe_images             videos_understand
+audios_understand         listen_audio                search_images
+reverse_image_search      enhance_image               remove_image_background
+get_asset_url
+```
+
+外加上传辅助 `upload_temp_url`（本地文件与 `data:` URL 要先传上去；HTTPS URL 直接透传）。
+
+**做的时候要拿捏的几件事：**
+
+- `MiniMax-Image` 这个模型 id 是插件自己起的 —— 站点目录里 `generate_image` 没有 model id。参考插件的 `MiniMax-H3` / `MiniMax-H3-Max` / `MiniMax-Hailuo-2.3` 才是真站点 id。
+- 图像：`generate_image` 收 `{requests:[{prompt, aspect_ratio, area, n, output_format, reference_images}]}` → `success_items[].node_id` → `get_asset_url` 换下载链接。`area` 只有 `1K/2K/4K`；**不支持 mask 编辑**（带 mask 直接 400）。
+- 图像的下载链接**头几次可能带水印**（`/visible/` rendition，参考插件 issue #974），要等几秒重问。
+- 视频：`submit_video_generation` 返回 `task_id`，再轮询 `query_video_generation`。三个模型的 duration / resolution / ratio 规则各不相同（见 `matrix-tools.json` 里的 `allOf` 分支）。
+- web search 走 `/mavis/api/v1/mcp/web_search`，在 LLM host 上，**不签名**。
+
+
 ## 2. 站点与端点
 
 只支持国际站（Global）。参考插件的 `SITES["minimax-code-global"]`：
