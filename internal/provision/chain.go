@@ -290,9 +290,13 @@ func (c *Chain) update(ctx context.Context, email, password string, acc store.Ac
 			notes = append(notes, "出口组没能更新："+err.Error())
 		}
 	}
-	notes, _ = c.keep(ctx, acc.ID, password, now, notes)
+	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
 	notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
-	return Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}, nil
+	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
+	if !stored {
+		res.Stage = StageStore
+	}
+	return res, nil
 }
 
 // keep encrypts the password and writes it down, when there is a

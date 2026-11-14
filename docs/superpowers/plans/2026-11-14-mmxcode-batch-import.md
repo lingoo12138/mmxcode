@@ -4387,9 +4387,13 @@ func (c *Chain) update(ctx context.Context, email, password string, acc store.Ac
 			notes = append(notes, "出口组没能更新："+err.Error())
 		}
 	}
-	notes, _ = c.keep(ctx, acc.ID, password, now, notes)
+	notes, stored := c.keep(ctx, acc.ID, password, now, notes)
 	notes = append(notes, "这个账号已经在库里了，更新了原来那一行")
-	return Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}, nil
+	res := Result{Email: email, OK: true, AccountID: acc.ID, Message: strings.Join(notes, "；")}
+	if !stored {
+		res.Stage = StageStore
+	}
+	return res, nil
 }
 
 // keep encrypts the password and writes it down, when there is a
@@ -4797,6 +4801,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -4944,22 +4949,22 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 		// 说的，说他「没有密钥」是冤枉他。
 		fmt.Fprintf(out, "密码没有存进库里（没有 %s）。\n", PasswordKeyEnv)
 	}
-	if e.store != nil {
-		// 收尾的这一笔不能被掐断的上下文掐掉：时限到了的时候，已经
-		// 进来的那些账号要留在记录里，不能白跑一场。写不进去也要说。
-		if err := e.store.FinishImportRun(context.WithoutCancel(ctx), runID, time.Now(),
-			ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
-			return err
-		}
-	}
 	if runErr != nil {
 		// 说清楚这趟是被掐断的：不是所有账号都失败了，是有人不想让它
 		// 再跑下去了。已经进来的那些在上面写着。
 		fmt.Fprintf(out, "清单里共 %d 个，还有 %d 个没轮到：这趟导入被中途截断了（%v）。\n",
 			len(entries), len(entries)-len(results), runErr)
-		return runErr
 	}
-	return nil
+	if e.store != nil {
+		// 收尾的这一笔不能被掐断的上下文掐掉：时限到了的时候，已经
+		// 进来的那些账号要留在记录里，不能白跑一场。
+		if err := e.store.FinishImportRun(context.WithoutCancel(ctx), runID, time.Now(),
+			ok, len(results)-ok, provision.ResultsJSON(results)); err != nil {
+			// 收尾没写成也是错，但截断的原因不能跟着它一起没了。
+			return errors.Join(runErr, err)
+		}
+	}
+	return runErr
 }
 
 // passwordKeeper gives the function that encrypts a password, or nil
