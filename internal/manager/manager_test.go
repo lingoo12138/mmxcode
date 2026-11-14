@@ -1950,6 +1950,58 @@ func TestAReloginOfAnActiveAccountIsRefused(t *testing.T) {
 	}
 }
 
+// TestTheAccountAnotherOneIsSigningInIsNotAFailure says the loser of
+// the race is not counted as a failure.
+//
+// 调度器的一轮和命令行里的那一次可能撞上：一个正在登，另一个排在后
+// 面。排着的那个醒来的时候，账号已经登好了——它不是失败，是没活干。
+// 算成失败的话，页面上写着「失败 1」，而账号其实好好的。
+func TestTheAccountAnotherOneIsSigningInIsNotAFailure(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	holding := make(chan struct{})
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		close(holding)
+		// 慢一点：让排在那后面的一趟挤在锁上。
+		time.Sleep(200 * time.Millisecond)
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: "acc_1", Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	// 一个重登占着这个账号。
+	done := make(chan error, 1)
+	go func() { done <- m.Relogin(ctx, "acc_1") }()
+	<-holding
+	// 这一趟排在后面：它醒来的时候，账号已经登好了。
+	fixed, failed := m.ReloginAll(ctx, 0)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if failed != 0 {
+		t.Fatalf("failed = %d, want 0: the account was signed in by the other one", failed)
+	}
+	if fixed != 0 {
+		t.Fatalf("fixed = %d, want 0: this run signed nothing in", fixed)
+	}
+}
+
 func TestAFailedReloginKeepsTheTokenThatIsThere(t *testing.T) {
 	// 这次重登失败，什么都没说手里那条链的事：令牌不能动。
 	m := newTestManager(t, nil)
