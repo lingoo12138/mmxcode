@@ -18,9 +18,13 @@ function makePage() {
   const table = {
     hidden: true,
     rows: 0,
+    cells: [],
     tbody: {
       textContent: '',
-      appendChild: function () { table.rows += 1; },
+      appendChild: function (tr) {
+        table.rows += 1;
+        table.cells.push(tr.children.map(function (td) { return td.textContent; }));
+      },
     },
     querySelector: function () { return table.tbody; },
   };
@@ -36,7 +40,11 @@ function makePage() {
         return null;
       },
       createElement: function () {
-        return { textContent: '', appendChild: function () {} };
+        return {
+          textContent: '',
+          children: [],
+          appendChild: function (c) { this.children.push(c); },
+        };
       },
       querySelector: function () { return null; },
     },
@@ -87,6 +95,29 @@ if (!page.status.textContent.includes('the key is not right')) {
 }
 if (!page.status.textContent.includes('失败 0')) {
   console.error('the page counts a whole-run failure as an account: ' + page.status.textContent);
+  process.exit(1);
+}
+
+// 表里那一行写的是「整趟」，不是「失败」：上面那句说的是「失败 0」，
+// 表里再有一个「失败」，两处对不上，人不知道该信哪个。
+const wholeRow = page.table.cells[page.table.cells.length - 1];
+if (!wholeRow || wholeRow[1] !== '整趟') {
+  console.error('the whole-run row is labelled ' + JSON.stringify(wholeRow && wholeRow[1]) +
+    ', want 整趟');
+  process.exit(1);
+}
+
+// 账号那一行还是「失败」：整趟和账号得分开。
+page.table.cells = [];
+context.showImportResults({
+  ok: 1,
+  failed: 1,
+  results: '[{"email":"a@example.com","ok":false,"message":"the password is wrong"}]',
+});
+const accountRow = page.table.cells[page.table.cells.length - 1];
+if (!accountRow || accountRow[1] !== '失败') {
+  console.error('the account row is labelled ' + JSON.stringify(accountRow && accountRow[1]) +
+    ', want 失败');
   process.exit(1);
 }
 

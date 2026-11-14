@@ -305,7 +305,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// The chain cannot go on: the token in hand is spent and there
 		// is no newer one the site would take. Only a human can mend
 		// this, by signing the account in again.
-		if mErr := m.markSignedOut(ctx, accountID, chainBrokenReason); mErr != nil {
+		if mErr := m.markSignedOut(ctx, accountID, cur.Access, chainBrokenReason); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the broken chain could not be saved: %w", mErr))
 		}
 		return nil, err
@@ -320,7 +320,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// The cause goes with it: "the outcome is not known" says
 		// which case it is, but the transport's own words say what
 		// happened, and the sign-out branch keeps those too.
-		if mErr := m.markError(ctx, accountID, unknownOutcomeReason+": "+err.Error()); mErr != nil {
+		if mErr := m.markError(ctx, accountID, cur.Access, unknownOutcomeReason+": "+err.Error()); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the error could not be saved: %w", mErr))
 		}
 		return nil, err
@@ -362,7 +362,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 	// The sign-out has to be written down. An account that stays active
 	// with a token the site has refused is handed out again and again,
 	// and every request pays for a renewal that cannot work.
-	if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+	if mErr := m.markSignedOut(ctx, accountID, cur.Access, err.Error()); mErr != nil {
 		return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
 	}
 	return nil, err
@@ -464,26 +464,31 @@ func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Toke
 // has refused must not keep a token that every request would try to
 // renew.
 //
-// The state is written with the narrow setter, and not with the one
-// that writes every field: the name, the proxy and the rest of the
-// account are not this method's business, and writing them back from a
+// The write is **conditional**: it happens only while the token row
+// still holds the access token that was refused. Another process may
+// have signed the account in again in the meantime, and writing the
+// sign-out then would undo that sign-in — the fresh token would be
+// taken away, and the account would be shown as signed out while it
+// holds a token that works.
+//
+// access is the access token of the chain in hand: the one the refusal
+// is about. The state is written with the narrow setter, and not with
+// the one that writes every field: the name, the proxy and the rest of
+// the account are not this method's business, and writing them back from a
 // copy that was read a moment ago would undo a change another writer
 // made in between.
 //
 // The error is not swallowed: a sign-out that could not be written
 // down is an account that stays active with a token the site refuses.
-func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) error {
-	if err := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, reason, time.Now()); err != nil {
+func (m *Manager) markSignedOut(ctx context.Context, accountID, access, reason string) error {
+	written, err := m.Store.SignOutIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
+	if err != nil {
 		return err
 	}
-	// The token row is blanked: the sign-in is gone, so the token is
-	// of no use, and keeping it would send the account back to the
-	// site for a renewal that was already refused.
-	if err := m.Store.SaveToken(ctx, store.Token{
-		AccountID: accountID,
-		UpdatedAt: time.Now(),
-	}); err != nil {
-		return err
+	if !written {
+		// 有人在这中间把账号救回来了：库里那份令牌已经不是手里这一份
+		// 了，这次失败说的已经不是它了。这一边不动它。
+		return nil
 	}
 	// The renewer forgets the account too: a signed-out account must
 	// not be able to renew, and a token of the old sign-in must not be
@@ -504,14 +509,16 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) e
 // that this account is in trouble instead of showing it as a normal
 // one.
 //
-// The state is written with the narrow setter, for the same reason as
-// in markSignedOut.
+// The write is conditional, for the same reason as in markSignedOut: the
+// error is about the chain in hand, and a chain that has moved on since
+// is somebody else's business.
 //
 // The renewer is not told anything: it has to keep the record of the
 // token whose outcome is not known, because that token must not be sent
 // again.
-func (m *Manager) markError(ctx context.Context, accountID, reason string) error {
-	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusError, reason, time.Now())
+func (m *Manager) markError(ctx context.Context, accountID, access, reason string) error {
+	_, err := m.Store.MarkErrorIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
+	return err
 }
 
 // note writes a note on the account without changing its state.
@@ -633,25 +640,41 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusActive, "", time.Now())
 }
 
+// ReloginResult says what one round of re-logins came to.
+type ReloginResult struct {
+	// Fixed is how many accounts were signed in again.
+	Fixed int
+	// Failed is how many could not be signed in again.
+	Failed int
+	// Reasons says why the ones that failed failed: one line per account.
+	Reasons []string
+}
+
 // ReloginAll signs in again every account that is signed out and has
 // a password.
 //
-// It gives back how many it fixed and how many it did not. The limit
-// says how many one round touches; zero means all of them.
+// It gives back how many it fixed, how many it did not, and why.
+//
+// 理由是要的：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 而「一个都没试成」（连账号都没列出来）和「都试了，都登回去了」在只
+// 看着两个数字的时候是一样的——上一次那个错就是这样被藏起来的。
 //
 // An account without a password is skipped and is not a failure: it
 // was never brought in with one, so there is nothing to sign in with,
 // and that is not this round's fault.
-func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int) {
+func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, error) {
+	var out ReloginResult
 	accounts, err := m.Store.ListAccounts(ctx)
 	if err != nil {
-		return 0, 0
+		// 账号都没列出来，这一趟就根本没跑。把它说成「成功 0，失败 0」，
+		// 人会以为没什么要登的。
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
 	}
 	for _, acc := range accounts {
 		if acc.Status != store.StatusSignedOut {
 			continue
 		}
-		if limit > 0 && fixed+failed >= limit {
+		if limit > 0 && out.Fixed+out.Failed >= limit {
 			break
 		}
 		cipher, err := m.Store.Password(ctx, acc.ID)
@@ -663,12 +686,22 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (fixed, failed int)
 				// 别人刚把它登回去了：这不算失败。
 				continue
 			}
-			failed++
+			out.Failed++
+			out.Reasons = append(out.Reasons, reloginReason(acc, err))
 			continue
 		}
-		fixed++
+		out.Fixed++
 	}
-	return fixed, failed
+	return out, nil
+}
+
+// reloginReason says which account did not sign in again, and why.
+func reloginReason(acc store.Account, err error) string {
+	who := acc.Name
+	if who == "" {
+		who = acc.ID
+	}
+	return who + "（" + acc.ID + "）：" + err.Error()
 }
 
 // spentRefresh remembers the refresh token that really went to the
@@ -773,7 +806,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		// asked for under that group.
 		snap.MembershipError = err.Error()
 		if isRefusal(err) {
-			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 				return store.UsageSnapshot{}, err
 			}
 		}
@@ -873,7 +906,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		// to do with the account.
 		snap.WindowsError = err.Error()
 		if isRefusal(err) {
-			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 				return store.UsageSnapshot{}, err
 			}
 		}
@@ -884,7 +917,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 	case err == nil:
 		snap.Plan = title
 	case isRefusal(err):
-		if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+		if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 			return store.UsageSnapshot{}, err
 		}
 	default:

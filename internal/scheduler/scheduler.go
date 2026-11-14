@@ -132,9 +132,17 @@ func (s *Scheduler) RenewTokens(ctx context.Context) {
 // waits between two rounds, so a sign-in that failed is not retried
 // every minute.
 func (s *Scheduler) Relogin(ctx context.Context) {
-	fixed, failed := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
-	if fixed > 0 || failed > 0 {
-		fmt.Printf("relogin: %d fixed, %d failed\n", fixed, failed)
+	res, err := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
+	if err != nil {
+		// 这一趟根本没跑：说清楚，不然看着像「没什么要登的」。
+		fmt.Printf("relogin: %v\n", err)
+		return
+	}
+	if res.Fixed > 0 || res.Failed > 0 {
+		fmt.Printf("relogin: %d fixed, %d failed\n", res.Fixed, res.Failed)
+	}
+	for _, r := range res.Reasons {
+		fmt.Printf("relogin: %s\n", r)
 	}
 }
 

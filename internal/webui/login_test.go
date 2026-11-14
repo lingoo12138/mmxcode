@@ -35,6 +35,13 @@ type fakeSite struct {
 	token    string
 	identity string
 	seen     []string
+	// tokens counts the token requests that came in.
+	tokens int
+	// tokenFor gives the answer to the n-th token request.
+	//
+	// 它是给「每一次登录都是一个不一样的站点账号」那种测试用的：同一
+	// 个站点账号登三次，库里只有一行。
+	tokenFor func(n int) string
 }
 
 // RoundTrip answers one request.
@@ -47,7 +54,12 @@ func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
 	case site.DeviceCodePath:
 		body = f.device
 	case site.TokenPath:
-		body = f.token
+		if f.tokenFor != nil {
+			body = f.tokenFor(f.tokens)
+			f.tokens++
+		} else {
+			body = f.token
+		}
 	case site.IdentityPath:
 		body = f.identity
 	}
@@ -207,11 +219,16 @@ func TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable(t *testing.T) {
 //
 // 账号的 id 是主键：两个登录在同一毫秒里结束，第二个会被数据库挡下
 // 来。挡下来的那一个要是没人说，这一次登录就悄悄没了。
+//
+// 这三次登录是三个不一样的站点账号（令牌里的 sub 不一样）：同一个站点
+// 账号登三次，库里只有一行，那是另一条规则。
 func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 	f := &fakeSite{
 		device: deviceAnswer,
-		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
-			`","refresh_token":"rt","expires_in":3600}`,
+		tokenFor: func(n int) string {
+			return `{"access_token":"` + tokenWithSubject(fmt.Sprintf("jwt-subject-%d", n)) +
+				`","refresh_token":"rt","expires_in":3600}`
+		},
 		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
 	}
 	w, s := newFakeSiteWebUI(t, f)
@@ -233,6 +250,41 @@ func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 		if !strings.HasPrefix(a.ID, "acc_") {
 			t.Errorf("id = %q, want the acc_ prefix", a.ID)
 		}
+	}
+}
+
+// TestTheSameAccountSignedInTwiceIsOneRow says signing the same site
+// account in twice does not make two live rows.
+//
+// 一个站点账号在库里只能有一行。这一行多半是批量导入进来的：登录又
+// 登了一遍，是把那一行改好，不是再插一行——同一个站点账号两行都是活
+// 的，轮转会挑到两次，页面把它列两遍，而且其中一个的令牌迟早被另一个
+// 的重登作废。
+func TestTheSameAccountSignedInTwiceIsOneRow(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+		if rec.Code != 200 {
+			t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	accs := waitForAccounts(t, s, 1)
+	// 两个登录都要走完：再等一会儿，看有没有多出第二行。
+	time.Sleep(200 * time.Millisecond)
+	accs, err := s.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accs) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", accs)
 	}
 }
 

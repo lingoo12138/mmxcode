@@ -78,7 +78,7 @@ type WebUI struct {
 	// stand in for the network.
 	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
 	// Relogin signs the accounts that are signed out in again.
-	Relogin func(ctx context.Context) (fixed, failed int)
+	Relogin func(ctx context.Context) (manager.ReloginResult, error)
 	// PasswordNote says what happens to the passwords of the accounts
 	// that are brought in.
 	//
@@ -441,20 +441,21 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 		// 自己带着的东西填。
 		fmt.Fprintf(os.Stderr, "webui: signed in, but the account's identity could not be read: %v\n", ierr)
 	}
-	acc.Name = firstNonEmpty(who.Email, who.RealUserID, tok.Subject)
+	// 名字不给：库里已经有这一行的时候，名字是上次那人自己写的标签，
+	// 一次登录不该把它换掉。新账号的名字由库来起（地址、用户 id、令牌
+	// 里带的那个 id）。
 	acc.UserID = firstNonEmpty(who.RealUserID, tok.Subject)
 	acc.Email = who.Email
-	if err := w.Store.CreateAccount(ctx, acc); err != nil {
+	// 库里已经有这个站点账号了（多半是批量导入进来的）：改那一行，不再
+	// 另起一行——同一个站点账号两行都是活的，轮转会挑到两次。
+	acc, err = w.Store.SignIn(ctx, acc, store.Token{
+		Access: tok.Access, Refresh: tok.Refresh,
+		ExpiresAt: tok.Expires, Subject: tok.Subject,
+	})
+	if err != nil {
 		// 建账号失败要说出来：不然这一次登录就悄悄没了，人只看到
 		// 页面在转圈。
 		w.failLogin(id, "the account could not be written down: "+err.Error())
-		return
-	}
-	if err := w.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID, Access: tok.Access, Refresh: tok.Refresh,
-		ExpiresAt: tok.Expires, Subject: tok.Subject, UpdatedAt: now,
-	}); err != nil {
-		w.failLogin(id, "the token could not be written down: "+err.Error())
 		return
 	}
 	w.mu.Lock()
@@ -777,11 +778,45 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	views := make([]importRunView, 0, len(runs))
+	for _, r := range runs {
+		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
+	}
 	return map[string]any{
 		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
-		"Runs":         runs,
+		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
 	}, nil
+}
+
+// importRunView is one import run as the page shows it.
+//
+// 整趟没成的导入，成功和失败都是零：光看那两个数，看不出这一趟出了什
+// 么事，像是这一趟什么都没干。理由得摆在眼前。
+type importRunView struct {
+	store.ImportRun
+	// Whole is why the run failed as a whole, when it did.
+	Whole string
+}
+
+// wholeReason gives the reason a run failed as a whole.
+//
+// 整趟没成的时候，结果里有一行是整趟的（whole），它说的就是这一趟为什
+// 么没成。那一行不是账号：失败的账号数是零，可这一趟确实没成，得说。
+func wholeReason(results string) string {
+	if strings.TrimSpace(results) == "" {
+		return ""
+	}
+	var list []provision.Result
+	if err := json.Unmarshal([]byte(results), &list); err != nil {
+		return ""
+	}
+	for _, r := range list {
+		if r.Whole {
+			return r.Message
+		}
+	}
+	return ""
 }
 
 // apiImport takes a list of accounts and brings them in.
@@ -903,13 +938,24 @@ func stageOf(err error) provision.Stage {
 }
 
 // apiRelogin signs the accounts that are signed out in again.
+//
+// 理由要带回去：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 这一趟根本没跑的时候也要说，不能让它看着像「没什么要登的」。
 func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 	if w.Relogin == nil {
 		http.Error(rw, "这个网关没有重登", http.StatusNotImplemented)
 		return
 	}
-	fixed, failed := w.Relogin(r.Context())
-	writeJSON(rw, map[string]any{"fixed": fixed, "failed": failed})
+	res, err := w.Relogin(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"fixed":   res.Fixed,
+		"failed":  res.Failed,
+		"reasons": res.Reasons,
+	})
 }
 
 // apiImportRun says how one batch import is going.

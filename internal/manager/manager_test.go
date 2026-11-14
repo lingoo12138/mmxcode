@@ -1357,6 +1357,100 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 	}
 }
 
+// TestTheSignOutDoesNotUndoAFreshSignIn says a refusal does not sign
+// out an account that somebody else has signed in again.
+//
+// 手里这份令牌的续期被站点拒了（站点说这个 refresh token 不认），可是
+// 这期间另一个进程把这账号登回来了：库里换成了新令牌。这时候把签出
+// 写下去，就是把别人刚登好的账号作废掉，还把那份新令牌收走——页面会
+// 说这个账号登出了，轮转池也不用它，而它手里握着一份能用的凭据。
+func TestTheSignOutDoesNotUndoAFreshSignIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+
+	// 另一个进程把这账号登回来了：库里换成了新令牌。
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "fresh", Refresh: "freshref",
+		ExpiresAt: now.Add(2 * time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 这一边拿着旧令牌去续期，被拒了。
+	cur := &oauth.Token{Access: "old", Refresh: "ref", Expires: now.Add(time.Minute)}
+	if _, err := m.Renew(ctx, "acc_01", cur); err == nil {
+		t.Fatal("expected an error")
+	}
+
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusActive {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusActive)
+	}
+	tok, err := m.Store.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "fresh" || tok.Refresh != "freshref" {
+		t.Fatalf("the token = %+v, want the one the other sign-in wrote", tok)
+	}
+}
+
+// TestASignedOutAccountIsStillFoundByItsSubject says signing an
+// account out does not lose the key that says which site account it is.
+//
+// 签出是要收走令牌的：站点不认这个登录了，这份凭据没有用。可是令牌行
+// 里的 subject 得留着——那是站点那边账号自己的 id，是「这个站点账号在
+// 库里是哪一行」的键。签出的账号恰恰是最要紧的那一个：操作的人看见它
+// 掉线了，第一件事就是重新导入它。键要是被抹掉，那一次导入就会当成
+// 新账号，再插一行——两行都是活的，轮转会挑到两次。
+func TestASignedOutAccountIsStillFoundByItsSubject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	seedAccount(t, m, "acc_01", "old", "ref", now.Add(time.Minute))
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(time.Minute), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Token(ctx, "acc_01"); err == nil {
+		t.Fatal("expected an error")
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	acc, err := m.Store.AccountBySubject(ctx, "sub-1")
+	if err != nil {
+		t.Fatalf("the signed-out account is not found by its subject: %v", err)
+	}
+	if acc.ID != "acc_01" {
+		t.Fatalf("account = %q, want acc_01", acc.ID)
+	}
+}
+
 // TestARenewalThatWorkedIsKeptWhenTheWriteFails says a renewal that
 // worked is not thrown away because the database would not take it.
 //
@@ -1775,9 +1869,12 @@ func TestReloginAllOnlyTouchesTheAccountsThatHaveAPassword(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 		})
 	}
-	fixed, failed := m.ReloginAll(ctx, 10)
-	if fixed != 1 || failed != 0 {
-		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	res, err := m.ReloginAll(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fixed != 1 || res.Failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", res.Fixed, res.Failed)
 	}
 	acc, err := m.Store.GetAccount(ctx, "acc_2")
 	if err != nil {
@@ -1815,9 +1912,82 @@ func TestReloginAllStopsAtTheLimit(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 		})
 	}
-	fixed, failed := m.ReloginAll(ctx, 2)
-	if fixed != 2 || failed != 0 {
-		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	res, err := m.ReloginAll(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fixed != 2 || res.Failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", res.Fixed, res.Failed)
+	}
+}
+
+// TestReloginAllSaysWhyTheOnesThatFailedFailed says the reasons are not
+// thrown away.
+//
+// 只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。而「一个都
+// 没试成」（连账号都没列出来）和「都登回去了」在只看着两个数字的时候
+// 是一样的。
+func TestReloginAllSaysWhyTheOnesThatFailedFailed(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	m.Key = key
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "the first one", Status: store.StatusSignedOut,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return errors.New("the site refused it")
+	}
+
+	res, err := m.ReloginAll(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Failed != 1 || res.Fixed != 0 {
+		t.Fatalf("res = %+v, want one failure", res)
+	}
+	if len(res.Reasons) != 1 {
+		t.Fatalf("reasons = %v, want one line", res.Reasons)
+	}
+	if !strings.Contains(res.Reasons[0], "the site refused it") {
+		t.Fatalf("reason = %q, want the cause in it", res.Reasons[0])
+	}
+	if !strings.Contains(res.Reasons[0], "acc_1") {
+		t.Fatalf("reason = %q, want it to name the account", res.Reasons[0])
+	}
+}
+
+// TestReloginAllSaysWhenItCouldNotStart says a round that could not even
+// start says so.
+//
+// 账号都列不出来，这一趟就根本没跑。把它说成「成功 0，失败 0」，人会
+// 以为没什么要登的。
+func TestReloginAllSaysWhenItCouldNotStart(t *testing.T) {
+	m, path := newTestManagerWithPath(t, nil)
+	ctx := context.Background()
+	// 让读账号这一句炸掉：像磁盘坏了那样。
+	db := rawDB(t, path)
+	if _, err := db.Exec(`DROP TABLE accounts`); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := m.ReloginAll(ctx, 0)
+	if err == nil {
+		t.Fatalf("res = %+v, want an error", res)
+	}
+	if res.Fixed != 0 || res.Failed != 0 {
+		t.Fatalf("res = %+v, want nothing counted", res)
 	}
 }
 
@@ -1836,9 +2006,12 @@ func TestReloginAllLeavesTheActiveAccountsAlone(t *testing.T) {
 		called = true
 		return nil
 	}
-	fixed, failed := m.ReloginAll(ctx, 0)
-	if fixed != 0 || failed != 0 {
-		t.Fatalf("fixed = %d, failed = %d", fixed, failed)
+	res, err := m.ReloginAll(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fixed != 0 || res.Failed != 0 {
+		t.Fatalf("fixed = %d, failed = %d", res.Fixed, res.Failed)
 	}
 	if called {
 		t.Fatal("an active account was signed in again")
@@ -1990,15 +2163,18 @@ func TestTheAccountAnotherOneIsSigningInIsNotAFailure(t *testing.T) {
 	go func() { done <- m.Relogin(ctx, "acc_1") }()
 	<-holding
 	// 这一趟排在后面：它醒来的时候，账号已经登好了。
-	fixed, failed := m.ReloginAll(ctx, 0)
+	res, err := m.ReloginAll(ctx, 0)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if failed != 0 {
-		t.Fatalf("failed = %d, want 0: the account was signed in by the other one", failed)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if fixed != 0 {
-		t.Fatalf("fixed = %d, want 0: this run signed nothing in", fixed)
+	if res.Failed != 0 {
+		t.Fatalf("failed = %d, want 0: the account was signed in by the other one", res.Failed)
+	}
+	if res.Fixed != 0 {
+		t.Fatalf("fixed = %d, want 0: this run signed nothing in", res.Fixed)
 	}
 }
 

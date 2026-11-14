@@ -50,10 +50,16 @@ func runRelogin(ctx context.Context, e *env, out io.Writer, accountID, group str
 		fmt.Fprintf(out, "重登完成：%s\n", accountID)
 		return nil
 	}
-	fixed, failed := e.mgr.ReloginAll(ctx, 0)
-	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", fixed, failed)
-	if failed > 0 {
-		return fmt.Errorf("有 %d 个账号没登回去", failed)
+	res, err := e.mgr.ReloginAll(ctx, 0)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "重登完成：成功 %d，失败 %d。\n", res.Fixed, res.Failed)
+	for _, r := range res.Reasons {
+		fmt.Fprintf(out, "  %s\n", r)
+	}
+	if res.Failed > 0 {
+		return fmt.Errorf("有 %d 个账号没登回去", res.Failed)
 	}
 	return nil
 }

@@ -292,7 +292,10 @@ function showImportResults(run) {
   if (!Array.isArray(results)) results = [];
   for (const r of results) {
     const tr = document.createElement('tr');
-    const cells = [r.email, r.ok ? '成功' : '失败', r.message || ''];
+    // 整趟没成的那一行不是账号：它写的是「整趟」，不是「失败」——不然
+    // 表里有一个「失败」，而上面那句说的是「失败 0」，两处对不上。
+    const label = r.whole ? '整趟' : (r.ok ? '成功' : '失败');
+    const cells = [r.email, label, r.message || ''];
     for (const c of cells) {
       const td = document.createElement('td');
       td.textContent = c;
@@ -324,7 +327,14 @@ document.addEventListener('click', async (ev) => {
     const res = await fetch('/api/relogin', { method: 'POST' });
     const answer = await readAnswer(res);
     if (!answer.ok) throw new Error(messageOf(answer));
-    status.textContent = '成功 ' + answer.json.fixed + '，失败 ' + answer.json.failed;
+    // 理由要摆出来：只说「失败 2」，人得自己去一个一个看是哪个账号、
+    // 为什么。
+    const reasons = Array.isArray(answer.json.reasons) ? answer.json.reasons : [];
+    let text = '成功 ' + answer.json.fixed + '，失败 ' + answer.json.failed;
+    if (reasons.length) {
+      text += '。' + reasons.join('；');
+    }
+    status.textContent = text;
   } catch (e) {
     status.textContent = '失败：' + e.message;
   }

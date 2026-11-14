@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/gateway"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/provision"
 	"mmxcode/internal/scheduler"
 	"mmxcode/internal/webui"
@@ -105,7 +106,7 @@ func (e *env) wireImport(ui *webui.WebUI) {
 		}
 		return runner.Run(ctx, entries)
 	}
-	ui.Relogin = func(ctx context.Context) (int, int) {
+	ui.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
 		return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
 	}
 }

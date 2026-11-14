@@ -22,7 +22,7 @@
   {{if .Runs}}
   <h2>最近的导入</h2>
   <table>
-    <thead><tr><th>时间</th><th>来源</th><th>成功</th><th>失败</th></tr></thead>
+    <thead><tr><th>时间</th><th>来源</th><th>成功</th><th>失败</th><th>说明</th></tr></thead>
     <tbody>
       {{range .Runs}}
       <tr>
@@ -30,6 +30,7 @@
         <td>{{.Source}}</td>
         <td class="good">{{.OK}}</td>
         <td class="bad">{{.Failed}}</td>
+        <td>{{.Whole}}</td>
       </tr>
       {{end}}
     </tbody>

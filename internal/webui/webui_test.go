@@ -78,7 +78,9 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 		}
 		return out, nil
 	}
-	w.Relogin = func(ctx context.Context) (int, int) { return 1, 0 }
+	w.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
+		return manager.ReloginResult{Fixed: 1}, nil
+	}
 	return w, s
 }
 
@@ -1139,6 +1141,37 @@ func TestTheReasonARunFailedAsAWholeIsNotLost(t *testing.T) {
 	// And in the log: the run has no column of its own for the reason.
 	if !strings.Contains(logged.String(), "the key is not right") {
 		t.Fatalf("the log does not say why the run failed: %q", logged.String())
+	}
+}
+
+// TestTheHistorySaysWhyARunFailedAsAWhole says the page says why a run
+// failed as a whole, after a reload.
+//
+// 整趟没成的导入，成功和失败都是零。刷新一次页面，光看那两个数，看不
+// 出这一趟出了什么事——像是这一趟什么都没干。理由得摆在眼前：那一行
+// 不是账号，可这一趟确实没成。
+func TestTheHistorySaysWhyARunFailedAsAWhole(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateImportRun(context.Background(), store.ImportRun{
+		ID: "run_1", Source: "web", StartedAt: now, Total: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	results := `[{"email":"（整趟）","ok":false,"whole":true,"message":"整趟导入没能完成：the key is not right"}]`
+	if err := s.FinishImportRun(context.Background(), "run_1", now, 0, 0, results); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "the key is not right") {
+		t.Fatalf("the page does not say why the run failed: %q", body)
 	}
 }
 
