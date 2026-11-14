@@ -26,4 +26,17 @@ schedule:
   token_refresh: 5m
   egress_health: 2m
 
+batch:
+  # 批量导入时每个账号之间的间隔
+  interval: 3s
+  # 批量导入走哪个出口组（空 = 全局默认出口）
+  group: ""
+  relogin:
+    # 账号掉线了自动用存着的密码登回去（默认关）
+    enabled: false
+    # 调度器两趟之间隔多久
+    cooldown: 1h
+    # 一轮最多处理多少个账号
+    max_accounts: 20
+
 db: "/data/mmxcode.db"

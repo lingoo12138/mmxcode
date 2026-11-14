@@ -20,6 +20,8 @@ services:
       MMXCODE_CONFIG: /app/config.yaml
       # 容器内访问宿主机的代理要写 host.docker.internal
       MMXCODE_PROXY_DEFAULT: "${MMXCODE_PROXY_DEFAULT:-http://host.docker.internal:7890}"
+      # 导入用的密码要加密存库，密钥在这里。不设 = 登录一次就丢。
+      MMXCODE_PASSWORD_KEY: ${MMXCODE_PASSWORD_KEY:-}
       TZ: Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
