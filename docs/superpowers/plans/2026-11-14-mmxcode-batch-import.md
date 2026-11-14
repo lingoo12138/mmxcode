@@ -1921,6 +1921,7 @@ func (s *Store) SignOutIfTheTokenIsStillThere(ctx context.Context, id, access, r
 	}
 	return written, nil
 }
+
 ```
 
 ```go
@@ -1933,6 +1934,7 @@ func (s *Store) SignOutIfTheTokenIsStillThere(ctx context.Context, id, access, r
 func (s *Store) MarkErrorIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
 	return s.setStatusIfTokenUnchanged(ctx, s.db, id, access, StatusError, reason, updatedAt)
 }
+
 ```
 
 还有登录那一条路要按同一套规矩走：`mmxcode login` 和页面上那个登录，以前
@@ -2011,6 +2013,7 @@ func (s *Store) SignIn(ctx context.Context, a Account, tok Token) (Account, erro
 	}
 	return out, nil
 }
+
 ```
 
 - [x] **Step 4: 跑测试，确认它过了**
@@ -4788,6 +4791,37 @@ func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T)
 	}
 }
 
+// TestTheAddressIsTrimmed says the address is written without the
+// spaces around it.
+//
+// 地址是去重的键之一：同一个地址写成两种样子（一边带空格一边不带），
+// 库里就会看成两个账号。
+func TestTheAddressIsTrimmed(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 站点那边报的地址两头带着空格。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "  real@example.com  "}, nil
+	}
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "real@example.com" {
+		t.Fatalf("email = %q, want it trimmed", st.rows[0].Email)
+	}
+
+	// 清单上的地址两头带着空格，站点那边又问不出身份。
+	st2 := &fakeStore{}
+	c2 := aChain(st2)
+	c2.Identity = nil
+	if _, err := c2.Import(context.Background(), "  alias@example.com  ", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st2.rows[0].Email != "alias@example.com" {
+		t.Fatalf("email = %q, want it trimmed", st2.rows[0].Email)
+	}
+}
+
 // TestTheAddressIsNotTakenOverFromAnotherAccount says an address that
 // another account already has is not written onto this one.
 //
@@ -6529,6 +6563,7 @@ type ReloginResult struct {
 	// Reasons says why the ones that failed failed: one line per account.
 	Reasons []string
 }
+
 ```
 
 ```go
@@ -6540,6 +6575,7 @@ func reloginReason(acc store.Account, err error) string {
 	}
 	return who + "（" + acc.ID + "）：" + err.Error()
 }
+
 ```
 
 ```go
@@ -7160,6 +7196,7 @@ type importRunView struct {
 	// Whole is why the run failed as a whole, when it did.
 	Whole string
 }
+
 ```
 
 ```go
@@ -7182,6 +7219,7 @@ func wholeReason(results string) string {
 	}
 	return ""
 }
+
 ```
 
 ```go
