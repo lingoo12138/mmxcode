@@ -16,7 +16,10 @@ func newReloginCmd(e *env) *cobra.Command {
 		Use:   "relogin",
 		Short: "把签出的账号登回去",
 		Long: "用存着的密码，把签出（signed_out）的账号重新登一遍。\n" +
-			"没有存密码的账号登不回去——那个键没有就是没有。",
+			"没有存密码的账号登不回去——那个键没有就是没有。\n" +
+			"同一个账号不会同时登两遍，不过这只在一个进程里算数：这个命令跟\n" +
+			"一个正在跑着的 mmxcode serve 用同一个库的时候，两个进程可能同时登\n" +
+			"同一个账号。要是不想撞上，就别一边开着 serve 一边跑这一条。",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, group, all)
 		},

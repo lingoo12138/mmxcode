@@ -158,3 +158,20 @@ func TestReloginRefusesAnUnknownGroup(t *testing.T) {
 		t.Errorf("the error does not name the group: %v", err)
 	}
 }
+
+// TestTheReloginHelpSaysTheQueueIsOneProcess says the relogin command
+// says that its queue only counts inside one process.
+//
+// 排队是进程内的：这条命令跟一个正在跑的 serve 用同一个库的时候，两个
+// 进程可能同时登同一个账号。这件事得在命令的说明里写着，不然人以为
+// 「同一个账号不会同时登两遍」在任何时候都成立。
+func TestTheReloginHelpSaysTheQueueIsOneProcess(t *testing.T) {
+	e := testEnv(t)
+	cmd := newReloginCmd(e)
+	if !strings.Contains(cmd.Long, "进程") {
+		t.Fatalf("the help does not say the queue is one process: %q", cmd.Long)
+	}
+	if !strings.Contains(cmd.Long, "serve") {
+		t.Fatalf("the help does not mention the other process: %q", cmd.Long)
+	}
+}
