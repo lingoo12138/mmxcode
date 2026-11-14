@@ -1083,11 +1083,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1425,9 +1421,12 @@ type SiteError struct {
 }
 
 func (e *SiteError) Error() string {
-	msg := e.Message
-	if msg == "" {
-		msg = Explain(e.Code)
+	// The site's own message is in English and says nothing a person
+	// can act on; the code is what says what to do. The site's words
+	// come along, but they do not replace the explanation.
+	msg := Explain(e.Code)
+	if e.Message != "" {
+		msg = fmt.Sprintf("%s（站点说：%s）", msg, e.Message)
 	}
 	return fmt.Sprintf("the site refused the sign-in (%d): %s", e.Code, msg)
 }
@@ -1762,6 +1761,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -1810,7 +1810,7 @@ type BadLine struct {
 // One account per line: "email|password". A line that starts with a
 // "#" is a comment and an empty line is skipped. Everything after the
 // first "|" is the password, so a password may contain a "|".
-func Parse(r interface{ Read([]byte) (int, error) }) ([]Entry, []BadLine) {
+func Parse(r io.Reader) ([]Entry, []BadLine) {
 	var entries []Entry
 	var bad []BadLine
 	raw, err := readAll(r)
@@ -1901,8 +1901,6 @@ type Runner struct {
 	Interval time.Duration
 	// Sleep waits. A nil one waits with the context.
 	Sleep func(ctx context.Context, d time.Duration) error
-	// Now is the clock.
-	Now func() time.Time
 }
 
 // Run brings in every entry and gives back what happened to each.
@@ -2012,7 +2010,7 @@ func ResultsJSON(results []Result) string {
 }
 ```
 
-（`Parse` 的参数写成了 `interface{ Read([]byte) (int, error) }`——那是 `io.Reader` 的写法，直接用 `io.Reader` 更清楚，记得 import `"io"`。`readAll` 用 `io.ReadAll` 就行。）
+（`Parse` 收的是 `io.Reader`，读全部用 `io.ReadAll`。`Runner.Now` 这个字段计划里写了但用不上，去掉。）
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
