@@ -381,6 +381,28 @@ func TestRoundRobinTakesTheLeastRecentlyUsedAccount(t *testing.T) {
 	}
 }
 
+// TestTheCursorBreaksTheTie says the cursor is what decides between
+// the accounts that were used at the same moment.
+//
+// 最久没用过的时刻一样的账号有好几个时，光看时刻分不出来。游标指着
+// 谁就给谁：轮转才转得起来。
+func TestTheCursorBreaksTheTie(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"), acc("acc_03"))
+	r := New(p, Options{MaxAttempts: 3, Strategy: StrategyRoundRobin})
+	// 中间那个用过，另外两个一次也没用过：时刻一样，谁也不比谁老。
+	r.lastUsed["acc_02"] = time.Now()
+	// 游标停在 acc_02 上：它用过，不在候选里；下一个候选是 acc_03。
+	r.cursor = 1
+
+	got, err := r.Pick(context.Background(), "", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_03" {
+		t.Fatalf("picked %s, want the one the cursor points at", got.AccountID)
+	}
+}
+
 func TestPrefersTheAccountWithCredits(t *testing.T) {
 	p := newFakePool(acc("acc_01"), acc("acc_02"))
 	p.remaining = map[string]float64{"acc_01": 10, "acc_02": 500}

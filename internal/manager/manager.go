@@ -483,11 +483,11 @@ func (m *Manager) markError(ctx context.Context, accountID, reason string) error
 // whose record was lost. The account itself is still good, so the
 // state it has is kept and only the note is written.
 //
-// The state is read first and written back, because the store has no
-// setter that writes the note alone. That leaves a small race: the
-// state can change between the read and the write, and a sign-out in
-// that moment would be undone. The store should grow a setter that
-// writes the note alone, and the race goes with it.
+// The note is written with a setter that writes the note alone: the
+// status column is not touched, and the account is not read back to be
+// written again. A sign-out that happens while the note is being
+// written keeps its status — the two writers share the note column,
+// and that is all they share.
 //
 // The note is best effort. A note that could not be written down must
 // not make a working token unusable, and the fault that stopped the

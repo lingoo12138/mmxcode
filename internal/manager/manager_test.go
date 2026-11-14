@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,9 +155,9 @@ func TestTokenRefreshesWhenAboutToExpire(t *testing.T) {
 }
 
 func TestTokenRefreshOnlyOnceUnderConcurrency(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		time.Sleep(50 * time.Millisecond)
 		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
 	}))
@@ -185,8 +186,8 @@ func TestTokenRefreshOnlyOnceUnderConcurrency(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		<-done
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was spent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", n)
 	}
 }
 
@@ -827,9 +828,9 @@ func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
 //
 // 登出的账号要把令牌抹掉，不然每次请求都要白白付一次续期。
 func TestSignedOutAccountFailsFast(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid_grant"}`))
 	}))
@@ -867,8 +868,8 @@ func TestSignedOutAccountFailsFast(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); err == nil {
 		t.Fatal("expected an error")
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh was sent %d times, want 1", n)
 	}
 }
 
@@ -928,9 +929,9 @@ func jwtWithAccountID(accountID string) string {
 // 一份，没有令牌可以再换。这个账号只能重新登录，状态要写成登出，最后
 // 一条错误要说明是链断了，而不是让它接着重试。
 func TestChainBrokenSignsTheAccountOut(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid_grant"}`))
 	}))
@@ -963,8 +964,8 @@ func TestChainBrokenSignsTheAccountOut(t *testing.T) {
 	if !strings.Contains(a.LastError, "chain") {
 		t.Fatalf("last error = %q, want the broken chain", a.LastError)
 	}
-	if calls != 0 {
-		t.Fatalf("the site was asked %d times, want 0", calls)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("the site was asked %d times, want 0", n)
 	}
 }
 
@@ -975,9 +976,9 @@ func TestChainBrokenSignsTheAccountOut(t *testing.T) {
 // 所以它不能再发一次；但站点没有说这个登录失效了，账号不能写成登出。
 // 错误要记到账号上，WebUI 才看得出这个账号出了什么事。
 func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		// 回答还没写出来连接就断了：请求到了站点，回答没回来
 		panic(http.ErrAbortHandler)
 	}))
@@ -1005,8 +1006,8 @@ func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
 		t.Fatalf("error = %v, want the unknown outcome", err)
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", n)
 	}
 }
 
@@ -1174,9 +1175,11 @@ func TestTheTokenCarriesTheSitesAccountID(t *testing.T) {
 // 了；更要紧的是忘了"已经花掉"的记录，那个 refresh token 就会被再发
 // 一次，站点会回 invalid_grant，账号就白登出了。
 func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
-	var calls int
+	// 计数器是给处理请求的那条线程写的：普通变量在竞态检测器眼里就是
+	// 一个数据竞争。
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		panic(http.ErrAbortHandler)
 	}))
 	defer srv.Close()
@@ -1205,8 +1208,8 @@ func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
 		t.Fatalf("error = %v, want the unknown outcome", err)
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", n)
 	}
 }
 
@@ -1358,9 +1361,9 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 // 账号，而库里那份 refresh 已经花掉了，下一次请求又要再花一次 refresh
 // token。
 func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
 	}))
 	defer srv.Close()
@@ -1379,8 +1382,8 @@ func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
 	if tok == nil || tok.Access != "new" {
 		t.Fatalf("token = %+v, want the token the site handed out", tok)
 	}
-	if calls != 1 {
-		t.Fatalf("the site was asked %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the site was asked %d times, want 1", n)
 	}
 	// 写库失败这件事要写在账号上，WebUI 才看得出库里那份是旧的
 	a, err := m.Store.GetAccount(ctx, "acc_01")
@@ -1399,9 +1402,9 @@ func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
 // 令牌端点回 500：令牌还在有效期内，还有几分钟能用。为了几分钟后的
 // 一次续期失败就把现在能用的令牌扔掉，是白扔。
 func TestAFailedRenewalKeepsTheTokenInHand(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"the token endpoint is down"}`))
 	}))
@@ -1420,8 +1423,8 @@ func TestAFailedRenewalKeepsTheTokenInHand(t *testing.T) {
 	if tok == nil || tok.Access != "old" {
 		t.Fatalf("token = %+v, want the token in hand", tok)
 	}
-	if calls != 1 {
-		t.Fatalf("the site was asked %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the site was asked %d times, want 1", n)
 	}
 }
 
@@ -1480,9 +1483,9 @@ func TestAnAccountWithoutATokenIsNotSignedIn(t *testing.T) {
 // 续期成功了但写库失败：renewer 手里那份是新的，库里那份是旧的。再续
 // 一次就是再花一个 refresh token，而那一枚可能已经没了。
 func TestTheRenewersTokenIsUsedWhenItIsNewer(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.Write([]byte(`{"access_token":"other","refresh_token":"otherref","expires_in":3600}`))
 	}))
 	defer srv.Close()
@@ -1508,8 +1511,8 @@ func TestTheRenewersTokenIsUsedWhenItIsNewer(t *testing.T) {
 	if tok.Access != "new" {
 		t.Fatalf("access = %q, want the newer one", tok.Access)
 	}
-	if calls != 0 {
-		t.Fatalf("the site was asked %d times, want 0", calls)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("the site was asked %d times, want 0", n)
 	}
 	// 新的一份也写进库里
 	stored, err := m.Store.GetToken(ctx, "acc_01")

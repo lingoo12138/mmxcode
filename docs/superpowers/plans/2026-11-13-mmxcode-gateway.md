@@ -114,6 +114,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -258,9 +259,9 @@ func TestTokenRefreshesWhenAboutToExpire(t *testing.T) {
 }
 
 func TestTokenRefreshOnlyOnceUnderConcurrency(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		time.Sleep(50 * time.Millisecond)
 		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
 	}))
@@ -289,8 +290,8 @@ func TestTokenRefreshOnlyOnceUnderConcurrency(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		<-done
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was spent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was spent %d times, want 1", n)
 	}
 }
 
@@ -931,9 +932,9 @@ func TestForceRenewWalksTheChainWhenTheStoreIsBehind(t *testing.T) {
 //
 // 登出的账号要把令牌抹掉，不然每次请求都要白白付一次续期。
 func TestSignedOutAccountFailsFast(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid_grant"}`))
 	}))
@@ -971,8 +972,8 @@ func TestSignedOutAccountFailsFast(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); err == nil {
 		t.Fatal("expected an error")
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh was sent %d times, want 1", n)
 	}
 }
 
@@ -1032,9 +1033,9 @@ func jwtWithAccountID(accountID string) string {
 // 一份，没有令牌可以再换。这个账号只能重新登录，状态要写成登出，最后
 // 一条错误要说明是链断了，而不是让它接着重试。
 func TestChainBrokenSignsTheAccountOut(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid_grant"}`))
 	}))
@@ -1067,8 +1068,8 @@ func TestChainBrokenSignsTheAccountOut(t *testing.T) {
 	if !strings.Contains(a.LastError, "chain") {
 		t.Fatalf("last error = %q, want the broken chain", a.LastError)
 	}
-	if calls != 0 {
-		t.Fatalf("the site was asked %d times, want 0", calls)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("the site was asked %d times, want 0", n)
 	}
 }
 
@@ -1079,9 +1080,9 @@ func TestChainBrokenSignsTheAccountOut(t *testing.T) {
 // 所以它不能再发一次；但站点没有说这个登录失效了，账号不能写成登出。
 // 错误要记到账号上，WebUI 才看得出这个账号出了什么事。
 func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		// 回答还没写出来连接就断了：请求到了站点，回答没回来
 		panic(http.ErrAbortHandler)
 	}))
@@ -1109,8 +1110,8 @@ func TestUnknownOutcomeIsNotASignOut(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
 		t.Fatalf("error = %v, want the unknown outcome", err)
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", n)
 	}
 }
 
@@ -1278,9 +1279,11 @@ func TestTheTokenCarriesTheSitesAccountID(t *testing.T) {
 // 了；更要紧的是忘了"已经花掉"的记录，那个 refresh token 就会被再发
 // 一次，站点会回 invalid_grant，账号就白登出了。
 func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
-	var calls int
+	// 计数器是给处理请求的那条线程写的：普通变量在竞态检测器眼里就是
+	// 一个数据竞争。
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		panic(http.ErrAbortHandler)
 	}))
 	defer srv.Close()
@@ -1309,8 +1312,8 @@ func TestTheRenewerKeepsItsChainWhenTheOutcomeIsUnknown(t *testing.T) {
 	if _, err := m.Token(ctx, "acc_01"); !errors.Is(err, oauth.ErrRefreshOutcomeUnknown) {
 		t.Fatalf("error = %v, want the unknown outcome", err)
 	}
-	if calls != 1 {
-		t.Fatalf("the refresh token was sent %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the refresh token was sent %d times, want 1", n)
 	}
 }
 
@@ -1462,9 +1465,9 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 // 账号，而库里那份 refresh 已经花掉了，下一次请求又要再花一次 refresh
 // token。
 func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
 	}))
 	defer srv.Close()
@@ -1483,8 +1486,8 @@ func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
 	if tok == nil || tok.Access != "new" {
 		t.Fatalf("token = %+v, want the token the site handed out", tok)
 	}
-	if calls != 1 {
-		t.Fatalf("the site was asked %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the site was asked %d times, want 1", n)
 	}
 	// 写库失败这件事要写在账号上，WebUI 才看得出库里那份是旧的
 	a, err := m.Store.GetAccount(ctx, "acc_01")
@@ -1503,9 +1506,9 @@ func TestARenewalThatWorkedIsKeptWhenTheWriteFails(t *testing.T) {
 // 令牌端点回 500：令牌还在有效期内，还有几分钟能用。为了几分钟后的
 // 一次续期失败就把现在能用的令牌扔掉，是白扔。
 func TestAFailedRenewalKeepsTheTokenInHand(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"the token endpoint is down"}`))
 	}))
@@ -1524,8 +1527,8 @@ func TestAFailedRenewalKeepsTheTokenInHand(t *testing.T) {
 	if tok == nil || tok.Access != "old" {
 		t.Fatalf("token = %+v, want the token in hand", tok)
 	}
-	if calls != 1 {
-		t.Fatalf("the site was asked %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the site was asked %d times, want 1", n)
 	}
 }
 
@@ -1584,9 +1587,9 @@ func TestAnAccountWithoutATokenIsNotSignedIn(t *testing.T) {
 // 续期成功了但写库失败：renewer 手里那份是新的，库里那份是旧的。再续
 // 一次就是再花一个 refresh token，而那一枚可能已经没了。
 func TestTheRenewersTokenIsUsedWhenItIsNewer(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.Write([]byte(`{"access_token":"other","refresh_token":"otherref","expires_in":3600}`))
 	}))
 	defer srv.Close()
@@ -1612,8 +1615,8 @@ func TestTheRenewersTokenIsUsedWhenItIsNewer(t *testing.T) {
 	if tok.Access != "new" {
 		t.Fatalf("access = %q, want the newer one", tok.Access)
 	}
-	if calls != 0 {
-		t.Fatalf("the site was asked %d times, want 0", calls)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("the site was asked %d times, want 0", n)
 	}
 	// 新的一份也写进库里
 	stored, err := m.Store.GetToken(ctx, "acc_01")
@@ -2217,11 +2220,11 @@ func (m *Manager) markError(ctx context.Context, accountID, reason string) error
 // whose record was lost. The account itself is still good, so the
 // state it has is kept and only the note is written.
 //
-// The state is read first and written back, because the store has no
-// setter that writes the note alone. That leaves a small race: the
-// state can change between the read and the write, and a sign-out in
-// that moment would be undone. The store should grow a setter that
-// writes the note alone, and the race goes with it.
+// The note is written with a setter that writes the note alone: the
+// status column is not touched, and the account is not read back to be
+// written again. A sign-out that happens while the note is being
+// written keeps its status — the two writers share the note column,
+// and that is all they share.
 //
 // The note is best effort. A note that could not be written down must
 // not make a working token unusable, and the fault that stopped the
@@ -3471,6 +3474,28 @@ func TestRoundRobinTakesTheLeastRecentlyUsedAccount(t *testing.T) {
 	}
 }
 
+// TestTheCursorBreaksTheTie says the cursor is what decides between
+// the accounts that were used at the same moment.
+//
+// 最久没用过的时刻一样的账号有好几个时，光看时刻分不出来。游标指着
+// 谁就给谁：轮转才转得起来。
+func TestTheCursorBreaksTheTie(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"), acc("acc_03"))
+	r := New(p, Options{MaxAttempts: 3, Strategy: StrategyRoundRobin})
+	// 中间那个用过，另外两个一次也没用过：时刻一样，谁也不比谁老。
+	r.lastUsed["acc_02"] = time.Now()
+	// 游标停在 acc_02 上：它用过，不在候选里；下一个候选是 acc_03。
+	r.cursor = 1
+
+	got, err := r.Pick(context.Background(), "", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_03" {
+		t.Fatalf("picked %s, want the one the cursor points at", got.AccountID)
+	}
+}
+
 func TestPrefersTheAccountWithCredits(t *testing.T) {
 	p := newFakePool(acc("acc_01"), acc("acc_02"))
 	p.remaining = map[string]float64{"acc_01": 10, "acc_02": 500}
@@ -3654,6 +3679,285 @@ func TestTheStrategyIsChecked(t *testing.T) {
 	// New 不会因为策略写错就失败：它退回粘性的那个
 	if r := New(newFakePool(), Options{Strategy: "sticky-ish"}); r == nil {
 		t.Fatal("no rotator")
+	}
+}
+
+func TestSessionFromHeaders(t *testing.T) {
+	h := map[string][]string{
+		"X-Session-Id":      {"abc"},
+		"X-Conversation-Id": {"def"},
+	}
+	s := SessionOf(h, "sys", "hello")
+	if s.UpstreamID != "abc" {
+		t.Fatalf("upstream id = %q", s.UpstreamID)
+	}
+	h2 := map[string][]string{"X-Conversation-Id": {"def"}}
+	if got := SessionOf(h2, "sys", "hello"); got.UpstreamID != "def" {
+		t.Fatalf("upstream id = %q", got.UpstreamID)
+	}
+}
+
+func TestSessionKeyIsHashed(t *testing.T) {
+	// 客户端自己那串字符串不进数据库键
+	h := map[string][]string{"X-Session-Id": {"abc"}}
+	s := SessionOf(h, "sys", "hello")
+	if s.Key == "" {
+		t.Fatal("no key")
+	}
+	if strings.Contains(s.Key, "abc") {
+		t.Fatalf("key = %q, it holds the client's own string", s.Key)
+	}
+	if SessionOf(h, "sys", "hello").Key != s.Key {
+		t.Fatal("the same conversation gave two keys")
+	}
+	other := SessionOf(map[string][]string{"X-Session-Id": {"def"}}, "sys", "hello")
+	if other.Key == s.Key {
+		t.Fatal("two conversations gave the same key")
+	}
+}
+
+func TestSessionFromHash(t *testing.T) {
+	a := SessionOf(nil, "sys", "hello")
+	b := SessionOf(nil, "sys", "hello")
+	if a.Key == "" {
+		t.Fatal("expected a key")
+	}
+	if a.Key != b.Key {
+		t.Fatal("the same conversation gave two keys")
+	}
+	c := SessionOf(nil, "sys", "other")
+	if a.Key == c.Key {
+		t.Fatal("two conversations gave the same key")
+	}
+	if a.UpstreamID == "" {
+		t.Fatal("expected an upstream session id")
+	}
+}
+
+func TestTwoIdenticalFirstMessagesShareTheUpstreamID(t *testing.T) {
+	// 这是已知的碰撞，而且是定义上的碰撞：会话键就是 system prompt 加
+	// 第一条 user 消息的哈希，两段一样的开场白是同一个会话。数据库里
+	// 存着的上游 id 也是按会话键给的，所以这两个会话共用一个上游会话，
+	// 上游分不出是两个会话。服务器分不出来：请求里没有能分开它们的东西，
+	// 要分开只能让客户端带上 X-Session-Id。
+	a := SessionOf(nil, "sys", "hello")
+	b := SessionOf(nil, "sys", "hello")
+	if a.UpstreamID != b.UpstreamID {
+		t.Fatal("the two conversations got different upstream ids")
+	}
+}
+
+func TestSessionEmpty(t *testing.T) {
+	s := SessionOf(nil, "", "")
+	if s.Key != "" || s.UpstreamID != "" {
+		t.Fatalf("session = %+v", s)
+	}
+}
+
+// idPool is a pool that keeps an upstream id for every session.
+//
+// 有上游 id 的池子：id 是它自己给的，不是请求算出来的。
+type idPool struct {
+	*fakePool
+	ids map[string]string
+	// asked holds the keys the pool was asked for.
+	asked []string
+	// err is what UpstreamID fails with.
+	err error
+}
+
+func (p *idPool) UpstreamID(_ context.Context, key string) (string, error) {
+	p.asked = append(p.asked, key)
+	if p.err != nil {
+		return "", p.err
+	}
+	if id, ok := p.ids[key]; ok {
+		return id, nil
+	}
+	id := "up-" + key
+	p.ids[key] = id
+	return id, nil
+}
+
+func newIDPool(accounts ...store.Account) *idPool {
+	return &idPool{fakePool: newFakePool(accounts...), ids: map[string]string{}}
+}
+
+// TestTheUpstreamIDComesFromThePool says the id the upstream is told
+// about is the one the pool keeps.
+//
+// 上游看到的是数据库里存着的那个 id，不是请求算出来的那个。
+func TestTheUpstreamIDComesFromThePool(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+	sess := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+
+	got, err := r.UpstreamID(context.Background(), sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "up-"+sess.Key {
+		t.Fatalf("upstream id = %q", got)
+	}
+	if len(p.asked) != 1 || p.asked[0] != sess.Key {
+		t.Fatalf("the pool was asked %v", p.asked)
+	}
+}
+
+// TestTheUpstreamIDFallsBackToTheDerivedOne says a pool that keeps no
+// id leaves the derived one in place.
+//
+// 没有上游 id 的池子：退回请求自己算出来的那个，规则和从前一样。
+func TestTheUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
+	// fakePool 没有 UpstreamID 方法：它就是那种给不出 id 的池子。
+	p := newFakePool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 客户端带了会话 id：退回的就是客户端自己那串。
+	withHeader := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+	got, err := r.UpstreamID(context.Background(), withHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "client-1" {
+		t.Fatalf("upstream id = %q, want the client's own", got)
+	}
+
+	// 客户端没带：退回的是第一条消息的哈希。
+	fromMessage := SessionOf(nil, "sys", "hello")
+	got, err = r.UpstreamID(context.Background(), fromMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" || got != fromMessage.UpstreamID {
+		t.Fatalf("upstream id = %q, want the hash of the first message", got)
+	}
+}
+
+// TestTwoSessionsGetDifferentUpstreamIDs says two conversations do not
+// share the id the upstream is told about.
+//
+// 两个会话拿到两个不同的上游 id。
+func TestTwoSessionsGetDifferentUpstreamIDs(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	a, err := r.UpstreamID(context.Background(),
+		SessionOf(map[string][]string{"X-Session-Id": {"a"}}, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.UpstreamID(context.Background(),
+		SessionOf(map[string][]string{"X-Session-Id": {"b"}}, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == "" || b == "" {
+		t.Fatalf("upstream ids = %q and %q", a, b)
+	}
+	if a == b {
+		t.Fatalf("the two sessions got the same upstream id %q", a)
+	}
+}
+
+// TestASessionWithNoKeyHasNoUpstreamID says a request with no
+// conversation at all names nothing.
+//
+// 没有会话就没有对话要命名：池子也不问。
+func TestASessionWithNoKeyHasNoUpstreamID(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.UpstreamID(context.Background(), SessionOf(nil, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("upstream id = %q", got)
+	}
+	if len(p.asked) != 0 {
+		t.Fatalf("the pool was asked %v", p.asked)
+	}
+}
+
+// TestTheUpstreamIDFailsWhenThePoolCannotBeAsked says a pool that has
+// the id but cannot read it is an error.
+//
+// 读不到存着的 id 就不能装作没有：上游会把这段对话当成新的一段。
+func TestTheUpstreamIDFailsWhenThePoolCannotBeAsked(t *testing.T) {
+	p := newIDPool(acc("acc_01"))
+	p.err = errors.New("the database is down")
+	r := New(p, Options{MaxAttempts: 3})
+
+	sess := SessionOf(map[string][]string{"X-Session-Id": {"client-1"}}, "sys", "hello")
+	if _, err := r.UpstreamID(context.Background(), sess); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestDecide(t *testing.T) {
+	cases := []struct {
+		name string
+		f    Failure
+		want Action
+	}{
+		{"配额拒绝", Failure{Status: 429, Body: []byte(`{"message":"insufficient balance"}`)}, ActionFailover},
+		{"403 配额", Failure{Status: 403, Body: []byte(`{"message":"额度不足"}`)}, ActionFailover},
+		{"402 配额", Failure{Status: 402, Body: []byte(`{"message":"quota exceeded"}`)}, ActionFailover},
+		{"429 限流", Failure{Status: 429, Body: []byte(`{"message":"too many requests"}`)}, ActionRetrySame},
+		{"500", Failure{Status: 500}, ActionRetrySame},
+		{"网络错误", Failure{Network: true}, ActionRetrySame},
+		{"跨站重定向", Failure{OtherSite: true}, ActionGiveUp},
+		{"401", Failure{Status: 401}, ActionRenew},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Decide(c.f); got != c.want {
+				t.Fatalf("Decide = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestDecideRenewsOnARefusedSignIn(t *testing.T) {
+	cases := []struct {
+		name string
+		f    Failure
+	}{
+		{"调用方说的", Failure{Status: 200, Refused: true}},
+		{"200 里的 1000048", Failure{Status: 200, Body: []byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`)}},
+		{"base_resp 里的 1000048", Failure{Status: 200, Body: []byte(`{"base_resp":{"status_code":1000048,"status_msg":"the sign-in was refused"}}`)}},
+		{"403 里的 1000048", Failure{Status: 403, Body: []byte(`{"statusInfo":{"code":1000048,"message":"the sign-in was refused"}}`)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Decide(c.f); got != ActionRenew {
+				t.Fatalf("Decide = %v, want %v", got, ActionRenew)
+			}
+		})
+	}
+}
+
+func TestDecideIgnoresTheQuotaWordsOutsideTheMessage(t *testing.T) {
+	// 身体里有 "credit" 和 "limit"，但那不是上游说的拒绝，
+	// 不能因此把这个账号的窗口记成用完。
+	f := Failure{Status: 429, Body: []byte(`{"message":"the request failed","detail":{"credit":5,"limit":100}}`)}
+	if got := Decide(f); got != ActionRetrySame {
+		t.Fatalf("Decide = %v, want %v", got, ActionRetrySame)
+	}
+}
+
+func TestDecideReadsTheQuotaWordsFromTheNestedMessage(t *testing.T) {
+	f := Failure{Status: 429, Body: []byte(`{"error":{"message":"insufficient balance"}}`)}
+	if got := Decide(f); got != ActionFailover {
+		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
+	}
+}
+
+func TestDecideUsesTheMessageTheCallerParsed(t *testing.T) {
+	f := Failure{Status: 429, Message: "insufficient balance"}
+	if got := Decide(f); got != ActionFailover {
+		t.Fatalf("Decide = %v, want %v", got, ActionFailover)
 	}
 }
 ```
@@ -4828,7 +5132,6 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var best store.Account
 	var bestAt time.Time
 	var candidates []int
 	found := false
@@ -4839,8 +5142,9 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 		at := r.lastUsed[a.ID]
 		switch {
 		case !found, at.Before(bestAt):
-			best, bestAt, found = a, at, true
+			bestAt = at
 			candidates = []int{i}
+			found = true
 		case at.Equal(bestAt):
 			candidates = append(candidates, i)
 		}
@@ -4850,7 +5154,7 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 	}
 
 	idx := candidates[0]
-	if len(candidates) > 1 && len(all) > 0 {
+	if len(candidates) > 1 {
 		start := r.cursor % len(all)
 		for _, c := range candidates {
 			if c >= start {
@@ -4860,7 +5164,8 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 		}
 	}
 	r.cursor = idx + 1
-	return best, nil
+	// 给出去的就是游标挑的那个：候选都是同一个时刻，差别只在游标。
+	return all[idx], nil
 }
 
 // markUsed records that an account was handed out.

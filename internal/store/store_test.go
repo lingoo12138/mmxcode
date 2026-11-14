@@ -958,11 +958,15 @@ func TestThePathWithAQuestionMarkIsThePath(t *testing.T) {
 // everybody.
 //
 // 数据库里有明文的 refresh token，别人不能读。
+//
+// 目录是存储层自己建的那一个：它建成只有属主能进的样子。已经在那儿
+// 的目录不归它管 —— 把用户自己挑的目录改成 700 是它不该做的事。文件
+// 不一样：不管是谁建的，存储层都把它改成 600。
 func TestTheFileIsOnlyForItsOwner(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows has no such a mode")
 	}
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "data")
 	path := filepath.Join(dir, "data.db")
 	s, err := Open(path)
 	if err != nil {
@@ -985,6 +989,16 @@ func TestTheFileIsOnlyForItsOwner(t *testing.T) {
 	}
 	if mode := di.Mode().Perm(); mode != 0o700 {
 		t.Fatalf("the directory's mode is %o, want 700", mode)
+	}
+	// WAL 和 SHM 里也是明文：SQLite 照着数据库文件的权限建它们。
+	for _, name := range []string{path + "-wal", path + "-shm"} {
+		wi, err := os.Stat(name)
+		if err != nil {
+			continue
+		}
+		if mode := wi.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("%s's mode is %o, want 600", filepath.Base(name), mode)
+		}
 	}
 }
 

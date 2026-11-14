@@ -516,7 +516,6 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var best store.Account
 	var bestAt time.Time
 	var candidates []int
 	found := false
@@ -527,8 +526,9 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 		at := r.lastUsed[a.ID]
 		switch {
 		case !found, at.Before(bestAt):
-			best, bestAt, found = a, at, true
+			bestAt = at
 			candidates = []int{i}
+			found = true
 		case at.Equal(bestAt):
 			candidates = append(candidates, i)
 		}
@@ -538,7 +538,7 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 	}
 
 	idx := candidates[0]
-	if len(candidates) > 1 && len(all) > 0 {
+	if len(candidates) > 1 {
 		start := r.cursor % len(all)
 		for _, c := range candidates {
 			if c >= start {
@@ -548,7 +548,8 @@ func (r *Rotator) nextAccount(all []store.Account, usable map[string]bool) (stor
 		}
 	}
 	r.cursor = idx + 1
-	return best, nil
+	// 给出去的就是游标挑的那个：候选都是同一个时刻，差别只在游标。
+	return all[idx], nil
 }
 
 // markUsed records that an account was handed out.

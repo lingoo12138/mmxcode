@@ -174,6 +174,10 @@ type EgressHealth struct {
 // The directory and the file are made for their owner only: the file
 // holds the refresh tokens of every account in clear. Windows has no
 // such a mode, and there the file is left as Windows made it.
+//
+// A directory that is already there is left as it is: the store does
+// not tighten the permissions of a directory the user picked. The file
+// itself is always tightened, whoever made it.
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

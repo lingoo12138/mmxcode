@@ -5,3 +5,14 @@ tmp.db
 tmp.db-wal
 tmp.db-shm
 *.md
+
+# 本地的东西不进构建上下文：配置文件里有 api key，.env 里也是。
+config.yaml
+config.local.yaml
+.env
+.env.*
+!.env.example
+
+# 计划同步脚本和别的工作文件
+.tmp-review
+.worktrees
