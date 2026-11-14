@@ -328,8 +328,15 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 			}
 		}
 	}
-	return "", errors.New("device authorize: there is no default group to approve")
+	return "", ErrNoDefaultGroup
 }
+
+// ErrNoDefaultGroup is the answer when the site has no default group
+// to approve the code into.
+//
+// It is not worth trying again: the group is not there, and it will
+// not be there in five seconds either.
+var ErrNoDefaultGroup = errors.New("device authorize: there is no default group to approve")
 
 // findGroups finds the groups in the site's answer.
 //
