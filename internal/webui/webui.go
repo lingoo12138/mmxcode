@@ -750,7 +750,19 @@ func (w *WebUI) apiEvents(rw http.ResponseWriter, r *http.Request) {
 
 // writeJSON writes a JSON answer.
 func writeJSON(rw http.ResponseWriter, v any) {
+	writeJSONStatus(rw, http.StatusOK, v)
+}
+
+// writeJSONStatus writes a JSON answer with a status code.
+//
+// The header is set before the status is written: after WriteHeader the
+// header map is frozen, and a Content-Type set afterwards never reaches
+// the client. Go sniffs the body instead and says text/plain, and the
+// page's script then cannot read the answer — it reads nothing, and the
+// upload looks like it failed even though it went through.
+func writeJSONStatus(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(status)
 	json.NewEncoder(rw).Encode(v)
 }
 
@@ -825,9 +837,8 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go w.runImport(runID, entries)
-	// writeJSON 在这个包里只有两个参数，自己不写状态码：要 202 就先写。
-	rw.WriteHeader(http.StatusAccepted)
-	writeJSON(rw, map[string]any{"id": runID})
+	// 202：导入在后台跑着，这个回答只说这一次导入的号。
+	writeJSONStatus(rw, http.StatusAccepted, map[string]any{"id": runID})
 }
 
 // newImportRunID makes the name of one import run.

@@ -964,3 +964,48 @@ func TestTheImportPageSaysThePasswordsAreNotKept(t *testing.T) {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 }
+
+// TestTheUploadAnswerIsJSONOnTheWire says the upload's answer reaches
+// the browser as JSON.
+//
+// 这个测试要用真的服务器，不能用 httptest.NewRecorder：Recorder 的
+// 头不会像真的服务器那样在 WriteHeader 的时候被定下来，所以头丢了
+// 它也看不见。真的服务器上丢了这个头，浏览器拿到的就是
+// text/plain，页面上的脚本读不出那个 id，上传明明成功了，页面上却是
+// 「失败」。
+func TestTheUploadAnswerIsJSONOnTheWire(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	resp, err := http.Post(srv.URL+"/api/import", part.FormDataContentType(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ID == "" {
+		t.Fatal("the answer has no run id")
+	}
+}

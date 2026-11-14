@@ -6134,9 +6134,8 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go w.runImport(runID, entries)
-	// writeJSON 在这个包里只有两个参数，自己不写状态码：要 202 就先写。
-	rw.WriteHeader(http.StatusAccepted)
-	writeJSON(rw, map[string]any{"id": runID})
+	// 202：导入在后台跑着，这个回答只说这一次导入的号。
+	writeJSONStatus(rw, http.StatusAccepted, map[string]any{"id": runID})
 }
 
 // runImport brings a batch in and writes down what came of it.
@@ -6171,6 +6170,31 @@ func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 ```
 
 （`writeJSON` 这个包里多半已经有了；没有就照着别的 API 处理器的样子写一个。`log` 要 import `"log"`。）
+
+写 JSON 的那个函数要能带状态码，而且头得先写：`WriteHeader` 之后头就
+定下来了，之后再设的 `Content-Type` 到不了客户端，Go 改成猜正文，
+发出去的是 `text/plain`。页面上那个脚本只认 json，猜出来的头会让它
+读不出那个 id，上传明明成功了，页面上却写着「失败」。
+
+```go
+// writeJSON writes a JSON answer.
+func writeJSON(rw http.ResponseWriter, v any) {
+	writeJSONStatus(rw, http.StatusOK, v)
+}
+
+// writeJSONStatus writes a JSON answer with a status code.
+//
+// The header is set before the status is written: after WriteHeader the
+// header map is frozen, and a Content-Type set afterwards never reaches
+// the client. Go sniffs the body instead and says text/plain, and the
+// page's script then cannot read the answer — it reads nothing, and the
+// upload looks like it failed even though it went through.
+func writeJSONStatus(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+```
 
 4. 页面的模板 `internal/webui/templates/import.html`：
 
