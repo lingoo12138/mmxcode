@@ -2237,7 +2237,10 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 		// any more.
 		return
 	}
-	_ = m.Store.UpdateAccountStatus(ctx, accountID, a.Status, reason, time.Now())
+	// The error is written on its own: the status is not written, and
+	// not read back to be written again. A sign-out that happened
+	// while this was being written must not be undone by it.
+	_ = m.Store.SetAccountLastError(ctx, accountID, reason, time.Now())
 }
 
 // spentRefresh remembers the refresh token that really went to the
@@ -2457,16 +2460,11 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 			return store.UsageSnapshot{}, err
 		}
 	default:
-		// The plan's name could not be read, and the failure is lost
-		// here: the snapshot has no field for it, and Plan: "" reads
-		// as "this account has no plan" rather than "the plan could
-		// not be read". The membership's failure and the windows'
-		// failure have a field each; the plan's has none, and it
-		// cannot go into theirs without saying something false.
-		//
-		// What is needed is a plan_error column on usage_snapshots
-		// and a setter for it. Until it is there, the failure of this
-		// reading is nowhere.
+		// The plan's name could not be read. The failure is kept:
+		// a plan whose name could not be read is not a plan without
+		// a name, and Plan: "" would read as "this account has no
+		// plan" rather than "the plan could not be read".
+		snap.PlanError = err.Error()
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
@@ -8791,6 +8789,70 @@ func TestTheLastErrorIsNotMarkup(t *testing.T) {
 		t.Fatalf("the last error is not escaped: %s", body)
 	}
 }
+
+// TestAPIPatchDoesNotUndoASignOut says changing an account through
+// the API does not put a signed-out account back to active.
+//
+// 改账号不能把登出的账号改回 active。
+func TestAPIPatchDoesNotUndoASignOut(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	if err := s.UpdateAccountStatus(ctx, "acc_01", store.StatusSignedOut,
+		"the site refused the token", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01",
+		strings.NewReader(`{"name":"新名字","proxy_group":"warp"}`))
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Errorf("the status is %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.LastError != "the site refused the token" {
+		t.Errorf("the last error is %q", a.LastError)
+	}
+	// 改的还是要改。
+	if a.Name != "新名字" || a.ProxyGroup != "warp" {
+		t.Errorf("account = %+v", a)
+	}
+}
+
+// TestAPIDeleteOfAnAccountThatIsNotThere says deleting an account that
+// is not there is a 404, not a 500.
+//
+// 删一个没有的账号是 404。
+func TestAPIDeleteOfAnAccountThatIsNotThere(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodDelete, "/api/accounts/acc_nope", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPIPatchOfAnAccountThatIsNotThere says the same for a change.
+//
+// 改一个没有的账号也是 404。
+func TestAPIPatchOfAnAccountThatIsNotThere(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_nope",
+		strings.NewReader(`{"name":"x"}`))
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -9092,6 +9154,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -9575,11 +9638,12 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&body)
 		a, err := w.Store.GetAccount(r.Context(), id)
 		if err != nil {
-			http.Error(rw, err.Error(), http.StatusNotFound)
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(rw, "no such account: "+id, http.StatusNotFound)
+				return
+			}
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
-		}
-		if body.Name != nil {
-			a.Name = *body.Name
 		}
 		if body.ProxyGroup != nil {
 			// 组名写错会让账号悄悄改走全局默认。挡在这里。
@@ -9601,14 +9665,27 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 				a.ProxyURL = *body.ProxyURL
 			}
 		}
-		a.UpdatedAt = time.Now()
-		if err := w.Store.UpdateAccount(r.Context(), a); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
+		// 名字和出口分开写。整行写回去会把别的写者在这中间改的东西抹掉：
+		// 管理器刚写下的登出，会被这一次改名字抹回 active。
+		if body.Name != nil && *body.Name != a.Name {
+			if err := w.Store.SetAccountName(r.Context(), a.ID, *body.Name, time.Now()); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if body.ProxyGroup != nil || body.ProxyURL != nil {
+			if err := w.Store.SetAccountProxy(r.Context(), a.ID, a.ProxyGroup, a.ProxyURL, time.Now()); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		writeJSON(rw, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := w.Store.DeleteAccount(r.Context(), id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(rw, "no such account: "+id, http.StatusNotFound)
+				return
+			}
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}

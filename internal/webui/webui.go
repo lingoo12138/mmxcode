@@ -8,6 +8,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -491,11 +492,12 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&body)
 		a, err := w.Store.GetAccount(r.Context(), id)
 		if err != nil {
-			http.Error(rw, err.Error(), http.StatusNotFound)
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(rw, "no such account: "+id, http.StatusNotFound)
+				return
+			}
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
-		}
-		if body.Name != nil {
-			a.Name = *body.Name
 		}
 		if body.ProxyGroup != nil {
 			// 组名写错会让账号悄悄改走全局默认。挡在这里。
@@ -517,14 +519,27 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 				a.ProxyURL = *body.ProxyURL
 			}
 		}
-		a.UpdatedAt = time.Now()
-		if err := w.Store.UpdateAccount(r.Context(), a); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
+		// 名字和出口分开写。整行写回去会把别的写者在这中间改的东西抹掉：
+		// 管理器刚写下的登出，会被这一次改名字抹回 active。
+		if body.Name != nil && *body.Name != a.Name {
+			if err := w.Store.SetAccountName(r.Context(), a.ID, *body.Name, time.Now()); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if body.ProxyGroup != nil || body.ProxyURL != nil {
+			if err := w.Store.SetAccountProxy(r.Context(), a.ID, a.ProxyGroup, a.ProxyURL, time.Now()); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		writeJSON(rw, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := w.Store.DeleteAccount(r.Context(), id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(rw, "no such account: "+id, http.StatusNotFound)
+				return
+			}
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}

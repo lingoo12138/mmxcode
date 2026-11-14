@@ -503,7 +503,10 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 		// any more.
 		return
 	}
-	_ = m.Store.UpdateAccountStatus(ctx, accountID, a.Status, reason, time.Now())
+	// The error is written on its own: the status is not written, and
+	// not read back to be written again. A sign-out that happened
+	// while this was being written must not be undone by it.
+	_ = m.Store.SetAccountLastError(ctx, accountID, reason, time.Now())
 }
 
 // spentRefresh remembers the refresh token that really went to the
@@ -723,16 +726,11 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 			return store.UsageSnapshot{}, err
 		}
 	default:
-		// The plan's name could not be read, and the failure is lost
-		// here: the snapshot has no field for it, and Plan: "" reads
-		// as "this account has no plan" rather than "the plan could
-		// not be read". The membership's failure and the windows'
-		// failure have a field each; the plan's has none, and it
-		// cannot go into theirs without saying something false.
-		//
-		// What is needed is a plan_error column on usage_snapshots
-		// and a setter for it. Until it is there, the failure of this
-		// reading is nowhere.
+		// The plan's name could not be read. The failure is kept:
+		// a plan whose name could not be read is not a plan without
+		// a name, and Plan: "" would read as "this account has no
+		// plan" rather than "the plan could not be read".
+		snap.PlanError = err.Error()
 	}
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {

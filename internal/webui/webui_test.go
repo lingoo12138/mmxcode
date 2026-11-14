@@ -450,3 +450,67 @@ func TestTheLastErrorIsNotMarkup(t *testing.T) {
 		t.Fatalf("the last error is not escaped: %s", body)
 	}
 }
+
+// TestAPIPatchDoesNotUndoASignOut says changing an account through
+// the API does not put a signed-out account back to active.
+//
+// 改账号不能把登出的账号改回 active。
+func TestAPIPatchDoesNotUndoASignOut(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	if err := s.UpdateAccountStatus(ctx, "acc_01", store.StatusSignedOut,
+		"the site refused the token", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01",
+		strings.NewReader(`{"name":"新名字","proxy_group":"warp"}`))
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	a, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Errorf("the status is %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.LastError != "the site refused the token" {
+		t.Errorf("the last error is %q", a.LastError)
+	}
+	// 改的还是要改。
+	if a.Name != "新名字" || a.ProxyGroup != "warp" {
+		t.Errorf("account = %+v", a)
+	}
+}
+
+// TestAPIDeleteOfAnAccountThatIsNotThere says deleting an account that
+// is not there is a 404, not a 500.
+//
+// 删一个没有的账号是 404。
+func TestAPIDeleteOfAnAccountThatIsNotThere(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodDelete, "/api/accounts/acc_nope", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPIPatchOfAnAccountThatIsNotThere says the same for a change.
+//
+// 改一个没有的账号也是 404。
+func TestAPIPatchOfAnAccountThatIsNotThere(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_nope",
+		strings.NewReader(`{"name":"x"}`))
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
