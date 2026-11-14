@@ -1038,6 +1038,37 @@ func TestAnAccountIsFoundByItsSubjectEvenWhenTheAddressIsDifferent(t *testing.T)
 	}
 }
 
+// TestTheAddressIsTrimmed says the address is written without the
+// spaces around it.
+//
+// 地址是去重的键之一：同一个地址写成两种样子（一边带空格一边不带），
+// 库里就会看成两个账号。
+func TestTheAddressIsTrimmed(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 站点那边报的地址两头带着空格。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{Email: "  real@example.com  "}, nil
+	}
+	if _, err := c.Import(context.Background(), "alias@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].Email != "real@example.com" {
+		t.Fatalf("email = %q, want it trimmed", st.rows[0].Email)
+	}
+
+	// 清单上的地址两头带着空格，站点那边又问不出身份。
+	st2 := &fakeStore{}
+	c2 := aChain(st2)
+	c2.Identity = nil
+	if _, err := c2.Import(context.Background(), "  alias@example.com  ", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if st2.rows[0].Email != "alias@example.com" {
+		t.Fatalf("email = %q, want it trimmed", st2.rows[0].Email)
+	}
+}
+
 // TestTheAddressIsNotTakenOverFromAnotherAccount says an address that
 // another account already has is not written onto this one.
 //

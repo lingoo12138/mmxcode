@@ -479,6 +479,49 @@ func TestASignInLandsOnTheRowThatIsAlreadyThere(t *testing.T) {
 	}
 }
 
+// TestTheAddressIsWrittenWithoutTheSpacesAroundIt says the address is
+// stored trimmed.
+//
+// 地址是去重的键之一：同一个地址写成两种样子（一边带空格一边不带），
+// 库里就会看成两个账号。
+func TestTheAddressIsWrittenWithoutTheSpacesAroundIt(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "one", Email: "  a@example.com  ",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByEmail(ctx, "a@example.com")
+	if err != nil {
+		t.Fatalf("the account by its address: %v", err)
+	}
+	if got.Email != "a@example.com" {
+		t.Fatalf("email = %q, want it trimmed", got.Email)
+	}
+
+	// 登录那一路也一样：地址两头带着空格，落库的时候得去掉。
+	if _, err := s.SignIn(ctx, Account{
+		ID: "acc_2", Name: "two", Email: "  b@example.com  ",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+		Subject: "sub-2", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s.AccountByEmail(ctx, "b@example.com")
+	if err != nil {
+		t.Fatalf("the account by its address: %v", err)
+	}
+	if got2.Email != "b@example.com" {
+		t.Fatalf("email = %q, want it trimmed", got2.Email)
+	}
+}
+
 // TestASignInOfAnotherAccountMakesItsOwnRow says two site accounts are
 // two rows.
 func TestASignInOfAnotherAccountMakesItsOwnRow(t *testing.T) {
