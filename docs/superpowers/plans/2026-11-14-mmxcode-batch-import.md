@@ -5880,6 +5880,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `internal/webui/webui.go`
 - Modify: `internal/webui/webui_test.go`
 - Create: `internal/webui/templates/import.html`
+- Create: `internal/webui/templates/relogin.html`
+- Modify: `internal/webui/templates/layout.html`
 - Modify: `internal/webui/static/app.js`
 - Modify: `cmd/mmxcode/serve.go`
 
@@ -6375,7 +6377,7 @@ func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 
 ```
 
-8. **重登那一页**（设计文档 §8.1 里写着 `/accounts/relogin`：列出签出且有
+7. **重登那一页**（设计文档 §8.1 里写着 `/accounts/relogin`：列出签出且有
    密码的账号，一键重登）。重登页**不受上传那个闸限制**——它不碰明文密码。
 
    路由，在页面那一段里加：
@@ -6502,7 +6504,7 @@ func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
 
 ```
 
-7. `cmd/mmxcode/serve.go` 里接线：
+8. `cmd/mmxcode/serve.go` 里接线：
 
 ```go
 			ui := webui.New(e.mgr, e.cfg, e.store)
@@ -6554,6 +6556,29 @@ git commit -m "feat(webui): 批量导入页和重登页
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+#### 几处容易踩的地方
+
+- **状态码和 `Content-Type` 的先后。** 这个包里的 `writeJSON(rw, v)` 自己设
+  `Content-Type`，但它**不写状态码**。要 202 就得先 `rw.WriteHeader(202)`——
+  那样写的话，`writeJSON` 后设的那个头就被 Go 丢掉了（`WriteHeader` 之后
+  头就定死了），回答会以 `text/plain` 出去，页面上的 `readAnswer` 就不把它
+  当 JSON，`watchImport` 读 `answer.json.id` 时炸掉，页面显示"失败"，其实
+  上传是成的。所以：**先把头设好，再写状态码**。
+- **测这个要用真的服务器。** `httptest.NewRecorder` 的头不会像真的服务器那样
+  定死，所以用 Recorder 测不出上面那个毛病。要起一个 `httptest.NewServer`，
+  看客户端真正收到的是什么。
+- **上传不许落盘。** `ParseMultipartForm(4<<20)` 这样的内存上限下，超过上限的
+  清单会真的写到 `os.TempDir()` 里去——明文密码就落盘了，违反设计 §8.4。要用
+  `http.MaxBytesReader` 把请求体卡住，并且给解析器的内存**比请求体的上限大**，
+  溢出的那条路才走不到。
+- **`e.runner` 返回两个值**（`(*provision.Runner, error)`），不能一句
+  `runner := e.runner(...)` 就算完。
+- **重登那一页只列还存着密码的账号。** 没有密码的账号登不回去，列出来配一个
+  按不动的按钮比不列更糟。测试里那个账号得先 `SetPassword`。
+- **密钥是坏的，要停下来。** `passwordKeeper` 的契约是：密钥没设 = 密码用完就
+  丢；密钥设了但是坏的 = 停下来。把错误丢掉（`keeper, _ := ...`）会悄悄造出
+  一库谁也登不回去的账号。
 
 ---
 
@@ -6735,5 +6760,6 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 9. `uuid` 出现两次的时候，站点读的是哪一个。网页那边公共的那一份在前、自己
    的那一份在后，常见的解析器取第一个（`url.Values.Get`、`URLSearchParams.get`、
    Java 的 `getParameter`）——但这是猜的
-10. 同一个账号导两次会不会在库里留下两行。`Chain.Import` 每回都新建一行，
-    库里没有按邮箱找账号的法子
+10. 同一个账号导两次，站点那边认不认。我们这边是一行：第二次导入会把这一行的
+    令牌换掉。但站点那边——第二次登录换来的令牌会不会把第一次那把 refresh
+    token 作废——只有真账号能试出来
