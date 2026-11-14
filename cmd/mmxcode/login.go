@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -58,11 +59,34 @@ func newLoginCmd(e *env) *cobra.Command {
 				return err
 			}
 			fmt.Printf("已登录：%s (%s)\n", acc.Name, acc.ID)
+			readCredits(ctx, e, cmd.OutOrStdout(), acc.ID)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "账号标签")
 	return cmd
+}
+
+// readCredits reads one account's credits now.
+//
+// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看得到
+// 它有多少积分。读不到不算登录失败——账号是进来了的，账本读不到是另一件
+// 事，但要说出来。
+func readCredits(ctx context.Context, e *env, out io.Writer, accountID string) {
+	if e.mgr == nil || accountID == "" {
+		return
+	}
+	snap, err := e.mgr.RefreshUsage(ctx, accountID)
+	if err != nil {
+		fmt.Fprintf(out, "积分读不到：%v\n", err)
+		return
+	}
+	if !snap.HasAmounts {
+		fmt.Fprintln(out, "积分读不到。")
+		return
+	}
+	fmt.Fprintf(out, "积分：剩 %.2f（发了 %.2f，花了 %.2f）\n",
+		snap.Remaining, snap.Granted, snap.Consumed)
 }
 
 // newAccountID makes an account id.

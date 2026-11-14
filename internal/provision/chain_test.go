@@ -153,6 +153,36 @@ func (t fakeTx) AccountBySubject(ctx context.Context, subject string) (store.Acc
 	return t.s.lookupSubject(subject)
 }
 
+func (t fakeTx) AccountByUserID(ctx context.Context, userID string) (store.Account, error) {
+	return t.s.lookupUserID(userID)
+}
+
+// lookupUserID gives the account with that site user id.
+//
+// 真的库里是按 accounts.user_id 找的：站点给的那个真的那个 id。一个站
+// 点账号一个，重登多少次都是它。
+func (s *fakeStore) lookupUserID(userID string) (store.Account, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return store.Account{}, fmt.Errorf("get the account by user id: %w", store.ErrNotFound)
+	}
+	var found store.Account
+	have := false
+	for _, r := range s.rows {
+		if strings.TrimSpace(r.UserID) != userID {
+			continue
+		}
+		if !have || r.CreatedAt.Before(found.CreatedAt) ||
+			(r.CreatedAt.Equal(found.CreatedAt) && r.ID < found.ID) {
+			found, have = r, true
+		}
+	}
+	if !have {
+		return store.Account{}, fmt.Errorf("get the account by user id %s: %w", userID, store.ErrNotFound)
+	}
+	return found, nil
+}
+
 func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 	t.s.waitMake()
 	return t.s.createAccount(a)
@@ -1264,5 +1294,41 @@ func TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver(t *testing.T) {
 	}
 	if pe.Message != "connection reset" {
 		t.Fatalf("message = %q, want what went wrong", pe.Message)
+	}
+}
+
+// TestAnAccountIsFoundByItsUserIDEvenWhenTheAddressIsDifferent says the
+// site user id finds the account.
+//
+// 有的账号站点那边报不出邮箱：清单上写的地址是别名，令牌里也没有 sub。
+// 只有站点给的那个真的 user id 认得出是哪一个站点账号——少了这一步，再
+// 导一次就多一行活的，同一个站点账号两行都在轮转池里。
+func TestAnAccountIsFoundByItsUserIDEvenWhenTheAddressIsDifferent(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 站点那边报不出邮箱，也没有别的线索，只有那个 user id。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{RealUserID: "u1"}, nil
+	}
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		return &oauth.Token{Access: "acc", Refresh: "ref"}, nil
+	}
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v", st.rows)
+	}
+
+	// 第二趟：清单上的地址换了，站点那边报的还是同一个 user id。
+	res, err := c.Import(context.Background(), "other@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row for one site account", st.rows)
+	}
+	if res.AccountID != "acc_1" {
+		t.Fatalf("account id = %q, want the row that was already there", res.AccountID)
 	}
 }

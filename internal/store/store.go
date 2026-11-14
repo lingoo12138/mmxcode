@@ -929,6 +929,18 @@ func findForSignIn(ctx context.Context, tx Tx, a Account, tok Token) (Account, e
 			return Account{}, err
 		}
 	}
+	// 站点给的那个真的 user id：有的账号没有邮箱，令牌里也没有 sub，
+	// 只有它认得出是哪一个站点账号。少了这一步，这样的账号每登一次就
+	// 多一行活的。
+	if a.UserID != "" {
+		row, err := tx.AccountByUserID(ctx, a.UserID)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
 	return Account{}, nil
 }
 
@@ -1243,6 +1255,9 @@ type Tx interface {
 	// subject, when there is one. It says ErrNotFound when there is
 	// none.
 	AccountBySubject(ctx context.Context, subject string) (Account, error)
+	// AccountByUserID gives the account with that site user id, when
+	// there is one. It says ErrNotFound when there is none.
+	AccountByUserID(ctx context.Context, userID string) (Account, error)
 	// CreateAccount inserts an account.
 	CreateAccount(ctx context.Context, a Account) error
 	// SaveToken writes an account's token.
@@ -1313,6 +1328,10 @@ func (t *sqlTx) AccountByEmail(ctx context.Context, email string) (Account, erro
 
 func (t *sqlTx) AccountBySubject(ctx context.Context, subject string) (Account, error) {
 	return t.s.accountBySubject(ctx, t.tx, subject)
+}
+
+func (t *sqlTx) AccountByUserID(ctx context.Context, userID string) (Account, error) {
+	return t.s.accountByUserID(ctx, t.tx, userID)
 }
 
 func (t *sqlTx) CreateAccount(ctx context.Context, a Account) error {
@@ -1440,6 +1459,39 @@ func (s *Store) accountByEmail(ctx context.Context, db execer, email string) (Ac
 	}
 	if err != nil {
 		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
+	}
+	return a, nil
+}
+
+// AccountByUserID gives the account with that site user id.
+//
+// 用户 id 是站点那边给的那个真的那个（realUserID）：签到和积分明细要的
+// 是它。它是账号最稳当的钥匙——有的账号没有邮箱，令牌里也没有 sub，只
+// 有它一直在。
+//
+// 空的 user id 不是一把钥匙：没有它的账号，谁也不是。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountByUserID(ctx context.Context, userID string) (Account, error) {
+	return s.accountByUserID(ctx, s.db, userID)
+}
+
+func (s *Store) accountByUserID(ctx context.Context, db execer, userID string) (Account, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return Account{}, fmt.Errorf("get the account by user id: %w", ErrNotFound)
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
+			last_error, created_at, updated_at
+		FROM accounts WHERE user_id = ?
+		ORDER BY created_at, id LIMIT 1`, userID)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by user id %s: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by user id %s: %w", userID, err)
 	}
 	return a, nil
 }

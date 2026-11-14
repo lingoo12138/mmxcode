@@ -27,11 +27,31 @@ import (
 
 // Execute runs the command line and gives the process its exit code.
 func Execute() int {
-	if err := newRoot().Execute(); err != nil {
+	root, _ := newRoot()
+	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 	return 0
+}
+
+// APIKeysEnv is the environment variable that holds the api keys.
+//
+// 镜像里不带密钥：密钥是申请来的，写进镜像就等于把它摊在别人眼前。
+// 它从环境变量进来，配置文件里可以一把都没有。
+const APIKeysEnv = "MMXCODE_API_KEYS"
+
+// apiKeysFromEnv gives the api keys the environment brings.
+//
+// 逗号分隔。一把空的 key 等于没有 key：它会被去掉。
+func apiKeysFromEnv(v string) []string {
+	var out []string
+	for _, k := range strings.Split(v, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // env is what the commands share.
@@ -48,7 +68,7 @@ type env struct {
 	makeRunner func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner
 }
 
-func newRoot() *cobra.Command {
+func newRoot() (*cobra.Command, *env) {
 	var (
 		configPath string
 		dbPath     string
@@ -74,6 +94,10 @@ func newRoot() *cobra.Command {
 		}
 		if v := os.Getenv("MMXCODE_PROXY_DEFAULT"); v != "" {
 			cfg.Proxy.Default = v
+		}
+		// 密钥也可以从环境变量来：镜像里不带密钥，密钥是申请来的。
+		if v := os.Getenv(APIKeysEnv); v != "" {
+			cfg.Server.APIKeys = append(cfg.Server.APIKeys, apiKeysFromEnv(v)...)
 		}
 		e.cfg = cfg
 		s, err := store.Open(cfg.DB)
@@ -118,7 +142,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
 	root.AddCommand(newServeCmd(e))
-	return root
+	return root, e
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }

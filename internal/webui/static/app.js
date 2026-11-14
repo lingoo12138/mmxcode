@@ -339,3 +339,52 @@ document.addEventListener('click', async (ev) => {
     status.textContent = '失败：' + e.message;
   }
 });
+
+// 用量：现读一遍账本。
+//
+// 页面上那些数是上一次读数时的数，按一下「刷新」就是现在读一遍。
+// 读完之后要把整页取回来——页面是服务端渲染的，只有重新取一次才是
+// 现在的数。
+document.addEventListener('click', async (ev) => {
+  const button = ev.target.closest('#usage-refresh');
+  if (!button) return;
+  const status = document.getElementById('usage-status');
+  button.disabled = true;
+  if (status) status.textContent = '正在读账本……';
+  try {
+    const res = await fetch('/api/usage/refresh', { method: 'POST' });
+    const answer = await readAnswer(res);
+    if (!answer.ok) throw new Error(messageOf(answer));
+    // 理由要摆出来：只说「失败 1」，人得自己去一个一个看是哪个账号、
+    // 为什么。
+    const reasons = Array.isArray(answer.json.reasons) ? answer.json.reasons : [];
+    let text = '读了 ' + answer.json.refreshed + ' 个账号，失败 ' + answer.json.failed;
+    if (reasons.length) {
+      text += '。' + reasons.join('；');
+    }
+    // 刷新会把页面上的一切换掉，刚才那句话得留下来。
+    try {
+      sessionStorage.setItem('mmxcode-usage-refresh', text);
+    } catch (e) {
+      /* 存不下也就算了 */
+    }
+    location.reload();
+  } catch (e) {
+    if (status) status.textContent = '失败：' + e.message;
+    button.disabled = false;
+  }
+});
+
+// 刷新之后把刚才那句话摆出来。
+(function () {
+  let text = '';
+  try {
+    text = sessionStorage.getItem('mmxcode-usage-refresh') || '';
+    sessionStorage.removeItem('mmxcode-usage-refresh');
+  } catch (e) {
+    text = '';
+  }
+  if (!text) return;
+  const status = document.getElementById('usage-status');
+  if (status) status.textContent = text;
+})();

@@ -31,6 +31,14 @@ const (
 	StateExpired = "expired"
 	// StateUnavailable means the credits could not be read.
 	StateUnavailable = "unavailable"
+	// StateUnread means the account's credits were never read: the
+	// account is in the database, but no reading of it has been made
+	// yet.
+	//
+	// 没读过跟读不到是两回事：读不到是这一次失败了，没读过是从头
+	// 就没读过。两个都不算数——它们不是零，是不知道——但人要知道
+	// 是哪一种：读不到要去看看出了什么事，没读过只是还没轮到。
+	StateUnread = "unread"
 )
 
 // AccountUsage is one account's credits.
@@ -75,6 +83,14 @@ type Summary struct {
 	// AccountsExpired counts the accounts whose credits were read and
 	// have all run out, so a short total can say why it is short.
 	AccountsExpired int `json:"accounts_expired"`
+	// AccountsUnread counts the accounts whose credits were never read.
+	AccountsUnread int `json:"accounts_unread"`
+	// Readings counts the accounts that have a reading of their
+	// credits, whatever the reading said.
+	//
+	// 没有读数的时候，"读数时间"没有可说：说成汇总的时间，读数就像
+	// 是刚刚才读的——其实一个账号都没读过。
+	Readings int `json:"readings"`
 	// Accounts is each account's own numbers.
 	Accounts []AccountUsage `json:"accounts"`
 }
@@ -85,15 +101,41 @@ type Summary struct {
 // the newer one is the account's reading and the older one is left
 // out: summing both would count the same credits twice.
 //
+// accounts are the accounts in the database. They are there so that an
+// account whose credits have never been read is in the summary too:
+// without it a brand new account is nowhere to be seen, and "not in
+// the summary" reads as "no credits". The accounts given may be nil:
+// then only the accounts with a reading are in the summary, and no
+// email is known.
+//
 // now decides which batches count: one that has run out is out. It is
 // also what an expired reading is compared with, so that the same
 // reading does not change its state from one call to the next.
-func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
+func Aggregate(snaps []store.UsageSnapshot, accounts []store.Account, now time.Time) Summary {
 	s := Summary{UpdatedAt: now}
-	var newest time.Time
+	reading := map[string]store.UsageSnapshot{}
 	for _, sn := range newestPerAccount(snaps) {
-		au := AccountUsage{ID: sn.AccountID}
+		reading[sn.AccountID] = sn
+	}
+	emails := map[string]string{}
+	ids := make(map[string]bool, len(accounts)+len(reading))
+	for _, a := range accounts {
+		emails[a.ID] = a.Email
+		ids[a.ID] = true
+	}
+	for id := range reading {
+		ids[id] = true
+	}
+	var newest time.Time
+	for id := range ids {
+		au := AccountUsage{ID: id, Email: emails[id]}
+		sn, read := reading[id]
 		switch {
+		case !read:
+			// 没读过：这个账号在库里，只是还没有人读过它的账本。它
+			// 不是零——它是不算数，而且人得看得见它。
+			au.State = StateUnread
+			s.AccountsUnread++
 		case !sn.HasAmounts:
 			// The credits could not be read: the account is left out
 			// of the totals rather than counted as zero.
@@ -124,8 +166,11 @@ func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
 				}
 			}
 		}
-		if sn.CreatedAt.After(newest) {
-			newest = sn.CreatedAt
+		if read {
+			s.Readings++
+			if sn.CreatedAt.After(newest) {
+				newest = sn.CreatedAt
+			}
 		}
 		s.Accounts = append(s.Accounts, au)
 	}

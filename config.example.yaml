@@ -1,5 +1,8 @@
 server:
   listen: ":8080"
+  # 网关的 key（也是后台登录那把）。不写 = 不鉴权，这时只允许听本机。
+  # 也可以用环境变量 MMXCODE_API_KEYS 给（逗号隔开）：密钥是申请来的，
+  # 不该躺在文件里。
   api_keys: ["sk-local-xxxx"]
 
 proxy:

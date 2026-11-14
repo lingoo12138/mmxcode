@@ -38,7 +38,7 @@ func TestAggregate(t *testing.T) {
 			CreatedAt: now.Add(-time.Minute),
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 900 {
 		t.Fatalf("granted = %v, want 900", s.TotalGranted)
 	}
@@ -73,7 +73,7 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Consumed: 1, Remaining: 9},
 		{AccountID: "acc_02", HasAmounts: false},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 10 {
 		t.Fatalf("granted = %v, want 10", s.TotalGranted)
 	}
@@ -90,7 +90,7 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 }
 
 func TestAggregateEmpty(t *testing.T) {
-	s := Aggregate(nil, time.Now())
+	s := Aggregate(nil, nil, time.Now())
 	if s.TotalGranted != 0 || s.TotalRemaining != 0 {
 		t.Fatalf("summary = %+v", s)
 	}
@@ -119,7 +119,7 @@ func TestAggregateCountsAnAccountOnce(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 100 {
 		t.Fatalf("granted = %v, want 100: one account is one account", s.TotalGranted)
 	}
@@ -147,7 +147,7 @@ func TestAggregateKeepsTheNewestReading(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 300 {
 		t.Fatalf("granted = %v, want 300: the newest reading counts", s.TotalGranted)
 	}
@@ -172,7 +172,7 @@ func TestAggregateTellsExpiredFromUnread(t *testing.T) {
 			AccountID: "acc_02", HasAmounts: false, CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 0 {
 		t.Fatalf("granted = %v, want 0: expired credits are not counted", s.TotalGranted)
 	}
@@ -210,7 +210,7 @@ func TestAggregateTellsZeroFromUnread(t *testing.T) {
 			Granted: 0, Consumed: 0, Remaining: 0, CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.AccountsUnavailable != 0 {
 		t.Fatalf("unavailable = %d, want 0: a zero is not an unknown", s.AccountsUnavailable)
 	}
@@ -235,13 +235,53 @@ func TestAggregateUpdatedAtIsTheReadingTime(t *testing.T) {
 	read := now.Add(-2 * time.Minute)
 	s := Aggregate([]store.UsageSnapshot{
 		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: read},
-	}, now)
+	}, nil, now)
 	if !s.UpdatedAt.Equal(read) {
 		t.Fatalf("updated_at = %v, want the reading time %v", s.UpdatedAt, read)
 	}
 	// 没有读数时退回汇总时间
-	empty := Aggregate(nil, now)
+	empty := Aggregate(nil, nil, now)
 	if !empty.UpdatedAt.Equal(now) {
 		t.Fatalf("updated_at = %v, want %v", empty.UpdatedAt, now)
+	}
+}
+
+// TestAnAccountThatWasNeverReadIsInTheSummary says an account whose
+// credits were never read is in the summary.
+//
+// 一个账号刚导进来、还没到下一次读数的时候，它不是「没有积分」——它是
+// 没读过。汇总里少了它，人会以为它没有积分；页面上少了它，人会以为
+// 它不在库里。
+func TestAnAccountThatWasNeverReadIsInTheSummary(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 600, Consumed: 120.5, Remaining: 479.5,
+			ExpiresAt: now.Add(48 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
+		},
+	}
+	accounts := []store.Account{
+		{ID: "acc_01", Email: "a@example.com"},
+		{ID: "acc_02", Email: "b@example.com"},
+	}
+	s := Aggregate(snaps, accounts, now)
+	got := accountOf(t, s, "acc_02")
+	if got.State != StateUnread {
+		t.Fatalf("state = %q, want %q", got.State, StateUnread)
+	}
+	if got.Email != "b@example.com" {
+		t.Fatalf("email = %q, want the account's address", got.Email)
+	}
+	if s.AccountsUnread != 1 {
+		t.Fatalf("unread = %d, want 1", s.AccountsUnread)
+	}
+	// 没读过的账号不算进总数：它不是零，是不知道。
+	if s.TotalGranted != 600 {
+		t.Fatalf("granted = %v, want 600", s.TotalGranted)
+	}
+	if s.TotalRemaining != 479.5 {
+		t.Fatalf("remaining = %v, want 479.5", s.TotalRemaining)
 	}
 }

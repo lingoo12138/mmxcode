@@ -687,7 +687,7 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, err
 				continue
 			}
 			out.Failed++
-			out.Reasons = append(out.Reasons, reloginReason(acc, err))
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
 			continue
 		}
 		out.Fixed++
@@ -695,13 +695,51 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, err
 	return out, nil
 }
 
-// reloginReason says which account did not sign in again, and why.
-func reloginReason(acc store.Account, err error) string {
+// accountReason says which account it was, and what went wrong.
+//
+// 谁和为什么都要说：一个账号读不到，人得知道是哪一个，才知道去看哪
+// 一行。
+func accountReason(acc store.Account, err error) string {
 	who := acc.Name
 	if who == "" {
 		who = acc.ID
 	}
 	return who + "（" + acc.ID + "）：" + err.Error()
+}
+
+// UsageRefreshResult says what one round of usage readings came to.
+type UsageRefreshResult struct {
+	// Refreshed counts the accounts whose credits were read.
+	Refreshed int
+	// Failed counts the accounts whose credits could not be read.
+	Failed int
+	// Reasons says why each of those failed, one line per account.
+	Reasons []string
+}
+
+// RefreshAllUsage reads every account's credits now.
+//
+// 这是页面上那个「刷新」按钮按下去以后做的事：所有账号的账本现读一
+// 遍，不等调度器下一趟。一个账号读不到不影响别的——但要说出来是哪一
+// 个，人才知道去看哪一行。
+//
+// 账号都没列出来的时候，这一趟就根本没跑：把它说成「读了 0 个」，人
+// 会以为账本是空的。
+func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, error) {
+	var out UsageRefreshResult
+	accounts, err := m.Store.ListAccounts(ctx)
+	if err != nil {
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
+	}
+	for _, acc := range accounts {
+		if _, err := m.RefreshUsage(ctx, acc.ID); err != nil {
+			out.Failed++
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
+			continue
+		}
+		out.Refreshed++
+	}
+	return out, nil
 }
 
 // spentRefresh remembers the refresh token that really went to the

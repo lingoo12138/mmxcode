@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +41,7 @@ func captureStdout(t *testing.T, fn func()) string {
 }
 
 func TestRootHasEveryCommand(t *testing.T) {
-	root := newRoot()
+	root, _ := newRoot()
 	have := map[string]bool{}
 	for _, c := range root.Commands() {
 		have[c.Name()] = true
@@ -192,6 +195,43 @@ func TestUsageJSON(t *testing.T) {
 	}
 }
 
+// TestUsageRefreshReadsTheCreditsNow says the command can ask for a
+// reading now.
+//
+// 命令行里的数也是上一次读数时的数。要看现在的数，就得能说一声「现在
+// 读一遍」，而不是等着下一个周期。
+func TestUsageRefreshReadsTheCreditsNow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(time.Hour))
+
+	out := captureStdout(t, func() {
+		cmd := newUsageCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"--refresh"})
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("usage: %v", err)
+		}
+	})
+	if !strings.Contains(out, "600") {
+		t.Errorf("the command did not read the credits:\n%s", out)
+	}
+	if !strings.Contains(out, "读了") {
+		t.Errorf("the command did not say how many it read:\n%s", out)
+	}
+}
+
 func TestNewAccountIDIsNotEmpty(t *testing.T) {
 	if !strings.HasPrefix(newAccountID(), "acc_") {
 		t.Errorf("the account id does not start with acc_: %q", newAccountID())
@@ -330,5 +370,43 @@ func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
 	}
 	if a.LastError != "the site refused the token" {
 		t.Errorf("the last error is %q", a.LastError)
+	}
+}
+
+// TestTheApiKeysComeFromTheEnvironment says the gateway's api keys can
+// come from the environment.
+//
+// 镜像里不带密钥：密钥从环境变量进来，配置文件里可以一把都没有。密钥
+// 是申请来的，写进镜像就等于把它摊在别人眼前。
+func TestTheApiKeysComeFromTheEnvironment(t *testing.T) {
+	t.Setenv(APIKeysEnv, "sk-one, sk-two")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  listen: \"127.0.0.1:8080\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, e := newRoot()
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"--config", path, "--db", filepath.Join(dir, "t.db"), "usage"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	keys := e.cfg.Server.APIKeys
+	if len(keys) != 2 || keys[0] != "sk-one" || keys[1] != "sk-two" {
+		t.Fatalf("api keys = %q, want the two from the environment", keys)
+	}
+}
+
+// TestAnEmptyApiKeyInTheEnvironmentIsDropped says a key that is only a
+// space is not a key.
+//
+// 空的一把 key 等于没有 key：一个不带 key 的请求带来的也是空串，两边
+// 一比就"相等"了——于是所有请求都过了这道门。
+func TestAnEmptyApiKeyInTheEnvironmentIsDropped(t *testing.T) {
+	t.Setenv(APIKeysEnv, "sk-one, ,  ,sk-two")
+	keys := apiKeysFromEnv(os.Getenv(APIKeysEnv))
+	if len(keys) != 2 {
+		t.Fatalf("keys = %q, want the two real ones", keys)
 	}
 }

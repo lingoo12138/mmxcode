@@ -129,6 +129,14 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 				fmt.Fprintf(out, "（%s）", r.Message)
 			}
 			fmt.Fprintln(out)
+			// 刚进来的账号马上读一次账本：不等调度器那一趟（15 分
+			// 钟），人才看得到它有多少积分。读不到不算导入失败——
+			// 账号是进来了的，账本读不到是另一件事。
+			if e.mgr != nil && r.AccountID != "" {
+				if _, err := e.mgr.RefreshUsage(ctx, r.AccountID); err != nil {
+					fmt.Fprintf(out, "      积分读不到：%v\n", err)
+				}
+			}
 			continue
 		}
 		fmt.Fprintf(out, "  ✘ %s\t%s：%s", r.Email, r.Stage, r.Message)

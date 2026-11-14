@@ -11,12 +11,24 @@ import (
 )
 
 func newUsageCmd(e *env) *cobra.Command {
-	var asJSON bool
+	var asJSON, refresh bool
 	cmd := &cobra.Command{
 		Use:   "usage",
 		Short: "网关内账号的积分汇总",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
+			if refresh {
+				// 现读一遍：页面上和这里看到的数都是上一次读数时的数，
+				// 想看现在的就得说一声。
+				res, err := e.mgr.RefreshAllUsage(ctx)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("读了 %d 个账号，失败 %d\n", res.Refreshed, res.Failed)
+				for _, reason := range res.Reasons {
+					fmt.Println(reason)
+				}
+			}
 			snaps, err := e.store.LatestUsageSnapshots(ctx)
 			if err != nil {
 				return err
@@ -25,14 +37,7 @@ func newUsageCmd(e *env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			emails := map[string]string{}
-			for _, a := range accounts {
-				emails[a.ID] = a.Email
-			}
-			s := usage.Aggregate(snaps, nowUTC())
-			for i := range s.Accounts {
-				s.Accounts[i].Email = emails[s.Accounts[i].ID]
-			}
+			s := usage.Aggregate(snaps, accounts, nowUTC())
 			if asJSON {
 				b, err := json.MarshalIndent(s, "", "  ")
 				if err != nil {
@@ -49,9 +54,13 @@ func newUsageCmd(e *env) *cobra.Command {
 			if s.AccountsUnavailable > 0 {
 				fmt.Printf("有 %d 个账号的积分读不到\n", s.AccountsUnavailable)
 			}
+			if s.AccountsUnread > 0 {
+				fmt.Printf("有 %d 个账号的积分还没读过\n", s.AccountsUnread)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "输出 JSON")
+	cmd.Flags().BoolVar(&refresh, "refresh", false, "现读一遍账本，不看上次读数")
 	return cmd
 }

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +39,53 @@ func aFakeEnv(t *testing.T) *env {
 		}
 	}
 	return e
+}
+
+// TestTheImportReadsTheCreditsOfTheNewAccount says an account that
+// just came in has its credits read.
+//
+// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
+// 来的账号马上就读一次账本。
+func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	var reads atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			reads.Add(1)
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(time.Hour))
+	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+		return &provision.Runner{
+			Importer: &provision.Importer{
+				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
+					return provision.Result{Email: email, OK: true, AccountID: "acc_1"}, nil
+				},
+			},
+			Interval: interval,
+			Sleep:    func(context.Context, time.Duration) error { return nil },
+		}
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.txt")
+	if err := os.WriteFile(path, []byte("a@example.com|pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runImport(context.Background(), e, &out, path, "", time.Millisecond, false); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() == 0 {
+		t.Fatalf("the credits of the new account were not read:\n%s", out.String())
+	}
 }
 
 func TestImportReadsTheFileAndSaysWhatHappened(t *testing.T) {

@@ -281,6 +281,104 @@ func TestRefreshUsage(t *testing.T) {
 	}
 }
 
+// TestRefreshAllUsageReadsEveryAccount says one round of readings
+// covers every account.
+//
+// 一次刷新要把所有账号都读一遍：页面上那个「刷新」按钮按一下，人要
+// 看到的是所有账号现在的数，不是其中一个的数。
+func TestRefreshAllUsageReadsEveryAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1234567890",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		m.Store.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "acc", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+
+	res, err := m.RefreshAllUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Refreshed != 2 || res.Failed != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	snaps, err := m.Store.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("snapshots = %d, want one per account", len(snaps))
+	}
+}
+
+// TestRefreshAllUsageSaysWhichAccountFailed says the round says which
+// account could not be read.
+//
+// 一个账号读不到，不能把整趟说成失败了，也不能什么都不说：读不到的那
+// 一个要说得出来，人才知道去看哪一个。
+func TestRefreshAllUsageSaysWhichAccountFailed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "读得到的", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+	// 这个账号没有令牌：读不到。
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "读不到的", Status: store.StatusActive, UserID: "0987654321",
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	res, err := m.RefreshAllUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Refreshed != 1 || res.Failed != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(res.Reasons) != 1 {
+		t.Fatalf("reasons = %v, want one", res.Reasons)
+	}
+	if !strings.Contains(res.Reasons[0], "acc_02") {
+		t.Fatalf("reason = %q, want it to name the account", res.Reasons[0])
+	}
+}
+
 func TestCheckinDelegates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

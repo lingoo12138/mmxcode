@@ -1831,6 +1831,9 @@ type Tx interface {
 	// subject, when there is one. It says ErrNotFound when there is
 	// none.
 	AccountBySubject(ctx context.Context, subject string) (Account, error)
+	// AccountByUserID gives the account with that site user id, when
+	// there is one. It says ErrNotFound when there is none.
+	AccountByUserID(ctx context.Context, userID string) (Account, error)
 	// CreateAccount inserts an account.
 	CreateAccount(ctx context.Context, a Account) error
 	// SaveToken writes an account's token.
@@ -3906,6 +3909,36 @@ func (t fakeTx) AccountBySubject(ctx context.Context, subject string) (store.Acc
 	return t.s.lookupSubject(subject)
 }
 
+func (t fakeTx) AccountByUserID(ctx context.Context, userID string) (store.Account, error) {
+	return t.s.lookupUserID(userID)
+}
+
+// lookupUserID gives the account with that site user id.
+//
+// 真的库里是按 accounts.user_id 找的：站点给的那个真的那个 id。一个站
+// 点账号一个，重登多少次都是它。
+func (s *fakeStore) lookupUserID(userID string) (store.Account, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return store.Account{}, fmt.Errorf("get the account by user id: %w", store.ErrNotFound)
+	}
+	var found store.Account
+	have := false
+	for _, r := range s.rows {
+		if strings.TrimSpace(r.UserID) != userID {
+			continue
+		}
+		if !have || r.CreatedAt.Before(found.CreatedAt) ||
+			(r.CreatedAt.Equal(found.CreatedAt) && r.ID < found.ID) {
+			found, have = r, true
+		}
+	}
+	if !have {
+		return store.Account{}, fmt.Errorf("get the account by user id %s: %w", userID, store.ErrNotFound)
+	}
+	return found, nil
+}
+
 func (t fakeTx) CreateAccount(ctx context.Context, a store.Account) error {
 	t.s.waitMake()
 	return t.s.createAccount(a)
@@ -5019,6 +5052,42 @@ func TestAFailureIsNotWorthTryingAgainWhenTheRunIsOver(t *testing.T) {
 		t.Fatalf("message = %q, want what went wrong", pe.Message)
 	}
 }
+
+// TestAnAccountIsFoundByItsUserIDEvenWhenTheAddressIsDifferent says the
+// site user id finds the account.
+//
+// 有的账号站点那边报不出邮箱：清单上写的地址是别名，令牌里也没有 sub。
+// 只有站点给的那个真的 user id 认得出是哪一个站点账号——少了这一步，再
+// 导一次就多一行活的，同一个站点账号两行都在轮转池里。
+func TestAnAccountIsFoundByItsUserIDEvenWhenTheAddressIsDifferent(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	// 站点那边报不出邮箱，也没有别的线索，只有那个 user id。
+	c.Identity = func(ctx context.Context, access, subject string) (account.Identity, error) {
+		return account.Identity{RealUserID: "u1"}, nil
+	}
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		return &oauth.Token{Access: "acc", Refresh: "ref"}, nil
+	}
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v", st.rows)
+	}
+
+	// 第二趟：清单上的地址换了，站点那边报的还是同一个 user id。
+	res, err := c.Import(context.Background(), "other@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.rows) != 1 {
+		t.Fatalf("rows = %v, want one row for one site account", st.rows)
+	}
+	if res.AccountID != "acc_1" {
+		t.Fatalf("account id = %q, want the row that was already there", res.AccountID)
+	}
+}
 ```
 
 - [x] **Step 2: 跑测试，确认它失败**
@@ -5226,7 +5295,7 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	var existed bool
 	var row store.Account
 	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject)
+		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
 		if err != nil {
 			return err
 		}
@@ -5388,12 +5457,14 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 //     只有它是一直在的。
 //   - 站点那边报的邮箱
 //   - 清单上写的邮箱
+//   - 站点那边报的那个真的 user id（realUserID）：有的账号站点那边报不
+//     出邮箱，令牌里也没有 sub，只有它认得出是哪一个站点账号。
 //
 // 找到两样却指向两个不一样的行，说明库里本来就有同一个站点账号的两行：
 // 那不是这次导入造成的，但要说出来——两行都在轮转池里，页面把它列两遍。
 //
 // 找不到不是错：那就是一个新账号。
-func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (store.Account, []string, error) {
+func findIn(ctx context.Context, tx store.Tx, mail, email, subject, userID string) (store.Account, []string, error) {
 	var notes []string
 	var found store.Account
 	have := false
@@ -5424,6 +5495,18 @@ func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (stor
 		}
 		asked[strings.ToLower(key)] = true
 		acc, err := tx.AccountByEmail(ctx, key)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
+	}
+	// 站点给的那个真的 user id：地址和令牌都认不出是哪一个站点账号的
+	// 时候，它是最后那把钥匙。
+	if userID != "" {
+		acc, err := tx.AccountByUserID(ctx, userID)
 		switch {
 		case err == nil:
 			add(acc)
@@ -5607,9 +5690,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -5639,6 +5725,53 @@ func aFakeEnv(t *testing.T) *env {
 		}
 	}
 	return e
+}
+
+// TestTheImportReadsTheCreditsOfTheNewAccount says an account that
+// just came in has its credits read.
+//
+// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
+// 来的账号马上就读一次账本。
+func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	var reads atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			reads.Add(1)
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"0","remaining_amount":"600","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(time.Hour))
+	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+		return &provision.Runner{
+			Importer: &provision.Importer{
+				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
+					return provision.Result{Email: email, OK: true, AccountID: "acc_1"}, nil
+				},
+			},
+			Interval: interval,
+			Sleep:    func(context.Context, time.Duration) error { return nil },
+		}
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.txt")
+	if err := os.WriteFile(path, []byte("a@example.com|pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runImport(context.Background(), e, &out, path, "", time.Millisecond, false); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() == 0 {
+		t.Fatalf("the credits of the new account were not read:\n%s", out.String())
+	}
 }
 
 func TestImportReadsTheFileAndSaysWhatHappened(t *testing.T) {
@@ -5946,6 +6079,14 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 				fmt.Fprintf(out, "（%s）", r.Message)
 			}
 			fmt.Fprintln(out)
+			// 刚进来的账号马上读一次账本：不等调度器那一趟（15 分
+			// 钟），人才看得到它有多少积分。读不到不算导入失败——
+			// 账号是进来了的，账本读不到是另一件事。
+			if e.mgr != nil && r.AccountID != "" {
+				if _, err := e.mgr.RefreshUsage(ctx, r.AccountID); err != nil {
+					fmt.Fprintf(out, "      积分读不到：%v\n", err)
+				}
+			}
 			continue
 		}
 		fmt.Fprintf(out, "  ✘ %s\t%s：%s", r.Email, r.Stage, r.Message)
@@ -6567,8 +6708,11 @@ type ReloginResult struct {
 ```
 
 ```go
-// reloginReason says which account did not sign in again, and why.
-func reloginReason(acc store.Account, err error) string {
+// accountReason says which account it was, and what went wrong.
+//
+// 谁和为什么都要说：一个账号读不到，人得知道是哪一个，才知道去看哪
+// 一行。
+func accountReason(acc store.Account, err error) string {
 	who := acc.Name
 	if who == "" {
 		who = acc.ID
@@ -6702,7 +6846,7 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, err
 				continue
 			}
 			out.Failed++
-			out.Reasons = append(out.Reasons, reloginReason(acc, err))
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
 			continue
 		}
 		out.Fixed++
@@ -7326,6 +7470,9 @@ func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 		switch {
 		case r.OK:
 			ok++
+			// 刚进来的账号马上读一次账本：不等调度器那一趟（15 分
+			// 钟），人才看得到它有多少积分。
+			w.refreshUsage(ctx, r.AccountID)
 		case !r.Whole:
 			// 整趟没成的那一行不是账号：它不算进失败的账号数里。
 			failed++

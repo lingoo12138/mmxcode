@@ -710,6 +710,7 @@ func writeFile(path, body string) error {
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }
+
 ```
 
 - [ ] **Step 3: 运行测试确认失败**
@@ -8747,6 +8748,7 @@ func testClient(t *testing.T) *upstream.Client {
 	t.Helper()
 	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
 }
+
 ```
 
 并加 import `"mmxcode/internal/upstream"`。
@@ -10849,6 +10851,7 @@ func testClient(t *testing.T) *upstream.Client {
 	t.Helper()
 	return upstream.New(upstream.Options{Timeout: 5 * time.Second})
 }
+
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -12256,6 +12259,16 @@ func clampPercent(f float64) float64 {
 **`Membership` 里两次调用同一个端点是错的** —— 参考实现是先取工作区列表再带 workspace_id 取会员信息。简化实现：国际站两个接口都 404，所以直接调会员接口，404 就返回 `Known: false`。把 `Membership` 改成：
 
 ```go
+// Membership reads the account's plan.
+//
+// The international site answers the membership API with 404, which
+// means the plan is unknown, not that there is none.
+//
+// The answer's fields are read from the top level first and from the
+// object under "data" second, the way the reference reads them: a
+// field at the top level wins, and one that is only under "data" is
+// used when the top level does not carry it. The real answer nests
+// them under "data", so a plan that is only there is a plan.
 func (c *Client) Membership(ctx context.Context, access, userID string) (Membership, error) {
 	m, err := c.membershipOnce(ctx, access, userID)
 	if err == nil {
@@ -12266,6 +12279,7 @@ func (c *Client) Membership(ctx context.Context, access, userID string) (Members
 	}
 	return Membership{}, err
 }
+
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -12585,6 +12599,7 @@ func testAccountClient(t *testing.T, srv *httptest.Server) *account.Client {
 	c.SetBase(srv.URL, srv.URL)
 	return c
 }
+
 ```
 
 **但 `account.Client` 的 `call` 是私有的，`checkin` 包调不到。** 把 `account` 包的签名调用导出：把 `call` 改成 `Call`，并把 `RefusedError` 导出。改完后 `checkin` 用 `c.Call(...)`。
@@ -12605,8 +12620,59 @@ Expected: FAIL —— `undefined: New`
 // Call sends one signed account API request.
 //
 // The body is "{}" for a POST and nil for a GET, as MiniMax Code sends
-// it. The answer's business codes are checked before it is handed back.
-func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []signKV) ([]byte, error) {
+// it. What is signed is exactly what goes on the wire: a POST whose
+// body was not given sends "{}" and signs "{}". The answer's business
+// codes are checked before it is handed back.
+func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []QueryKV) ([]byte, error) {
+	now := c.now()
+	// The reference signs the bytes it sends: a POST's body, or "{}"
+	// when it has none. A signature over anything else is refused.
+	wire := wireBody(method, body)
+	signed := sign.Sign(c.base, path, sign.Options{
+		Access:   access,
+		UserID:   userID,
+		Body:     wire,
+		Query:    query,
+		Now:      now.UnixMilli(),
+		TZOffset: c.tzOffset,
+		OSName:   c.osName,
+		Lang:     site.Lang,
+	})
+	var req *http.Request
+	var err error
+	if method == http.MethodPost {
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(wire)))
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range signed.Headers() {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := c.up.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := upstream.ReadBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, &RefusedError{Status: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, &statusError{status: resp.StatusCode}
+	}
+	if err := upstream.CheckEnvelope("account", raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 ```
 
 把 `internal/account/account.go` 里所有 `c.call(` 改成 `c.Call(`。
@@ -12852,12 +12918,68 @@ type signKV = sign.KV
 ```go
 // QueryKV is one query parameter for a signed call.
 type QueryKV = sign.KV
+
 ```
 
 并把该文件里所有 `signKV` 改成 `QueryKV`，`Call` 的签名也改：
 
 ```go
+// Call sends one signed account API request.
+//
+// The body is "{}" for a POST and nil for a GET, as MiniMax Code sends
+// it. What is signed is exactly what goes on the wire: a POST whose
+// body was not given sends "{}" and signs "{}". The answer's business
+// codes are checked before it is handed back.
 func (c *Client) Call(ctx context.Context, access, userID, method, path string, body []byte, query []QueryKV) ([]byte, error) {
+	now := c.now()
+	// The reference signs the bytes it sends: a POST's body, or "{}"
+	// when it has none. A signature over anything else is refused.
+	wire := wireBody(method, body)
+	signed := sign.Sign(c.base, path, sign.Options{
+		Access:   access,
+		UserID:   userID,
+		Body:     wire,
+		Query:    query,
+		Now:      now.UnixMilli(),
+		TZOffset: c.tzOffset,
+		OSName:   c.osName,
+		Lang:     site.Lang,
+	})
+	var req *http.Request
+	var err error
+	if method == http.MethodPost {
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, strings.NewReader(string(wire)))
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, signed.URL, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range signed.Headers() {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := c.up.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := upstream.ReadBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, &RefusedError{Status: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, &statusError{status: resp.StatusCode}
+	}
+	if err := upstream.CheckEnvelope("account", raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 ```
 
 `account.go` 里 `checkinQuery` 的类型也改成 `[]QueryKV`。
@@ -12933,7 +13055,7 @@ func TestAggregate(t *testing.T) {
 			CreatedAt: now.Add(-time.Minute),
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 900 {
 		t.Fatalf("granted = %v, want 900", s.TotalGranted)
 	}
@@ -12968,7 +13090,7 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Consumed: 1, Remaining: 9},
 		{AccountID: "acc_02", HasAmounts: false},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 10 {
 		t.Fatalf("granted = %v, want 10", s.TotalGranted)
 	}
@@ -12985,7 +13107,7 @@ func TestAggregateSkipsAccountsWithoutAmounts(t *testing.T) {
 }
 
 func TestAggregateEmpty(t *testing.T) {
-	s := Aggregate(nil, time.Now())
+	s := Aggregate(nil, nil, time.Now())
 	if s.TotalGranted != 0 || s.TotalRemaining != 0 {
 		t.Fatalf("summary = %+v", s)
 	}
@@ -13014,7 +13136,7 @@ func TestAggregateCountsAnAccountOnce(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 100 {
 		t.Fatalf("granted = %v, want 100: one account is one account", s.TotalGranted)
 	}
@@ -13042,7 +13164,7 @@ func TestAggregateKeepsTheNewestReading(t *testing.T) {
 			ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 300 {
 		t.Fatalf("granted = %v, want 300: the newest reading counts", s.TotalGranted)
 	}
@@ -13067,7 +13189,7 @@ func TestAggregateTellsExpiredFromUnread(t *testing.T) {
 			AccountID: "acc_02", HasAmounts: false, CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.TotalGranted != 0 {
 		t.Fatalf("granted = %v, want 0: expired credits are not counted", s.TotalGranted)
 	}
@@ -13105,7 +13227,7 @@ func TestAggregateTellsZeroFromUnread(t *testing.T) {
 			Granted: 0, Consumed: 0, Remaining: 0, CreatedAt: now,
 		},
 	}
-	s := Aggregate(snaps, now)
+	s := Aggregate(snaps, nil, now)
 	if s.AccountsUnavailable != 0 {
 		t.Fatalf("unavailable = %d, want 0: a zero is not an unknown", s.AccountsUnavailable)
 	}
@@ -13130,14 +13252,54 @@ func TestAggregateUpdatedAtIsTheReadingTime(t *testing.T) {
 	read := now.Add(-2 * time.Minute)
 	s := Aggregate([]store.UsageSnapshot{
 		{AccountID: "acc_01", HasAmounts: true, Granted: 10, Remaining: 10, CreatedAt: read},
-	}, now)
+	}, nil, now)
 	if !s.UpdatedAt.Equal(read) {
 		t.Fatalf("updated_at = %v, want the reading time %v", s.UpdatedAt, read)
 	}
 	// 没有读数时退回汇总时间
-	empty := Aggregate(nil, now)
+	empty := Aggregate(nil, nil, now)
 	if !empty.UpdatedAt.Equal(now) {
 		t.Fatalf("updated_at = %v, want %v", empty.UpdatedAt, now)
+	}
+}
+
+// TestAnAccountThatWasNeverReadIsInTheSummary says an account whose
+// credits were never read is in the summary.
+//
+// 一个账号刚导进来、还没到下一次读数的时候，它不是「没有积分」——它是
+// 没读过。汇总里少了它，人会以为它没有积分；页面上少了它，人会以为
+// 它不在库里。
+func TestAnAccountThatWasNeverReadIsInTheSummary(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	snaps := []store.UsageSnapshot{
+		{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 600, Consumed: 120.5, Remaining: 479.5,
+			ExpiresAt: now.Add(48 * time.Hour),
+			CreatedAt: now.Add(-time.Minute),
+		},
+	}
+	accounts := []store.Account{
+		{ID: "acc_01", Email: "a@example.com"},
+		{ID: "acc_02", Email: "b@example.com"},
+	}
+	s := Aggregate(snaps, accounts, now)
+	got := accountOf(t, s, "acc_02")
+	if got.State != StateUnread {
+		t.Fatalf("state = %q, want %q", got.State, StateUnread)
+	}
+	if got.Email != "b@example.com" {
+		t.Fatalf("email = %q, want the account's address", got.Email)
+	}
+	if s.AccountsUnread != 1 {
+		t.Fatalf("unread = %d, want 1", s.AccountsUnread)
+	}
+	// 没读过的账号不算进总数：它不是零，是不知道。
+	if s.TotalGranted != 600 {
+		t.Fatalf("granted = %v, want 600", s.TotalGranted)
+	}
+	if s.TotalRemaining != 479.5 {
+		t.Fatalf("remaining = %v, want 479.5", s.TotalRemaining)
 	}
 }
 ```
@@ -13188,6 +13350,14 @@ const (
 	StateExpired = "expired"
 	// StateUnavailable means the credits could not be read.
 	StateUnavailable = "unavailable"
+	// StateUnread means the account's credits were never read: the
+	// account is in the database, but no reading of it has been made
+	// yet.
+	//
+	// 没读过跟读不到是两回事：读不到是这一次失败了，没读过是从头
+	// 就没读过。两个都不算数——它们不是零，是不知道——但人要知道
+	// 是哪一种：读不到要去看看出了什么事，没读过只是还没轮到。
+	StateUnread = "unread"
 )
 
 // AccountUsage is one account's credits.
@@ -13232,6 +13402,14 @@ type Summary struct {
 	// AccountsExpired counts the accounts whose credits were read and
 	// have all run out, so a short total can say why it is short.
 	AccountsExpired int `json:"accounts_expired"`
+	// AccountsUnread counts the accounts whose credits were never read.
+	AccountsUnread int `json:"accounts_unread"`
+	// Readings counts the accounts that have a reading of their
+	// credits, whatever the reading said.
+	//
+	// 没有读数的时候，"读数时间"没有可说：说成汇总的时间，读数就像
+	// 是刚刚才读的——其实一个账号都没读过。
+	Readings int `json:"readings"`
 	// Accounts is each account's own numbers.
 	Accounts []AccountUsage `json:"accounts"`
 }
@@ -13242,15 +13420,41 @@ type Summary struct {
 // the newer one is the account's reading and the older one is left
 // out: summing both would count the same credits twice.
 //
+// accounts are the accounts in the database. They are there so that an
+// account whose credits have never been read is in the summary too:
+// without it a brand new account is nowhere to be seen, and "not in
+// the summary" reads as "no credits". The accounts given may be nil:
+// then only the accounts with a reading are in the summary, and no
+// email is known.
+//
 // now decides which batches count: one that has run out is out. It is
 // also what an expired reading is compared with, so that the same
 // reading does not change its state from one call to the next.
-func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
+func Aggregate(snaps []store.UsageSnapshot, accounts []store.Account, now time.Time) Summary {
 	s := Summary{UpdatedAt: now}
-	var newest time.Time
+	reading := map[string]store.UsageSnapshot{}
 	for _, sn := range newestPerAccount(snaps) {
-		au := AccountUsage{ID: sn.AccountID}
+		reading[sn.AccountID] = sn
+	}
+	emails := map[string]string{}
+	ids := make(map[string]bool, len(accounts)+len(reading))
+	for _, a := range accounts {
+		emails[a.ID] = a.Email
+		ids[a.ID] = true
+	}
+	for id := range reading {
+		ids[id] = true
+	}
+	var newest time.Time
+	for id := range ids {
+		au := AccountUsage{ID: id, Email: emails[id]}
+		sn, read := reading[id]
 		switch {
+		case !read:
+			// 没读过：这个账号在库里，只是还没有人读过它的账本。它
+			// 不是零——它是不算数，而且人得看得见它。
+			au.State = StateUnread
+			s.AccountsUnread++
 		case !sn.HasAmounts:
 			// The credits could not be read: the account is left out
 			// of the totals rather than counted as zero.
@@ -13281,8 +13485,11 @@ func Aggregate(snaps []store.UsageSnapshot, now time.Time) Summary {
 				}
 			}
 		}
-		if sn.CreatedAt.After(newest) {
-			newest = sn.CreatedAt
+		if read {
+			s.Readings++
+			if sn.CreatedAt.After(newest) {
+				newest = sn.CreatedAt
+			}
 		}
 		s.Accounts = append(s.Accounts, au)
 	}
@@ -13403,17 +13610,39 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
 
 // Execute runs the command line and gives the process its exit code.
 func Execute() int {
-	if err := newRoot().Execute(); err != nil {
+	root, _ := newRoot()
+	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 	return 0
+}
+
+// APIKeysEnv is the environment variable that holds the api keys.
+//
+// 镜像里不带密钥：密钥是申请来的，写进镜像就等于把它摊在别人眼前。
+// 它从环境变量进来，配置文件里可以一把都没有。
+const APIKeysEnv = "MMXCODE_API_KEYS"
+
+// apiKeysFromEnv gives the api keys the environment brings.
+//
+// 逗号分隔。一把空的 key 等于没有 key：它会被去掉。
+func apiKeysFromEnv(v string) []string {
+	var out []string
+	for _, k := range strings.Split(v, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // env is what the commands share.
@@ -13424,9 +13653,13 @@ type env struct {
 	egr   *egress.Resolver
 	acc   *account.Client
 	mgr   *manager.Manager
+
+	// makeRunner makes the batch driver. It is a field so that a test
+	// can run a batch without a network.
+	makeRunner func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner
 }
 
-func newRoot() *cobra.Command {
+func newRoot() (*cobra.Command, *env) {
 	var (
 		configPath string
 		dbPath     string
@@ -13453,6 +13686,10 @@ func newRoot() *cobra.Command {
 		if v := os.Getenv("MMXCODE_PROXY_DEFAULT"); v != "" {
 			cfg.Proxy.Default = v
 		}
+		// 密钥也可以从环境变量来：镜像里不带密钥，密钥是申请来的。
+		if v := os.Getenv(APIKeysEnv); v != "" {
+			cfg.Server.APIKeys = append(cfg.Server.APIKeys, apiKeysFromEnv(v)...)
+		}
 		e.cfg = cfg
 		s, err := store.Open(cfg.DB)
 		if err != nil {
@@ -13472,6 +13709,14 @@ func newRoot() *cobra.Command {
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
+		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
+		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
+			e.mgr.Key = key
+		} else if strings.TrimSpace(os.Getenv(PasswordKeyEnv)) != "" {
+			// 密钥设了但是不对：说一声，别让人以为密码存下了。
+			fmt.Fprintf(os.Stderr, "warning: %s is set but unusable: %v\n", PasswordKeyEnv, err)
+		}
+		e.mgr.ReloginFn = e.reloginFn("")
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -13481,12 +13726,14 @@ func newRoot() *cobra.Command {
 	}
 
 	root.AddCommand(newLoginCmd(e))
+	root.AddCommand(newImportCmd(e))
+	root.AddCommand(newReloginCmd(e))
 	root.AddCommand(newAccountsCmd(e))
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
 	root.AddCommand(newServeCmd(e))
-	return root
+	return root, e
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
@@ -13512,6 +13759,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13545,46 +13793,56 @@ func newLoginCmd(e *env) *cobra.Command {
 			if err != nil {
 				fmt.Printf("登录成功，但读不到账户信息：%v\n", err)
 			}
-			label := name
-			if label == "" {
-				label = id.Email
-			}
-			if label == "" {
-				label = id.RealUserID
-			}
-			if label == "" {
-				label = tok.Subject
-			}
 
 			now := time.Now()
-			acc := store.Account{
+			// 库里已经有这个站点账号了（多半是批量导入进来的）：改那一行，
+			// 不再另起一行——同一个站点账号两行都是活的，轮转会挑到两次。
+			acc, err := e.store.SignIn(ctx, store.Account{
 				ID:        newAccountID(),
-				Name:      label,
+				Name:      name,
 				UserID:    firstNonEmpty(id.RealUserID, tok.Subject),
 				Email:     id.Email,
 				Status:    store.StatusActive,
 				CreatedAt: now,
 				UpdatedAt: now,
-			}
-			if err := e.store.CreateAccount(ctx, acc); err != nil {
-				return err
-			}
-			if err := e.store.SaveToken(ctx, store.Token{
-				AccountID: acc.ID,
+			}, store.Token{
 				Access:    tok.Access,
 				Refresh:   tok.Refresh,
 				ExpiresAt: tok.Expires,
 				Subject:   tok.Subject,
-				UpdatedAt: now,
-			}); err != nil {
+			})
+			if err != nil {
 				return err
 			}
 			fmt.Printf("已登录：%s (%s)\n", acc.Name, acc.ID)
+			readCredits(ctx, e, cmd.OutOrStdout(), acc.ID)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "账号标签")
 	return cmd
+}
+
+// readCredits reads one account's credits now.
+//
+// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看得到
+// 它有多少积分。读不到不算登录失败——账号是进来了的，账本读不到是另一件
+// 事，但要说出来。
+func readCredits(ctx context.Context, e *env, out io.Writer, accountID string) {
+	if e.mgr == nil || accountID == "" {
+		return
+	}
+	snap, err := e.mgr.RefreshUsage(ctx, accountID)
+	if err != nil {
+		fmt.Fprintf(out, "积分读不到：%v\n", err)
+		return
+	}
+	if !snap.HasAmounts {
+		fmt.Fprintln(out, "积分读不到。")
+		return
+	}
+	fmt.Fprintf(out, "积分：剩 %.2f（发了 %.2f，花了 %.2f）\n",
+		snap.Remaining, snap.Granted, snap.Consumed)
 }
 
 // newAccountID makes an account id.
@@ -13741,6 +13999,7 @@ func groupNames(groups map[string]string) string {
 	sort.Strings(names)
 	return strings.Join(names, ", ")
 }
+
 ```
 
 - [ ] **Step 4: 写 checkin、usage、models 子命令**
@@ -13828,12 +14087,24 @@ import (
 )
 
 func newUsageCmd(e *env) *cobra.Command {
-	var asJSON bool
+	var asJSON, refresh bool
 	cmd := &cobra.Command{
 		Use:   "usage",
 		Short: "网关内账号的积分汇总",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
+			if refresh {
+				// 现读一遍：页面上和这里看到的数都是上一次读数时的数，
+				// 想看现在的就得说一声。
+				res, err := e.mgr.RefreshAllUsage(ctx)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("读了 %d 个账号，失败 %d\n", res.Refreshed, res.Failed)
+				for _, reason := range res.Reasons {
+					fmt.Println(reason)
+				}
+			}
 			snaps, err := e.store.LatestUsageSnapshots(ctx)
 			if err != nil {
 				return err
@@ -13842,14 +14113,7 @@ func newUsageCmd(e *env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			emails := map[string]string{}
-			for _, a := range accounts {
-				emails[a.ID] = a.Email
-			}
-			s := usage.Aggregate(snaps, nowUTC())
-			for i := range s.Accounts {
-				s.Accounts[i].Email = emails[s.Accounts[i].ID]
-			}
+			s := usage.Aggregate(snaps, accounts, nowUTC())
 			if asJSON {
 				b, err := json.MarshalIndent(s, "", "  ")
 				if err != nil {
@@ -13866,10 +14130,14 @@ func newUsageCmd(e *env) *cobra.Command {
 			if s.AccountsUnavailable > 0 {
 				fmt.Printf("有 %d 个账号的积分读不到\n", s.AccountsUnavailable)
 			}
+			if s.AccountsUnread > 0 {
+				fmt.Printf("有 %d 个账号的积分还没读过\n", s.AccountsUnread)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "输出 JSON")
+	cmd.Flags().BoolVar(&refresh, "refresh", false, "现读一遍账本，不看上次读数")
 	return cmd
 }
 ```
@@ -14269,7 +14537,10 @@ package main
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14304,7 +14575,7 @@ func captureStdout(t *testing.T, fn func()) string {
 }
 
 func TestRootHasEveryCommand(t *testing.T) {
-	root := newRoot()
+	root, _ := newRoot()
 	have := map[string]bool{}
 	for _, c := range root.Commands() {
 		have[c.Name()] = true
@@ -14458,6 +14729,43 @@ func TestUsageJSON(t *testing.T) {
 	}
 }
 
+// TestUsageRefreshReadsTheCreditsNow says the command can ask for a
+// reading now.
+//
+// 命令行里的数也是上一次读数时的数。要看现在的数，就得能说一声「现在
+// 读一遍」，而不是等着下一个周期。
+func TestUsageRefreshReadsTheCreditsNow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+	e := testEnvWithServer(t, srv)
+	seedAccount(t, e, time.Now().Add(time.Hour))
+
+	out := captureStdout(t, func() {
+		cmd := newUsageCmd(e)
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"--refresh"})
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("usage: %v", err)
+		}
+	})
+	if !strings.Contains(out, "600") {
+		t.Errorf("the command did not read the credits:\n%s", out)
+	}
+	if !strings.Contains(out, "读了") {
+		t.Errorf("the command did not say how many it read:\n%s", out)
+	}
+}
+
 func TestNewAccountIDIsNotEmpty(t *testing.T) {
 	if !strings.HasPrefix(newAccountID(), "acc_") {
 		t.Errorf("the account id does not start with acc_: %q", newAccountID())
@@ -14596,6 +14904,44 @@ func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
 	}
 	if a.LastError != "the site refused the token" {
 		t.Errorf("the last error is %q", a.LastError)
+	}
+}
+
+// TestTheApiKeysComeFromTheEnvironment says the gateway's api keys can
+// come from the environment.
+//
+// 镜像里不带密钥：密钥从环境变量进来，配置文件里可以一把都没有。密钥
+// 是申请来的，写进镜像就等于把它摊在别人眼前。
+func TestTheApiKeysComeFromTheEnvironment(t *testing.T) {
+	t.Setenv(APIKeysEnv, "sk-one, sk-two")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  listen: \"127.0.0.1:8080\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, e := newRoot()
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"--config", path, "--db", filepath.Join(dir, "t.db"), "usage"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	keys := e.cfg.Server.APIKeys
+	if len(keys) != 2 || keys[0] != "sk-one" || keys[1] != "sk-two" {
+		t.Fatalf("api keys = %q, want the two from the environment", keys)
+	}
+}
+
+// TestAnEmptyApiKeyInTheEnvironmentIsDropped says a key that is only a
+// space is not a key.
+//
+// 空的一把 key 等于没有 key：一个不带 key 的请求带来的也是空串，两边
+// 一比就"相等"了——于是所有请求都过了这道门。
+func TestAnEmptyApiKeyInTheEnvironmentIsDropped(t *testing.T) {
+	t.Setenv(APIKeysEnv, "sk-one, ,  ,sk-two")
+	keys := apiKeysFromEnv(os.Getenv(APIKeysEnv))
+	if len(keys) != 2 {
+		t.Fatalf("keys = %q, want the two real ones", keys)
 	}
 }
 ```

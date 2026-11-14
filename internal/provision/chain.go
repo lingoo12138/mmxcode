@@ -191,7 +191,7 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	var existed bool
 	var row store.Account
 	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject)
+		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
 		if err != nil {
 			return err
 		}
@@ -353,12 +353,14 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 //     只有它是一直在的。
 //   - 站点那边报的邮箱
 //   - 清单上写的邮箱
+//   - 站点那边报的那个真的 user id（realUserID）：有的账号站点那边报不
+//     出邮箱，令牌里也没有 sub，只有它认得出是哪一个站点账号。
 //
 // 找到两样却指向两个不一样的行，说明库里本来就有同一个站点账号的两行：
 // 那不是这次导入造成的，但要说出来——两行都在轮转池里，页面把它列两遍。
 //
 // 找不到不是错：那就是一个新账号。
-func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (store.Account, []string, error) {
+func findIn(ctx context.Context, tx store.Tx, mail, email, subject, userID string) (store.Account, []string, error) {
 	var notes []string
 	var found store.Account
 	have := false
@@ -389,6 +391,18 @@ func findIn(ctx context.Context, tx store.Tx, mail, email, subject string) (stor
 		}
 		asked[strings.ToLower(key)] = true
 		acc, err := tx.AccountByEmail(ctx, key)
+		switch {
+		case err == nil:
+			add(acc)
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return store.Account{}, nil, err
+		}
+	}
+	// 站点给的那个真的 user id：地址和令牌都认不出是哪一个站点账号的
+	// 时候，它是最后那把钥匙。
+	if userID != "" {
+		acc, err := tx.AccountByUserID(ctx, userID)
 		switch {
 		case err == nil:
 			add(acc)

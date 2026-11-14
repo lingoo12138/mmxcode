@@ -1768,6 +1768,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
@@ -1821,6 +1822,43 @@ type Manager struct {
 	Renewer *oauth.Renewer
 	// TokenURL is where a refresh token is traded in.
 	TokenURL string
+	// Key opens the passwords the accounts were brought in with.
+	//
+	// It is empty when there is no key: then an account cannot be
+	// signed in again, and saying so is better than pretending.
+	Key secret.Key
+	// ReloginFn signs an account in again. It is a field so that a
+	// test can stand in for the network.
+	ReloginFn ReloginFunc
+	// reloginLocks serialises the relogin of one account.
+	reloginLocks reloginLocks
+}
+
+// reloginLocks serialises the relogin of one account.
+//
+// 调度器的一轮和人在命令行里的那一次可能撞上。同一个账号被登两次，
+// 站点那边就是两个设备码、两个会话、两条新链；后失败的那一次还会把
+// 先成功那一次存好的令牌抹掉。
+type reloginLocks struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+// lock takes the lock of one account and gives back the way to let it
+// go.
+func (l *reloginLocks) lock(id string) func() {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sync.Mutex{}
+	}
+	mu, ok := l.m[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		l.m[id] = mu
+	}
+	l.mu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // New makes a manager.
@@ -2004,7 +2042,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// The chain cannot go on: the token in hand is spent and there
 		// is no newer one the site would take. Only a human can mend
 		// this, by signing the account in again.
-		if mErr := m.markSignedOut(ctx, accountID, chainBrokenReason); mErr != nil {
+		if mErr := m.markSignedOut(ctx, accountID, cur.Access, chainBrokenReason); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the broken chain could not be saved: %w", mErr))
 		}
 		return nil, err
@@ -2019,7 +2057,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// The cause goes with it: "the outcome is not known" says
 		// which case it is, but the transport's own words say what
 		// happened, and the sign-out branch keeps those too.
-		if mErr := m.markError(ctx, accountID, unknownOutcomeReason+": "+err.Error()); mErr != nil {
+		if mErr := m.markError(ctx, accountID, cur.Access, unknownOutcomeReason+": "+err.Error()); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the error could not be saved: %w", mErr))
 		}
 		return nil, err
@@ -2061,7 +2099,7 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 	// The sign-out has to be written down. An account that stays active
 	// with a token the site has refused is handed out again and again,
 	// and every request pays for a renewal that cannot work.
-	if mErr := m.markSignedOut(ctx, accountID, err.Error()); mErr != nil {
+	if mErr := m.markSignedOut(ctx, accountID, cur.Access, err.Error()); mErr != nil {
 		return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
 	}
 	return nil, err
@@ -2163,26 +2201,31 @@ func (m *Manager) ForceRenew(ctx context.Context, accountID string) (*oauth.Toke
 // has refused must not keep a token that every request would try to
 // renew.
 //
-// The state is written with the narrow setter, and not with the one
-// that writes every field: the name, the proxy and the rest of the
-// account are not this method's business, and writing them back from a
+// The write is **conditional**: it happens only while the token row
+// still holds the access token that was refused. Another process may
+// have signed the account in again in the meantime, and writing the
+// sign-out then would undo that sign-in — the fresh token would be
+// taken away, and the account would be shown as signed out while it
+// holds a token that works.
+//
+// access is the access token of the chain in hand: the one the refusal
+// is about. The state is written with the narrow setter, and not with
+// the one that writes every field: the name, the proxy and the rest of
+// the account are not this method's business, and writing them back from a
 // copy that was read a moment ago would undo a change another writer
 // made in between.
 //
 // The error is not swallowed: a sign-out that could not be written
 // down is an account that stays active with a token the site refuses.
-func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) error {
-	if err := m.Store.UpdateAccountStatus(ctx, accountID, store.StatusSignedOut, reason, time.Now()); err != nil {
+func (m *Manager) markSignedOut(ctx context.Context, accountID, access, reason string) error {
+	written, err := m.Store.SignOutIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
+	if err != nil {
 		return err
 	}
-	// The token row is blanked: the sign-in is gone, so the token is
-	// of no use, and keeping it would send the account back to the
-	// site for a renewal that was already refused.
-	if err := m.Store.SaveToken(ctx, store.Token{
-		AccountID: accountID,
-		UpdatedAt: time.Now(),
-	}); err != nil {
-		return err
+	if !written {
+		// 有人在这中间把账号救回来了：库里那份令牌已经不是手里这一份
+		// 了，这次失败说的已经不是它了。这一边不动它。
+		return nil
 	}
 	// The renewer forgets the account too: a signed-out account must
 	// not be able to renew, and a token of the old sign-in must not be
@@ -2203,14 +2246,16 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, reason string) e
 // that this account is in trouble instead of showing it as a normal
 // one.
 //
-// The state is written with the narrow setter, for the same reason as
-// in markSignedOut.
+// The write is conditional, for the same reason as in markSignedOut: the
+// error is about the chain in hand, and a chain that has moved on since
+// is somebody else's business.
 //
 // The renewer is not told anything: it has to keep the record of the
 // token whose outcome is not known, because that token must not be sent
 // again.
-func (m *Manager) markError(ctx context.Context, accountID, reason string) error {
-	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusError, reason, time.Now())
+func (m *Manager) markError(ctx context.Context, accountID, access, reason string) error {
+	_, err := m.Store.MarkErrorIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
+	return err
 }
 
 // note writes a note on the account without changing its state.
@@ -2244,6 +2289,194 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 	// not read back to be written again. A sign-out that happened
 	// while this was being written must not be undone by it.
 	_ = m.Store.SetAccountLastError(ctx, accountID, reason, time.Now())
+}
+
+// ErrNotSignedOut says the account is not signed out.
+//
+// 重登是给签出的账号准备的。状态不是签出的账号，替它登录没有意义：
+// 它手里那条链还能用，重登一次只会把还能用的令牌换掉。
+var ErrNotSignedOut = errors.New("这个账号不是签出状态，不用重登")
+
+// ReloginFunc signs an account in again with the password it was
+// brought in with.
+type ReloginFunc func(ctx context.Context, acc store.Account, password string) error
+
+// Relogin signs an account in again with the password it was brought
+// in with.
+//
+// An account without a password cannot be signed in again: there is
+// nothing to sign in with. That is an error, not a silent skip — the
+// person who asked wants to know.
+//
+// Only a signed-out account is signed in again. An account that is
+// still active has a token that works, and signing it in again would
+// replace that token with a new one for no reason.
+func (m *Manager) Relogin(ctx context.Context, accountID string) error {
+	acc, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if acc.Status != store.StatusSignedOut {
+		return ErrNotSignedOut
+	}
+	// 同一个账号的重登要一个一个来：调度器的一轮和命令行里的那一次
+	// 可能撞上，两个都登的话，站点那边就是两个设备码、两个会话。
+	unlock := m.reloginLocks.lock(accountID)
+	defer unlock()
+	// 等锁的时候别人可能已经把这个账号登回去了。再登一次是白登，
+	// 而且会把刚换好的令牌再换一次。
+	acc, err = m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if acc.Status != store.StatusSignedOut {
+		return ErrNotSignedOut
+	}
+	cipher, err := m.Store.Password(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if cipher == "" {
+		return errors.New("这个账号没有存密码，没法自己登回去")
+	}
+	if len(m.Key) == 0 {
+		// 没有密钥，密文就开不了。密文在，说明当初是存过的，是密钥
+		// 现在没了——说清楚，别让人以为是账号的问题。
+		return errors.New("没有密码的密钥，存着的密文开不了")
+	}
+	password, err := m.Key.Open(cipher)
+	if err != nil {
+		return err
+	}
+	if m.ReloginFn == nil {
+		return errors.New("没有地方能重新登录")
+	}
+	if err := m.ReloginFn(ctx, acc, password); err != nil {
+		// 登不回去说的是这次登录失败，不是手里那条链的事。所以令牌
+		// 不动：清空它只能毁掉一个还能用的凭据，什么也救不回来。
+		// 这里写下的只是失败的原因，账号还是签出的。
+		//
+		// 写是**有条件**的：另一个进程可能刚把这个账号登回去了，那一
+		// 行现在是 active 了，这时候把它写回 signed_out，就是把别人刚
+		// 换好的令牌作废掉，还让这个账号显示成登出的状态——手里却握着
+		// 一份能用的凭据，轮转池不用它，下一轮又要登一次。
+		written, mErr := m.Store.MarkSignedOut(ctx, accountID, err.Error(), time.Now())
+		if mErr != nil {
+			return errors.Join(err, fmt.Errorf("the failure could not be saved: %w", mErr))
+		}
+		if !written {
+			// 别人已经把它登回去了：原因照样要说给听着的人，但状态
+			// 是别人的，不能由这一边改回去。
+			return errors.Join(err, ErrNotSignedOut)
+		}
+		return err
+	}
+	// 旧的那条链就此作废：这次登录换来的令牌是新的链，旧的刷新令牌
+	// 再也不会被发出去了。
+	m.Renewer.Forget(accountID)
+	return m.Store.UpdateAccountStatus(ctx, accountID, store.StatusActive, "", time.Now())
+}
+
+// ReloginResult says what one round of re-logins came to.
+type ReloginResult struct {
+	// Fixed is how many accounts were signed in again.
+	Fixed int
+	// Failed is how many could not be signed in again.
+	Failed int
+	// Reasons says why the ones that failed failed: one line per account.
+	Reasons []string
+}
+
+// ReloginAll signs in again every account that is signed out and has
+// a password.
+//
+// It gives back how many it fixed, how many it did not, and why.
+//
+// 理由是要的：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 而「一个都没试成」（连账号都没列出来）和「都试了，都登回去了」在只
+// 看着两个数字的时候是一样的——上一次那个错就是这样被藏起来的。
+//
+// An account without a password is skipped and is not a failure: it
+// was never brought in with one, so there is nothing to sign in with,
+// and that is not this round's fault.
+func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, error) {
+	var out ReloginResult
+	accounts, err := m.Store.ListAccounts(ctx)
+	if err != nil {
+		// 账号都没列出来，这一趟就根本没跑。把它说成「成功 0，失败 0」，
+		// 人会以为没什么要登的。
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
+	}
+	for _, acc := range accounts {
+		if acc.Status != store.StatusSignedOut {
+			continue
+		}
+		if limit > 0 && out.Fixed+out.Failed >= limit {
+			break
+		}
+		cipher, err := m.Store.Password(ctx, acc.ID)
+		if err != nil || cipher == "" {
+			continue
+		}
+		if err := m.Relogin(ctx, acc.ID); err != nil {
+			if errors.Is(err, ErrNotSignedOut) {
+				// 别人刚把它登回去了：这不算失败。
+				continue
+			}
+			out.Failed++
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
+			continue
+		}
+		out.Fixed++
+	}
+	return out, nil
+}
+
+// accountReason says which account it was, and what went wrong.
+//
+// 谁和为什么都要说：一个账号读不到，人得知道是哪一个，才知道去看哪
+// 一行。
+func accountReason(acc store.Account, err error) string {
+	who := acc.Name
+	if who == "" {
+		who = acc.ID
+	}
+	return who + "（" + acc.ID + "）：" + err.Error()
+}
+
+// UsageRefreshResult says what one round of usage readings came to.
+type UsageRefreshResult struct {
+	// Refreshed counts the accounts whose credits were read.
+	Refreshed int
+	// Failed counts the accounts whose credits could not be read.
+	Failed int
+	// Reasons says why each of those failed, one line per account.
+	Reasons []string
+}
+
+// RefreshAllUsage reads every account's credits now.
+//
+// 这是页面上那个「刷新」按钮按下去以后做的事：所有账号的账本现读一
+// 遍，不等调度器下一趟。一个账号读不到不影响别的——但要说出来是哪一
+// 个，人才知道去看哪一行。
+//
+// 账号都没列出来的时候，这一趟就根本没跑：把它说成「读了 0 个」，人
+// 会以为账本是空的。
+func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, error) {
+	var out UsageRefreshResult
+	accounts, err := m.Store.ListAccounts(ctx)
+	if err != nil {
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
+	}
+	for _, acc := range accounts {
+		if _, err := m.RefreshUsage(ctx, acc.ID); err != nil {
+			out.Failed++
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
+			continue
+		}
+		out.Refreshed++
+	}
+	return out, nil
 }
 
 // spentRefresh remembers the refresh token that really went to the
@@ -2348,7 +2581,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		// asked for under that group.
 		snap.MembershipError = err.Error()
 		if isRefusal(err) {
-			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 				return store.UsageSnapshot{}, err
 			}
 		}
@@ -2448,7 +2681,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 		// to do with the account.
 		snap.WindowsError = err.Error()
 		if isRefusal(err) {
-			if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+			if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 				return store.UsageSnapshot{}, err
 			}
 		}
@@ -2459,7 +2692,7 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 	case err == nil:
 		snap.Plan = title
 	case isRefusal(err):
-		if err := m.markSignedOut(ctx, accountID, err.Error()); err != nil {
+		if err := m.markSignedOut(ctx, accountID, tok.Access, err.Error()); err != nil {
 			return store.UsageSnapshot{}, err
 		}
 	default:
@@ -2738,6 +2971,7 @@ func doWith(req *http.Request, transport http.RoundTripper, timeout time.Duratio
 		current = nextReq
 	}
 }
+
 ```
 
 `DoWith` 里 `client.Do(current)` 的第二个返回值在 `err != nil` 时，Go 会把它包进 `*url.Error`，所以 `OtherSiteError` 会被包一层。用 `errors.As` 取。
@@ -4393,54 +4627,6 @@ func isQuotaMessage(message string) bool {
 创建 `internal/rotator/rotator.go`：
 
 ```go
-// Package rotator picks the account a request goes to, and says what
-// to do when the account cannot answer.
-//
-// A conversation is bound to one account and stays there. The binding
-// is by session key: the client's own session id when it has one, and
-// otherwise a hash of the system prompt and the first user message.
-// When the bound account is spent or gone, another is picked and the
-// conversation is rebound.
-//
-// A binding is moved only when the bound account cannot answer at all:
-// it is spent, it is signed out, or it is gone. An account that has
-// already been tried in this request and failed is another thing: a
-// different account answers that one request, and the conversation
-// stays where it is. One 5xx does not move a conversation to another
-// account for good.
-//
-// The exhaustion is per account and per plan group. The site's plan
-// windows ("5 hours", "7 days") belong to a group, and the models of a
-// group spend from the same windows: a group that is spent answers
-// none of its models until the window comes back, and a model of
-// another group is not touched by it.
-//
-// The upstream conversation id is the one the database keeps: an
-// opaque id, made once and kept, so the upstream sees one conversation
-// and the mapping survives a restart. A pool that cannot supply one
-// falls back to the id the request derives: the client's own session id
-// when it sent one, and a hash of the first message when it did not.
-//
-// What that does not fix: two conversations whose system prompt and
-// first user message are the same, from a client that sends no session
-// id of its own, are one session by this design's own definition -- the
-// session key is a hash of those two things. They therefore share one
-// upstream id, and one upstream conversation, however random that id
-// is. The server cannot tell them apart: there is nothing in the
-// request that does. The fix for that case is the client sending
-// X-Session-Id.
-package rotator
-
-import (
-	"context"
-	"fmt"
-	"strings"
-	"sync"
-	"time"
-
-	"mmxcode/internal/store"
-)
-
 // Pool is the account pool the rotator picks from.
 type Pool interface {
 	// Accounts gives every account.
@@ -5003,6 +5189,7 @@ func (r *Rotator) isExhausted(exhausted []store.Exhausted, accountID, windowKey 
 	}
 	return false
 }
+
 ```
 
 
@@ -10019,10 +10206,17 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 package webui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10032,11 +10226,16 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
 
-func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
+// newTestWebUIWithConfig makes a WebUI with a given configuration.
+//
+// The import page is only there when no API key is set, so a test that
+// wants to see it there needs a configuration of its own.
+func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Store) {
 	t.Helper()
 	s, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -10067,12 +10266,32 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
 	mgr := manager.New(s, up, acc, egress.New(groups, ""), oauth.NewRenewer())
-	cfg := config.Default()
 	// The outlet groups are the configuration's; the resolver is built
 	// from the same map, so the page and the resolver agree on which
 	// groups there are.
-	cfg.Proxy.Groups = groups
-	return New(mgr, cfg, s), s
+	if len(cfg.Proxy.Groups) == 0 {
+		cfg.Proxy.Groups = groups
+	}
+	w := New(mgr, cfg, s)
+	// The import and the relogin talk to the site, and a test must
+	// never talk to MiniMax itself: they are fields so that the test
+	// can stand in for the network.
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		out := make([]provision.Result, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, provision.Result{Email: e.Email, OK: true, AccountID: "acc_02"})
+		}
+		return out, nil
+	}
+	w.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
+		return manager.ReloginResult{Fixed: 1}, nil
+	}
+	return w, s
+}
+
+func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
+	t.Helper()
+	return newTestWebUIWithConfig(t, config.Default())
 }
 
 func TestAccountsPage(t *testing.T) {
@@ -10175,6 +10394,87 @@ func TestAPIUsageCarriesTheState(t *testing.T) {
 	}
 	if states["acc_01"] != "read" || states["acc_02"] != "expired" {
 		t.Fatalf("states = %v, body = %s", states, rec.Body.String())
+	}
+}
+
+// TestTheUsagePageSaysAnAccountThatWasNeverRead says the page says an
+// account whose credits were never read.
+//
+// 没读过跟读不到是两回事。页面上写「读不到」，人会以为是出了什么
+// 事，要去查站点；其实只是还没轮到读它。
+func TestTheUsagePageSaysAnAccountThatWasNeverRead(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "还没读") {
+		t.Fatalf("the page does not say the account was never read: %s", body)
+	}
+	if strings.Contains(body, "读不到") {
+		t.Fatalf("the page says the account cannot be read: %s", body)
+	}
+}
+
+// TestTheUsageCanBeRefreshedNow says a reading can be asked for now.
+//
+// 页面上那些数是上一次读数时的数。要看现在的数，就得能说一声「现在
+// 读一遍」——不等调度器那一趟。
+func TestTheUsageCanBeRefreshedNow(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/usage/refresh", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Refreshed int      `json:"refreshed"`
+		Failed    int      `json:"failed"`
+		Reasons   []string `json:"reasons"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// 测试里的站点是个 404 的替身：这个账号的账本读不到。但这一趟
+	// 跑了，失败的也要说出来。
+	if out.Failed != 1 {
+		t.Fatalf("failed = %d, body = %s", out.Failed, rec.Body.String())
+	}
+	if len(out.Reasons) != 1 {
+		t.Fatalf("reasons = %v, want one", out.Reasons)
+	}
+}
+
+// TestTheUsagePageHasARefreshButton says the page offers the refresh.
+func TestTheUsagePageHasARefreshButton(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "usage-refresh") {
+		t.Fatalf("the page has no refresh button: %s", rec.Body.String())
+	}
+}
+
+// TestTheScriptRefreshesTheUsage says the page's script asks for the
+// reading.
+func TestTheScriptRefreshesTheUsage(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/static/app.js", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "/api/usage/refresh") {
+		t.Fatalf("the script does not ask for a reading: %s", rec.Body.String())
 	}
 }
 
@@ -10530,6 +10830,672 @@ func TestAPIPatchOfAnAccountThatIsNotThere(t *testing.T) {
 	w.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheImportPageIsThereWhenNoAPIKeysAreSet says the import page is
+// there when the gateway has no key.
+//
+// 没有 key 的网关只听本机，明文密码不出这台机器，所以上传是开的。
+func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "批量导入") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
+// shut when the gateway has a key.
+//
+// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
+func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatal("the import page is open with API keys set")
+	}
+}
+
+// TestTheImportIsNotTakenWithAPIKeysAreSet says the upload itself is
+// shut too, not only the page.
+//
+// 页面关着而接口开着，那道闸就没有意义。
+func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestUploadingAFileAnswersWithAJobID says an upload gets an answer
+// that says which run to watch.
+//
+// 导入在后台跑，回答里给的是那一次的编号。
+func TestUploadingAFileAnswersWithAJobID(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"id\"") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheImportIsWrittenDown says the run is written down, so that the
+// page can say how it went.
+//
+// 跑完了要有痕迹：不然人只能盯着一个转圈的页面等。
+func TestTheImportIsWrittenDown(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	if run.OK != 1 || run.Failed != 0 {
+		t.Fatalf("run = %+v", run)
+	}
+}
+
+// TestTheAnswerToTheUploadHasNoPassword says the password of the list
+// does not go back out in the answer.
+//
+// 清单里有明文密码，回答里不能有。
+func TestTheAnswerToTheUploadHasNoPassword(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|secretpassword\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secretpassword") {
+		t.Fatalf("the password is in the answer: %s", rec.Body.String())
+	}
+}
+
+// TestTheBadLinesAreLoggedWithoutTheirPasswords says the log of a
+// list that cannot be read has no password in it.
+//
+// 清单里的密码是明文，日志是会被人看见的东西。
+func TestTheBadLinesAreLoggedWithoutTheirPasswords(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	var logged bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("notanemail|secretpassword\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(logged.String(), "secretpassword") {
+		t.Fatalf("the password is in the log: %s", logged.String())
+	}
+}
+
+// TestTheImportPageShowsTheRunsBefore says the import page says what
+// the last imports came to.
+//
+// 跑过的导入要在页面上看得见：人得知道刚才那趟成了几个。
+func TestTheImportPageShowsTheRunsBefore(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateImportRun(context.Background(), store.ImportRun{
+		ID: "run_1", Source: "web", StartedAt: now, Total: 3, OK: 2, Failed: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "最近的导入") {
+		t.Fatalf("the runs are not on the page: %q", body)
+	}
+	if !strings.Contains(body, "web") {
+		t.Fatalf("the source of the run is not on the page: %q", body)
+	}
+}
+
+// TestAListThatIsTooBigIsRefused says a list that is too big is turned
+// away.
+//
+// 清单是有上限的：请求的大小是有限的，而清单进内存的地方比这个上限
+// 大，所以它不会落到磁盘上的临时文件里去。
+func TestAListThatIsTooBigIsRefused(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("a@example.com|pw\n", 700000)
+	fw.Write([]byte(big))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAnUploadWithoutAFileIsRefused says an upload that has no file in
+// it is turned away.
+func TestAnUploadWithoutAFileIsRefused(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("other", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheUploadedListNeverLandsOnTheDisk says the uploaded list is not
+// written to a temporary file.
+//
+// 清单里有明文密码：它只该在内存里走一趟，不该落到磁盘上。
+// 清单比解析器的内存上限还大的时候，它本来会写进临时文件。
+func TestTheUploadedListNeverLandsOnTheDisk(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	// 临时目录换成一个空的：请求之后它里面不该多出东西来。
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 五兆字节：比解析器给的内存还多，比请求的上限还少。
+	fw.Write([]byte(strings.Repeat("a@example.com|pw\n", 300000)))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		names := make([]string, 0, len(left))
+		for _, e := range left {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("the list is on the disk: %v", names)
+	}
+}
+
+// TestTheReloginIsAskedFor says the relogin can be asked for.
+//
+// 重登是页面上一个按钮点出来的。
+// 重登是页面上一个按钮点出来的。
+func TestTheReloginIsAskedFor(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	req := httptest.NewRequest(http.MethodPost, "/api/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fixed") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageListsTheSignedOutAccounts says the relogin page
+// says which accounts are signed out.
+//
+// 签出了的账号要看得见，才知道该重登谁。
+func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_09", Name: "掉了的", Email: "b@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 没有密码就登不回去：这样的账号才拿得出手。
+	if err := s.SetPassword(context.Background(), "acc_09", "cipher", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "b@example.com") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageHasNoAccountWithoutAPassword says an account that
+// has no password is not on the relogin page.
+//
+// 没有密码就没有能登回去的东西，把它摆在那儿只会让人白按一次。
+func TestTheReloginPageHasNoAccountWithoutAPassword(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_10", Name: "没有密码的", Email: "c@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "c@example.com") {
+		t.Fatalf("an account without a password is on the page: %q", rec.Body.String())
+	}
+}
+
+// TestTheReloginPageHasNoCipherText says the page does not carry the
+// password that is stored.
+//
+// 存的密码是加密的，可它也不该到页面上。
+func TestTheReloginPageHasNoCipherText(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_11", Name: "掉了的", Email: "d@example.com",
+		Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(context.Background(), "acc_11", "ciphertext", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "ciphertext") {
+		t.Fatalf("the stored password is on the page: %q", rec.Body.String())
+	}
+}
+
+// TestTheImportPageSaysThePasswordsAreNotKept says the import page
+// says so when the passwords are not kept.
+//
+// 没有密钥的时候密码不入库。页面上一个字都不说，人就以为每个账号以
+// 后都能自己登回去——账号掉线的时候才知道，那时已经晚了。
+func TestTheImportPageSaysThePasswordsAreNotKept(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	w.PasswordNote = "密码没有存进库里（没有 MMXCODE_PASSWORD_KEY）。"
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// TestTheUploadAnswerIsJSONOnTheWire says the upload's answer reaches
+// the browser as JSON.
+//
+// 这个测试要用真的服务器，不能用 httptest.NewRecorder：Recorder 的
+// 头不会像真的服务器那样在 WriteHeader 的时候被定下来，所以头丢了
+// 它也看不见。真的服务器上丢了这个头，浏览器拿到的就是
+// text/plain，页面上的脚本读不出那个 id，上传明明成功了，页面上却是
+// 「失败」。
+func TestTheUploadAnswerIsJSONOnTheWire(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	resp, err := http.Post(srv.URL+"/api/import", part.FormDataContentType(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "json") {
+		t.Fatalf("content type = %q, want json", ct)
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ID == "" {
+		t.Fatal("the answer has no run id")
+	}
+}
+
+// TestTheWebImportReadsTheCreditsOfTheNewAccount says an account that
+// just came in through the page has its credits read.
+//
+// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
+// 来的账号马上就读一次账本。
+func TestTheWebImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return []provision.Result{{Email: "a@example.com", OK: true, AccountID: "acc_01"}}, nil
+	}
+	w.runImport("run_1", []provision.Entry{{Email: "a@example.com", Password: "pw"}})
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("the credits of the new account were not read: %d readings", len(snaps))
+	}
+}
+
+// TestARunThatFailedAsAWholeStillHasAnArrayOfResults says a run that
+// failed as a whole keeps a results that the page can read.
+//
+// 一整趟导入失败的时候（比如密钥配错了），没有一条结果。存下来的那
+// 一串以前是 "null"：页面上那个脚本 JSON.parse('null') 解析出来是
+// null，接着遍历就炸了，页面上写着「失败」，结果表也不出来。
+func TestARunThatFailedAsAWholeStillHasAnArrayOfResults(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return nil, errors.New("the key is not right")
+	}
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	if run.Results == "" || !strings.HasPrefix(run.Results, "[") {
+		t.Fatalf("results = %q, want an array", run.Results)
+	}
+	// The stored text has to be an array the page can walk through.
+	var results []map[string]any
+	if err := json.Unmarshal([]byte(run.Results), &results); err != nil {
+		t.Fatal(err)
+	}
+	// "null" parses all right and then comes out as nothing: the page
+	// walks through it and falls over.
+	if results == nil {
+		t.Fatalf("results = %q, want an array, not a null", run.Results)
+	}
+}
+
+// TestTheReasonARunFailedAsAWholeIsNotLost says the reason a whole
+// run failed does not disappear.
+//
+// 整趟失败的时候，原因原来既没进日志，也没进结果表：页面上只有「失
+// 败 1」，人永远不知道是钥匙写错了还是站点在限流。钥匙写错这一件
+// 事，页面上得说得出来。
+func TestTheReasonARunFailedAsAWholeIsNotLost(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return nil, errors.New("the key is not right")
+	}
+	var logged bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	// The reason has to be in the results: that is what the page shows.
+	if !strings.Contains(run.Results, "the key is not right") {
+		t.Fatalf("results = %q, want the reason in them", run.Results)
+	}
+	// 那一行不是账号：这一趟一个账号都没处理成，失败的账号数是零。
+	// 把整趟的失败算成账号的失败，页面上就会说「失败 1」，而清单上有
+	// 一个账号——那一个其实不是失败在这一趟上的。
+	if run.Failed != 0 {
+		t.Fatalf("run = %+v, want no account counted as failed", run)
+	}
+	if run.OK != 0 {
+		t.Fatalf("run = %+v, want no account counted as done", run)
+	}
+	// And in the log: the run has no column of its own for the reason.
+	if !strings.Contains(logged.String(), "the key is not right") {
+		t.Fatalf("the log does not say why the run failed: %q", logged.String())
+	}
+}
+
+// TestTheHistorySaysWhyARunFailedAsAWhole says the page says why a run
+// failed as a whole, after a reload.
+//
+// 整趟没成的导入，成功和失败都是零。刷新一次页面，光看那两个数，看不
+// 出这一趟出了什么事——像是这一趟什么都没干。理由得摆在眼前：那一行
+// 不是账号，可这一趟确实没成。
+func TestTheHistorySaysWhyARunFailedAsAWhole(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateImportRun(context.Background(), store.ImportRun{
+		ID: "run_1", Source: "web", StartedAt: now, Total: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	results := `[{"email":"（整趟）","ok":false,"whole":true,"message":"整趟导入没能完成：the key is not right"}]`
+	if err := s.FinishImportRun(context.Background(), "run_1", now, 0, 0, results); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "the key is not right") {
+		t.Fatalf("the page does not say why the run failed: %q", body)
+	}
+}
+
+// TestTheImportResultsScriptSurvivesAResultsThatIsNotAnArray says the
+// page's script does not throw on a run whose results are not an array.
+//
+// 脚本那一半也守着：它拿到一个不是数组的东西时不许炸，也不许把结果表
+// 藏着。这一半是 node 跑的：这个仓库没有别的跑法，node 不在的时候
+// 这一条就跳过去——Go 那一半（存下来的结果得是 "[]"）还是照样守着。
+func TestTheImportResultsScriptSurvivesAResultsThatIsNotAnArray(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("no node in this environment")
+	}
+	p := exec.Command(node, filepath.Join("testdata", "import_results_guard.js"))
+	if out, err := p.CombinedOutput(); err != nil {
+		t.Fatalf("the script guard failed: %v\n%s", err, out)
 	}
 }
 ```
@@ -10971,6 +11937,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -10982,6 +11949,7 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/usage"
@@ -11029,6 +11997,20 @@ type WebUI struct {
 	Cfg config.Config
 	// Store is the database.
 	Store *store.Store
+	// Import brings a batch of accounts in. It is a field so that the
+	// page and the command share one task, and so that a test can
+	// stand in for the network.
+	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
+	// Relogin signs the accounts that are signed out in again.
+	Relogin func(ctx context.Context) (manager.ReloginResult, error)
+	// PasswordNote says what happens to the passwords of the accounts
+	// that are brought in.
+	//
+	// It is empty when the passwords are kept. When they are not, the
+	// page has to say so: an account whose password was thrown away
+	// cannot sign itself back in, and the person has to know that
+	// before the account drops out.
+	PasswordNote string
 
 	tmpl    *template.Template
 	mu      sync.Mutex
@@ -11069,6 +12051,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/usage":
 		w.apiUsage(rw, r)
 		return
+	case "/api/usage/refresh":
+		w.apiUsageRefresh(rw, r)
+		return
 	case "/api/egress":
 		w.apiEgress(rw, r)
 		return
@@ -11081,9 +12066,19 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/events":
 		w.apiEvents(rw, r)
 		return
+	case "/api/import":
+		w.apiImport(rw, r)
+		return
+	case "/api/relogin":
+		w.apiRelogin(rw, r)
+		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/accounts/") {
 		w.apiAccount(rw, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/import/") {
+		w.apiImportRun(rw, r)
 		return
 	}
 	switch r.URL.Path {
@@ -11095,6 +12090,17 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		w.page(rw, r, "usage.html", w.usageData)
 	case "/login":
 		w.page(rw, r, "login.html", w.loginData)
+	case "/import":
+		// 只有没配 key 的网关才开放上传：配了 key 就说明别的机器能
+		// 进来，明文密码不该从那儿过。
+		if len(w.Cfg.Server.APIKeys) > 0 {
+			http.NotFound(rw, r)
+			return
+		}
+		w.page(rw, r, "import.html", w.importData)
+	case "/relogin":
+		// 重登页不受上传那个闸限制：它不接触明文密码。
+		w.page(rw, r, "relogin.html", w.reloginData)
 	default:
 		http.NotFound(rw, r)
 	}
@@ -11269,14 +12275,7 @@ func (w *WebUI) usageData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	emails := map[string]string{}
-	for _, a := range accounts {
-		emails[a.ID] = a.Email
-	}
-	s := usage.Aggregate(snaps, time.Now())
-	for i := range s.Accounts {
-		s.Accounts[i].Email = emails[s.Accounts[i].ID]
-	}
+	s := usage.Aggregate(snaps, accounts, time.Now())
 	return map[string]any{"Summary": s}, nil
 }
 
@@ -11362,22 +12361,26 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 		// 自己带着的东西填。
 		fmt.Fprintf(os.Stderr, "webui: signed in, but the account's identity could not be read: %v\n", ierr)
 	}
-	acc.Name = firstNonEmpty(who.Email, who.RealUserID, tok.Subject)
+	// 名字不给：库里已经有这一行的时候，名字是上次那人自己写的标签，
+	// 一次登录不该把它换掉。新账号的名字由库来起（地址、用户 id、令牌
+	// 里带的那个 id）。
 	acc.UserID = firstNonEmpty(who.RealUserID, tok.Subject)
 	acc.Email = who.Email
-	if err := w.Store.CreateAccount(ctx, acc); err != nil {
+	// 库里已经有这个站点账号了（多半是批量导入进来的）：改那一行，不再
+	// 另起一行——同一个站点账号两行都是活的，轮转会挑到两次。
+	acc, err = w.Store.SignIn(ctx, acc, store.Token{
+		Access: tok.Access, Refresh: tok.Refresh,
+		ExpiresAt: tok.Expires, Subject: tok.Subject,
+	})
+	if err != nil {
 		// 建账号失败要说出来：不然这一次登录就悄悄没了，人只看到
 		// 页面在转圈。
 		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
-	if err := w.Store.SaveToken(ctx, store.Token{
-		AccountID: acc.ID, Access: tok.Access, Refresh: tok.Refresh,
-		ExpiresAt: tok.Expires, Subject: tok.Subject, UpdatedAt: now,
-	}); err != nil {
-		w.failLogin(id, "the token could not be written down: "+err.Error())
-		return
-	}
+	// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人
+	// 才看得到它有多少积分。读不到不算登录失败——账号是进来了的。
+	w.refreshUsage(ctx, acc.ID)
 	w.mu.Lock()
 	delete(w.pending, id)
 	w.mu.Unlock()
@@ -11475,7 +12478,27 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, map[string]any{"done": false})
 }
 
-// apiUsage gives the credits of every account.
+// apiUsageRefresh reads every account's credits now.
+//
+// 页面上那些数是上一次读数时的数。这一趟是现读的：不等调度器，也不
+// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。
+func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
+	res, err := w.Mgr.RefreshAllUsage(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, reason := range res.Reasons {
+		log.Printf("usage: %s", reason)
+	}
+	writeJSON(rw, map[string]any{
+		"refreshed": res.Refreshed,
+		"failed":    res.Failed,
+		"reasons":   res.Reasons,
+	})
+}
+
+// apiUsage gives the credits summary.
 func (w *WebUI) apiUsage(rw http.ResponseWriter, r *http.Request) {
 	snaps, err := w.Store.LatestUsageSnapshots(r.Context())
 	if err != nil {
@@ -11487,14 +12510,7 @@ func (w *WebUI) apiUsage(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	emails := map[string]string{}
-	for _, a := range accounts {
-		emails[a.ID] = a.Email
-	}
-	s := usage.Aggregate(snaps, time.Now())
-	for i := range s.Accounts {
-		s.Accounts[i].Email = emails[s.Accounts[i].ID]
-	}
+	s := usage.Aggregate(snaps, accounts, time.Now())
 	writeJSON(rw, s)
 }
 
@@ -11671,8 +12687,274 @@ func (w *WebUI) apiEvents(rw http.ResponseWriter, r *http.Request) {
 
 // writeJSON writes a JSON answer.
 func writeJSON(rw http.ResponseWriter, v any) {
+	writeJSONStatus(rw, http.StatusOK, v)
+}
+
+// writeJSONStatus writes a JSON answer with a status code.
+//
+// The header is set before the status is written: after WriteHeader the
+// header map is frozen, and a Content-Type set afterwards never reaches
+// the client. Go sniffs the body instead and says text/plain, and the
+// page's script then cannot read the answer — it reads nothing, and the
+// upload looks like it failed even though it went through.
+func writeJSONStatus(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(status)
 	json.NewEncoder(rw).Encode(v)
+}
+
+// maxImportBytes is how big an uploaded list may be.
+//
+// 一行一个账号，八兆字节已经是很长的一份清单了。
+const maxImportBytes = 8 << 20
+
+// importData is the import page's data.
+func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
+	runs, err := w.Store.ListImportRuns(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]importRunView, 0, len(runs))
+	for _, r := range runs {
+		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
+	}
+	return map[string]any{
+		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
+		"Runs":         views,
+		"PasswordNote": w.PasswordNote,
+	}, nil
+}
+
+// importRunView is one import run as the page shows it.
+//
+// 整趟没成的导入，成功和失败都是零：光看那两个数，看不出这一趟出了什
+// 么事，像是这一趟什么都没干。理由得摆在眼前。
+type importRunView struct {
+	store.ImportRun
+	// Whole is why the run failed as a whole, when it did.
+	Whole string
+}
+
+// wholeReason gives the reason a run failed as a whole.
+//
+// 整趟没成的时候，结果里有一行是整趟的（whole），它说的就是这一趟为什
+// 么没成。那一行不是账号：失败的账号数是零，可这一趟确实没成，得说。
+func wholeReason(results string) string {
+	if strings.TrimSpace(results) == "" {
+		return ""
+	}
+	var list []provision.Result
+	if err := json.Unmarshal([]byte(results), &list); err != nil {
+		return ""
+	}
+	for _, r := range list {
+		if r.Whole {
+			return r.Message
+		}
+	}
+	return ""
+}
+
+// apiImport takes a list of accounts and brings them in.
+//
+// The list is a file: every line is an account. The work goes on in
+// the background, and the answer says which run to watch.
+//
+// The file is read into memory and thrown away afterwards: it holds
+// passwords in the clear, and it must not land on the disk.
+func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
+	if len(w.Cfg.Server.APIKeys) > 0 {
+		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
+		return
+	}
+	if w.Import == nil {
+		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
+		return
+	}
+	// The request has a size limit, and the memory that ParseMultipartForm
+	// is given is bigger than it: the list therefore never reaches a
+	// temporary file, it stays in memory.
+	r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
+	if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(rw, "没有文件", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	entries, bad := provision.Parse(file)
+	for _, b := range bad {
+		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了。
+		log.Printf("import: 第 %d 行：%s", b.Line, b.Reason)
+	}
+	if len(entries) == 0 {
+		http.Error(rw, "清单里没有能用的账号", http.StatusBadRequest)
+		return
+	}
+	runID := newImportRunID()
+	now := time.Now()
+	if err := w.Store.CreateImportRun(r.Context(), store.ImportRun{
+		ID: runID, Source: "web", StartedAt: now, Total: len(entries),
+	}); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	go w.runImport(runID, entries)
+	// 202：导入在后台跑着，这个回答只说这一次导入的号。
+	writeJSONStatus(rw, http.StatusAccepted, map[string]any{"id": runID})
+}
+
+// newImportRunID makes the name of one import run.
+//
+// 时间还不够：两次上传可能落在同一毫秒里，那样的第二个会被主键挡下。
+func newImportRunID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("run_%d", time.Now().UnixMilli())
+	}
+	return fmt.Sprintf("run_%d_%s", time.Now().UnixMilli(), hex.EncodeToString(b))
+}
+
+// runImport brings a batch in and writes down what came of it.
+//
+// A run that fails as a whole says why, in two places: in the log, and
+// in the results the page shows. The run has no column of its own for
+// it, so the reason goes in as a row of its own — otherwise the page
+// says only "failed 1" and the operator never learns that the key was
+// wrong.
+//
+// 那一行不是账号，所以它不算进失败的账号数里：一个账号都没处理的这一趟，
+// 失败的账号数是零。整趟为什么没成，由那一行自己说。
+func (w *WebUI) runImport(runID string, entries []provision.Entry) {
+	ctx := context.Background()
+	results, err := w.Import(ctx, entries)
+	if err != nil {
+		log.Printf("import %s: %v", runID, err)
+		results = append(results, provision.Result{
+			Email:   "（整趟）",
+			OK:      false,
+			Whole:   true,
+			Stage:   stageOf(err),
+			Message: "整趟导入没能完成：" + err.Error(),
+		})
+	}
+	ok := 0
+	failed := 0
+	for _, r := range results {
+		switch {
+		case r.OK:
+			ok++
+			// 刚进来的账号马上读一次账本：不等调度器那一趟（15 分
+			// 钟），人才看得到它有多少积分。
+			w.refreshUsage(ctx, r.AccountID)
+		case !r.Whole:
+			// 整趟没成的那一行不是账号：它不算进失败的账号数里。
+			failed++
+		}
+	}
+	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
+		log.Printf("import %s: %v", runID, err)
+	}
+}
+
+// refreshUsage reads one account's credits now.
+//
+// 读不到不算导入失败：账号是进来了的，账本读不到是另一件事。它要
+// 记下来，别让它悄悄没掉。
+func (w *WebUI) refreshUsage(ctx context.Context, accountID string) {
+	if w.Mgr == nil || accountID == "" {
+		return
+	}
+	if _, err := w.Mgr.RefreshUsage(ctx, accountID); err != nil {
+		log.Printf("import: %s 的积分读不到：%v", accountID, err)
+	}
+}
+
+// stageOf says where an import failed, when it says.
+//
+// 整趟失败的时候，失败在哪儿也是话的一部分：错在哪一步，人要看得见。
+func stageOf(err error) provision.Stage {
+	var pe *provision.Error
+	if errors.As(err, &pe) {
+		return pe.Stage
+	}
+	return ""
+}
+
+// apiRelogin signs the accounts that are signed out in again.
+//
+// 理由要带回去：只说「失败 2」，人得自己去一个一个看是哪个账号、为什么。
+// 这一趟根本没跑的时候也要说，不能让它看着像「没什么要登的」。
+func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
+	if w.Relogin == nil {
+		http.Error(rw, "这个网关没有重登", http.StatusNotImplemented)
+		return
+	}
+	res, err := w.Relogin(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"fixed":   res.Fixed,
+		"failed":  res.Failed,
+		"reasons": res.Reasons,
+	})
+}
+
+// apiImportRun says how one batch import is going.
+func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/import/")
+	run, err := w.Store.GetImportRun(r.Context(), id)
+	if err != nil {
+		http.Error(rw, "没有这一次导入", http.StatusNotFound)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"id":          run.ID,
+		"source":      run.Source,
+		"total":       run.Total,
+		"ok":          run.OK,
+		"failed":      run.Failed,
+		"results":     run.Results,
+		"finished_at": !run.FinishedAt.IsZero(),
+	})
+}
+
+// reloginData is the relogin page's data.
+//
+// Only the accounts that are signed out and still have a password are
+// listed: the others cannot be signed in again, and saying so is
+// better than a button that cannot work.
+func (w *WebUI) reloginData(ctx context.Context) (map[string]any, error) {
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0)
+	for _, a := range accounts {
+		if a.Status != store.StatusSignedOut {
+			continue
+		}
+		cipher, err := w.Store.Password(ctx, a.ID)
+		if err != nil || cipher == "" {
+			continue
+		}
+		// 存着的密码是加密的，可它也不该到页面上：这里只说这个账号
+		// 还能登回去。
+		out = append(out, map[string]any{
+			"ID": a.ID, "Name": a.Name, "Email": a.Email, "Error": a.LastError,
+		})
+	}
+	return map[string]any{"SignedOut": out}, nil
 }
 ```
 
@@ -12364,17 +13646,39 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/provision"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
 
 // Execute runs the command line and gives the process its exit code.
 func Execute() int {
-	if err := newRoot().Execute(); err != nil {
+	root, _ := newRoot()
+	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 	return 0
+}
+
+// APIKeysEnv is the environment variable that holds the api keys.
+//
+// 镜像里不带密钥：密钥是申请来的，写进镜像就等于把它摊在别人眼前。
+// 它从环境变量进来，配置文件里可以一把都没有。
+const APIKeysEnv = "MMXCODE_API_KEYS"
+
+// apiKeysFromEnv gives the api keys the environment brings.
+//
+// 逗号分隔。一把空的 key 等于没有 key：它会被去掉。
+func apiKeysFromEnv(v string) []string {
+	var out []string
+	for _, k := range strings.Split(v, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // env is what the commands share.
@@ -12385,9 +13689,13 @@ type env struct {
 	egr   *egress.Resolver
 	acc   *account.Client
 	mgr   *manager.Manager
+
+	// makeRunner makes the batch driver. It is a field so that a test
+	// can run a batch without a network.
+	makeRunner func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner
 }
 
-func newRoot() *cobra.Command {
+func newRoot() (*cobra.Command, *env) {
 	var (
 		configPath string
 		dbPath     string
@@ -12414,6 +13722,10 @@ func newRoot() *cobra.Command {
 		if v := os.Getenv("MMXCODE_PROXY_DEFAULT"); v != "" {
 			cfg.Proxy.Default = v
 		}
+		// 密钥也可以从环境变量来：镜像里不带密钥，密钥是申请来的。
+		if v := os.Getenv(APIKeysEnv); v != "" {
+			cfg.Server.APIKeys = append(cfg.Server.APIKeys, apiKeysFromEnv(v)...)
+		}
 		e.cfg = cfg
 		s, err := store.Open(cfg.DB)
 		if err != nil {
@@ -12433,6 +13745,14 @@ func newRoot() *cobra.Command {
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
+		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
+		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
+			e.mgr.Key = key
+		} else if strings.TrimSpace(os.Getenv(PasswordKeyEnv)) != "" {
+			// 密钥设了但是不对：说一声，别让人以为密码存下了。
+			fmt.Fprintf(os.Stderr, "warning: %s is set but unusable: %v\n", PasswordKeyEnv, err)
+		}
+		e.mgr.ReloginFn = e.reloginFn("")
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -12442,12 +13762,14 @@ func newRoot() *cobra.Command {
 	}
 
 	root.AddCommand(newLoginCmd(e))
+	root.AddCommand(newImportCmd(e))
+	root.AddCommand(newReloginCmd(e))
 	root.AddCommand(newAccountsCmd(e))
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))
 	root.AddCommand(newServeCmd(e))
-	return root
+	return root, e
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
@@ -14782,6 +16104,20 @@ type fakeSite struct {
 	token    string
 	identity string
 	seen     []string
+	// tokens counts the token requests that came in.
+	tokens int
+	// tokenFor gives the answer to the n-th token request.
+	//
+	// 它是给「每一次登录都是一个不一样的站点账号」那种测试用的：同一
+	// 个站点账号登三次，库里只有一行。
+	tokenFor func(n int) string
+	// identityFor gives the answer to the n-th identity request.
+	//
+	// 站点给的那个真的 user id 是账号最靠得住的钥匙：两个登录要是那
+	// 一个一样，那是同一个站点账号，库里只有一行。
+	identityFor func(n int) string
+	// identities counts the identity requests that came in.
+	identities int
 }
 
 // RoundTrip answers one request.
@@ -14794,9 +16130,19 @@ func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
 	case site.DeviceCodePath:
 		body = f.device
 	case site.TokenPath:
-		body = f.token
+		if f.tokenFor != nil {
+			body = f.tokenFor(f.tokens)
+			f.tokens++
+		} else {
+			body = f.token
+		}
 	case site.IdentityPath:
-		body = f.identity
+		if f.identityFor != nil {
+			body = f.identityFor(f.identities)
+			f.identities++
+		} else {
+			body = f.identity
+		}
 	}
 	if body == "" {
 		status, body = http.StatusNotFound, `{"error":"no such endpoint"}`
@@ -14808,6 +16154,30 @@ func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    r,
 	}, nil
+}
+
+// creditAnswer is what the site answers to a request for the ledger.
+//
+// 一笔还没有花掉的额度：发了 600，花了 0，还剩 600。
+const creditAnswer = `{"total_count":1,"details":[{"credit_type":1,` +
+	`"granted_amount":"600","consumed_amount":"0","remaining_amount":"600",` +
+	`"granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`
+
+// serve answers the account API for the stand-in server.
+//
+// 账号的 API 走的是账号自己的出口（直连），所以要有一台真的服务器接着
+// 它：直连出去就是问真的站点去了。答的是同一份 stand-in 的答案。
+func (f *fakeSite) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, r.Method+" "+r.URL.Path)
+	switch r.URL.Path {
+	case site.CreditPath:
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(creditAnswer))
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // paths gives the paths that were asked for.
@@ -14834,6 +16204,11 @@ func newFakeSiteWebUI(t *testing.T, f *fakeSite) (*WebUI, *store.Store) {
 	t.Cleanup(func() { s.Close() })
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: f})
 	acc := account.New(up)
+	// 账号的 API 要有一台服务器接着：账号自己的出口是直连的，直连出去
+	// 就是问真的站点去了。令牌的端点还在 stand-in 后面。
+	srv := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(srv.Close)
+	acc.SetBase(srv.URL, srv.URL)
 	mgr := manager.New(s, up, acc, egress.New(map[string]string{}, ""), oauth.NewRenewer())
 	return New(mgr, config.Default(), s), s
 }
@@ -14916,6 +16291,47 @@ func TestTheWebUIAcquiresTheRealUserIDAndEmail(t *testing.T) {
 	}
 }
 
+// TestTheWebLoginReadsTheCreditsOfTheNewAccount says an account signed
+// in through the page has its credits read.
+//
+// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看
+// 得到它有多少积分。
+func TestTheWebLoginReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890",` +
+			`"userEmail":"who@example.com"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	waitForAccounts(t, s, 1)
+	waitForPath(t, f, site.CreditPath)
+}
+
+// waitForPath waits until the site was asked for a path.
+//
+// 登录是在后台做的：账号进了库，读账本是在它之后。测试不能靠运气。
+func waitForPath(t *testing.T, f *fakeSite, path string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range f.paths() {
+			if strings.HasSuffix(p, path) {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the site was never asked for %s: %v", path, f.paths())
+}
+
 // TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable says a sign-in
 // that worked is not thrown away because the identity could not be read.
 //
@@ -14954,12 +16370,19 @@ func TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable(t *testing.T) {
 //
 // 账号的 id 是主键：两个登录在同一毫秒里结束，第二个会被数据库挡下
 // 来。挡下来的那一个要是没人说，这一次登录就悄悄没了。
+//
+// 这三次登录是三个不一样的站点账号（站点给的那个 user id 不一样）：同
+// 一个站点账号登三次，库里只有一行，那是另一条规则。
 func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 	f := &fakeSite{
 		device: deviceAnswer,
-		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
-			`","refresh_token":"rt","expires_in":3600}`,
-		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
+		tokenFor: func(n int) string {
+			return `{"access_token":"` + tokenWithSubject(fmt.Sprintf("jwt-subject-%d", n)) +
+				`","refresh_token":"rt","expires_in":3600}`
+		},
+		identityFor: func(n int) string {
+			return `{"data":{"userInfo":{"realUserID":"` + fmt.Sprintf("user-%d", n) + `"}}}`
+		},
 	}
 	w, s := newFakeSiteWebUI(t, f)
 
@@ -14980,6 +16403,41 @@ func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 		if !strings.HasPrefix(a.ID, "acc_") {
 			t.Errorf("id = %q, want the acc_ prefix", a.ID)
 		}
+	}
+}
+
+// TestTheSameAccountSignedInTwiceIsOneRow says signing the same site
+// account in twice does not make two live rows.
+//
+// 一个站点账号在库里只能有一行。这一行多半是批量导入进来的：登录又
+// 登了一遍，是把那一行改好，不是再插一行——同一个站点账号两行都是活
+// 的，轮转会挑到两次，页面把它列两遍，而且其中一个的令牌迟早被另一个
+// 的重登作废。
+func TestTheSameAccountSignedInTwiceIsOneRow(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+		if rec.Code != 200 {
+			t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	accs := waitForAccounts(t, s, 1)
+	// 两个登录都要走完：再等一会儿，看有没有多出第二行。
+	time.Sleep(200 * time.Millisecond)
+	accs, err := s.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accs) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", accs)
 	}
 }
 

@@ -18,6 +18,10 @@ services:
       - ${MMXCODE_CONFIG_FILE:-./config.docker.yaml}:/app/config.yaml:ro
     environment:
       MMXCODE_CONFIG: /app/config.yaml
+      # 网关的 api key（也是后台登录的那把钥匙）。镜像里不带它：密钥是申
+      # 请来的，在 .env 里写 MMXCODE_API_KEYS=sk-xxx，多把用逗号隔开。
+      # 不设的话，网关只肯听在本机——它不肯把自己白送出去。
+      MMXCODE_API_KEYS: "${MMXCODE_API_KEYS:-}"
       # 容器内访问宿主机的代理要写 host.docker.internal
       MMXCODE_PROXY_DEFAULT: "${MMXCODE_PROXY_DEFAULT:-http://host.docker.internal:7890}"
       # 导入用的密码要加密存库，密钥在这里。不设 = 登录一次就丢。

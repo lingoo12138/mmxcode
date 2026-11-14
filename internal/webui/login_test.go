@@ -42,6 +42,13 @@ type fakeSite struct {
 	// 它是给「每一次登录都是一个不一样的站点账号」那种测试用的：同一
 	// 个站点账号登三次，库里只有一行。
 	tokenFor func(n int) string
+	// identityFor gives the answer to the n-th identity request.
+	//
+	// 站点给的那个真的 user id 是账号最靠得住的钥匙：两个登录要是那
+	// 一个一样，那是同一个站点账号，库里只有一行。
+	identityFor func(n int) string
+	// identities counts the identity requests that came in.
+	identities int
 }
 
 // RoundTrip answers one request.
@@ -61,7 +68,12 @@ func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
 			body = f.token
 		}
 	case site.IdentityPath:
-		body = f.identity
+		if f.identityFor != nil {
+			body = f.identityFor(f.identities)
+			f.identities++
+		} else {
+			body = f.identity
+		}
 	}
 	if body == "" {
 		status, body = http.StatusNotFound, `{"error":"no such endpoint"}`
@@ -73,6 +85,30 @@ func (f *fakeSite) RoundTrip(r *http.Request) (*http.Response, error) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    r,
 	}, nil
+}
+
+// creditAnswer is what the site answers to a request for the ledger.
+//
+// 一笔还没有花掉的额度：发了 600，花了 0，还剩 600。
+const creditAnswer = `{"total_count":1,"details":[{"credit_type":1,` +
+	`"granted_amount":"600","consumed_amount":"0","remaining_amount":"600",` +
+	`"granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`
+
+// serve answers the account API for the stand-in server.
+//
+// 账号的 API 走的是账号自己的出口（直连），所以要有一台真的服务器接着
+// 它：直连出去就是问真的站点去了。答的是同一份 stand-in 的答案。
+func (f *fakeSite) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, r.Method+" "+r.URL.Path)
+	switch r.URL.Path {
+	case site.CreditPath:
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(creditAnswer))
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // paths gives the paths that were asked for.
@@ -99,6 +135,11 @@ func newFakeSiteWebUI(t *testing.T, f *fakeSite) (*WebUI, *store.Store) {
 	t.Cleanup(func() { s.Close() })
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second, Transport: f})
 	acc := account.New(up)
+	// 账号的 API 要有一台服务器接着：账号自己的出口是直连的，直连出去
+	// 就是问真的站点去了。令牌的端点还在 stand-in 后面。
+	srv := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(srv.Close)
+	acc.SetBase(srv.URL, srv.URL)
 	mgr := manager.New(s, up, acc, egress.New(map[string]string{}, ""), oauth.NewRenewer())
 	return New(mgr, config.Default(), s), s
 }
@@ -181,6 +222,47 @@ func TestTheWebUIAcquiresTheRealUserIDAndEmail(t *testing.T) {
 	}
 }
 
+// TestTheWebLoginReadsTheCreditsOfTheNewAccount says an account signed
+// in through the page has its credits read.
+//
+// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看
+// 得到它有多少积分。
+func TestTheWebLoginReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	f := &fakeSite{
+		device: deviceAnswer,
+		token: `{"access_token":"` + tokenWithSubject("jwt-subject") +
+			`","refresh_token":"rt","expires_in":3600}`,
+		identity: `{"data":{"userInfo":{"realUserID":"1234567890",` +
+			`"userEmail":"who@example.com"}}}`,
+	}
+	w, s := newFakeSiteWebUI(t, f)
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/accounts", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	waitForAccounts(t, s, 1)
+	waitForPath(t, f, site.CreditPath)
+}
+
+// waitForPath waits until the site was asked for a path.
+//
+// 登录是在后台做的：账号进了库，读账本是在它之后。测试不能靠运气。
+func waitForPath(t *testing.T, f *fakeSite, path string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range f.paths() {
+			if strings.HasSuffix(p, path) {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the site was never asked for %s: %v", path, f.paths())
+}
+
 // TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable says a sign-in
 // that worked is not thrown away because the identity could not be read.
 //
@@ -220,8 +302,8 @@ func TestTheWebUIKeepsTheLoginWhenTheIdentityIsUnreadable(t *testing.T) {
 // 账号的 id 是主键：两个登录在同一毫秒里结束，第二个会被数据库挡下
 // 来。挡下来的那一个要是没人说，这一次登录就悄悄没了。
 //
-// 这三次登录是三个不一样的站点账号（令牌里的 sub 不一样）：同一个站点
-// 账号登三次，库里只有一行，那是另一条规则。
+// 这三次登录是三个不一样的站点账号（站点给的那个 user id 不一样）：同
+// 一个站点账号登三次，库里只有一行，那是另一条规则。
 func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 	f := &fakeSite{
 		device: deviceAnswer,
@@ -229,7 +311,9 @@ func TestTwoSignInsDoNotShareAnAccountID(t *testing.T) {
 			return `{"access_token":"` + tokenWithSubject(fmt.Sprintf("jwt-subject-%d", n)) +
 				`","refresh_token":"rt","expires_in":3600}`
 		},
-		identity: `{"data":{"userInfo":{"realUserID":"1234567890"}}}`,
+		identityFor: func(n int) string {
+			return `{"data":{"userInfo":{"realUserID":"` + fmt.Sprintf("user-%d", n) + `"}}}`
+		},
 	}
 	w, s := newFakeSiteWebUI(t, f)
 

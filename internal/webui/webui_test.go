@@ -192,6 +192,87 @@ func TestAPIUsageCarriesTheState(t *testing.T) {
 	}
 }
 
+// TestTheUsagePageSaysAnAccountThatWasNeverRead says the page says an
+// account whose credits were never read.
+//
+// 没读过跟读不到是两回事。页面上写「读不到」，人会以为是出了什么
+// 事，要去查站点；其实只是还没轮到读它。
+func TestTheUsagePageSaysAnAccountThatWasNeverRead(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "还没读") {
+		t.Fatalf("the page does not say the account was never read: %s", body)
+	}
+	if strings.Contains(body, "读不到") {
+		t.Fatalf("the page says the account cannot be read: %s", body)
+	}
+}
+
+// TestTheUsageCanBeRefreshedNow says a reading can be asked for now.
+//
+// 页面上那些数是上一次读数时的数。要看现在的数，就得能说一声「现在
+// 读一遍」——不等调度器那一趟。
+func TestTheUsageCanBeRefreshedNow(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/usage/refresh", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Refreshed int      `json:"refreshed"`
+		Failed    int      `json:"failed"`
+		Reasons   []string `json:"reasons"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// 测试里的站点是个 404 的替身：这个账号的账本读不到。但这一趟
+	// 跑了，失败的也要说出来。
+	if out.Failed != 1 {
+		t.Fatalf("failed = %d, body = %s", out.Failed, rec.Body.String())
+	}
+	if len(out.Reasons) != 1 {
+		t.Fatalf("reasons = %v, want one", out.Reasons)
+	}
+}
+
+// TestTheUsagePageHasARefreshButton says the page offers the refresh.
+func TestTheUsagePageHasARefreshButton(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "usage-refresh") {
+		t.Fatalf("the page has no refresh button: %s", rec.Body.String())
+	}
+}
+
+// TestTheScriptRefreshesTheUsage says the page's script asks for the
+// reading.
+func TestTheScriptRefreshesTheUsage(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/static/app.js", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "/api/usage/refresh") {
+		t.Fatalf("the script does not ask for a reading: %s", rec.Body.String())
+	}
+}
+
 // TestThePageHasAWayOut says the page offers a way out when the gateway
 // has a key to sign in with.
 //
@@ -1012,6 +1093,27 @@ func TestTheUploadAnswerIsJSONOnTheWire(t *testing.T) {
 	}
 	if out.ID == "" {
 		t.Fatal("the answer has no run id")
+	}
+}
+
+// TestTheWebImportReadsTheCreditsOfTheNewAccount says an account that
+// just came in through the page has its credits read.
+//
+// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
+// 来的账号马上就读一次账本。
+func TestTheWebImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	w.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		return []provision.Result{{Email: "a@example.com", OK: true, AccountID: "acc_01"}}, nil
+	}
+	w.runImport("run_1", []provision.Entry{{Email: "a@example.com", Password: "pw"}})
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("the credits of the new account were not read: %d readings", len(snaps))
 	}
 }
 

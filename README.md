@@ -73,7 +73,16 @@ mmxcode models                   # 模型列表
 
 `serve` 自己没有别的开关：监听地址、key、轮转参数都在配置文件里。
 
-其余子命令的开关：`login --name`（账号标签）、`accounts proxy --group/--url`（出口组名 / 单独的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）。
+其余子命令的开关：`login --name`（账号标签）、`accounts proxy --group/--url`（出口组名 / 单独的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）、`usage --refresh`（现读一遍账本，不看上次读数）。
+
+### 积分什么时候读
+
+账本是站点那边的数，网关只能去问它要。
+
+- 调度器每 `schedule.usage_refresh`（默认 15 分钟）问一遍所有账号；读到的每一次都存一行。
+- 刚登录进来的账号、刚导入进来的账号，马上问一次 —— 不用等那一趟。
+- 想现在就知道：`mmxcode usage --refresh`，或者在「用量」那一页上点「刷新」。
+- 一次也没读过的账号，在页面上和命令行里都写着「还没读」：它跟「读到了但是读不出来」不是一回事。
 
 ### 批量导入
 
@@ -173,6 +182,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `/api/accounts/{id}/checkin` | POST | 给这个账号签到 |
 | `/api/accounts/{id}/usage` | GET | 读这个账号的积分 |
 | `/api/usage` | GET | 所有账号的积分汇总 |
+| `/api/usage/refresh` | POST | 立刻把所有账号的账本读一遍 |
 | `/api/egress` | GET | 出口组和它们的状态 |
 | `/api/egress/test` | POST | 立刻测一个出口组 |
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
@@ -201,7 +211,7 @@ WebUI 页面：
 - 一个 key 都不配时，鉴权整体跳过。所以 `mmxcode serve` 只允许听本机地址：`server.listen` 不是回环地址（`:8080`、`0.0.0.0:8080` 都不算）就直接报错退出：
 
   ```
-  no api key is configured, so the gateway would listen on :8080 for everyone; put api_keys in the config or listen on 127.0.0.1
+  no api key is configured, so the gateway would listen on :8080 for everyone; put api_keys in the config or MMXCODE_API_KEYS, or listen on 127.0.0.1
   ```
 
 - 鉴权对所有路径生效。带 key 的请求（`x-api-key` 头或 `Authorization: Bearer`）一律放行；不带 key 的请求分两种：`/api/` 下的接口回 401，浏览器要开的页面回登录页 `/signin`（200），登录页上填 key 换来的 cookie 之后就能进管理界面。
@@ -241,7 +251,9 @@ WebUI 页面：
 | `schedule.token_refresh` | `5m` | token 续期检查间隔 |
 | `schedule.egress_health` | `2m` | 出口健康检查间隔 |
 
-环境变量：`MMXCODE_CONFIG` 是 `--config` 的默认值；`MMXCODE_PROXY_DEFAULT` 覆盖 `proxy.default`（不设就不覆盖）。
+环境变量：`MMXCODE_CONFIG` 是 `--config` 的默认值；`MMXCODE_PROXY_DEFAULT` 覆盖 `proxy.default`（不设就不覆盖）；`MMXCODE_API_KEYS` 给出网关的 key 列表（逗号隔开，不设就不覆盖配置里的）。
+
+密钥放哪里都行：配置文件里的 `server.api_keys`，或者环境变量 `MMXCODE_API_KEYS`。容器里推荐后者 —— 密钥是申请来的，写进镜像就等于把它摊在别人眼前。两者都没有的时候，网关只肯听本机地址（`server.listen` 不是回环地址就报错退出）。后台登录用的就是这把 key：它是管理界面和网关共用的那一把。
 
 两个值写错了 `mmxcode serve` 会拒绝启动，而不是悄悄按别的来：`schedule.checkin_at` 不是 `HH:MM` 会报 `schedule.checkin_at = "..."; want HH:MM`，`upstream.site` 不是 `global` 会报 `upstream.site = "..."; only "global" is supported`。
 
@@ -272,7 +284,9 @@ compose 做的事：
 - 挂配置文件：默认挂仓库里的 `config.docker.yaml` 到 `/app/config.yaml`（只读）。要用自己的副本就设 `MMXCODE_CONFIG_FILE=./config.yaml`。
 - 挂数据目录：默认是 Docker 命名卷 `mmxcode-data`，容器里是 `/data`，数据库落在 `/data/mmxcode.db`。
 - 容器以非 root 用户 `mmxcode`（uid 10001）运行，`/data` 归它所有。
-- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）、`MMXCODE_PASSWORD_KEY`（批量导入的密码加密密钥；不设就不存密码）。
+- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）、`MMXCODE_PASSWORD_KEY`（批量导入的密码加密密钥；不设就不存密码）、`MMXCODE_API_KEYS`（网关的 key，也就是后台登录那把；镜像里不带密钥，在 `.env` 里写 `MMXCODE_API_KEYS=sk-xxx`，多把用逗号隔开）。
+
+  不设 `MMXCODE_API_KEYS` 的话，容器里的网关只肯听本机：它监听的是 `:8080`（所有网卡），没有 key 就等于把它白送出去，所以它会报错退出。
 
 数据目录：
 

@@ -41,7 +41,9 @@ func newServeCmd(e *env) *cobra.Command {
 			// 没配 key 时只听本机，不然就是把模型白送出去
 			listen := e.cfg.Server.Listen
 			if len(e.cfg.Server.APIKeys) == 0 && !isLoopback(listen) {
-				return fmt.Errorf("no api key is configured, so the gateway would listen on %s for everyone; put api_keys in the config or listen on 127.0.0.1", listen)
+				return fmt.Errorf("no api key is configured, so the gateway would listen on %s for everyone; "+
+					"put api_keys in the config or %s, or listen on 127.0.0.1",
+					listen, APIKeysEnv)
 			}
 
 			ui := webui.New(e.mgr, e.cfg, e.store)

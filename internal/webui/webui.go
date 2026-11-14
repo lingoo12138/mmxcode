@@ -127,6 +127,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/usage":
 		w.apiUsage(rw, r)
 		return
+	case "/api/usage/refresh":
+		w.apiUsageRefresh(rw, r)
+		return
 	case "/api/egress":
 		w.apiEgress(rw, r)
 		return
@@ -348,14 +351,7 @@ func (w *WebUI) usageData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	emails := map[string]string{}
-	for _, a := range accounts {
-		emails[a.ID] = a.Email
-	}
-	s := usage.Aggregate(snaps, time.Now())
-	for i := range s.Accounts {
-		s.Accounts[i].Email = emails[s.Accounts[i].ID]
-	}
+	s := usage.Aggregate(snaps, accounts, time.Now())
 	return map[string]any{"Summary": s}, nil
 }
 
@@ -458,6 +454,9 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
+	// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人
+	// 才看得到它有多少积分。读不到不算登录失败——账号是进来了的。
+	w.refreshUsage(ctx, acc.ID)
 	w.mu.Lock()
 	delete(w.pending, id)
 	w.mu.Unlock()
@@ -555,7 +554,27 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, map[string]any{"done": false})
 }
 
-// apiUsage gives the credits of every account.
+// apiUsageRefresh reads every account's credits now.
+//
+// 页面上那些数是上一次读数时的数。这一趟是现读的：不等调度器，也不
+// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。
+func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
+	res, err := w.Mgr.RefreshAllUsage(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, reason := range res.Reasons {
+		log.Printf("usage: %s", reason)
+	}
+	writeJSON(rw, map[string]any{
+		"refreshed": res.Refreshed,
+		"failed":    res.Failed,
+		"reasons":   res.Reasons,
+	})
+}
+
+// apiUsage gives the credits summary.
 func (w *WebUI) apiUsage(rw http.ResponseWriter, r *http.Request) {
 	snaps, err := w.Store.LatestUsageSnapshots(r.Context())
 	if err != nil {
@@ -567,14 +586,7 @@ func (w *WebUI) apiUsage(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	emails := map[string]string{}
-	for _, a := range accounts {
-		emails[a.ID] = a.Email
-	}
-	s := usage.Aggregate(snaps, time.Now())
-	for i := range s.Accounts {
-		s.Accounts[i].Email = emails[s.Accounts[i].ID]
-	}
+	s := usage.Aggregate(snaps, accounts, time.Now())
 	writeJSON(rw, s)
 }
 
@@ -916,6 +928,9 @@ func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 		switch {
 		case r.OK:
 			ok++
+			// 刚进来的账号马上读一次账本：不等调度器那一趟（15 分
+			// 钟），人才看得到它有多少积分。
+			w.refreshUsage(ctx, r.AccountID)
 		case !r.Whole:
 			// 整趟没成的那一行不是账号：它不算进失败的账号数里。
 			failed++
@@ -923,6 +938,19 @@ func (w *WebUI) runImport(runID string, entries []provision.Entry) {
 	}
 	if err := w.Store.FinishImportRun(ctx, runID, time.Now(), ok, failed, provision.ResultsJSON(results)); err != nil {
 		log.Printf("import %s: %v", runID, err)
+	}
+}
+
+// refreshUsage reads one account's credits now.
+//
+// 读不到不算导入失败：账号是进来了的，账本读不到是另一件事。它要
+// 记下来，别让它悄悄没掉。
+func (w *WebUI) refreshUsage(ctx context.Context, accountID string) {
+	if w.Mgr == nil || accountID == "" {
+		return
+	}
+	if _, err := w.Mgr.RefreshUsage(ctx, accountID); err != nil {
+		log.Printf("import: %s 的积分读不到：%v", accountID, err)
 	}
 }
 

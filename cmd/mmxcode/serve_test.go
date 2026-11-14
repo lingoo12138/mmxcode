@@ -76,6 +76,11 @@ func TestServeRefusesWithoutAnAPIKeyOnAWideAddress(t *testing.T) {
 		if !strings.Contains(err.Error(), "no api key is configured") {
 			t.Errorf("the error for %s does not say the key is missing: %v", listen, err)
 		}
+		// 密钥有两个地方可以放：配置文件和环境变量。镜像里不放配置文件
+		// 里的密钥，所以那句话里要说得出来。
+		if !strings.Contains(err.Error(), APIKeysEnv) {
+			t.Errorf("the error for %s does not say where the key comes from: %v", listen, err)
+		}
 	}
 }
 

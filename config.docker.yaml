@@ -1,6 +1,8 @@
 server:
   listen: ":8080"
-  api_keys: ["sk-local-change-me"]
+  # 这里不写 api_keys：密钥是申请来的，写进镜像就等于把它摊在别人眼前。
+  # 密钥从环境变量来（见 docker-compose.yml 里的 MMXCODE_API_KEYS），
+  # 或者在部署的时候把它写进挂进去的配置文件。
 
 proxy:
   default: "http://host.docker.internal:7890"

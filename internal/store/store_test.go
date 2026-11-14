@@ -2278,3 +2278,79 @@ func TestAnAccountIsFoundByItsEmail(t *testing.T) {
 		t.Fatalf("error = %v, want not found", err)
 	}
 }
+
+// TestASignInLandsOnTheRowWithTheSameUserID says a sign-in lands on the
+// row that has the same site user id.
+//
+// 站点给的 realUserID 是账号唯一稳当的钥匙。有的账号没有邮箱，令牌里
+// 也没有 sub：这样的账号再登一遍，要是只按邮箱和 sub 找，就会多出一行
+// 活的——同一个站点账号两行都是活的，轮转会挑到两次，页面把它列两遍。
+func TestASignInLandsOnTheRowWithTheSameUserID(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	acc, err := s.SignIn(ctx, Account{
+		ID: "acc_1", Name: "the first one", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+		UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want the one that was made", acc.ID)
+	}
+
+	// 又登了一遍：没有邮箱，令牌里也没有 sub，只有那个 user id。
+	again, err := s.SignIn(ctx, Account{
+		ID: "acc_2", Name: "", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok2", Refresh: "ref2", ExpiresAt: now.Add(2 * time.Hour),
+		UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != "acc_1" {
+		t.Fatalf("account = %q, want the row that was already there", again.ID)
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", rows)
+	}
+}
+
+// TestTheAccountIsFoundByItsUserID says the site user id finds the
+// account.
+//
+// 签到和积分明细要的是真的那个 user id，找账号也要按它找得到。
+func TestTheAccountIsFoundByItsUserID(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "one", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByUserID(ctx, "578078539524956167")
+	if err != nil {
+		t.Fatalf("the account by its user id: %v", err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %q, want acc_1", got.ID)
+	}
+	// 空的 user id 不是一把钥匙：没有它的账号，谁也不是。
+	if _, err := s.AccountByUserID(ctx, "  "); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+}
