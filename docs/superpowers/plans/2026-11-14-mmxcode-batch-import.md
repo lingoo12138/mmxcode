@@ -860,6 +860,7 @@ package webauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -887,6 +888,12 @@ func newFakeSite(t *testing.T) *fakeSite {
 			if r.Header.Get("yy") == "" || r.Header.Get("x-signature") == "" {
 				t.Errorf("the device registration is not signed")
 			}
+			// The device registration is the one call whose own query
+			// is the uuid, and the web client puts the caller's query
+			// in front (design document 3.2).
+			if !strings.HasPrefix(r.URL.RawQuery, "uuid=") {
+				t.Errorf("the device registration query = %q, want it to start with the uuid", r.URL.RawQuery)
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"deviceIDStr": f.deviceID},
 			})
@@ -898,6 +905,10 @@ func newFakeSite(t *testing.T) *fakeSite {
 			f.logins = append(f.logins, body)
 			if r.Header.Get("yy") == "" {
 				t.Errorf("the login is not signed")
+			}
+			// The web flavour's own query: the common one, web's copy.
+			if r.URL.Query().Get("client") != "web" || r.URL.Query().Get("device_platform") != "web" {
+				t.Errorf("the login query = %q, want the web one", r.URL.RawQuery)
 			}
 			if body["authToken"] == nil {
 				// 探测：邮箱这一步。
@@ -912,6 +923,14 @@ func newFakeSite(t *testing.T) *fakeSite {
 				"data": map[string]any{"login_redirect": "/oauth-authorize"},
 			})
 		case "/oauth2/device/authorize":
+			// 这两步网页用的是原生 fetch，不过 axios 拦截器：不签名，
+			// 也不带那套公共 query。
+			if r.Header.Get("yy") != "" || r.Header.Get("x-signature") != "" {
+				t.Errorf("the device authorization is signed, but the web page does not sign it")
+			}
+			if r.URL.Query().Get("client") != "" {
+				t.Errorf("the device authorization carries the common query, but the web page does not")
+			}
 			if c, err := r.Cookie("_sid"); err != nil || c.Value != "session-1" {
 				t.Errorf("the device authorization has no session cookie")
 			}
@@ -934,6 +953,14 @@ func newFakeSite(t *testing.T) *fakeSite {
 
 func (f *fakeSite) client(t *testing.T) *Client {
 	return New(Options{BaseURL: f.server.URL, HTTP: f.server.Client()})
+}
+
+// login makes the client hold a session, the way Password does.
+func (f *fakeSite) login(t *testing.T, c *Client) {
+	t.Helper()
+	if err := c.Password(context.Background(), "a@example.com", "hunter2", "dev-1", "/oauth-authorize"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestTheDeviceIsRegistered(t *testing.T) {
@@ -992,6 +1019,7 @@ func TestTheCodeIsApprovedWithTheSession(t *testing.T) {
 	f := newFakeSite(t)
 	f.groups = `{"code":0,"data":{"groups":[{"id":"g1","name":"default","is_default":true},{"id":"g2","is_default":false}]}}`
 	c := f.client(t)
+	f.login(t, c)
 	if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
 		t.Fatal(err)
 	}
@@ -1013,6 +1041,7 @@ func TestAGroupThatIsNotThereIsAnError(t *testing.T) {
 	f := newFakeSite(t)
 	f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":false}]}}`
 	c := f.client(t)
+	f.login(t, c)
 	err := c.Approve(context.Background(), "ABCD-1234")
 	if err == nil {
 		t.Fatal("no error without a default group")
@@ -1038,7 +1067,7 @@ func TestTheSitesCodeBecomesAReadableError(t *testing.T) {
 		t.Fatal("no error")
 	}
 	var se *SiteError
-	if !errorsAs(err, &se) {
+	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want a site error", err)
 	}
 	if se.Code != 1200056 {
@@ -1046,6 +1075,140 @@ func TestTheSitesCodeBecomesAReadableError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "密码") {
 		t.Fatalf("err = %v, want it to say the account has no password", err)
+	}
+}
+
+// A site that answers with an error is not an approval. The caller
+// would otherwise go on waiting for a token that is never coming.
+func TestAServerErrorIsNotAnApproval(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"code":0,"data":{"groups":[{"id":"g1","is_default":true}]}}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer srv.Close()
+
+	c := New(Options{BaseURL: srv.URL, HTTP: srv.Client()})
+	err := c.Approve(context.Background(), "ABCD-1234")
+	if err == nil {
+		t.Fatal("no error from a server that said no")
+	}
+}
+
+// A refusal without a number of its own still has to say something a
+// person can act on. The site's own word is English, so the Chinese
+// explanation comes from the word.
+func TestARefusalWithoutACodeIsStillExplained(t *testing.T) {
+	err := &SiteError{Reason: "login_required", Message: "account session is missing or expired"}
+	if got := err.ExplainText(); got != "要先登录才能批准" {
+		t.Errorf("ExplainText = %q", got)
+	}
+	text := err.Error()
+	if !strings.Contains(text, "登录") {
+		t.Errorf("err = %q, want it to say a login is needed", text)
+	}
+	// The site's own words come along, but they do not replace the
+	// explanation.
+	if !strings.Contains(text, "account session is missing or expired") {
+		t.Errorf("err = %q, want the site's own words in it too", text)
+	}
+}
+
+// Even a word nobody has heard of gets a Chinese sentence.
+func TestAnUnknownRefusalWordIsStillExplained(t *testing.T) {
+	err := &SiteError{Reason: "something_new"}
+	text := err.Error()
+	if text == "" {
+		t.Fatal("no explanation at all")
+	}
+	if !strings.Contains(text, "站点") {
+		t.Errorf("err = %q, want it to say the site refused", text)
+	}
+}
+
+// The approve call answers with a word, not with a number, when the
+// session is no good.
+func TestTheApproveRefusalIsExplained(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"code":0,"data":{"groups":[{"id":"g1","is_default":true}]}}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":             "login_required",
+			"error_description": "account session is missing or expired",
+		})
+	}))
+	defer srv.Close()
+
+	c := New(Options{BaseURL: srv.URL, HTTP: srv.Client()})
+	err := c.Approve(context.Background(), "ABCD-1234")
+	if err == nil {
+		t.Fatal("no error")
+	}
+	var se *SiteError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want a site error", err)
+	}
+	if se.Reason != "login_required" {
+		t.Errorf("reason = %q", se.Reason)
+	}
+	if !strings.Contains(err.Error(), "登录") {
+		t.Errorf("err = %v, want it to say a login is needed", err)
+	}
+}
+
+// The session belongs to one account. Two clients must not share one,
+// or one account's session would approve another account's code.
+func TestEachClientHasItsOwnSession(t *testing.T) {
+	// This one gets its own server, because the point is to see that a
+	// client which never signed in sends no session cookie — and the
+	// fake site above treats a missing cookie as a failure.
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("_sid")
+		if err != nil {
+			seen = append(seen, "")
+		} else {
+			seen = append(seen, c.Value)
+		}
+		if r.URL.Path == "/oauth2/login" {
+			http.SetCookie(w, &http.Cookie{Name: "_sid", Value: "session-1", Path: "/"})
+			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{}})
+			return
+		}
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"code":0,"data":{"groups":[{"id":"g1","is_default":true}]}}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": 0})
+	}))
+	defer srv.Close()
+
+	a := New(Options{BaseURL: srv.URL, HTTP: srv.Client()})
+	b := New(Options{BaseURL: srv.URL, HTTP: srv.Client()})
+	if err := a.Password(context.Background(), "a@example.com", "hunter2", "dev-1", "/oauth-authorize"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	// a 的登录那一步还没有会话，批准那两步带着会话；b 从来没有登过，
+	// 它的两步都不带。jar 是各自的。
+	want := []string{"", "session-1", "session-1", "", ""}
+	if len(seen) != len(want) {
+		t.Fatalf("got %d requests, want %d", len(seen), len(want))
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Errorf("request %d had the session %q, want %q", i, seen[i], want[i])
+		}
 	}
 }
 ```
@@ -1088,11 +1251,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"mmxcode/internal/sign"
+	"mmxcode/internal/site"
 )
 
 // Paths of the calls the login makes.
@@ -1150,12 +1315,13 @@ func New(o Options) *Client {
 		now:  o.Now,
 		tz:   o.TZOffset,
 		lang: o.Lang,
+		uuid: newUUID(),
 	}
 	if c.now == nil {
 		c.now = time.Now
 	}
 	if c.lang == "" {
-		c.lang = "en"
+		c.lang = site.Lang
 	}
 	hc := o.HTTP
 	if hc == nil {
@@ -1186,7 +1352,10 @@ func (c *Client) RegisterDevice(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	s := c.sign(DeviceRegisterPath, body)
+	// The device registration is the one call whose own query is the
+	// uuid (design document 3.2). The web client puts the caller's
+	// query first, so the url starts with it.
+	s := c.sign(DeviceRegisterPath, body, []sign.KV{{K: "uuid", V: c.uuid}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -1236,6 +1405,9 @@ func (c *Client) Password(ctx context.Context, email, password, deviceID, redire
 }
 
 // login posts to the site's login endpoint.
+//
+// A nil authToken is the probe: it asks the site how this account
+// signs in. A token is the password, encrypted with the site's key.
 func (c *Client) login(ctx context.Context, email string, authToken *string, deviceID, redirect string) (map[string]any, error) {
 	body := map[string]any{
 		"loginType":      LoginTypePassword,
@@ -1252,7 +1424,7 @@ func (c *Client) login(ctx context.Context, email string, authToken *string, dev
 	if err != nil {
 		return nil, err
 	}
-	s := c.sign(LoginPath, raw)
+	s := c.sign(LoginPath, raw, nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
@@ -1274,8 +1446,16 @@ func (c *Client) login(ctx context.Context, email string, authToken *string, dev
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
 		return nil, fmt.Errorf("login: %w", err)
 	}
-	if answer.StatusInfo != nil && answer.StatusInfo.Code != 0 {
-		return nil, &SiteError{Code: answer.StatusInfo.Code, Message: answer.StatusInfo.Message}
+	if answer.StatusInfo != nil {
+		if answer.StatusInfo.Code != 0 {
+			return nil, &SiteError{Code: answer.StatusInfo.Code, Message: answer.StatusInfo.Message}
+		}
+		return answer.Data, nil
+	}
+	// No statusInfo: the site answered with the top-level code, which
+	// is how the mcode side refuses a sign-in (1000048).
+	if answer.Code != 0 {
+		return nil, &SiteError{Code: answer.Code}
 	}
 	return answer.Data, nil
 }
@@ -1284,6 +1464,10 @@ func (c *Client) login(ctx context.Context, email string, authToken *string, dev
 //
 // The session that Password got is the permission: without it the
 // site answers 401 and says a login is needed.
+//
+// The approve call is not signed and carries no common query: the web
+// page makes it with the browser's native fetch, which does not go
+// through the interceptor that signs the rest.
 func (c *Client) Approve(ctx context.Context, userCode string) error {
 	group, err := c.defaultGroup(ctx, userCode)
 	if err != nil {
@@ -1311,20 +1495,39 @@ func (c *Client) Approve(ctx context.Context, userCode string) error {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return errors.New("approve: the session is not good any more")
 	}
-	var answer struct {
-		Error   string `json:"error"`
-		Message string `json:"message"`
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// A refusal that is not a refusal must not look like an
+		// approval: the caller would go on waiting for a token that
+		// is never going to come.
+		return fmt.Errorf("approve: the site answered %s", resp.Status)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&answer); err == nil && answer.Error != "" {
-		return &SiteError{Message: answer.Error}
+	var answer struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+		Message          string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err == nil {
+		if answer.Error != "" {
+			msg := answer.ErrorDescription
+			if msg == "" {
+				msg = answer.Message
+			}
+			return &SiteError{Message: msg, Reason: answer.Error}
+		}
 	}
 	return nil
 }
 
 // defaultGroup asks the site which group the code belongs to.
+//
+// This call is not signed either, for the same reason the approve is
+// not.
 func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, error) {
-	url := fmt.Sprintf("%s%s?user_code=%s&app_id=%s", c.base, DeviceAuthorizePath, userCode, AppID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// The query is the one the web page sends, in its order. This call
+	// is not signed, so the order does not matter to the signature.
+	query := "user_code=" + url.QueryEscape(userCode) + "&app_id=" + AppID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.base+DeviceAuthorizePath+"?"+query, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1336,6 +1539,9 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		return "", errors.New("device authorize: the site wants a login")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", fmt.Errorf("device authorize: the site answered %s", resp.Status)
 	}
 	var answer any
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
@@ -1391,7 +1597,10 @@ func findGroups(v any) []map[string]any {
 }
 
 // sign makes a signed request for the web flavour.
-func (c *Client) sign(path string, body []byte) sign.Signed {
+//
+// The query is the caller's own query, which the web client puts in
+// front of the common one.
+func (c *Client) sign(path string, body []byte, query []sign.KV) sign.Signed {
 	return sign.Sign(c.base, path, sign.Options{
 		Flavor:   sign.FlavorWeb,
 		Now:      c.now().UnixMilli(),
@@ -1400,6 +1609,7 @@ func (c *Client) sign(path string, body []byte) sign.Signed {
 		Body:     body,
 		UUID:     c.uuid,
 		DeviceID: c.deviceID,
+		Query:    query,
 	})
 }
 
@@ -1418,17 +1628,54 @@ type SiteError struct {
 	Code int
 	// Message is what the site said.
 	Message string
+	// Reason is the site's own word for the refusal ("login_required"
+	// and the like). A refusal that comes without a number of its own
+	// carries the word, and that is what ExplainReason explains.
+	Reason string
+}
+
+// ExplainText says what the refusal means, in a human's words.
+//
+// It is Explain for a code the site gave, and ExplainReason for a
+// refusal that came without one. There is always a Chinese sentence
+// here: the site's own words are English and say nothing a person can
+// act on.
+func (e *SiteError) ExplainText() string {
+	if e.Code == 0 {
+		return ExplainReason(e.Reason)
+	}
+	return Explain(e.Code)
 }
 
 func (e *SiteError) Error() string {
 	// The site's own message is in English and says nothing a person
 	// can act on; the code is what says what to do. The site's words
 	// come along, but they do not replace the explanation.
-	msg := Explain(e.Code)
+	msg := e.ExplainText()
 	if e.Message != "" {
 		msg = fmt.Sprintf("%s（站点说：%s）", msg, e.Message)
 	}
+	if e.Code == 0 {
+		return "the site refused the sign-in: " + msg
+	}
 	return fmt.Sprintf("the site refused the sign-in (%d): %s", e.Code, msg)
+}
+
+// ExplainReason says what the site's own word for a refusal means.
+//
+// Some refusals come without a number of their own — the site just
+// says "login_required" or the like. That word is English and says
+// nothing a person can act on, so the explanation comes from the word.
+func ExplainReason(reason string) string {
+	switch reason {
+	case "login_required", "login_required_2":
+		return "要先登录才能批准"
+	case "invalid_grant":
+		return "这个设备码已经不能用了"
+	case "access_denied":
+		return "站点没有让这个设备码进来"
+	}
+	return "站点拒绝了，没有说为什么"
 }
 
 // Explain says what a site code means in a human's words.
@@ -1457,6 +1704,12 @@ func Explain(code int) string {
 
 // jsonBody builds a body the way the browser's JSON.stringify does:
 // compact, and with no HTML escaping.
+//
+// The bytes are what gets signed, so they have to be the bytes that
+// go on the wire. A map's keys are sorted by Go's encoder, which is
+// not what JSON.stringify does, but the site does not care about the
+// order of a JSON object's keys, and the signature is over exactly
+// these bytes — so the sorted order is fine.
 func jsonBody(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -1510,6 +1763,10 @@ gkUBUeGa9O+cWcPEwQIDAQAB
 //
 // The result is base64 of the RSA cipher text, which is what the site
 // expects in the "authToken" field.
+//
+// The padding of PKCS#1 v1.5 is random, so the same password gives a
+// different cipher text every time. The cipher text is not a password
+// hash and must never be stored as one.
 func encryptPassword(password string) (string, error) {
 	block, _ := pem.Decode([]byte(publicKeyPEM))
 	if block == nil {
@@ -1618,6 +1875,34 @@ func TestALineWithNoPassword(t *testing.T) {
 	}
 }
 
+func TestTheSameEmailTwiceIsOnlyOneAccount(t *testing.T) {
+	entries, bad := Parse(strings.NewReader("a@example.com|p\na@example.com|q\n"))
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries: %+v", len(entries), entries)
+	}
+	if len(bad) != 1 {
+		t.Fatalf("got %d bad lines: %+v", len(bad), bad)
+	}
+	if bad[0].Line != 2 {
+		t.Errorf("the line is %d, want 2", bad[0].Line)
+	}
+}
+
+func TestThePasswordIsNotInTheBadLine(t *testing.T) {
+	entries, bad := Parse(strings.NewReader("not-an-email|secret\nb@example.com|\n"))
+	if len(entries) != 0 {
+		t.Fatalf("got %d entries: %+v", len(entries), entries)
+	}
+	if len(bad) != 2 {
+		t.Fatalf("got %d bad lines: %+v", len(bad), bad)
+	}
+	for _, b := range bad {
+		if strings.Contains(b.Text, "secret") {
+			t.Fatalf("the password is in the bad line: %+v", b)
+		}
+	}
+}
+
 func TestTheRunnerTakesThemOneByOne(t *testing.T) {
 	var seen []string
 	r := &Runner{
@@ -1720,6 +2005,32 @@ func TestAWrongPasswordIsNotTriedAgain(t *testing.T) {
 	}
 }
 
+func TestTheTriesAreNotEndless(t *testing.T) {
+	var tries int
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				tries++
+				return Result{Email: email}, &Error{Stage: StageToken, Code: 1200007, Message: "not logged in", Retry: true}
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tries != 3 {
+		t.Fatalf("tried %d times, want 3", tries)
+	}
+	if out[0].OK {
+		t.Fatalf("out = %+v", out[0])
+	}
+	if out[0].Code != 1200007 {
+		t.Fatalf("the site's own code is gone: %+v", out[0])
+	}
+}
+
 func TestTheRunStopsWhenTheContextIsDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1732,6 +2043,37 @@ func TestTheRunStopsWhenTheContextIsDone(t *testing.T) {
 	}
 	if _, err := r.Run(ctx, []Entry{{Email: "a@example.com"}}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want the cancellation", err)
+	}
+}
+
+func TestTheRunStopsInTheMiddleOfAnAccount(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				cancel()
+				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true, Wait: time.Millisecond}
+			},
+		},
+		Sleep: func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+	}
+	if _, err := r.Run(ctx, []Entry{{Email: "a@example.com"}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the cancellation", err)
+	}
+}
+
+func TestTheResultsAreTheTextTheDatabaseKeeps(t *testing.T) {
+	raw := ResultsJSON([]Result{{
+		Email:   "a@example.com",
+		OK:      false,
+		Stage:   StagePassword,
+		Code:    1200046,
+		Message: "wrong password",
+	}})
+	for _, want := range []string{`"email":"a@example.com"`, `"ok":false`, `"stage":"password"`, `"code":1200046`} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("%s is not in %s", want, raw)
+		}
 	}
 }
 ```
@@ -1810,14 +2152,18 @@ type BadLine struct {
 // One account per line: "email|password". A line that starts with a
 // "#" is a comment and an empty line is skipped. Everything after the
 // first "|" is the password, so a password may contain a "|".
+//
+// An email that is already in the list is skipped: the second one is
+// said to be a line that is not an account.
 func Parse(r io.Reader) ([]Entry, []BadLine) {
 	var entries []Entry
 	var bad []BadLine
-	raw, err := readAll(r)
+	raw, err := io.ReadAll(r)
 	if err != nil {
 		return nil, []BadLine{{Line: 0, Reason: err.Error()}}
 	}
-	for i, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+	seen := map[string]bool{}
+	for i, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
 		n := i + 1
 		text := strings.TrimSpace(line)
 		if text == "" || strings.HasPrefix(text, "#") {
@@ -1838,6 +2184,12 @@ func Parse(r io.Reader) ([]Entry, []BadLine) {
 			bad = append(bad, BadLine{Line: n, Text: mask(email), Reason: "没有密码"})
 			continue
 		}
+		key := strings.ToLower(email)
+		if seen[key] {
+			bad = append(bad, BadLine{Line: n, Text: email, Reason: "已有这个账号"})
+			continue
+		}
+		seen[key] = true
 		entries = append(entries, Entry{Email: email, Password: password, Line: n})
 	}
 	return entries, bad
@@ -1846,17 +2198,17 @@ func Parse(r io.Reader) ([]Entry, []BadLine) {
 // Result is what happened to one account.
 type Result struct {
 	// Email is the account's email.
-	Email string
+	Email string `json:"email"`
 	// OK says whether the account is in the database now.
-	OK bool
+	OK bool `json:"ok"`
 	// Stage is where it stopped.
-	Stage Stage
+	Stage Stage `json:"stage"`
 	// Code is the site's own code, when the site gave one.
-	Code int
+	Code int `json:"code"`
 	// Message says what happened.
-	Message string
+	Message string `json:"message"`
 	// AccountID is the account's id, when it made it in.
-	AccountID string
+	AccountID string `json:"account_id,omitempty"`
 }
 
 // Error is an import failure and what to do about it.
@@ -1903,11 +2255,24 @@ type Runner struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 }
 
+// tries is how many times one account is tried at most.
+//
+// The first try and two more: a network hiccup is worth another go, a
+// password that is wrong is not, and three tries is enough to tell the
+// two apart without hammering the site.
+const tries = 3
+
 // Run brings in every entry and gives back what happened to each.
 //
 // One account does not stop the rest: a wrong password says nothing
 // about the next one.
+//
+// The error is only for the run itself stopping -- the context was
+// cancelled. An account that failed is a result, not an error.
 func (r *Runner) Run(ctx context.Context, entries []Entry) ([]Result, error) {
+	if r.Importer == nil || r.Importer.Import == nil {
+		return nil, errors.New("provision: 没有导入器")
+	}
 	var out []Result
 	for i, e := range entries {
 		if err := ctx.Err(); err != nil {
@@ -1919,21 +2284,37 @@ func (r *Runner) Run(ctx context.Context, entries []Entry) ([]Result, error) {
 			}
 		}
 		out = append(out, r.one(ctx, e))
+		// The account may have been cut short half way through, and
+		// the context is checked once more here: a run that was cut
+		// short must say so, even when the account it was cut short
+		// on was the last one.
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 	}
 	return out, nil
 }
 
 // one brings one account in, trying again when it is worth it.
 func (r *Runner) one(ctx context.Context, e Entry) Result {
-	const tries = 3
+	var last *Error
 	for attempt := 0; attempt < tries; attempt++ {
 		res, err := r.Importer.Import(ctx, e.Email, e.Password)
 		if err == nil {
+			if res.Email == "" {
+				res.Email = e.Email
+			}
 			return res
 		}
 		var pe *Error
 		if !errors.As(err, &pe) || !pe.Retry {
 			return resultOf(e, err)
+		}
+		last = pe
+		if attempt == tries-1 {
+			// The last try is the last one: waiting after it only
+			// makes the answer come later.
+			break
 		}
 		wait := pe.Wait
 		if wait <= 0 {
@@ -1943,7 +2324,9 @@ func (r *Runner) one(ctx context.Context, e Entry) Result {
 			return resultOf(e, err)
 		}
 	}
-	return resultOf(e, &Error{Stage: StageToken, Message: "试了几次都不成"})
+	res := resultOf(e, last)
+	res.Message = fmt.Sprintf("试了 %d 次都不成：%s", tries, res.Message)
+	return res
 }
 
 // resultOf turns an error into a result.
@@ -1992,6 +2375,9 @@ func looksLikeEmail(s string) bool {
 }
 
 // mask hides the password of a line that could not be read.
+//
+// The text of a bad line goes into the database's import-run log and
+// into the terminal, so a password must not be in it.
 func mask(text string) string {
 	at := strings.Index(text, "|")
 	if at < 0 {
@@ -2239,6 +2625,10 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 		return nil, c.webError(StagePassword, err)
 	}
 	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
+		if errors.Is(err, webauth.ErrNoDefaultGroup) {
+			// 站点没有默认组可批准，重试多少次都一样。
+			return nil, &Error{Stage: StageApprove, Message: err.Error()}
+		}
 		return nil, &Error{Stage: StageApprove, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
 	}
 	tok, err := c.Poll(ctx, d)
@@ -2318,9 +2708,11 @@ func (c *Chain) webError(stage Stage, err error) error {
 	var se *webauth.SiteError
 	if errors.As(err, &se) {
 		return &Error{
-			Stage:   stage,
-			Code:    se.Code,
-			Message: webauth.Explain(se.Code),
+			Stage: stage,
+			Code:  se.Code,
+			// ExplainText 是一句话的说法：有错误码就用错误码，没有
+			// 就用站点自己那个词（login_required 那种）。
+			Message: se.ExplainText(),
 		}
 	}
 	return &Error{Stage: stage, Message: err.Error(), Retry: true, Wait: 5 * time.Second}
@@ -3285,7 +3677,9 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go w.runImport(runID, entries)
-	writeJSON(rw, http.StatusAccepted, map[string]any{"id": runID})
+	// writeJSON 在这个包里只有两个参数，自己不写状态码：要 202 就先写。
+	rw.WriteHeader(http.StatusAccepted)
+	writeJSON(rw, map[string]any{"id": runID})
 }
 
 // runImport brings a batch in and writes down what came of it.
@@ -3314,7 +3708,7 @@ func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fixed, failed := w.Relogin(r.Context())
-	writeJSON(rw, http.StatusOK, map[string]any{"fixed": fixed, "failed": failed})
+	writeJSON(rw, map[string]any{"fixed": fixed, "failed": failed})
 }
 ```
 
