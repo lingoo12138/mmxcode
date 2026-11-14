@@ -401,30 +401,54 @@ type SiteError struct {
 	Code int
 	// Message is what the site said.
 	Message string
-	// Reason is the site's own word for the refusal, when it used one
-	// ("login_required" and the like).
+	// Reason is the site's own word for the refusal ("login_required"
+	// and the like). A refusal that comes without a number of its own
+	// carries the word, and that is what ExplainReason explains.
 	Reason string
+}
+
+// ExplainText says what the refusal means, in a human's words.
+//
+// It is Explain for a code the site gave, and ExplainReason for a
+// refusal that came without one. There is always a Chinese sentence
+// here: the site's own words are English and say nothing a person can
+// act on.
+func (e *SiteError) ExplainText() string {
+	if e.Code == 0 {
+		return ExplainReason(e.Reason)
+	}
+	return Explain(e.Code)
 }
 
 func (e *SiteError) Error() string {
 	// The site's own message is in English and says nothing a person
 	// can act on; the code is what says what to do. The site's words
 	// come along, but they do not replace the explanation.
-	if e.Code == 0 {
-		msg := e.Message
-		if msg == "" {
-			msg = e.Reason
-		}
-		if msg == "" {
-			msg = "站点没有说为什么"
-		}
-		return "the site refused the sign-in: " + msg
-	}
-	msg := Explain(e.Code)
+	msg := e.ExplainText()
 	if e.Message != "" {
 		msg = fmt.Sprintf("%s（站点说：%s）", msg, e.Message)
 	}
+	if e.Code == 0 {
+		return "the site refused the sign-in: " + msg
+	}
 	return fmt.Sprintf("the site refused the sign-in (%d): %s", e.Code, msg)
+}
+
+// ExplainReason says what the site's own word for a refusal means.
+//
+// Some refusals come without a number of their own — the site just
+// says "login_required" or the like. That word is English and says
+// nothing a person can act on, so the explanation comes from the word.
+func ExplainReason(reason string) string {
+	switch reason {
+	case "login_required", "login_required_2":
+		return "要先登录才能批准"
+	case "invalid_grant":
+		return "这个设备码已经不能用了"
+	case "access_denied":
+		return "站点没有让这个设备码进来"
+	}
+	return "站点拒绝了，没有说为什么"
 }
 
 // Explain says what a site code means in a human's words.

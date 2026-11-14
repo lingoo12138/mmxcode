@@ -241,6 +241,69 @@ func TestAServerErrorIsNotAnApproval(t *testing.T) {
 	}
 }
 
+// A refusal without a number of its own still has to say something a
+// person can act on. The site's own word is English, so the Chinese
+// explanation comes from the word.
+func TestARefusalWithoutACodeIsStillExplained(t *testing.T) {
+	err := &SiteError{Reason: "login_required", Message: "account session is missing or expired"}
+	if got := err.ExplainText(); got != "要先登录才能批准" {
+		t.Errorf("ExplainText = %q", got)
+	}
+	text := err.Error()
+	if !strings.Contains(text, "登录") {
+		t.Errorf("err = %q, want it to say a login is needed", text)
+	}
+	// The site's own words come along, but they do not replace the
+	// explanation.
+	if !strings.Contains(text, "account session is missing or expired") {
+		t.Errorf("err = %q, want the site's own words in it too", text)
+	}
+}
+
+// Even a word nobody has heard of gets a Chinese sentence.
+func TestAnUnknownRefusalWordIsStillExplained(t *testing.T) {
+	err := &SiteError{Reason: "something_new"}
+	text := err.Error()
+	if text == "" {
+		t.Fatal("no explanation at all")
+	}
+	if !strings.Contains(text, "站点") {
+		t.Errorf("err = %q, want it to say the site refused", text)
+	}
+}
+
+// The approve call answers with a word, not with a number, when the
+// session is no good.
+func TestTheApproveRefusalIsExplained(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"code":0,"data":{"groups":[{"id":"g1","is_default":true}]}}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":             "login_required",
+			"error_description": "account session is missing or expired",
+		})
+	}))
+	defer srv.Close()
+
+	c := New(Options{BaseURL: srv.URL, HTTP: srv.Client()})
+	err := c.Approve(context.Background(), "ABCD-1234")
+	if err == nil {
+		t.Fatal("no error")
+	}
+	var se *SiteError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want a site error", err)
+	}
+	if se.Reason != "login_required" {
+		t.Errorf("reason = %q", se.Reason)
+	}
+	if !strings.Contains(err.Error(), "登录") {
+		t.Errorf("err = %v, want it to say a login is needed", err)
+	}
+}
+
 // The session belongs to one account. Two clients must not share one,
 // or one account's session would approve another account's code.
 func TestEachClientHasItsOwnSession(t *testing.T) {
