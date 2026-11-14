@@ -463,3 +463,70 @@ func TestFormEncodeMatchesJS(t *testing.T) {
 		}
 	}
 }
+
+func TestTheWebFlavourSignsItsOwnQuery(t *testing.T) {
+	// 网页把公共 query 放在调用方的 query 后面（JS 的 {...params, ...common}
+	// 是这样展开的），而 CLI 是放在中间。两边的键序不一样，签名就不一样。
+	now := int64(1763000000000)
+	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
+		Flavor:   FlavorWeb,
+		Now:      now,
+		TZOffset: 28800,
+		Query:    []KV{{K: "uuid", V: "0f8fad5b-d9cb-469f-a165-70867728950e"}},
+		UUID:     "0f8fad5b-d9cb-469f-a165-70867728950e",
+		DeviceID: "574786429807779842",
+	})
+	want := "https://account.minimax.io/oauth2/login" +
+		"?uuid=0f8fad5b-d9cb-469f-a165-70867728950e" +
+		"&device_platform=web&biz_id=3&app_id=3001&version_code=22201" +
+		"&unix=1763000000000&timezone_offset=28800&sys_language=en&lang=en" +
+		"&uuid=0f8fad5b-d9cb-469f-a165-70867728950e&device_id=574786429807779842" +
+		"&os_name=Windows&browser_name=chrome&device_memory=16&cpu_core_num=16" +
+		"&browser_language=en&browser_platform=Win32&user_id=0&op_ticket=undefined" +
+		"&screen_width=1280&screen_height=800&client=web"
+	if s.URL != want {
+		t.Fatalf("url =\n%s\nwant\n%s", s.URL, want)
+	}
+}
+
+func TestTheWebFlavourSignsWhatItSends(t *testing.T) {
+	// 签的就是发的：把 URL 拿来重算一遍 yy 和 x-signature，两个都要对得上。
+	now := int64(1763000000000)
+	body := []byte(`{"loginType":"20","email":"a@example.com"}`)
+	s := Sign("https://account.minimax.io", "/oauth2/login", Options{
+		Flavor:   FlavorWeb,
+		Now:      now,
+		TZOffset: 28800,
+		Body:     body,
+	})
+	// yy = md5(encodeURIComponent(path?query) + "_" + body + md5(unix_ms) + "ooui")
+	at := s.URL[len("https://account.minimax.io"):]
+	yy := md5Hex(encodeURIComponent(at) + "_" + string(body) + md5Hex("1763000000000") + "ooui")
+	if s.YY != yy {
+		t.Errorf("yy = %q, want %q", s.YY, yy)
+	}
+	// x-signature = md5(x-timestamp + secret + body), and the timestamp
+	// is in seconds — the same one the header carries.
+	sig := md5Hex("1763000000" + Secret + string(body))
+	if s.Signature != sig {
+		t.Errorf("signature = %q, want %q", s.Signature, sig)
+	}
+}
+
+func TestTheMCodeFlavourIsUnchanged(t *testing.T) {
+	// CLI 那套不能动：调用方的 query 在中间，device_platform 是 mcode。
+	now := int64(1763000000000)
+	s := Sign("https://account.minimax.io", "/v1/api/user/identity", Options{
+		Now:      now,
+		TZOffset: 0,
+		Query:    []KV{{K: "group_id", V: "g1"}},
+	})
+	if !strings.Contains(s.URL, "device_platform=mcode") ||
+		!strings.Contains(s.URL, "browser_name=mcode") ||
+		!strings.Contains(s.URL, "client=mcode") {
+		t.Fatalf("url = %s", s.URL)
+	}
+	if strings.Contains(s.URL, "device_platform=web") {
+		t.Fatalf("url = %s", s.URL)
+	}
+}

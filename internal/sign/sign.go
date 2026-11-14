@@ -42,6 +42,21 @@ type KV struct {
 	V string
 }
 
+// Flavor is which client a signed request claims to be.
+//
+// The two clients sign the same way but send different things: the
+// CLI claims to be MiniMax Code and the web claims to be a browser.
+// The signature covers the query, so the query has to be the one that
+// client really sends.
+type Flavor int
+
+const (
+	// FlavorMCode is MiniMax Code, the CLI. It is the default.
+	FlavorMCode Flavor = iota
+	// FlavorWeb is the MiniMax account website.
+	FlavorWeb
+)
+
 // Options is what a request's signature is made of.
 type Options struct {
 	// Access is the account's access token, put in Authorization.
@@ -74,6 +89,10 @@ type Options struct {
 	//     come after it, so a repeated key keeps the caller's place but
 	//     takes the reference's value. "lang" and "client" are the
 	//     reference's, "user_id" is the option's.
+	//
+	// The web client builds its query the other way round: the caller's
+	// query comes first and the common ones after it, so a key that is
+	// in both is in the query twice.
 	Query []KV
 	// Now is the request's time in Unix milliseconds.
 	//
@@ -84,10 +103,33 @@ type Options struct {
 	Now int64
 	// TZOffset is the client's timezone offset in seconds.
 	TZOffset int
-	// OSName is the client's platform name. An empty one is "linux".
+	// OSName is the client's platform name. An empty one is "linux"
+	// for the CLI and "Windows" for the web client.
 	OSName string
 	// Lang is the site's language. An empty one is the site's own.
 	Lang string
+	// Flavor says which client the request claims to be. The zero
+	// value is the CLI, so the existing callers do not change.
+	Flavor Flavor
+	// UUID is the web client's long-lived device id. The browser
+	// keeps one in localStorage and sends it with every request.
+	UUID string
+	// DeviceID is the number the device registration handed out.
+	DeviceID string
+	// ScreenWidth and ScreenHeight are the screen the web client
+	// claims to have.
+	ScreenWidth  int
+	ScreenHeight int
+	// DeviceMemory and CPUCores are the machine the web client claims.
+	DeviceMemory int
+	CPUCores     int
+	// BrowserLanguage and BrowserPlatform are what the web client
+	// claims about itself.
+	BrowserLanguage string
+	BrowserPlatform string
+	// OpTicket is the web session's ticket. Before signing in the
+	// browser sends the word "undefined", and so does this.
+	OpTicket string
 }
 
 // Signed is a signed request's URL and headers.
@@ -124,31 +166,105 @@ func Sign(origin, path string, o Options) Signed {
 	if lang == "" {
 		lang = site.Lang
 	}
-	osName := o.OSName
-	if osName == "" {
-		osName = "linux"
+	// The rest are what the web client claims about itself. The CLI
+	// sends none of them.
+	browserLanguage := o.BrowserLanguage
+	if browserLanguage == "" {
+		browserLanguage = "en"
+	}
+	browserPlatform := o.BrowserPlatform
+	if browserPlatform == "" {
+		browserPlatform = "Win32"
+	}
+	deviceMemory := o.DeviceMemory
+	if deviceMemory == 0 {
+		deviceMemory = 16
+	}
+	cpuCores := o.CPUCores
+	if cpuCores == 0 {
+		cpuCores = 16
+	}
+	screenWidth := o.ScreenWidth
+	if screenWidth == 0 {
+		screenWidth = 1280
+	}
+	screenHeight := o.ScreenHeight
+	if screenHeight == 0 {
+		screenHeight = 800
+	}
+	opTicket := o.OpTicket
+	if opTicket == "" {
+		// The browser sends the word "undefined" before signing in:
+		// the ticket is not in the session yet.
+		opTicket = "undefined"
 	}
 
 	p := newParams()
-	p.set("device_platform", "mcode")
-	p.set("biz_id", "3")
-	p.set("app_id", "3001")
-	p.set("version_code", "22201")
-	for _, kv := range o.Query {
-		p.set(kv.K, kv.V)
+	switch o.Flavor {
+	case FlavorWeb:
+		// The web client sends the caller's own parameters first and
+		// the common ones after them, so a key that is in both is in
+		// the query twice.
+		osName := o.OSName
+		if osName == "" {
+			osName = "Windows"
+		}
+		userID := jsTrim(o.UserID)
+		if userID == "" {
+			userID = "0"
+		}
+		for _, kv := range o.Query {
+			p.append(kv.K, kv.V)
+		}
+		p.append("device_platform", "web")
+		p.append("biz_id", "3")
+		p.append("app_id", "3001")
+		p.append("version_code", "22201")
+		p.append("unix", strconv.FormatInt(o.Now, 10))
+		p.append("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.append("sys_language", lang)
+		p.append("lang", lang)
+		p.append("uuid", o.UUID)
+		p.append("device_id", o.DeviceID)
+		p.append("os_name", osName)
+		p.append("browser_name", "chrome")
+		p.append("device_memory", strconv.Itoa(deviceMemory))
+		p.append("cpu_core_num", strconv.Itoa(cpuCores))
+		p.append("browser_language", browserLanguage)
+		p.append("browser_platform", browserPlatform)
+		p.append("user_id", userID)
+		p.append("op_ticket", opTicket)
+		p.append("screen_width", strconv.Itoa(screenWidth))
+		p.append("screen_height", strconv.Itoa(screenHeight))
+		p.append("client", "web")
+	default:
+		// The CLI puts the caller's parameters in the middle and the
+		// defaults around them. That is what the reference does, and
+		// the order is part of the signature.
+		osName := o.OSName
+		if osName == "" {
+			osName = "linux"
+		}
+		p.set("device_platform", "mcode")
+		p.set("biz_id", "3")
+		p.set("app_id", "3001")
+		p.set("version_code", "22201")
+		for _, kv := range o.Query {
+			p.set(kv.K, kv.V)
+		}
+		p.set("unix", strconv.FormatInt(o.Now, 10))
+		p.set("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.set("sys_language", lang)
+		p.set("lang", lang)
+		p.set("device_id", "0")
+		p.set("os_name", osName)
+		p.set("browser_name", "mcode")
+		p.set("user_id", jsTrim(o.UserID))
+		if p.get("user_id") == "" {
+			p.set("user_id", "0")
+		}
+		p.set("client", "mcode")
 	}
-	p.set("unix", strconv.FormatInt(o.Now, 10))
-	p.set("timezone_offset", strconv.Itoa(o.TZOffset))
-	p.set("sys_language", lang)
-	p.set("lang", lang)
-	p.set("device_id", "0")
-	p.set("os_name", osName)
-	p.set("browser_name", "mcode")
-	p.set("user_id", jsTrim(o.UserID))
-	if p.get("user_id") == "" {
-		p.set("user_id", "0")
-	}
-	p.set("client", "mcode")
 
 	query := p.encode()
 	target, at := resolveURL(origin, path, query)
@@ -243,34 +359,53 @@ func resolveURL(origin, path, query string) (target, at string) {
 }
 
 // params is an ordered query parameter set: setting a key that is
-// already there changes its value and keeps its place.
+// already there changes its value and keeps its place, and appending a
+// key puts it there a second time, further down.
 type params struct {
-	keys []string
-	vals map[string]string
+	entries []KV
+	// index is where a key's value is set, so that setting a key again
+	// changes its value and keeps its place.
+	index map[string]int
 }
 
 func newParams() *params {
-	return &params{vals: map[string]string{}}
+	return &params{index: map[string]int{}}
 }
 
 func (p *params) set(k, v string) {
-	if _, ok := p.vals[k]; !ok {
-		p.keys = append(p.keys, k)
+	if i, ok := p.index[k]; ok {
+		p.entries[i].V = v
+		return
 	}
-	p.vals[k] = v
+	p.index[k] = len(p.entries)
+	p.entries = append(p.entries, KV{K: k, V: v})
 }
 
-func (p *params) get(k string) string { return p.vals[k] }
+// append puts the key at the end, even when it is already there.
+//
+// The web client builds its query by appending: the caller's own
+// parameters first and the common ones after them, so a key that is in
+// both is in the query twice.
+func (p *params) append(k, v string) {
+	p.entries = append(p.entries, KV{K: k, V: v})
+}
+
+func (p *params) get(k string) string {
+	if i, ok := p.index[k]; ok {
+		return p.entries[i].V
+	}
+	return ""
+}
 
 func (p *params) encode() string {
 	var b strings.Builder
-	for i, k := range p.keys {
+	for i, e := range p.entries {
 		if i > 0 {
 			b.WriteByte('&')
 		}
-		b.WriteString(formEncode(k))
+		b.WriteString(formEncode(e.K))
 		b.WriteByte('=')
-		b.WriteString(formEncode(p.vals[k]))
+		b.WriteString(formEncode(e.V))
 	}
 	return b.String()
 }
