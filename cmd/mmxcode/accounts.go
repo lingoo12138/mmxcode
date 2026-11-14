@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"mmxcode/internal/store"
 )
 
 func newAccountsCmd(e *env) *cobra.Command {
@@ -58,7 +61,13 @@ func newAccountsRemoveCmd(e *env) *cobra.Command {
 		Short: "删除账号",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return e.store.DeleteAccount(context.Background(), args[0])
+			ctx := context.Background()
+			err := e.store.DeleteAccount(ctx, args[0])
+			if errors.Is(err, store.ErrNotFound) {
+				// 存储层说的是"没有这一行"，人说的是"没有这个账号"。
+				return fmt.Errorf("no such account: %s", args[0])
+			}
+			return err
 		},
 	}
 }
@@ -76,6 +85,9 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 			ctx := context.Background()
 			a, err := e.store.GetAccount(ctx, args[0])
 			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					return fmt.Errorf("no such account: %s", args[0])
+				}
 				return err
 			}
 			if group != "" {
@@ -88,8 +100,9 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 			if url != "" {
 				a.ProxyURL = url
 			}
-			a.UpdatedAt = nowUTC()
-			return e.store.UpdateAccount(ctx, a)
+			// 只写出口那两列。整行写回去会把别的写者在这中间改的东西抹掉：
+			// 登出刚写下的状态，会被这一次改代理抹回 active。
+			return e.store.SetAccountProxy(ctx, a.ID, a.ProxyGroup, a.ProxyURL, nowUTC())
 		},
 	}
 	cmd.Flags().StringVar(&group, "group", "", "出口组名")

@@ -228,3 +228,107 @@ func testEnv(t *testing.T) *env {
 	}
 	return &env{cfg: config.Default(), store: s}
 }
+
+// TestAccountsRemoveSaysThereIsNoSuchAccount says removing an account
+// that is not there says so in words a person can act on.
+//
+// 删一个没有的账号，要说"没有这个账号"，不是"store: not found"。
+func TestAccountsRemoveSaysThereIsNoSuchAccount(t *testing.T) {
+	e := testEnv(t)
+	cmd := newAccountsRemoveCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_nope"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("accounts remove took an account that is not there")
+	}
+	if !strings.Contains(err.Error(), "no such account") {
+		t.Errorf("the error does not say there is no such account: %v", err)
+	}
+	if !strings.Contains(err.Error(), "acc_nope") {
+		t.Errorf("the error does not name the account: %v", err)
+	}
+}
+
+// TestAccountsProxyKeepsTheOtherField says changing the group leaves
+// the address alone, and the other way round.
+//
+// 改组不动地址，改地址不动组。
+func TestAccountsProxyKeepsTheOtherField(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--url", "http://127.0.0.1:2:8080"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy --url: %v", err)
+	}
+
+	cmd = newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy --group: %v", err)
+	}
+
+	a, err := e.store.GetAccount(context.Background(), "acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if a.ProxyGroup != "hk" {
+		t.Errorf("the group is %q, want %q", a.ProxyGroup, "hk")
+	}
+	if a.ProxyURL != "http://127.0.0.1:2:8080" {
+		t.Errorf("the address is %q, want it kept", a.ProxyURL)
+	}
+}
+
+// TestAccountsProxyDoesNotUndoASignOut says changing an account's
+// outlet does not put a signed-out account back to active.
+//
+// 改出口不能把登出的账号改回 active。
+func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
+	e := testEnv(t)
+	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := e.store.UpdateAccountStatus(context.Background(), "acc_1",
+		store.StatusSignedOut, "the site refused the token", now); err != nil {
+		t.Fatalf("sign out: %v", err)
+	}
+
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy: %v", err)
+	}
+
+	a, err := e.store.GetAccount(context.Background(), "acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Errorf("the status is %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if a.LastError != "the site refused the token" {
+		t.Errorf("the last error is %q", a.LastError)
+	}
+}
