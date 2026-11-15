@@ -170,7 +170,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses` | Codex Responses |
-| `GET /v1/models` | 模型列表 |
+| `GET /v1/models` | 模型列表（站点自己那份） |
 | `GET /v1/usage` | magpie 的额度卡片：这个网关还剩多少积分 |
 
 管理接口，都在 `/api/` 下：
@@ -228,6 +228,14 @@ WebUI 页面：
 - 配了 `server.api_keys` 时，每个请求都要带 `x-api-key` 或 `Authorization: Bearer <key>`；两个头都没有、或者 key 不对，一律 401。
 - 鉴权对所有路径生效。带 key 的请求（`x-api-key` 头或 `Authorization: Bearer`）一律放行；不带 key 的请求分两种：`/api/` 下的接口回 401，浏览器要开的页面回登录页 `/signin`（200），登录页上填 key 换来的 cookie 之后就能进管理界面。
 - cookie 的值是拿 key 算出来的 HMAC，服务器自己不留东西；`HttpOnly`、`SameSite=Strict`，走 TLS 时才加 `Secure`。
+
+### 模型列表
+
+`GET /v1/models` 给的是**站点自己那份**名单：网关去 MiniMax 读一次，读到的留着（十分钟），客户端问十回，站点被问一回。
+
+- 问的时候不带账号的令牌：站点没有令牌也答，而带令牌去问有可能在路上把令牌续了 —— 一份模型名单不值得换一把新令牌。
+- 站点答不上来（断网、站点改形状）的时候，摆的是**内置的那一份**（`mmxcode models` 打印的就是它）。内置的那一份也会旧：MiniMax 把 `MiniMax-M3.1-Flash-Preview` 改叫 `MiniMax-M3.1-Flash` 之后，内置的那份差点就挑不到现在这个模型。所以它只是兜底，不是主路。
+- 站点现在给的名单是 `MiniMax-M3.1-Flash` 和 `MiniMax-M3`。
 
 ### 申请聊天用的 key
 

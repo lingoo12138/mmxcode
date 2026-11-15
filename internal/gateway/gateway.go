@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -81,6 +82,15 @@ type Server struct {
 	NativeChatCompletions atomic.Bool
 	// WebUI serves the management pages, when there is one.
 	WebUI http.Handler
+	// modelsMu guards the model list that was read.
+	modelsMu sync.Mutex
+	// models is the model list, the site's own or the built-in one.
+	models []site.Model
+	// modelsAt is when it was read.
+	modelsAt time.Time
+	// modelsLive says the list is the site's own, and not the built-in
+	// one that is served when the site cannot be reached.
+	modelsLive bool
 }
 
 // New makes a gateway.
@@ -956,15 +966,17 @@ func backConvert(body []byte, proto protocol, model string) ([]byte, error) {
 
 // handleModels serves the model list.
 //
-// The list is the built-in one. The site's own model endpoint answers
-// the shape of the provider config and not the shape of a model list,
-// so the live list was never read: it was fetched on every call and
-// thrown away, and it could even renew a token on the way.
+// The list is the site's own: it is read from MiniMax and kept for a
+// while, because the site's list changes a few times a year and a
+// client asking for it should not be made to wait for a trip to
+// MiniMax every time.
 //
-// 现场的模型列表不在这个网关的活儿里：网关给的是它自己知道的那一份。
+// 站点答不上来的时候摆的是内置的那一份：那是站点已知有的东西，比一
+// 份空名单好。内置的那一份也会旧（站点改过模型的名字），所以它只
+// 是兜底，不是主路。
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
-	for _, m := range site.FallbackModels() {
+	for _, m := range s.modelsFor(r.Context()) {
 		data = append(data, map[string]any{
 			"id": m.ID, "object": "model", "owned_by": "minimax",
 		})

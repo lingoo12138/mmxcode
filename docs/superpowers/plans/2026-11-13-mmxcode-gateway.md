@@ -9323,6 +9323,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -9373,6 +9374,15 @@ type Server struct {
 	NativeChatCompletions atomic.Bool
 	// WebUI serves the management pages, when there is one.
 	WebUI http.Handler
+	// modelsMu guards the model list that was read.
+	modelsMu sync.Mutex
+	// models is the model list, the site's own or the built-in one.
+	models []site.Model
+	// modelsAt is when it was read.
+	modelsAt time.Time
+	// modelsLive says the list is the site's own, and not the built-in
+	// one that is served when the site cannot be reached.
+	modelsLive bool
 }
 
 // New makes a gateway.
@@ -10248,15 +10258,17 @@ func backConvert(body []byte, proto protocol, model string) ([]byte, error) {
 
 // handleModels serves the model list.
 //
-// The list is the built-in one. The site's own model endpoint answers
-// the shape of the provider config and not the shape of a model list,
-// so the live list was never read: it was fetched on every call and
-// thrown away, and it could even renew a token on the way.
+// The list is the site's own: it is read from MiniMax and kept for a
+// while, because the site's list changes a few times a year and a
+// client asking for it should not be made to wait for a trip to
+// MiniMax every time.
 //
-// 现场的模型列表不在这个网关的活儿里：网关给的是它自己知道的那一份。
+// 站点答不上来的时候摆的是内置的那一份：那是站点已知有的东西，比一
+// 份空名单好。内置的那一份也会旧（站点改过模型的名字），所以它只
+// 是兜底，不是主路。
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
-	for _, m := range site.FallbackModels() {
+	for _, m := range s.modelsFor(r.Context()) {
 		data = append(data, map[string]any{
 			"id": m.ID, "object": "model", "owned_by": "minimax",
 		})
@@ -16076,25 +16088,35 @@ func TestABodyOverTheLimitIsRefused(t *testing.T) {
 	}
 }
 
-// TestTheModelListDoesNotAskTheUpstream says the model list is the
-// built-in one and that asking for it costs nothing.
+// TestTheModelListIsReadOnceFromTheSite says the model list is the
+// site's own, and that asking for it costs one request.
 //
 // 站点的模型接口给的是 provider config 的样子，不是模型列表的样子：
-// 每次去问都问不到东西，白白多一次上游请求，还可能顺手续一次令牌。
-// 现场的模型列表本来就不在这个网关的活儿里。
-func TestTheModelListDoesNotAskTheUpstream(t *testing.T) {
+// 要读它得照着那个样子读（internal/account 的 ParseModels）。问的时候
+// 不带令牌 —— 带上有可能在路上把令牌续了，一份模型名单不值得换一把
+// 新令牌。
+//
+// 名单一年也换不了几回，所以读到的那份留着：客户端问十回，站点被问一
+// 回。答得看不懂的时候（这里答的是模型列表的样子，不是 provider
+// config 的样子）摆的还是内置的那一份。
+func TestTheModelListIsReadOnceFromTheSite(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"data":[{"id":"whatever"}]}`))
 	})
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	w := httptest.NewRecorder()
-	h.gw.ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("code = %d", w.Code)
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+		h.gw.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("code = %d", w.Code)
+		}
+		last = w
 	}
-	if h.hits != 0 {
-		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	if h.hits != 1 {
+		t.Fatalf("the upstream was asked %d times, want 1", h.hits)
 	}
+	w := last
 	var body struct {
 		Object string `json:"object"`
 		Data   []struct {

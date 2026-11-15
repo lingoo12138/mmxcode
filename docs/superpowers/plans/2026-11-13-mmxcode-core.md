@@ -1233,6 +1233,15 @@ var fallbackModels = []Model{
 		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
 	},
 	{
+		// 站点现在叫这个名字：M3.1-Flash-Preview 是它以前的名字，
+		// 站点自己给的那个 id 才是客户端要用的。
+		ID: "MiniMax-M3.1-Flash", Name: "M3.1-Flash",
+		Context: 1048576, Output: 524288,
+		Inputs:   []string{"text", "image", "video"},
+		Thinking: ThinkingForcedOn,
+		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
+	},
+	{
 		ID: "MiniMax-M3", Name: "M3",
 		Context: 1048576, Output: 524288,
 		Inputs:   []string{"text", "image", "video"},
@@ -1377,6 +1386,7 @@ func TestFallbackModelsLimits(t *testing.T) {
 	}
 	wants := map[string]want{
 		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
+		"MiniMax-M3.1-Flash":         {1048576, 524288, "M3.1-Flash", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
 		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, []string{"none", "high"}},
 		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn, nil},
 		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn, nil},
@@ -16788,11 +16798,14 @@ func TestModelsPrintsTheFallbackList(t *testing.T) {
 		}
 		lines++
 	}
-	if lines != 4 {
-		t.Errorf("models printed %d lines, want 4:\n%s", lines, out)
+	if lines != 5 {
+		t.Errorf("models printed %d lines, want 5:\n%s", lines, out)
 	}
 	if !strings.Contains(out, "MiniMax-M3") {
 		t.Errorf("models did not mention MiniMax-M3:\n%s", out)
+	}
+	if !strings.Contains(out, "MiniMax-M3.1-Flash") {
+		t.Errorf("models did not mention MiniMax-M3.1-Flash:\n%s", out)
 	}
 }
 

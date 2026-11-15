@@ -50,6 +50,15 @@ var fallbackModels = []Model{
 		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
 	},
 	{
+		// 站点现在叫这个名字：M3.1-Flash-Preview 是它以前的名字，
+		// 站点自己给的那个 id 才是客户端要用的。
+		ID: "MiniMax-M3.1-Flash", Name: "M3.1-Flash",
+		Context: 1048576, Output: 524288,
+		Inputs:   []string{"text", "image", "video"},
+		Thinking: ThinkingForcedOn,
+		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
+	},
+	{
 		ID: "MiniMax-M3", Name: "M3",
 		Context: 1048576, Output: 524288,
 		Inputs:   []string{"text", "image", "video"},

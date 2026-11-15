@@ -69,11 +69,14 @@ func TestModelsPrintsTheFallbackList(t *testing.T) {
 		}
 		lines++
 	}
-	if lines != 4 {
-		t.Errorf("models printed %d lines, want 4:\n%s", lines, out)
+	if lines != 5 {
+		t.Errorf("models printed %d lines, want 5:\n%s", lines, out)
 	}
 	if !strings.Contains(out, "MiniMax-M3") {
 		t.Errorf("models did not mention MiniMax-M3:\n%s", out)
+	}
+	if !strings.Contains(out, "MiniMax-M3.1-Flash") {
+		t.Errorf("models did not mention MiniMax-M3.1-Flash:\n%s", out)
 	}
 }
 

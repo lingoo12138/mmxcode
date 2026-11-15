@@ -718,6 +718,12 @@ type modelEntry struct {
 	EffortOptions []string `json:"effort_options"`
 }
 
+// ParseModels reads MiniMax Code's model config as models.
+//
+// It is the exported face of the reading: the gateway reads the site's
+// own list itself, and the answer it gets is in this shape.
+func ParseModels(body []byte) []site.Model { return parseModels(body) }
+
 // parseModels reads MiniMax Code's model config as models.
 //
 // The answer is {providers:[{providerId:"minimax",config:{models:{<id>:{…}},
