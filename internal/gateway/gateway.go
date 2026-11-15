@@ -118,6 +118,8 @@ type Server struct {
 
 // New makes a gateway.
 func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Handler) *Server {
+	// 多久算热是配置说了算：管理器记着谁刚被用过，这个窗口是它的。
+	mgr.HotWindow = cfg.Usage.Refresh.HotWindow.Duration()
 	g := &Server{
 		Mgr:          mgr,
 		Cfg:          cfg,
@@ -145,6 +147,13 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		Strategy:    cfg.Rotation.Strategy,
 	})
 	return g
+}
+
+// round makes the reader of the credits.
+//
+// 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
+func (s *Server) round() *usage.Round {
+	return usage.NewRound(s.Store, s.Reader, s.Mgr.HotAccounts, s.Cfg)
 }
 
 // Close stops the background work and waits for it.

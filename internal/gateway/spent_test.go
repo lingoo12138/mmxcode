@@ -25,6 +25,8 @@ type fakeReader struct {
 	err error
 	// reads counts the readings that were asked for.
 	reads int
+	// asked are the accounts the readings were asked for.
+	asked []string
 }
 
 // set gives the reader what it should say.
@@ -40,6 +42,7 @@ func (f *fakeReader) RefreshUsage(ctx context.Context, accountID string) (store.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
+	f.asked = append(f.asked, accountID)
 	if f.err != nil {
 		return store.UsageSnapshot{}, f.err
 	}
@@ -51,6 +54,15 @@ func (f *fakeReader) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.reads
+}
+
+// askedFor says which accounts the readings were asked for.
+//
+// 它记下问的是谁：光数次数说不清是哪些账号被问过。
+func (f *fakeReader) askedFor() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.asked...)
 }
 
 // readingOf makes a reading that says the windows it has.

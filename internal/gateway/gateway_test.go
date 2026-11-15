@@ -1540,6 +1540,95 @@ func TestTheUsageCardIsMagpiesShape(t *testing.T) {
 	}
 }
 
+// TestTheCardRefreshReadsOnlyTheHotAccounts says the card's refresh
+// reads the hot accounts and no others.
+//
+// 卡片是 magpie 画的：它等不了。顺序读所有账号就是卡死的来源 —— 一
+// 个账号要问三四个请求，N 个账号就是 N 倍。
+func TestTheCardRefreshReadsOnlyTheHotAccounts(t *testing.T) {
+	var mu sync.Mutex
+	var askedAbout []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		// 站点被问起了谁：账号的 user_id 就在地址上。
+		mu.Lock()
+		askedAbout = append(askedAbout, r.URL.Query().Get("user_id"))
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	})
+	// 管理器读额度也指到假服务器：这一条路上同样不碰 MiniMax 自己。
+	h.gw.Mgr.Acc.SetBase(h.srv.URL, h.srv.URL)
+	ctx := context.Background()
+	now := time.Now()
+	// 两个热账号：它们得在库里，读到的数才有地方可写（外键指着账号）。
+	for _, id := range []string{"acc_hot1", "acc_hot2"} {
+		h.store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "0987654321",
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	// 冷账号上一次读到的数：卡片要摆着它。
+	if err := h.store.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 500, Consumed: 62.5, Remaining: 437.5,
+		Plan: "Token Plan M3", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 这两个刚被用过：它们是最热的。
+	h.gw.Mgr.MarkUsed("acc_hot1")
+	h.gw.Mgr.MarkUsed("acc_hot2")
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage?refresh=1", nil)
+	rec := httptest.NewRecorder()
+	h.gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// 读的是那两个热的。
+	asked := map[string]bool{}
+	for _, id := range h.reader.askedFor() {
+		asked[id] = true
+	}
+	for _, id := range []string{"acc_hot1", "acc_hot2"} {
+		if !asked[id] {
+			t.Errorf("the reader was not asked for %s, it was asked for %v", id, h.reader.askedFor())
+		}
+	}
+	// 冷的那个没有读：它上一次读到的数摆着就够。
+	if asked["acc_01"] {
+		t.Errorf("the reader was asked for the cold acc_01, it was asked for %v", h.reader.askedFor())
+	}
+	// 站点也没有被问起冷账号：那一个一个读就是卡片卡死的地方。
+	mu.Lock()
+	about := append([]string(nil), askedAbout...)
+	mu.Unlock()
+	for _, uid := range about {
+		if uid == "1234567890" {
+			t.Errorf("the site was asked about the cold acc_01: %v", about)
+			break
+		}
+	}
+	// 卡片还是卡片的形状。
+	var out struct {
+		Plan    string `json:"plan"`
+		Balance string `json:"balance"`
+		Windows []struct {
+			Name string `json:"name"`
+		} `json:"windows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Plan != "Token Plan M3" {
+		t.Errorf("plan = %q, want %q", out.Plan, "Token Plan M3")
+	}
+	if out.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q", out.Balance, "437.5 credits")
+	}
+	if len(out.Windows) == 0 {
+		t.Error("the card has no windows")
+	}
+}
+
 // TestTheUsageCardNeedsAKey says the card is behind the key.
 //
 // 卡片说的是这个网关还剩多少积分：那不是给路人看的。

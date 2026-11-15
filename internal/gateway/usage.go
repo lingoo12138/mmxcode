@@ -16,14 +16,17 @@ import (
 // 把我们这些账号的积分画出来。
 //
 // 卡片说的是上一次读到的数（调度器每 15 分钟读一遍，后台页面上也有一个
-// 「刷新」按钮）。要现读一遍就在地址上加 refresh=1。
+// 「刷新」按钮）。要现读一遍就在地址上加 refresh=1：那一遍只现读最热的几
+// 个账号 —— 卡片等不了所有账号的账。
 //
 // 这个接口在聊天那扇门后面：手里有那把 key 的（聊天用的、或者后台登录
 // 用的）都能问。问不到的就是没带 key。
 func (s *Server) usageCard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if r.URL.Query().Get("refresh") == "1" && s.Mgr != nil {
-		res, err := s.Mgr.RefreshAllUsage(ctx)
+		// 卡片那条路只现读最热的几个：卡片永远几秒内回来。其余的账
+		// 用上一次读到的数。
+		res, err := s.round().RefreshHot(ctx)
 		if err != nil {
 			// 读不到不是没有卡片：上一次读到的数照样摆出来，只是它是
 			// 上一次的。理由记在日志里。
