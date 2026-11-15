@@ -532,6 +532,14 @@ func TestTheLatestCheckinsOfEveryAccount(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save checkin: %v", err)
 	}
+	// 同一天再签一次是改那一行，不是插第二行：id 不变，时刻往前走。
+	// 于是"id 最大的那条"不是最新的那条。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_1", Day: "2026-11-14", Outcome: "claimed",
+		Credit: 40, Streak: 1, CreatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
 	got, err := s.LatestCheckins(context.Background())
 	if err != nil {
 		t.Fatalf("latest checkins: %v", err)
@@ -539,10 +547,15 @@ func TestTheLatestCheckinsOfEveryAccount(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("the check-ins = %d, want one per account", len(got))
 	}
+	byAccount := map[string]store.Checkin{}
 	for _, c := range got {
-		if c.AccountID == "acc_1" && c.Credit != 20 {
-			t.Errorf("acc_1's check-in = %v, want the newest one", c.Credit)
-		}
+		byAccount[c.AccountID] = c
+	}
+	if byAccount["acc_1"].Credit != 40 {
+		t.Errorf("acc_1's check-in = %v, want the newest one", byAccount["acc_1"])
+	}
+	if byAccount["acc_2"].Credit != 30 {
+		t.Errorf("acc_2's check-in = %v, want its own", byAccount["acc_2"])
 	}
 }
 
@@ -709,16 +722,20 @@ go test ./internal/store/ ./internal/usage/
 ```go
 // LatestCheckins gives each account's newest check-in.
 //
-// The newest is the row with the greatest id: two check-ins of one
-// account can share a day, and the day alone would then name two rows.
-// The id grows with every row written, so it tells them apart, and
-// there is one row per account, always.
+// The newest is the one written last: a day is unique for an account,
+// but the same day's row is updated in place — its id stays the one it
+// was given and only its time moves. So the id does not say which
+// check-in is the latest; the time does. Ties go to the greater id.
 func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.account_id, c.day, c.outcome, c.credit, c.streak, c.message, c.created_at
 		FROM checkins c
-		JOIN (SELECT account_id, MAX(id) AS mid FROM checkins GROUP BY account_id)
-			m ON m.account_id = c.account_id AND m.mid = c.id
+		WHERE c.id = (
+			SELECT c2.id FROM checkins c2
+			WHERE c2.account_id = c.account_id
+			ORDER BY c2.created_at DESC, c2.id DESC
+			LIMIT 1
+		)
 		ORDER BY c.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("latest checkins: %w", err)
@@ -820,7 +837,9 @@ type target struct {
 // Targets gives the accounts to read now, in the order they should be
 // read.
 //
-// 该读的 = 从没读过的 ∪ 热的 ∪ 签到待补的 ∪ 标记到期的。
+// 该读的排在前面：签到待补的、标记到期的、从没读过的、热的。冷账号也
+// 在名单里，排在最后：一趟最多读几个（批次），排在前面的是该读的，
+// 冷账号排在后面——它被读到的时候读到的数也是旧的。
 func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	accounts, err := r.Store.ListAccounts(ctx)
 	if err != nil {
@@ -896,30 +915,20 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	// 其余的最久没读的先：越旧越可能过期。
-	cold := []string{}
-	for _, t := range ts {
-		if t.rank == rankCold {
-			cold = append(cold, t.id)
-		}
-	}
-	sort.SliceStable(cold, func(i, j int) bool {
-		return snapAt[cold[i]].Before(snapAt[cold[j]])
-	})
-	coldAt := map[string]int{}
-	for i, id := range cold {
-		coldAt[id] = i
-	}
-	for i := range ts {
-		if ts[i].rank == rankCold {
-			ts[i].order = coldAt[ts[i].id]
-		}
-	}
+	// 排在前面的先读。同一组里：冷账号最久没读的先（越旧越可能过期），
+	// 热的按用得多的先，其余按 id 分出来——结果每次一样。
 	sort.SliceStable(ts, func(i, j int) bool {
 		if ts[i].rank != ts[j].rank {
 			return ts[i].rank < ts[j].rank
 		}
-		return ts[i].order < ts[j].order
+		if ts[i].rank == rankCold {
+			if !snapAt[ts[i].id].Equal(snapAt[ts[j].id]) {
+				return snapAt[ts[i].id].Before(snapAt[ts[j].id])
+			}
+		} else if ts[i].order != ts[j].order {
+			return ts[i].order < ts[j].order
+		}
+		return ts[i].id < ts[j].id
 	})
 
 	out := make([]string, 0, len(ts))
@@ -2560,37 +2569,87 @@ git commit -m "feat(gateway): 卡片只现读最热的账号"
 
 - [ ] **Step 1: 写失败的测试**
 
-`internal/scheduler/scheduler_test.go` 里加：
+`internal/scheduler/scheduler_test.go` 里加（照着这个文件里 `TestUsageRefresh` 的那套环境写：起一个替身的站点服务器，让账本那个请求答一个数出来）：
 
 ```go
 // TestTheUsageRoundReadsTheAccountsThatNeedIt says the round reads the
-// accounts that need a reading, and not every account.
+// accounts that need a reading first, and stops at the batch.
 //
-// 账号多起来以后，冷账号的额度没有必要读：读了也是旧的。
+// 账号多起来以后，冷账号的额度没有必要读：读了也是旧的。批次满了就
+// 停，剩下的下一趟接着读——排在前面的是该读的。
 func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
-	s := newStore(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
 	now := time.Now()
-	for _, id := range []string{"acc_1", "acc_2"} {
-		if err := s.CreateAccount(context.Background(), store.Account{
-			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("create account: %v", err)
+	// acc_never 一次也没读过：它得读一次，不然卡上没有它。
+	// acc_cold 很久以前读过：它排在后面，这一趟轮不到它。
+	for _, id := range []string{"acc_never", "acc_cold"} {
+		s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_cold", Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: now.Add(-2 * time.Hour),
+	})
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	// The account API is pointed at the test server. Without this the
+	// test asks MiniMax for the numbers and waits for an answer that
+	// never comes.
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	// 一趟只读一个：读谁由排在前面的说了算。
+	cfg.Usage.Refresh.Batch = 1
+	sc := New(mgr, cfg)
+	sc.RefreshUsage(ctx)
+
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有那个从没读过的被读了。
+	fresh := 0
+	for _, snap := range snaps {
+		if snap.CreatedAt.After(now) {
+			fresh++
 		}
 	}
-	// acc_1 刚被用过：它是热的。
-	// acc_2 一次也没用过：它得读一次，不然卡上没有它。
-	sc := &Scheduler{Mgr: ..., Cfg: config.Default()}
-	...
+	if fresh != 1 {
+		t.Fatalf("the accounts read = %d, want only the one that needed it: %+v", fresh, snaps)
+	}
 }
 ```
-
-（这一条要照着 `internal/scheduler/scheduler_test.go` 里现有的那套测试环境写：那里已经有 `newStore` 和一个替身的 manager。）
 
 - [ ] **Step 2: 运行测试确认失败**
 
 ```
 go test ./internal/scheduler/
 ```
+
+失败：现在的 `RefreshUsage` 把每个账号都读了一遍，这一趟读了 2 个而不是 1 个。
 
 - [ ] **Step 3: 调度器读该读的**
 
