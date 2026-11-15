@@ -301,3 +301,79 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 		t.Fatalf("finish_reason = %q", finish)
 	}
 }
+
+// TestTheOpenAIRequestFallsBackWhenTheOpenPlatformIsNotConfigured says a
+// 503 from the open platform is "this account has no route there", not a
+// failure to hand to the client.
+//
+// MiniMax 的开放平台是给 API key 用的：MiniMax Code 的账号在那条路上没有
+// 配好的路由，站点答的是 503 和 direct_route_not_configured。这不是站点
+// 坏了，是这条路对这个账号不通 —— 跟"没有这条路"是一回事，该走 Anthropic
+// 那条。
+func TestTheOpenAIRequestFallsBackWhenTheOpenPlatformIsNotConfigured(t *testing.T) {
+	rec := &upstreamRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		if r.URL.Path == site.ChatCompletionsPath {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"open platform service unavailable, please retry",` +
+				`"errorCode":50115,"errorReason":"direct_route_not_configured"}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[{"type":"text","text":"hi"}]}`))
+	})
+
+	body := `{"model":"m","max_completion_tokens":32,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	paths, _ := rec.seen()
+	if len(paths) != 2 {
+		t.Fatalf("the upstream was asked %d times: %v", len(paths), paths)
+	}
+	if paths[1] != site.MessagesPath {
+		t.Fatalf("the second path = %q, want the Anthropic one", paths[1])
+	}
+	// 这一趟把这个账号的这条路关掉了，后面的请求不再去撞它。
+	if h.gw.NativeChatCompletions.Load() {
+		t.Fatal("the native path is still on")
+	}
+}
+
+// TestTheCodexRequestFallsBackWhenTheOpenPlatformIsNotConfigured says the
+// same for the Responses protocol.
+//
+// Codex 客户端走的是 /v1/responses，那条路在开放平台上也不通。
+func TestTheCodexRequestFallsBackWhenTheOpenPlatformIsNotConfigured(t *testing.T) {
+	rec := &upstreamRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		if r.URL.Path == site.ResponsesPath {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"open platform service unavailable, please retry",` +
+				`"errorCode":50115,"errorReason":"direct_route_not_configured"}`))
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[{"type":"text","text":"hi"}]}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	paths, _ := rec.seen()
+	if len(paths) != 2 {
+		t.Fatalf("the upstream was asked %d times: %v", len(paths), paths)
+	}
+	if paths[1] != site.MessagesPath {
+		t.Fatalf("the second path = %q, want the Anthropic one", paths[1])
+	}
+	if h.gw.NativeResponses.Load() {
+		t.Fatal("the native path is still on")
+	}
+}

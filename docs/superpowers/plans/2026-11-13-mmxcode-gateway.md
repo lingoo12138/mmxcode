@@ -9695,8 +9695,12 @@ accountLoop:
 				continue
 			}
 
-			// 上游没有这条路：改用本地转换，同一个账号再来一次
-			if resp.StatusCode == http.StatusNotFound {
+			// 上游没有这条路：改用本地转换，同一个账号再来一次。
+			//
+			// 开放平台对 MiniMax Code 的账号答的也是「没有这条路」：503
+			// 加一句 direct_route_not_configured。那不是站点坏了，是那条
+			// 路对这个账号不通 —— 该走 Anthropic 那条。
+			if resp.StatusCode == http.StatusNotFound || openPlatformNotConfigured(raw) {
 				fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
 				if ok {
 					upBody, upPath, convertBack = fb, fp, fback
@@ -9886,6 +9890,26 @@ func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool,
 		message = fmt.Sprintf("the upstream answered with HTTP %d", status)
 	}
 	writeError(w, proto, status, message)
+}
+
+// openPlatformNotConfigured says the upstream's answer is "the open
+// platform has no route for this account".
+//
+// MiniMax 的开放平台是给 API key 用的：MiniMax Code 的账号在那条路上没
+// 有配好的路由，站点答的是 503、errorCode 50115、direct_route_not_configured。
+// 这不是站点坏了，是这条路对这个账号不通：跟「没有这条路」是一回事。
+func openPlatformNotConfigured(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var env struct {
+		ErrorCode   int    `json:"errorCode"`
+		ErrorReason string `json:"errorReason"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return false
+	}
+	return env.ErrorCode == 50115 || env.ErrorReason == "direct_route_not_configured"
 }
 
 // attempt sends the request upstream and gives the answer back.

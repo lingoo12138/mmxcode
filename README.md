@@ -378,6 +378,9 @@ WARP 是额外的出口选项，跟按账号单独指定的代理并列。
 
 - **OpenAI**：先按原样发给上游的 `/chat/completions`；上游回 404（就是没有这个接口）时，改成本地转成 Anthropic 的 `/messages` 再发一次，回来的答案转回 OpenAI 的形状。这个判断只做一次，之后都走本地转换。
 - **Codex**：同样的办法，先试 `/responses`，404 就转成 Anthropic 再发。
+- **还有一种「没有这条路」**：MiniMax 的开放平台是给 API key 用的，MiniMax Code 的账号在那条路上没有配好的路由，站点答的是 **503** 加一句 `direct_route_not_configured`（`errorCode` 50115）。这不是站点坏了，是那条路对这个账号不通。网关认得这个回答，跟 404 一样处理：关掉那条路，改走 Anthropic。
+
+  认不出来的话，客户端拿到的就是 503 —— magpie 之类用 OpenAI 协议的客户端，一次对话都开不了头。
 
 转换出来的形状是客户端真的能用的：Codex 的非流式回答里，工具调用是 `function_call` 条目（`call_id`、`name`、`arguments` 都在），不是一段空文本。
 
