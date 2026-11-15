@@ -54,11 +54,20 @@ const headersFor = (key) => {
 // variantsOf are a model's reasoning levels, as @ai-sdk/anthropic options.
 //
 // "none" 是把思考关掉（模型自己说关得掉的时候）；其余的是思考的档位。
+//
+// 名单里的 "none" 和 "default" 是占位，不是档位，滤掉它们：不然
+// efforts 里一个 "none" 就把关掉思考的那一档盖掉，变成"adaptive 思考
+// + effort=none" —— 选它的人以为关了思考，其实没关。参考插件在读活
+// 名单的时候就这么滤（minimax/index.mjs:266）。
 function variantsOf(thinking, efforts) {
   const out = {}
   if (thinking === "switchable") out.none = { thinking: { type: "disabled" } }
-  if (efforts.length) {
-    for (const e of efforts) out[e] = { thinking: { type: "adaptive" }, effort: e }
+  const levels = efforts.filter((e) => {
+    const s = String(e).trim().toLowerCase()
+    return s !== "none" && s !== "default"
+  })
+  if (levels.length) {
+    for (const e of levels) out[e] = { thinking: { type: "adaptive" }, effort: e }
   } else if (thinking === "switchable") {
     out.high = { thinking: { type: "adaptive" } }
   }
@@ -154,9 +163,10 @@ async function modelsOf(base, key) {
 // authorize tries the gateway once, so that a sign-in that cannot work
 // says why.
 //
-// 有 key 而网关不认，是 key 的问题。没有 key 而网关说 401，不是问
-// 题：那是说"我要一把 key"，而那把 key 是可以没有的（网关一把 key
-// 都没有的时候它自己认）。
+// 网关一把 key 都没有的时候它自己认：聊天接口不鉴权，答的是 200 —— 那
+// 把 key 可以不填。网关有 key 的时候，没给对就答 401：那说明这次没给
+// 上，签入不能算成功（magpie 会把这样的账号记成签入失效，用户连原因
+// 都看不到）。
 async function authorize(base, key) {
   try {
     const res = await globalThis.fetch(base + "/v1/models", { headers: headersFor(key) })
@@ -165,7 +175,7 @@ async function authorize(base, key) {
       if (key) {
         return { type: "failed", error: "网关拒绝了这把 key —— 它开的是哪扇门？聊天接口要聊天 key，后台登录 key 也行" }
       }
-      return { type: "success", key: undefined, metadata: { base } }
+      return { type: "failed", error: "网关要一把 key：聊天接口要聊天 key（后台 /keys 申请的），后台登录 key 也行" }
     }
     return { type: "failed", error: `网关答了 HTTP ${res.status}` }
   } catch (e) {

@@ -218,11 +218,20 @@ const headersFor = (key) => {
 // variantsOf are a model's reasoning levels, as @ai-sdk/anthropic options.
 //
 // "none" 是把思考关掉（模型自己说关得掉的时候）；其余的是思考的档位。
+//
+// 名单里的 "none" 和 "default" 是占位，不是档位，滤掉它们：不然
+// efforts 里一个 "none" 就把关掉思考的那一档盖掉，变成"adaptive 思考
+// + effort=none" —— 选它的人以为关了思考，其实没关。参考插件在读活
+// 名单的时候就这么滤（minimax/index.mjs:266）。
 function variantsOf(thinking, efforts) {
   const out = {}
   if (thinking === "switchable") out.none = { thinking: { type: "disabled" } }
-  if (efforts.length) {
-    for (const e of efforts) out[e] = { thinking: { type: "adaptive" }, effort: e }
+  const levels = efforts.filter((e) => {
+    const s = String(e).trim().toLowerCase()
+    return s !== "none" && s !== "default"
+  })
+  if (levels.length) {
+    for (const e of levels) out[e] = { thinking: { type: "adaptive" }, effort: e }
   } else if (thinking === "switchable") {
     out.high = { thinking: { type: "adaptive" } }
   }
@@ -318,9 +327,10 @@ async function modelsOf(base, key) {
 // authorize tries the gateway once, so that a sign-in that cannot work
 // says why.
 //
-// 有 key 而网关不认，是 key 的问题。没有 key 而网关说 401，不是问
-// 题：那是说"我要一把 key"，而那把 key 是可以没有的（网关一把 key
-// 都没有的时候它自己认）。
+// 网关一把 key 都没有的时候它自己认：聊天接口不鉴权，答的是 200 —— 那
+// 把 key 可以不填。网关有 key 的时候，没给对就答 401：那说明这次没给
+// 上，签入不能算成功（magpie 会把这样的账号记成签入失效，用户连原因
+// 都看不到）。
 async function authorize(base, key) {
   try {
     const res = await globalThis.fetch(base + "/v1/models", { headers: headersFor(key) })
@@ -329,7 +339,7 @@ async function authorize(base, key) {
       if (key) {
         return { type: "failed", error: "网关拒绝了这把 key —— 它开的是哪扇门？聊天接口要聊天 key，后台登录 key 也行" }
       }
-      return { type: "success", key: undefined, metadata: { base } }
+      return { type: "failed", error: "网关要一把 key：聊天接口要聊天 key（后台 /keys 申请的），后台登录 key 也行" }
     }
     return { type: "failed", error: `网关答了 HTTP ${res.status}` }
   } catch (e) {
@@ -555,18 +565,37 @@ test("the sign-in keeps the address", async (t) => {
   assert.equal(res.metadata.base, base)
 })
 
-// TestTheSignInWithoutAKeyIsFine says a gateway that wants a key is
-// not a failed sign-in.
+// TestTheSignInSaysTheGatewayWantsAKey says a gateway that wants a key
+// is said in words.
 //
-// 那把 key 是 magpie 自己问用户要的：它还没有，所以 401 不是失败。
-test("the sign-in without a key is fine", async (t) => {
+// 网关一把 key 都没有的时候它自己认：聊天接口不鉴权，答的是 200。所以
+// 401 只可能是"网关有 key，而这次没给对"—— 少填了，或者填错了。签入
+// 不该把它当成功：magpie 会把这样的账号记成签入失效，用户连原因都
+// 看不到。
+test("the sign-in says the gateway wants a key", async (t) => {
   const base = await aGateway(t, (req, res) => {
     res.writeHead(401)
     res.end("{}")
   })
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base })
+  assert.equal(res.type, "failed")
+  assert.match(res.error, /网关要一把 key/)
+})
+
+// TestTheSignInWithoutAKeyIsFine says a gateway that wants no key is
+// signed in without one.
+//
+// 网关一把 key 都没有的时候它自己认：那把 key 可以不填，签入照样成。
+test("the sign-in without a key is fine", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ object: "list", data: [] }))
+  })
+  const plugin = await thePlugin()
+  const res = await plugin.auth.methods[0].authorize({ base })
   assert.equal(res.type, "success")
+  assert.equal(res.key, undefined)
 })
 
 // TestTheCardIsHandedOverAsItIs says the card comes from the gateway
@@ -628,6 +657,34 @@ test("the models are the gateway's", async (t) => {
   assert.equal(m.api.npm, "@ai-sdk/anthropic")
   assert.equal(m.api.url, base + "/v1")
   assert.ok(m.variants.low, "the reasoning levels are not said")
+})
+
+// TestTheNoneEffortDoesNotCoverTurningThinkingOff says a "none" in the
+// effort list does not take the "turn thinking off" level away.
+//
+// 名单里的 "none" 和 "default" 是占位，不是档位：滤掉它们，"none" 这
+// 一档才只可能是"把思考关掉"。不然选 none 的人以为关了思考，其实关
+// 的是"adaptive 思考 + effort=none"。
+test("the 'none' effort does not cover turning thinking off", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(
+      JSON.stringify({
+        object: "list",
+        data: [{ id: "MiniMax-M3", thinking: "switchable", efforts: ["none", "default", "high"] }],
+      }),
+    )
+  })
+  const plugin = await thePlugin()
+  const provider = { id: "mmxcode", models: {} }
+  const got = await plugin.provider.models(provider, { auth: { type: "api", key: "sk-x", metadata: { base } } })
+  const v = got["MiniMax-M3"].variants
+  // 选 none 是把思考关掉：没有 effort 跟着。
+  assert.deepEqual(v.none, { thinking: { type: "disabled" } })
+  assert.equal(v.none.effort, undefined)
+  assert.deepEqual(v.high, { thinking: { type: "adaptive" }, effort: "high" })
+  // "default" 是占位：它不是一档。
+  assert.equal(v.default, undefined)
 })
 
 // TestTheModelsFallBackWhenTheGatewayIsSilent says the built-in list
