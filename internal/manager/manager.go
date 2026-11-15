@@ -51,6 +51,11 @@ const renewWindow = 10 * time.Minute
 // others'.
 const accountTimeout = 5 * time.Second
 
+// defaultHotWindow is how long an account counts as hot when nobody says.
+//
+// 五个分钟：刚用过一次的账号，它的额度最可能刚变。
+const defaultHotWindow = 5 * time.Minute
+
 // The reasons an account's last error says.
 //
 // They say which case it is, because the two are mended in different
@@ -95,6 +100,16 @@ type Manager struct {
 	ReloginFn ReloginFunc
 	// reloginLocks serialises the relogin of one account.
 	reloginLocks reloginLocks
+	// hot counts the accounts that were used lately.
+	hot *hotCounter
+	// HotWindow is how long an account counts as hot after it was used.
+	//
+	// 它是配置说了算，所以它是公开的：网关起的时候会把它设成配置里的
+	// 那个。没有人设它的时候是五分钟。
+	//
+	// 它是起来的时候写一次、之后只读的东西，所以没有锁：写它要在服务
+	// 起来之前。
+	HotWindow time.Duration
 }
 
 // reloginLocks serialises the relogin of one account.
@@ -128,7 +143,9 @@ func (l *reloginLocks) lock(id string) func() {
 func New(s *store.Store, up *upstream.Client, acc *account.Client, egr *egress.Resolver, rw *oauth.Renewer) *Manager {
 	return &Manager{
 		Store: s, Up: up, Acc: acc, Egress: egr, Renewer: rw,
-		TokenURL: site.AccountURL(site.TokenPath),
+		TokenURL:  site.AccountURL(site.TokenPath),
+		hot:       newHotCounter(),
+		HotWindow: defaultHotWindow,
 	}
 }
 
@@ -1063,4 +1080,29 @@ func WindowGroup(model string) string {
 		return "video"
 	}
 	return "general"
+}
+
+// MarkUsed says an account was used.
+//
+// 聊天成功一次就算一次"用过"：热账号是"刚刚"的账，而这一笔就是刚刚。
+func (m *Manager) MarkUsed(accountID string) {
+	m.hot.mark(accountID, m.hotWindow(), time.Now())
+}
+
+// HotAccounts gives the accounts that were used lately, the most used
+// first.
+//
+// 它给的是"刚刚"的那批账号：读额度的时候它们在热的那一组里。
+func (m *Manager) HotAccounts() []string {
+	return m.hot.list(m.hotWindow(), time.Now())
+}
+
+// hotWindow says how long an account counts as hot.
+//
+// 配 0 的时候按默认算：0 分钟的窗口等于没有热账号，那不是关掉，是坏了。
+func (m *Manager) hotWindow() time.Duration {
+	if m.HotWindow <= 0 {
+		return defaultHotWindow
+	}
+	return m.HotWindow
 }
