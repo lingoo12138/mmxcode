@@ -16,7 +16,7 @@ func TestFallbackModelsLimits(t *testing.T) {
 	wants := map[string]want{
 		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
 		"MiniMax-M3.1-Flash":         {1048576, 524288, "M3.1-Flash", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
-		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, []string{"none", "high"}},
+		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, nil},
 		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn, nil},
 		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn, nil},
 	}
@@ -103,6 +103,17 @@ func TestAModelThatIsNotVerifiedKeepsItsOwnLimits(t *testing.T) {
 	}
 }
 
+// TestM3ThinkingVariants says M3's thinking is switchable and that it
+// names no effort levels.
+//
+// "none" 和 "default" 不是档位，是占位。参考插件读活名单的时候就把它们
+// 滤掉了（minimax/index.mjs 里 parseModels 的那一行 filter），它自己的
+// 内置名单里 M3 写的也是 efforts: []。
+//
+// 名单里留一个叫 "none" 的档位是有害的：插件那边先摆 none = 把思考关掉
+// 那一档，再遍历档位表 —— 档位表里有个叫 "none" 的，就把「关掉思考」
+// 那一档盖成「adaptive 思考 + effort=none」。选 none 的人以为关了思考，
+// 其实没关。
 func TestM3ThinkingVariants(t *testing.T) {
 	var m Model
 	for _, x := range FallbackModels() {
@@ -113,8 +124,7 @@ func TestM3ThinkingVariants(t *testing.T) {
 	if m.Thinking != ThinkingSwitchable {
 		t.Fatalf("M3 thinking = %q", m.Thinking)
 	}
-	// 规格里 M3 是 switchable：none / high
-	if len(m.Efforts) != 2 || m.Efforts[0] != "none" || m.Efforts[1] != "high" {
-		t.Fatalf("M3 efforts = %v", m.Efforts)
+	if len(m.Efforts) != 0 {
+		t.Fatalf("M3 efforts = %v, want none: \"none\" is not an effort level", m.Efforts)
 	}
 }

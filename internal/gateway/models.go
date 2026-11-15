@@ -84,6 +84,11 @@ func (s *Server) modelsFor(ctx context.Context) []site.Model {
 //
 // magpie 还要 context/output、能不能读图、思考档位，所以这些字段都
 // 给上：别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
+//
+// name 是模型的名字：站点给的是 "M3.1-Flash" 这种好看的名字，id 是
+// "MiniMax-M3.1-Flash"。magpie 的模型选择器摆的是 name —— 只给 id 的话，
+// 选择器里全是机器名。参考实现也是给名字的（modelOf 里 name: str(d,
+// "name") ?? id）。
 func modelEntry(m site.Model) map[string]any {
 	inputs := m.Inputs
 	if len(inputs) == 0 {
@@ -93,8 +98,15 @@ func modelEntry(m site.Model) map[string]any {
 	if efforts == nil {
 		efforts = []string{}
 	}
+	// 名字空了就用 id：空的名字比没有名字更坏 —— magpie 会把它当模型
+	// 的名字摆出来。
+	name := m.Name
+	if name == "" {
+		name = m.ID
+	}
 	return map[string]any{
 		"id": m.ID, "object": "model", "owned_by": "minimax",
+		"name": name,
 		"limit": map[string]any{
 			"context": m.Context,
 			"output":  m.Output,

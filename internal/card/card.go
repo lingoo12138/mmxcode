@@ -76,7 +76,17 @@ type Window struct {
 	// Name is the window's name.
 	Name string `json:"name"`
 	// Used is the share used, in percent.
-	Used float64 `json:"used"`
+	//
+	// 它是一个指针，为的是分清「不知道」和「真的是 0」：
+	//
+	// - nil 是不知道：这个窗口没有 count（Unlimited 的窗口就是这样）。
+	//   magpie 的规矩是「vendor 没说就别写 used，绝不要拿 0 冒充不知道」
+	//   —— 路由拿 used 给账号算权重，一个「不知道」的窗口报 0，就被
+	//   当成「还剩 100%」。
+	// - 指向 0 是真的是 0：这个窗口有 count，用量就是零。
+	//
+	// 所以指针是空的才不写这个字段，指向 0 照写。
+	Used *float64 `json:"used,omitempty"`
 	// Display is what the window says in words: "62.5 / 500".
 	Display string `json:"display,omitempty"`
 	// ResetsAt is when the window resets.
@@ -216,9 +226,10 @@ func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Windo
 	used := round2(math.Max(0, s.Consumed))
 	limit := round2(s.Granted)
 	left := round2(s.Remaining)
+	share := round2(100 * used / limit)
 	w := Window{
 		Name:    prefix + "Credits",
-		Used:    round2(100 * used / limit),
+		Used:    &share,
 		Display: strconv.FormatFloat(used, 'f', -1, 64) + " / " + strconv.FormatFloat(limit, 'f', -1, 64),
 		Amount:  &used,
 		Limit:   &limit,
@@ -251,13 +262,21 @@ func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window
 	}
 	out := make([]Window, 0, len(ws))
 	for _, w := range ws {
-		cw := Window{Name: prefix + w.Name, Used: w.Used}
+		cw := Window{Name: prefix + w.Name}
 		if w.Unlimited {
+			// Unlimited 的窗口没有 count：不知道用了多少，就不给它写
+			// used。写 0 是拿 0 冒充「不知道」—— magpie 的路由拿 used
+			// 给账号算权重，一个「不知道」的窗口报 0 就被当成「还剩
+			// 100%」。参考实现也是这样的：它给的是 {name, display:
+			// "Unlimited", aside:true}，里面没有 used。
 			cw.Display = "Unlimited"
 			cw.Aside = true
 			out = append(out, cw)
 			continue
 		}
+		// 这个窗口有 count：用了多少就是多少，真的是 0 就写 0。
+		used := w.Used
+		cw.Used = &used
 		if !w.ResetsAt.IsZero() {
 			t := w.ResetsAt
 			cw.ResetsAt = &t

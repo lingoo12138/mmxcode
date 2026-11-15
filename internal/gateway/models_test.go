@@ -177,6 +177,75 @@ func TestTheModelListCarriesWhatMagpieNeeds(t *testing.T) {
 	}
 }
 
+// TestTheModelListCarriesTheNames says every model says what it is
+// called, not only its id.
+//
+// 站点给的名字是 "M3.1-Flash" 这种好看的名字，id 是 "MiniMax-M3.1-Flash"。
+// magpie 的模型选择器摆的是 name：只给 id 的话，选择器里全是
+// "MiniMax-M3.1-Flash" 这样的机器名。参考实现也是给名字的（modelOf 里
+// name: str(d, "name") ?? id）。
+func TestTheModelListCarriesTheNames(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(oneModelAnswer))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	m := body.Data[0]
+	if m.Name != "M3.1-Flash" {
+		t.Errorf("name = %q, want %q", m.Name, "M3.1-Flash")
+	}
+}
+
+// TestTheBuiltInListCarriesTheNamesToo says the built-in list names its
+// models as well.
+//
+// 站点答不上来的时候摆的是内置的那一份：那份也带名字。名字是空的比没有
+// 名字更坏 —— magpie 会拿它当模型的名字摆出来。
+func TestTheBuiltInListCarriesTheNamesToo(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	for _, m := range body.Data {
+		if m.Name == "" {
+			t.Errorf("the model %q has no name: %s", m.ID, w.Body.String())
+		}
+	}
+}
+
 // TestTheBuiltInListIsServedWhenTheSiteIsSilent says the built-in list
 // is what is served when the site cannot be reached.
 func TestTheBuiltInListIsServedWhenTheSiteIsSilent(t *testing.T) {

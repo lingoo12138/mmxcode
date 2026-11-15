@@ -187,6 +187,102 @@ func TestTheModelListIsReadOnceFromTheSite(t *testing.T) {
 	}
 }
 
+// TestTheUpstreamRefusalDoesNotEndTheSignIn says a refusal from the
+// upstream does not tell magpie that the sign-in is gone.
+//
+// magpie 的规矩：401 默认就把这个账号标成「签入失效」，用户被踢回签入
+// 页 —— 除非回答里带 X-Magpie-Sign-In: kept。
+//
+// 网关后面所有账号同时死掉的那一次，客户端收到的是上游的 401。magpie 会
+// 把「网关这个账号」（用户签入的那个）标成签入失效，用户重新签进去发现
+// 一切正常 —— 网关是好的，坏的是网关后面的账号。参考插件在每个上游回答
+// 上都带着这个头（minimax/index.mjs 里 answer 那一句）。
+func TestTheUpstreamRefusalDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "kept" {
+		t.Errorf("the sign-in header = %q, want %q", got, "kept")
+	}
+}
+
+// TestTheUpstreamUnauthorizedDoesNotEndTheSignIn says the same of a 401
+// from the upstream.
+//
+// 上游说令牌旧了：网关续签一次，续签之后还是被拒，这个账号先放着，换一
+// 个。全部账号都这样的时候，客户端最后拿到的是上游的 401 —— 那时候
+// magpie 会以为签入没了，而签入其实好好的。
+func TestTheUpstreamUnauthorizedDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"the sign-in was refused"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "kept" {
+		t.Errorf("the sign-in header = %q, want %q", got, "kept")
+	}
+}
+
+// TestTheRefusedKeyStillEndsTheSignIn says the gateway's own refusal is
+// not excused.
+//
+// 客户端自己的 key 被拒，那是网关这扇门挡的：那把 key 不对，签入就是不行。
+// magpie 应该照旧把这个账号记成签入失效，所以那个头不能加在这个 401 上。
+func TestTheRefusedKeyStillEndsTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "" {
+		t.Errorf("the sign-in header = %q, want none: the key really was refused", got)
+	}
+}
+
+// TestABackendErrorDoesNotEndTheSignIn says the gateway's own failures
+// carry no sign-in header.
+//
+// 网关自己没通（502）：那跟签入没关系，也不需要说什么 —— 说「签入还在」
+// 反而会盖住一件该被看见的事。
+func TestABackendErrorDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 上游指到一个已经关掉的地方：连都连不上。
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	h.gw.UpstreamBase = deadURL
+	h.gw.Cfg.Rotation.MaxAttempts = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "" {
+		t.Errorf("the sign-in header = %q, want none", got)
+	}
+}
+
 // TestTheBackoffStopsWhenTheClientIsGone says the wait between two
 // attempts ends when the client goes away.
 //

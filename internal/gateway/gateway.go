@@ -769,6 +769,20 @@ func (s *Server) action(failure rotator.Failure) rotator.Action {
 // The words the client is given are the upstream's own when it said the
 // credits are gone: "usage limit reached: …" tells the client to wait
 // and try again, which a plain error does not.
+//
+// 一个上游的 401/403 还要带一个头：X-Magpie-Sign-In: kept。
+//
+// magpie 的规矩是「401 默认就把这个账号标成签入失效」，用户被踢回签入页
+// —— 除非回答里带这个头。网关后面所有账号同时死掉的那一次，客户端收到的
+// 是上游的 401；magpie 会把「网关这个账号」（用户签入的那个）标成签入失效，
+// 用户重新签进去发现一切正常 —— 网关是好的，坏的是网关后面的账号。参考
+// 插件在每一个上游回答上都带着这个头（minimax/index.mjs 里 answer 那
+// 一句：headers.set("X-Magpie-Sign-In", renewed && res.ok ? "renewed" :
+// "kept")）。
+//
+// 这个头只加在上游的 401/403 上。客户端自己的 key 被拒的那个 401 是网关
+// 这扇门挡的（ServeHTTP 里那个 writeError），不在这里走：那个 401 的意思
+// 就是「你的 key 不对」，magpie 应该照旧把签入记成失效。
 func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool, quotaMsg string, status int, message string, err error) {
 	if quota {
 		msg := quotaMsg
@@ -786,6 +800,15 @@ func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool,
 		}
 		writeError(w, proto, http.StatusBadGateway, msg)
 		return
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// 签入还是好的：坏的是网关后面的账号，不是用户签进来的这把。
+		//
+		// status 是上游自己给的：走到这里的每一个状态都是上游的。客户端
+		// 自己那把 key 被拒的 401 从来不到这里 —— 那是网关这扇门挡的
+		// （ServeHTTP 里那个 writeError），那个 401 的意思就是「你的 key
+		// 不对」，magpie 应该照旧把签入记成失效。
+		w.Header().Set("X-Magpie-Sign-In", "kept")
 	}
 	if message == "" {
 		message = fmt.Sprintf("the upstream answered with HTTP %d", status)

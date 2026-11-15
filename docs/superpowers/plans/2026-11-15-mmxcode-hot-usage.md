@@ -3517,6 +3517,45 @@ func (s *Server) liveModels(ctx context.Context) ([]site.Model, error) {
 
 ```go
 // modelEntry gives one model as the API tells it.
+//
+// magpie 还要 context/output、能不能读图、思考档位，所以这些字段都
+// 给上：别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
+//
+// name 是模型的名字：站点给的是 "M3.1-Flash" 这种好看的名字，id 是
+// "MiniMax-M3.1-Flash"。magpie 的模型选择器摆的是 name —— 只给 id 的话，
+// 选择器里全是机器名。参考实现也是给名字的（modelOf 里 name: str(d,
+// "name") ?? id）。
+func modelEntry(m site.Model) map[string]any {
+	inputs := m.Inputs
+	if len(inputs) == 0 {
+		inputs = []string{"text"}
+	}
+	efforts := m.Efforts
+	if efforts == nil {
+		efforts = []string{}
+	}
+	// 名字空了就用 id：空的名字比没有名字更坏 —— magpie 会把它当模型
+	// 的名字摆出来。
+	name := m.Name
+	if name == "" {
+		name = m.ID
+	}
+	return map[string]any{
+		"id": m.ID, "object": "model", "owned_by": "minimax",
+		"name": name,
+		"limit": map[string]any{
+			"context": m.Context,
+			"output":  m.Output,
+		},
+		"modalities": map[string]any{
+			"input":  inputs,
+			"output": []string{"text"},
+		},
+		"reasoning": m.Thinking != site.ThinkingOff,
+		"thinking":  string(m.Thinking),
+		"efforts":   efforts,
+	}
+}
 ```
 
 `internal/gateway/gateway.go` 的 `handleModels` 改成：
@@ -5331,9 +5370,10 @@ func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Windo
 	used := round2(math.Max(0, s.Consumed))
 	limit := round2(s.Granted)
 	left := round2(s.Remaining)
+	share := round2(100 * used / limit)
 	w := Window{
 		Name:    prefix + "Credits",
-		Used:    round2(100 * used / limit),
+		Used:    &share,
 		Display: strconv.FormatFloat(used, 'f', -1, 64) + " / " + strconv.FormatFloat(limit, 'f', -1, 64),
 		Amount:  &used,
 		Limit:   &limit,
@@ -5368,13 +5408,21 @@ func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window
 	}
 	out := make([]Window, 0, len(ws))
 	for _, w := range ws {
-		cw := Window{Name: prefix + w.Name, Used: w.Used}
+		cw := Window{Name: prefix + w.Name}
 		if w.Unlimited {
+			// Unlimited 的窗口没有 count：不知道用了多少，就不给它写
+			// used。写 0 是拿 0 冒充「不知道」—— magpie 的路由拿 used
+			// 给账号算权重，一个「不知道」的窗口报 0 就被当成「还剩
+			// 100%」。参考实现也是这样的：它给的是 {name, display:
+			// "Unlimited", aside:true}，里面没有 used。
 			cw.Display = "Unlimited"
 			cw.Aside = true
 			out = append(out, cw)
 			continue
 		}
+		// 这个窗口有 count：用了多少就是多少，真的是 0 就写 0。
+		used := w.Used
+		cw.Used = &used
 		if !w.ResetsAt.IsZero() {
 			t := w.ResetsAt
 			cw.ResetsAt = &t
@@ -6175,6 +6223,750 @@ git commit -m "fix(card): 卡上写着额度用完了"
 ```
 
 ---
+
+### Task 15: 照参考插件把形状对齐
+
+**Files:**
+- Modify: `internal/site/models.go`
+- Modify: `internal/site/models_test.go`
+- Modify: `internal/card/card.go`
+- Modify: `internal/card/card_test.go`
+- Modify: `internal/gateway/models.go`
+- Modify: `internal/gateway/models_test.go`
+- Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/failures_test.go`
+
+**要修的是什么**
+
+四处都是照着社区参考插件（`packages/minimax/index.mjs`，那份是契约）改的。
+
+**一、M3 的档位里不该有 "none"。** 内置名单原来写的是 `Efforts: []string{"none", "high"}`。参考插件的规矩是：**"none" 和 "default" 不是档位，是占位** —— 它读活名单的时候就滤掉了（`minimax/index.mjs` 里 parseModels 的那一行 filter），它自己的内置名单里 M3 写的是 `efforts: []`。
+
+为什么这个要紧：插件那边（`packages/mmxcode/index.mjs` 的 `variantsOf`）先摆 `none = {thinking:{type:"disabled"}}`（选 none 是**把思考关掉**），再遍历档位表 —— 档位表里有个叫 "none" 的，就把「关掉思考」那一档盖成「adaptive 思考 + effort=none」。选 none 的人以为关了思考，其实没关。
+
+改完的效果是：网关的 `/v1/models` 对 M3 报 `"efforts": []`，插件那边算出来的档位是 `none`（关掉思考）+ `high`（adaptive）—— 跟参考一模一样。（插件那边已经自己滤了 "none"/"default" 了 —— 双保险。但名单本身要跟参考一致。）
+
+**二、卡片的 `used` 不能拿 0 冒充「不知道」。** `card.Window.Used` 原来是 `float64`、`json:"used"`（没有 omitempty）→ 每个窗口都会带 `used`，Unlimited 窗口的 `Used` 是零值 → 卡片上就是 `"used": 0`。
+
+参考插件的 Unlimited 窗口是 `{name, display:"Unlimited", aside:true}` —— **没有 used**（`minimax/index.mjs` 里 `if (x.status === 3) { if (general) out.push({ name: own, display: "Unlimited", aside: true }); continue }`）。magpie 宿主的规矩是「vendor 没说就别写 used，绝不要拿 0 冒充『不知道』」，而且「没有 count 的窗口只剩它那行 display，routing 不读它」—— magpie 的路由会拿 `used` 给账号算权重，一个「不知道」的窗口报 0 就被当成「还剩 100%」。
+
+所以 `Used` 改成 `*float64`、`json:"used,omitempty"`（跟这个结构体里 `Amount`/`Limit` 的写法一个样）。**注意别用「omitempty 糊弄」** —— 指针是 nil 才不写；真的是 0% 用量的时候要写出 `0`（用指针正好能分开：nil = 不知道，指向 0 = 真的是 0）。
+
+**三、模型名单少了名字。** `modelEntry` 给每一行模型，没有放 `name` —— `site.Model` 里明明有 `Name`（从站点的 model config 读的，兜底名单里是 "M3.1-Flash" 这种好看的名字）。参考插件的 `modelOf` 给的是 `name: str(d, "name") ?? id`（`minimax/index.mjs` 约 229 行）。
+
+magpie 里会看到：模型选择器里显示的是 id（`MiniMax-M3.1-Flash`），而不是 "M3.1-Flash"。
+
+**四、上游的 401 不该让 magpie 以为「网关这把 key 被拒了」。** 现在的路：上游账号全死的时候，`writeFailure` 把上游的状态码原样给客户端 → 客户端收到 **401**。
+
+magpie 宿主的规矩：**401 默认就把这个账号标成「签入失效」**，用户被踢回签入页（除非回答里带 `X-Magpie-Sign-In: kept`）。参考插件在**每个**上游回答上都带这个头（`minimax/index.mjs` 约 918 行：`headers.set("X-Magpie-Sign-In", renewed && res.ok ? "renewed" : "kept")`）。
+
+所以：网关后面所有账号同时死掉的那一次，magpie 会把**「网关这个账号」**（也就是用户签入的那个）标成签入失效，用户被要求重新签入 —— 签进去会发现一切正常（网关是好的），真正坏的是网关后面的账号。
+
+改法：在 `writeFailure` 里，当这个失败是**上游**来的、状态码是 401 或 403 的时候，在写回答之前加一个头 `X-Magpie-Sign-In: kept`（意思是「签入还是好的，别把它记成失效」）。
+
+**要紧的地方**：这个头**只**加在上游的 401/403 上，**不能**加在「客户端自己的 key 被拒」的那个 401 上 —— 那个是网关那扇门挡的（`ServeHTTP` 里 `writeError(w, proto, http.StatusUnauthorized, "the key was refused")`），那个 401 的意思就是「你的 key 不对」，magpie 应该照旧把签入记成失效。
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/site/models_test.go` 里改（内置名单里 M3 没有档位了；"none" 是占位，不是档位）：
+
+```go
+func TestFallbackModelsLimits(t *testing.T) {
+	type want struct {
+		ctx, out int
+		name     string
+		inputs   []string
+		thinking Thinking
+		efforts  []string
+	}
+	wants := map[string]want{
+		"MiniMax-M3.1-Flash-Preview": {1048576, 524288, "M3.1-Flash-Preview", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
+		"MiniMax-M3.1-Flash":         {1048576, 524288, "M3.1-Flash", []string{"text", "image", "video"}, ThinkingForcedOn, []string{"low", "medium", "high", "xhigh", "max"}},
+		"MiniMax-M3":                 {1048576, 524288, "M3", []string{"text", "image", "video"}, ThinkingSwitchable, nil},
+		"MiniMax-M2.7":               {200000, 128000, "M2.7", []string{"text"}, ThinkingOn, nil},
+		"MiniMax-M2.7-highspeed":     {200000, 128000, "M2.7-highspeed", []string{"text"}, ThinkingOn, nil},
+	}
+	models := FallbackModels()
+	if len(models) != len(wants) {
+		t.Fatalf("got %d models, want %d", len(models), len(wants))
+	}
+	for _, m := range models {
+		w, ok := wants[m.ID]
+		if !ok {
+			t.Fatalf("unexpected model %q", m.ID)
+		}
+		if m.Context != w.ctx || m.Output != w.out {
+			t.Fatalf("%s limits = %d/%d, want %d/%d", m.ID, m.Context, m.Output, w.ctx, w.out)
+		}
+		if m.Name != w.name {
+			t.Fatalf("%s name = %q, want %q", m.ID, m.Name, w.name)
+		}
+		if strings.Join(m.Inputs, ",") != strings.Join(w.inputs, ",") {
+			t.Fatalf("%s inputs = %v, want %v", m.ID, m.Inputs, w.inputs)
+		}
+		if m.Thinking != w.thinking {
+			t.Fatalf("%s thinking = %q, want %q", m.ID, m.Thinking, w.thinking)
+		}
+		if strings.Join(m.Efforts, ",") != strings.Join(w.efforts, ",") {
+			t.Fatalf("%s efforts = %v, want %v", m.ID, m.Efforts, w.efforts)
+		}
+	}
+}
+```
+
+```go
+// TestM3ThinkingVariants says M3's thinking is switchable and that it
+// names no effort levels.
+//
+// "none" 和 "default" 不是档位，是占位。参考插件读活名单的时候就把它们
+// 滤掉了（minimax/index.mjs 里 parseModels 的那一行 filter），它自己的
+// 内置名单里 M3 写的也是 efforts: []。
+//
+// 名单里留一个叫 "none" 的档位是有害的：插件那边先摆 none = 把思考关掉
+// 那一档，再遍历档位表 —— 档位表里有个叫 "none" 的，就把「关掉思考」
+// 那一档盖成「adaptive 思考 + effort=none」。选 none 的人以为关了思考，
+// 其实没关。
+func TestM3ThinkingVariants(t *testing.T) {
+	var m Model
+	for _, x := range FallbackModels() {
+		if x.ID == "MiniMax-M3" {
+			m = x
+		}
+	}
+	if m.Thinking != ThinkingSwitchable {
+		t.Fatalf("M3 thinking = %q", m.Thinking)
+	}
+	if len(m.Efforts) != 0 {
+		t.Fatalf("M3 efforts = %v, want none: \"none\" is not an effort level", m.Efforts)
+	}
+}
+```
+
+`internal/card/card_test.go` 里加（Unlimited 的窗口没有 used；真的是 0 的窗口要写出 0）：
+
+```go
+// TestTheUnlimitedWindowDoesNotSayItUsedNothing says an unlimited window
+// does not claim it used nothing.
+//
+// 「不知道」和「真的是 0」是两件事。Unlimited 的窗口是没有 count 的：参考
+// 实现给的是 {name, display:"Unlimited", aside:true}，里面没有 used。写了
+// "used": 0 就是拿 0 冒充「不知道」，而 magpie 的路由拿 used 给账号算权重
+// —— 一个「不知道」的窗口报 0，就被当成「还剩 100%」。
+func TestTheUnlimitedWindowDoesNotSayItUsedNothing(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "3 hours", ModelName: "general", Unlimited: true},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 500,
+			WindowsJSON: string(ws),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	found := false
+	for _, w := range c.Windows {
+		if w.Display != "Unlimited" {
+			continue
+		}
+		found = true
+		if w.Used != nil {
+			t.Errorf("the unlimited window says it used %v: it does not know", *w.Used)
+		}
+	}
+	if !found {
+		t.Fatalf("windows = %+v, want an unlimited one", c.Windows)
+	}
+	// 卡片上也不该有那个字段。
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Windows []map[string]any `json:"windows"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range out.Windows {
+		if w["display"] != "Unlimited" {
+			continue
+		}
+		if _, ok := w["used"]; ok {
+			t.Errorf("the unlimited window has a used field: %s", b)
+		}
+	}
+}
+```
+
+```go
+// TestAWindowThatReallyUsedNothingSaysZero says a window that really
+// used nothing says zero.
+//
+// 「不知道」和「真的是 0」要分得开：真的是 0 的窗口要写出 0，不能因为
+// 指针是空就一起没了。
+func TestAWindowThatReallyUsedNothingSaysZero(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "7 days", ModelName: "general", Used: 0},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 500,
+			WindowsJSON: string(ws),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	found := false
+	for _, w := range c.Windows {
+		if w.Name != "7 days" {
+			continue
+		}
+		found = true
+		if w.Used == nil {
+			t.Error("the window says nothing about its use: it used nothing, that is zero")
+		} else if *w.Used != 0 {
+			t.Errorf("used = %v, want 0", *w.Used)
+		}
+	}
+	if !found {
+		t.Fatalf("windows = %+v, want a 7 days window", c.Windows)
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Windows []map[string]any `json:"windows"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range out.Windows {
+		if w["name"] != "7 days" {
+			continue
+		}
+		v, ok := w["used"]
+		if !ok {
+			t.Errorf("the window has no used field: %s", b)
+			continue
+		}
+		if v.(float64) != 0 {
+			t.Errorf("used = %v, want 0", v)
+		}
+	}
+}
+```
+
+`internal/gateway/models_test.go` 里加（名单要带名字；空名字比没有名字更坏）：
+
+```go
+// TestTheModelListCarriesTheNames says every model says what it is
+// called, not only its id.
+//
+// 站点给的名字是 "M3.1-Flash" 这种好看的名字，id 是 "MiniMax-M3.1-Flash"。
+// magpie 的模型选择器摆的是 name：只给 id 的话，选择器里全是
+// "MiniMax-M3.1-Flash" 这样的机器名。参考实现也是给名字的（modelOf 里
+// name: str(d, "name") ?? id）。
+func TestTheModelListCarriesTheNames(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(oneModelAnswer))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	m := body.Data[0]
+	if m.Name != "M3.1-Flash" {
+		t.Errorf("name = %q, want %q", m.Name, "M3.1-Flash")
+	}
+}
+```
+
+```go
+// TestTheBuiltInListCarriesTheNamesToo says the built-in list names its
+// models as well.
+//
+// 站点答不上来的时候摆的是内置的那一份：那份也带名字。名字是空的比没有
+// 名字更坏 —— magpie 会拿它当模型的名字摆出来。
+func TestTheBuiltInListCarriesTheNamesToo(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	for _, m := range body.Data {
+		if m.Name == "" {
+			t.Errorf("the model %q has no name: %s", m.ID, w.Body.String())
+		}
+	}
+}
+```
+
+`internal/gateway/failures_test.go` 里加（上游的 401/403 不算签入失效；网关自己挡掉的 key 那个 401 照旧算）：
+
+```go
+// TestTheUpstreamRefusalDoesNotEndTheSignIn says a refusal from the
+// upstream does not tell magpie that the sign-in is gone.
+//
+// magpie 的规矩：401 默认就把这个账号标成「签入失效」，用户被踢回签入
+// 页 —— 除非回答里带 X-Magpie-Sign-In: kept。
+//
+// 网关后面所有账号同时死掉的那一次，客户端收到的是上游的 401。magpie 会
+// 把「网关这个账号」（用户签入的那个）标成签入失效，用户重新签进去发现
+// 一切正常 —— 网关是好的，坏的是网关后面的账号。参考插件在每个上游回答
+// 上都带着这个头（minimax/index.mjs 里 answer 那一句）。
+func TestTheUpstreamRefusalDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"forbidden"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "kept" {
+		t.Errorf("the sign-in header = %q, want %q", got, "kept")
+	}
+}
+```
+
+```go
+// TestTheUpstreamUnauthorizedDoesNotEndTheSignIn says the same of a 401
+// from the upstream.
+//
+// 上游说令牌旧了：网关续签一次，续签之后还是被拒，这个账号先放着，换一
+// 个。全部账号都这样的时候，客户端最后拿到的是上游的 401 —— 那时候
+// magpie 会以为签入没了，而签入其实好好的。
+func TestTheUpstreamUnauthorizedDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"the sign-in was refused"}`))
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "kept" {
+		t.Errorf("the sign-in header = %q, want %q", got, "kept")
+	}
+}
+```
+
+```go
+// TestTheRefusedKeyStillEndsTheSignIn says the gateway's own refusal is
+// not excused.
+//
+// 客户端自己的 key 被拒，那是网关这扇门挡的：那把 key 不对，签入就是不行。
+// magpie 应该照旧把这个账号记成签入失效，所以那个头不能加在这个 401 上。
+func TestTheRefusedKeyStillEndsTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "" {
+		t.Errorf("the sign-in header = %q, want none: the key really was refused", got)
+	}
+}
+```
+
+```go
+// TestABackendErrorDoesNotEndTheSignIn says the gateway's own failures
+// carry no sign-in header.
+//
+// 网关自己没通（502）：那跟签入没关系，也不需要说什么 —— 说「签入还在」
+// 反而会盖住一件该被看见的事。
+func TestABackendErrorDoesNotEndTheSignIn(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 上游指到一个已经关掉的地方：连都连不上。
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	h.gw.UpstreamBase = deadURL
+	h.gw.Cfg.Rotation.MaxAttempts = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502, body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Magpie-Sign-In"); got != "" {
+		t.Errorf("the sign-in header = %q, want none", got)
+	}
+}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```
+go test ./internal/site/ ./internal/card/ ./internal/gateway/ -count=1
+```
+
+失败：M3 还有 "none" 那个档位；卡片的 Unlimited 窗口还带着 `used: 0`；名单里没有 `name`；上游的 401 上没有 `X-Magpie-Sign-In`。
+
+- [ ] **Step 3: 写实现**
+
+`internal/site/models.go` 的内置名单里，M3 的档位是空的（跟参考一样）：
+
+```go
+// fallbackModels is the list used when the live one can't be had.
+//
+// It is package-private on purpose: a caller that gets a copy can
+// change its copy, and there is no way to reach this one and change
+// it for everybody.
+//
+// The context and output limits are the ones the endpoint really allows,
+// not the ones MiniMax Code declares. Its model config says 512K/128K for
+// the M3 family, but the endpoint accepts 1,048,576 input tokens and
+// 524,288 output tokens for every one of them. An agent that believed the
+// advertised ones would compact its history about half way too early.
+var fallbackModels = []Model{
+	{
+		ID: "MiniMax-M3.1-Flash-Preview", Name: "M3.1-Flash-Preview",
+		Context: 1048576, Output: 524288,
+		Inputs:   []string{"text", "image", "video"},
+		Thinking: ThinkingForcedOn,
+		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
+	},
+	{
+		// 站点现在叫这个名字：M3.1-Flash-Preview 是它以前的名字，
+		// 站点自己给的那个 id 才是客户端要用的。
+		ID: "MiniMax-M3.1-Flash", Name: "M3.1-Flash",
+		Context: 1048576, Output: 524288,
+		Inputs:   []string{"text", "image", "video"},
+		Thinking: ThinkingForcedOn,
+		Efforts:  []string{"low", "medium", "high", "xhigh", "max"},
+	},
+	{
+		ID: "MiniMax-M3", Name: "M3",
+		Context: 1048576, Output: 524288,
+		Inputs:   []string{"text", "image", "video"},
+		Thinking: ThinkingSwitchable,
+		// 档位是空的：M3 能切思考，参考实现也是这么写的（efforts: []）。
+		//
+		// "none" 和 "default" 不是档位，是占位 —— 参考实现读活名单的时
+		// 候就把它们滤掉了。留一个叫 "none" 的档位在这里是有害的：插件
+		// 那边先摆「none = 把思考关掉」那一档，再遍历档位表，档位表里
+		// 有个叫 "none" 的，就把「关掉思考」那一档盖成「adaptive 思考 +
+		// effort=none」。选 none 的人以为关了思考，其实没关。
+		Efforts: nil,
+	},
+	{
+		ID: "MiniMax-M2.7", Name: "M2.7",
+		Context: 200000, Output: 128000,
+		Inputs:   []string{"text"},
+		Thinking: ThinkingOn,
+	},
+	{
+		ID: "MiniMax-M2.7-highspeed", Name: "M2.7-highspeed",
+		Context: 200000, Output: 128000,
+		Inputs:   []string{"text"},
+		Thinking: ThinkingOn,
+	},
+}
+```
+
+`internal/card/card.go` 的 `Window` —— `used` 是一个指针，为的是分清「不知道」和「真的是 0」：
+
+```go
+// Window is one window of the card.
+//
+// magpie 的窗口：名字、用掉的份额（百分比）、还有它数的是什么东西。
+type Window struct {
+	// Name is the window's name.
+	Name string `json:"name"`
+	// Used is the share used, in percent.
+	//
+	// 它是一个指针，为的是分清「不知道」和「真的是 0」：
+	//
+	// - nil 是不知道：这个窗口没有 count（Unlimited 的窗口就是这样）。
+	//   magpie 的规矩是「vendor 没说就别写 used，绝不要拿 0 冒充不知道」
+	//   —— 路由拿 used 给账号算权重，一个「不知道」的窗口报 0，就被
+	//   当成「还剩 100%」。
+	// - 指向 0 是真的是 0：这个窗口有 count，用量就是零。
+	//
+	// 所以指针是空的才不写这个字段，指向 0 照写。
+	Used *float64 `json:"used,omitempty"`
+	// Display is what the window says in words: "62.5 / 500".
+	Display string `json:"display,omitempty"`
+	// ResetsAt is when the window resets.
+	ResetsAt *time.Time `json:"resetsAt,omitempty"`
+	// Amount is what was used, when the window counts.
+	Amount *float64 `json:"amount,omitempty"`
+	// Limit is what was allowed, when the window counts.
+	Limit *float64 `json:"limit,omitempty"`
+	// Unit is what it counts, when it counts.
+	Unit string `json:"unit,omitempty"`
+	// Aside says the window is beside the plan, not part of it.
+	Aside bool `json:"aside,omitempty"`
+	// RunsOutAt is when what is left runs out.
+	RunsOutAt *time.Time `json:"runsOutAt,omitempty"`
+	// RunsOut is how much is left when it runs out.
+	RunsOut *float64 `json:"runsOut,omitempty"`
+}
+```
+
+`internal/card/card.go` 的 `creditWindow` —— 算出那个百分比之后取地址填进去：
+
+```go
+// creditWindow gives the credits as a window.
+//
+// magpie 的卡片上，积分是一个窗口：共给了多少、用了多少、什么时候用完。
+func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+	if !s.HasAmounts || s.Granted <= 0 {
+		return nil
+	}
+	// 账本给的是十进制的小数，加起来会带出一串小数点后头的零头。
+	// 四舍五入到两位：卡片上的数是给人看的。
+	used := round2(math.Max(0, s.Consumed))
+	limit := round2(s.Granted)
+	left := round2(s.Remaining)
+	share := round2(100 * used / limit)
+	w := Window{
+		Name:    prefix + "Credits",
+		Used:    &share,
+		Display: strconv.FormatFloat(used, 'f', -1, 64) + " / " + strconv.FormatFloat(limit, 'f', -1, 64),
+		Amount:  &used,
+		Limit:   &limit,
+		Unit:    "credits",
+	}
+	if spent.out {
+		// 用完的账号没有积分可以花：网关不会把它给客户端。卡上摆着
+		// 「437.5 / 500」就是骗人 —— 它说了就要兑现。
+		w.Display = "用完"
+		return []Window{w}
+	}
+	if !s.ExpiresAt.IsZero() {
+		t := s.ExpiresAt
+		w.RunsOutAt = &t
+		w.RunsOut = &left
+	}
+	return []Window{w}
+}
+```
+
+`internal/card/card.go` 的 `planWindows` —— Unlimited 那一支**不给它赋值**（留着 nil → 不写 `used`）；普通窗口照旧给 `w.Used`：
+
+```go
+// planWindows gives the plan's windows.
+func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+	if strings.TrimSpace(s.WindowsJSON) == "" {
+		return nil
+	}
+	var ws []account.Window
+	if err := json.Unmarshal([]byte(s.WindowsJSON), &ws); err != nil {
+		// 读不出来的窗口就是没有窗口：这里不能因为一个存坏的读数
+		// 就把整张卡片弄坏。
+		return nil
+	}
+	out := make([]Window, 0, len(ws))
+	for _, w := range ws {
+		cw := Window{Name: prefix + w.Name}
+		if w.Unlimited {
+			// Unlimited 的窗口没有 count：不知道用了多少，就不给它写
+			// used。写 0 是拿 0 冒充「不知道」—— magpie 的路由拿 used
+			// 给账号算权重，一个「不知道」的窗口报 0 就被当成「还剩
+			// 100%」。参考实现也是这样的：它给的是 {name, display:
+			// "Unlimited", aside:true}，里面没有 used。
+			cw.Display = "Unlimited"
+			cw.Aside = true
+			out = append(out, cw)
+			continue
+		}
+		// 这个窗口有 count：用了多少就是多少，真的是 0 就写 0。
+		used := w.Used
+		cw.Used = &used
+		if !w.ResetsAt.IsZero() {
+			t := w.ResetsAt
+			cw.ResetsAt = &t
+		}
+		if w.Amount != 0 {
+			v := w.Amount
+			cw.Amount = &v
+		}
+		if w.Limit != 0 {
+			v := w.Limit
+			cw.Limit = &v
+		}
+		cw.Unit = w.Unit
+		if spent.spentGroup(w.ModelName) {
+			// 这个组用完了：窗口上就写着「用完」，别让人以为还有。
+			cw.Display = "用完"
+		}
+		out = append(out, cw)
+	}
+	return out
+}
+```
+
+`internal/gateway/models.go` 的 `modelEntry` —— 名单里带上名字：
+
+```go
+// modelEntry gives one model as the API tells it.
+//
+// magpie 还要 context/output、能不能读图、思考档位，所以这些字段都
+// 给上：别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
+//
+// name 是模型的名字：站点给的是 "M3.1-Flash" 这种好看的名字，id 是
+// "MiniMax-M3.1-Flash"。magpie 的模型选择器摆的是 name —— 只给 id 的话，
+// 选择器里全是机器名。参考实现也是给名字的（modelOf 里 name: str(d,
+// "name") ?? id）。
+func modelEntry(m site.Model) map[string]any {
+	inputs := m.Inputs
+	if len(inputs) == 0 {
+		inputs = []string{"text"}
+	}
+	efforts := m.Efforts
+	if efforts == nil {
+		efforts = []string{}
+	}
+	// 名字空了就用 id：空的名字比没有名字更坏 —— magpie 会把它当模型
+	// 的名字摆出来。
+	name := m.Name
+	if name == "" {
+		name = m.ID
+	}
+	return map[string]any{
+		"id": m.ID, "object": "model", "owned_by": "minimax",
+		"name": name,
+		"limit": map[string]any{
+			"context": m.Context,
+			"output":  m.Output,
+		},
+		"modalities": map[string]any{
+			"input":  inputs,
+			"output": []string{"text"},
+		},
+		"reasoning": m.Thinking != site.ThinkingOff,
+		"thinking":  string(m.Thinking),
+		"efforts":   efforts,
+	}
+}
+```
+
+`internal/gateway/gateway.go` 的 `writeFailure` —— 上游的 401/403 带上「签入还是好的」那个头：
+
+```go
+// writeFailure writes the answer of a request that could not be served.
+//
+// The status is the upstream's own, when the upstream gave one: a 503
+// is a 503 and a 400 is a 400. Calling both of them a 429 tells the
+// client it was sent too fast, and it backs off from a gateway that is
+// not the problem. The one that stays a 429 is the refusal about the
+// credits: that is the one the client can do something about.
+//
+// A failure with no upstream status at all is the gateway's own: the
+// request never got through, and that is a 502.
+//
+// The words the client is given are the upstream's own when it said the
+// credits are gone: "usage limit reached: …" tells the client to wait
+// and try again, which a plain error does not.
+//
+// 一个上游的 401/403 还要带一个头：X-Magpie-Sign-In: kept。
+//
+// magpie 的规矩是「401 默认就把这个账号标成签入失效」，用户被踢回签入页
+// —— 除非回答里带这个头。网关后面所有账号同时死掉的那一次，客户端收到的
+// 是上游的 401；magpie 会把「网关这个账号」（用户签入的那个）标成签入失效，
+// 用户重新签进去发现一切正常 —— 网关是好的，坏的是网关后面的账号。参考
+// 插件在每一个上游回答上都带着这个头（minimax/index.mjs 里 answer 那
+// 一句：headers.set("X-Magpie-Sign-In", renewed && res.ok ? "renewed" :
+// "kept")）。
+//
+// 这个头只加在上游的 401/403 上。客户端自己的 key 被拒的那个 401 是网关
+// 这扇门挡的（ServeHTTP 里那个 writeError），不在这里走：那个 401 的意思
+// 就是「你的 key 不对」，magpie 应该照旧把签入记成失效。
+func (s *Server) writeFailure(w http.ResponseWriter, proto protocol, quota bool, quotaMsg string, status int, message string, err error) {
+	if quota {
+		msg := quotaMsg
+		if msg == "" {
+			msg = "the account's credits or plan are used up"
+		}
+		writeRateLimit(w, proto, msg)
+		return
+	}
+	if status == 0 {
+		// 上游没有给出状态：网络没通。这是网关自己的问题。
+		msg := "the request did not get through"
+		if err != nil {
+			msg = err.Error()
+		}
+		writeError(w, proto, http.StatusBadGateway, msg)
+		return
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// 签入还是好的：坏的是网关后面的账号，不是用户签进来的这把。
+		//
+		// status 是上游自己给的：走到这里的每一个状态都是上游的。客户端
+		// 自己那把 key 被拒的 401 从来不到这里 —— 那是网关这扇门挡的
+		// （ServeHTTP 里那个 writeError），那个 401 的意思就是「你的 key
+		// 不对」，magpie 应该照旧把签入记成失效。
+		w.Header().Set("X-Magpie-Sign-In", "kept")
+	}
+	if message == "" {
+		message = fmt.Sprintf("the upstream answered with HTTP %d", status)
+	}
+	writeError(w, proto, status, message)
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```
+go test ./internal/site/ ./internal/card/ ./internal/gateway/ -count=1
+```
+
+- [ ] **Step 5: 提交**
+
+```
+git add internal/site internal/card internal/gateway
+git commit -m "fix(gateway): 照参考插件对齐卡片、名单和签入的形状"
+```
+
+---
+
 
 ## 验证
 

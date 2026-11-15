@@ -63,7 +63,14 @@ var fallbackModels = []Model{
 		Context: 1048576, Output: 524288,
 		Inputs:   []string{"text", "image", "video"},
 		Thinking: ThinkingSwitchable,
-		Efforts:  []string{"none", "high"},
+		// 档位是空的：M3 能切思考，参考实现也是这么写的（efforts: []）。
+		//
+		// "none" 和 "default" 不是档位，是占位 —— 参考实现读活名单的时
+		// 候就把它们滤掉了。留一个叫 "none" 的档位在这里是有害的：插件
+		// 那边先摆「none = 把思考关掉」那一档，再遍历档位表，档位表里
+		// 有个叫 "none" 的，就把「关掉思考」那一档盖成「adaptive 思考 +
+		// effort=none」。选 none 的人以为关了思考，其实没关。
+		Efforts: nil,
 	},
 	{
 		ID: "MiniMax-M2.7", Name: "M2.7",

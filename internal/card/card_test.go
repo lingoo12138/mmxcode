@@ -207,8 +207,10 @@ func TestThePlanWindowsAreOnTheCard(t *testing.T) {
 	for _, w := range c.Windows {
 		if w.Name == "7 days" {
 			found = true
-			if w.Used != 24 {
-				t.Errorf("used = %v, want 24", w.Used)
+			if w.Used == nil {
+				t.Error("the window does not say how much of it was used")
+			} else if *w.Used != 24 {
+				t.Errorf("used = %v, want 24", *w.Used)
 			}
 			if w.ResetsAt == nil {
 				t.Error("the window has no resetsAt")
@@ -248,6 +250,116 @@ func TestAnUnlimitedWindowIsSaidSo(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("windows = %+v, want an unlimited one", c.Windows)
+	}
+}
+
+// TestTheUnlimitedWindowDoesNotSayItUsedNothing says an unlimited window
+// does not claim it used nothing.
+//
+// 「不知道」和「真的是 0」是两件事。Unlimited 的窗口是没有 count 的：参考
+// 实现给的是 {name, display:"Unlimited", aside:true}，里面没有 used。写了
+// "used": 0 就是拿 0 冒充「不知道」，而 magpie 的路由拿 used 给账号算权重
+// —— 一个「不知道」的窗口报 0，就被当成「还剩 100%」。
+func TestTheUnlimitedWindowDoesNotSayItUsedNothing(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "3 hours", ModelName: "general", Unlimited: true},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 500,
+			WindowsJSON: string(ws),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	found := false
+	for _, w := range c.Windows {
+		if w.Display != "Unlimited" {
+			continue
+		}
+		found = true
+		if w.Used != nil {
+			t.Errorf("the unlimited window says it used %v: it does not know", *w.Used)
+		}
+	}
+	if !found {
+		t.Fatalf("windows = %+v, want an unlimited one", c.Windows)
+	}
+	// 卡片上也不该有那个字段。
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Windows []map[string]any `json:"windows"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range out.Windows {
+		if w["display"] != "Unlimited" {
+			continue
+		}
+		if _, ok := w["used"]; ok {
+			t.Errorf("the unlimited window has a used field: %s", b)
+		}
+	}
+}
+
+// TestAWindowThatReallyUsedNothingSaysZero says a window that really
+// used nothing says zero.
+//
+// 「不知道」和「真的是 0」要分得开：真的是 0 的窗口要写出 0，不能因为
+// 指针是空就一起没了。
+func TestAWindowThatReallyUsedNothingSaysZero(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "7 days", ModelName: "general", Used: 0},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 500,
+			WindowsJSON: string(ws),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	found := false
+	for _, w := range c.Windows {
+		if w.Name != "7 days" {
+			continue
+		}
+		found = true
+		if w.Used == nil {
+			t.Error("the window says nothing about its use: it used nothing, that is zero")
+		} else if *w.Used != 0 {
+			t.Errorf("used = %v, want 0", *w.Used)
+		}
+	}
+	if !found {
+		t.Fatalf("windows = %+v, want a 7 days window", c.Windows)
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Windows []map[string]any `json:"windows"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range out.Windows {
+		if w["name"] != "7 days" {
+			continue
+		}
+		v, ok := w["used"]
+		if !ok {
+			t.Errorf("the window has no used field: %s", b)
+			continue
+		}
+		if v.(float64) != 0 {
+			t.Errorf("used = %v, want 0", v)
+		}
 	}
 }
 
@@ -331,7 +443,7 @@ func TestTheNumbersAreNotFullOfNoise(t *testing.T) {
 	if w.RunsOut == nil || *w.RunsOut != 399.95 {
 		t.Errorf("runsOut = %v, want 399.95", w.RunsOut)
 	}
-	if w.Used != 0.01 {
+	if w.Used == nil || *w.Used != 0.01 {
 		t.Errorf("used = %v, want 0.01", w.Used)
 	}
 }
