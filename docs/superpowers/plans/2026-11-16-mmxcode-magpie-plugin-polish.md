@@ -2251,8 +2251,27 @@ Expected: 过。卡片上是十几行，不是 98 行。
 
 ---
 
-## 待实测（跑完记在这儿）
+## 实测（本机，2026-11-16）
 
-1. 协议那一行在 magpie 的卡片上画出来是什么样（`aside` 的窗口没有 `used`）。
-2. 最多十个账号合不合手：98 个号的时候卡片上是十几行。要改就改 `internal/card` 里的 `shownAccounts`。
-3. provider 名改成「MMXCode 网关」之后，magpie 的 provider 列表和插件页显示的样子。
+`magpie quota mmxcode` 答的卡片（98 个号的池子）：
+
+```
+mmxcode · Free · http://127.0.0.1:8080  subscription  Credits 2% (746.72 / 39600)
+  账号 98 个账号 · 98 有读数
+  578078539524956167 Credits 87% (697.63 / 800)
+  BurnsSchwinn94062@hotmail.com Credits 8% (31.54 / 400)
+  ...
+  协议 Anthropic · Chat Completions · Responses
+  38853.28 credits left
+```
+
+- **98 个窗口 → 11 个**（全池一行、账号一行、七个有话说的账号、协议一行）。
+- 协议那一行画出来了：`协议 Anthropic · Chat Completions · Responses`（`aside` 的窗口，magpie 照样画，只是没有份额）。
+- provider 名：`magpie providers` 里是 `MMXCode 网关`，`signed in as http://127.0.0.1:8080`。
+- 账号名：签入时**账号 id 留空**，magpie 的账号列表里显示的是那个地址。
+- `magpie provider test mmxcode` 过：`✓ anthropic 847 ms · MiniMax-M3.1-Flash`。
+
+还剩的：
+
+1. 最多十个账号合不合手：现在是十个（98 个号里七个有过话，其余的没摆）。要改就改 `internal/card` 里的 `shownAccounts`。
+2. 想要账号名叫「生产网关」这样的，就签入的时候填账号 id —— 那样它就是一个名字，不是地址。
