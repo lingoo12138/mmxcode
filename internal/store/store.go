@@ -1923,17 +1923,25 @@ func usageSnapshotColumns(prefix string) string {
 
 // LatestUsageSnapshots gives each account's newest usage reading.
 //
-// The newest is the row with the greatest id. Two readings of one
-// account can share a millisecond, and the timestamp alone would then
-// name two rows -- and both would be summed, so the account's credits
-// would be counted twice. The id grows with every row written, so it
-// tells the readings apart, and there is one row per account, always.
+// The newest is the one that was read last: the time says when the
+// reading was made, and the id only breaks a tie between two readings
+// of the same millisecond.
+//
+// The id alone is not enough. A reading stamps its time when it starts
+// and writes it down when it ends, so two readings of one account that
+// overlap leave the older reading with the greater id -- and the card
+// would then show the older numbers. The check-ins have the same shape
+// and the same rule.
 func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+usageSnapshotColumns("s")+`
 		FROM usage_snapshots s
-		JOIN (SELECT account_id, MAX(id) AS mid FROM usage_snapshots GROUP BY account_id)
-			m ON m.account_id = s.account_id AND m.mid = s.id
+		WHERE s.id = (
+			SELECT s2.id FROM usage_snapshots s2
+			WHERE s2.account_id = s.account_id
+			ORDER BY s2.created_at DESC, s2.id DESC
+			LIMIT 1
+		)
 		ORDER BY s.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("latest usage snapshots: %w", err)
@@ -1955,15 +1963,16 @@ func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, erro
 
 // LatestUsageSnapshot gives one account's newest usage reading.
 //
-// It is the row with the greatest id, for the same reason as in
-// LatestUsageSnapshots: two readings of one account can share a
-// millisecond.
+// It is the reading that was made last, for the same reason as in
+// LatestUsageSnapshots: the time says which reading is the newest and
+// the id only breaks a tie.
 //
 // An account that was never read has no reading and no error.
 func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (UsageSnapshot, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+usageSnapshotColumns("")+`
-		FROM usage_snapshots WHERE account_id=? ORDER BY id DESC LIMIT 1`, accountID)
+		FROM usage_snapshots WHERE account_id=?
+		ORDER BY created_at DESC, id DESC LIMIT 1`, accountID)
 	u, err := scanUsageSnapshot(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UsageSnapshot{}, nil

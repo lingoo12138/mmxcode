@@ -45,14 +45,26 @@ func NewRound(s *store.Store, r Reader, hot func() []string, cfg config.Config) 
 //
 // 排在前面的先读：签到待补的卡上现在是错的，到期的马上要回轮转，从
 // 没读过的排在热的前面（它是一次性的活儿，排在后面就永远排在后
-// 面），热的刚变过，晚一轮没关系，其余的最久没读的先。
+// 面），热的刚变过，晚一轮没关系。
 const (
 	rankPending = iota
 	rankDue
 	rankNever
 	rankHot
-	rankCold
 )
+
+// retryWindow is how long a reading that failed is tried again.
+//
+// 读失败的账号要再读一遍（签到给的积分还在账本里等着），可是不能一
+// 直重试：一个永远读不回来的账号（账本的批次没有期限、上游在挂）
+// 会一直占着待补那一位，一趟的批次全被它拿走，从来没读过的账号就再
+// 也读不到——而每个账号至少读一次是硬要求。
+//
+// 所以重试是有期限的：失败之后的一段时间里还再读（上游多半是暂时
+// 的），过了这段时间就把这个账号放下，让别的账号先读。
+//
+// 它是一个常数，不是一个配置项：配置的键是规格定死了的。
+const retryWindow = 10 * time.Minute
 
 // target is one account to read, and where it stands in the order.
 type target struct {
@@ -62,14 +74,16 @@ type target struct {
 	rank int
 	// order is what breaks a tie inside the rank.
 	order int
+	// since is when it began to wait, for the ranks that wait.
+	since time.Time
 }
 
 // Targets gives the accounts to read now, in the order they should be
 // read.
 //
-// 该读的排在前面：签到待补的、标记到期的、从没读过的、热的。冷账号也
-// 在名单里，排在最后：一趟最多读几个（批次），排在前面的是该读的，
-// 冷账号排在后面——它被读到的时候读到的数也是旧的。
+// 该读的就是那四类：签到待补的、标记到期的、从没读过的、热的。冷账号
+// 不在名单里：它的数是旧的，读它只是把旧的数再读一遍——它被用到的时候
+// 自己会醒过来（旧的数是高估，轮转会挑它），那时候它就热了。
 func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	accounts, err := r.Store.ListAccounts(ctx)
 	if err != nil {
@@ -99,13 +113,20 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	for _, c := range checkins {
 		checkAt[c.AccountID] = c.CreatedAt
 	}
-	// 标记到期：标记的时刻到了，账号回到轮转里，但没有人读过它。
-	due := map[string]bool{}
+	// 标记到期：标记过了时刻，账号该回轮转里读一次了。
+	//
+	// 到期读一次就好：读过了（数变新了）它就不再到期。还有一个标记没
+	// 过时刻的，那个组还欠着额度，账号回不了轮转。
+	expiredAt := map[string]time.Time{}
+	stillSpent := map[string]bool{}
 	for _, e := range exhausted {
 		if e.Until.After(now) {
+			stillSpent[e.AccountID] = true
 			continue
 		}
-		due[e.AccountID] = true
+		if at, ok := expiredAt[e.AccountID]; !ok || e.Until.After(at) {
+			expiredAt[e.AccountID] = e.Until
+		}
 	}
 	hotAt := map[string]int{}
 	if r.Hot != nil {
@@ -125,38 +146,57 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 		// 签到待补：签到过了，账本还没读到。
 		//
 		// 签到是把它放进这个名单的那一件事：签到给了积分，可账本还没
-		// 读到（没读到，或者读到的那次失败了），卡上就还是旧的。
-		pending := !checked.IsZero() &&
-			(!hasSnap || checked.After(read) || !snapHas[a.ID])
+		// 读到，卡上就还是旧的。
+		//
+		// 读到的那次失败了也要再读，可是只再读一会儿（retryWindow）：
+		// 不限次数地重试，一个一直读不回来的账号就把整趟的批次占住
+		// 了，从来没读过的账号再也读不到。
+		pending := false
+		if !checked.IsZero() {
+			pending = !hasSnap || checked.After(read)
+			if !pending && !snapHas[a.ID] && now.Sub(checked) < retryWindow {
+				pending = true
+			}
+		}
+		// 标记到期：标记过了时刻，而且没人读过它。
+		//
+		// 读过了就不到期了：到期读一次，数变新，账号回轮转。
+		due := false
+		if until, ok := expiredAt[a.ID]; ok && !stillSpent[a.ID] {
+			due = !hasSnap || read.Before(until)
+		}
 		switch {
 		case pending:
-			ts = append(ts, target{id: a.ID, rank: rankPending})
-		case due[a.ID]:
-			ts = append(ts, target{id: a.ID, rank: rankDue})
+			ts = append(ts, target{id: a.ID, rank: rankPending, since: checked})
+		case due:
+			ts = append(ts, target{id: a.ID, rank: rankDue, since: expiredAt[a.ID]})
 		case !hasSnap:
 			// 从没读过的：卡上没有它，而且它永远排在最后就永远读不到。
 			ts = append(ts, target{id: a.ID, rank: rankNever})
 		default:
 			if at, ok := hotAt[a.ID]; ok {
 				ts = append(ts, target{id: a.ID, rank: rankHot, order: at})
-				continue
 			}
-			ts = append(ts, target{id: a.ID, rank: rankCold})
+			// 冷的：不读。它的数是旧的，被用到的时候它自己会醒过来。
 		}
 	}
 
-	// 排在前面的先读。同一组里：冷账号最久没读的先（越旧越可能过期），
-	// 热的按用得多的先，其余按 id 分出来——结果每次一样。
-	sort.SliceStable(ts, func(i, j int) bool {
+	// 排在前面的先读。同一组里：等得最久的先（签到待补的按签到的时
+	// 刻，标记到期的按到期的时刻），热的按用得多的先，其余按 id 分出
+	// 来——结果每次一样。
+	sort.Slice(ts, func(i, j int) bool {
 		if ts[i].rank != ts[j].rank {
 			return ts[i].rank < ts[j].rank
 		}
-		if ts[i].rank == rankCold {
-			if !snapAt[ts[i].id].Equal(snapAt[ts[j].id]) {
-				return snapAt[ts[i].id].Before(snapAt[ts[j].id])
+		switch ts[i].rank {
+		case rankPending, rankDue:
+			if !ts[i].since.Equal(ts[j].since) {
+				return ts[i].since.Before(ts[j].since)
 			}
-		} else if ts[i].order != ts[j].order {
-			return ts[i].order < ts[j].order
+		case rankHot:
+			if ts[i].order != ts[j].order {
+				return ts[i].order < ts[j].order
+			}
 		}
 		return ts[i].id < ts[j].id
 	})
@@ -204,7 +244,8 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 	if len(ids) == 0 {
 		return out, nil
 	}
-	if opts.Batch > 0 && len(ids) > opts.Batch {
+	opts.Batch = batch(opts.Batch)
+	if len(ids) > opts.Batch {
 		out.Skipped = len(ids) - opts.Batch
 		ids = ids[:opts.Batch]
 	}
@@ -295,7 +336,7 @@ func (r *Round) Options() Options {
 		Concurrency: f.Concurrency,
 		Timeout:     f.Timeout.Duration(),
 		Budget:      f.Budget.Duration(),
-		Batch:       f.Batch,
+		Batch:       batch(f.Batch),
 	}
 }
 
@@ -313,8 +354,19 @@ func (r *Round) CardOptions() Options {
 		Concurrency: f.Concurrency,
 		Timeout:     timeout,
 		Budget:      f.CardBudget.Duration(),
-		Batch:       f.Card,
+		Batch:       batch(f.Card),
 	}
+}
+
+// batch gives how many accounts one round reads at most.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+// 卡片那一趟也一样：card: 0 该是"读一个"，不是"全都读"。
+func batch(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
 }
 
 // HasRoom says whether a reading says the account has something to spend.

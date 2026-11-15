@@ -1229,6 +1229,57 @@ func TestTheAmountsAreKeptWithoutTheFlag(t *testing.T) {
 	}
 }
 
+// TestTheNewestUsageSnapshotIsTheOneReadLast says the newest reading
+// of an account is the one that was read last, not the one that was
+// written last.
+//
+// 读额度的时候时刻是在读的开头盖的，插入是在读完之后：两次读撞在
+// 一起的时候，先读到的那一次反而是后写进去的（id 更大）。只按 id
+// 排，卡上就摆着旧的数。
+//
+// 时刻说哪一次读是最新的，id 只在时刻一样时分出先后——跟签到那边
+// 一个样。
+func TestTheNewestUsageSnapshotIsTheOneReadLast(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+	readFirst := time.UnixMilli(1763000000000)
+	readLater := readFirst.Add(time.Minute)
+	// 先写进去的那一次读，是更晚读到的那一次。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Consumed: 0, Remaining: 100,
+		ExpiresAt: readLater.Add(time.Hour), CreatedAt: readLater,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 后写进去的那一次读，是更早读到的那一次：id 更大，读到的更早。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Consumed: 0, Remaining: 300,
+		ExpiresAt: readFirst.Add(time.Hour), CreatedAt: readFirst,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", got[0])
+	}
+	one, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", one)
+	}
+}
+
 // TestLatestUsageSnapshotIsOneRowPerAccount says two readings of one
 // account in the same millisecond come back as one row.
 //

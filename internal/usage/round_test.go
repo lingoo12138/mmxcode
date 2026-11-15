@@ -15,23 +15,18 @@ import (
 // accounts that need a reading, in the order they should be read.
 //
 // 该读的 = 从没读过的 ∪ 热的 ∪ 签到待补的 ∪ 标记到期的。没读过的排
-// 在热的前面：它是一次性的活儿，排在后面就永远排在后面。
+// 在热的前面：它是一次性的活儿，排在后面就永远排在后面。冷的账号不
+// 在名单里：它的数是旧的，读它也是把旧的数再读一遍。
 func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 	s := newStore(t)
 	now := time.Now()
-	mk(t, s, "acc_old", now.Add(-time.Hour))
-	mk(t, s, "acc_new", now.Add(-time.Minute))
+	mk(t, s, "acc_cold", now.Add(-time.Minute))
 	mk(t, s, "acc_never", time.Time{})
 	mk(t, s, "acc_hot", now.Add(-time.Hour))
 	mk(t, s, "acc_pending", now.Add(-time.Hour))
 	mk(t, s, "acc_due", now.Add(-time.Hour))
 
-	// 签到待补：签到比快照新，而且那次读没读到账本。
-	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
-		AccountID: "acc_pending", HasAmounts: false, CreatedAt: now.Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("save snapshot: %v", err)
-	}
+	// 签到待补：签到比快照新，卡上还是签到前的旧数。
 	if err := s.SaveCheckin(context.Background(), store.Checkin{
 		AccountID: "acc_pending", Day: "2026-11-15", Outcome: "claimed",
 		Credit: 10, CreatedAt: now,
@@ -49,7 +44,7 @@ func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("targets: %v", err)
 	}
-	want := []string{"acc_pending", "acc_due", "acc_never", "acc_hot", "acc_old", "acc_new"}
+	want := []string{"acc_pending", "acc_due", "acc_never", "acc_hot"}
 	if len(got) != len(want) {
 		t.Fatalf("the accounts to read = %v, want %v", got, want)
 	}
@@ -57,6 +52,168 @@ func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("the accounts to read = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestTheColdAccountsAreLeftAlone says a cold account is not read.
+//
+// 冷账号的数是旧的，读它也是把旧的数再读一遍。它自己会醒过来：旧的
+// 数是高估（积分只会往下走），轮转会挑它，它就热了，热了就该读。
+func TestTheColdAccountsAreLeftAlone(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_cold", now.Add(-time.Minute))
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheDueAccountIsReadOnceAfterItsMarkExpires says a spent mark
+// that has expired is read once, and then the account is left alone.
+//
+// 标记自然过期 → 到期读一次 → 数变新，账号回轮转（规格 §4.5 的恢复
+// 点 A）。一次就好：读过的账号不到期了，不然六个到期的账号就把一趟
+// 的批次占满，从来没读过的账号永远读不到。
+func TestTheDueAccountIsReadOnceAfterItsMarkExpires(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_due", now.Add(-time.Hour))
+	if err := s.SetExhausted(context.Background(), "acc_due", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_due" {
+		t.Fatalf("the accounts to read = %v, want the due one", got)
+	}
+	// 读过了：数变新了，它不到期了。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_due", Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheAccountThatIsStillSpentIsNotDue says an account that is
+// still spent for one group is not read.
+//
+// 它还有一个组欠着额度：读它只是把用完的那一组再读一遍。标记全过期
+// 了它才轮到——没过期的那一个说明它还欠着，回不了轮转。
+func TestTheAccountThatIsStillSpentIsNotDue(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_spent", now.Add(-time.Hour))
+	mk(t, s, "acc_waiting", now.Add(-time.Hour))
+	// 一个过期了，另一个还没有。
+	if err := s.SetExhausted(context.Background(), "acc_spent", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	if err := s.SetExhausted(context.Background(), "acc_spent", "other",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	// 标记还没到：它还欠着，不该读。
+	if err := s.SetExhausted(context.Background(), "acc_waiting", "general",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheFailedReadingIsNotRetriedForever says a reading that failed is
+// tried again for a while, and then the account is left alone.
+//
+// 读失败的账号要再读（签到给的积分还在账本里等着），可是不能一直重
+// 试：一个永远读不回来的账号就占着待补那一位，一趟的批次全被它拿
+// 走，从来没读过的账号再也读不到——而每个账号至少读一次是硬要求。
+func TestTheFailedReadingIsNotRetriedForever(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_failed", now.Add(-time.Hour))
+	// 那次读失败了：没有数。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_failed", HasAmounts: false, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	// 签到不久之前：还再读一遍。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_failed" {
+		t.Fatalf("the accounts to read = %v, want the failed one", got)
+	}
+	// 十一分钟以后：不再重读了，把它放下。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheCheckInThatIsNotOnTheCardIsStillPending says a check-in that
+// is newer than the reading is pending, whatever the retry window says.
+//
+// 签到给的积分卡上还没有，那是要补的：规格 §5.3 的那条规则跟重试的
+// 期限是两回事。
+func TestTheCheckInThatIsNotOnTheCardIsStillPending(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_checked", now.Add(-time.Hour))
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_checked", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_checked" {
+		t.Fatalf("the accounts to read = %v, want the pending one", got)
 	}
 }
 
@@ -182,6 +339,41 @@ func TestOneRoundKeepsToItsBatch(t *testing.T) {
 	}
 	if res.Skipped != 1 {
 		t.Fatalf("the skipped = %d, want one", res.Skipped)
+	}
+}
+
+// TestABatchOfZeroMeansOne says a batch of zero reads one account.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+func TestABatchOfZeroMeansOne(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: time.Second, Batch: 0})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want the one the batch left out", res.Skipped)
+	}
+}
+
+// TestTheBatchOfZeroIsOneInTheControls says the two rounds' controls
+// say one account when the config says zero.
+//
+// 卡片那一趟也是：card: 0 不该是"全都读"，该是"读一个"。
+func TestTheBatchOfZeroIsOneInTheControls(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.Batch = 0
+	cfg.Usage.Refresh.Card = 0
+	r := NewRound(nil, nil, nil, cfg)
+	if got := r.Options().Batch; got != 1 {
+		t.Errorf("the periodic batch = %d, want one", got)
+	}
+	if got := r.CardOptions().Batch; got != 1 {
+		t.Errorf("the card's batch = %d, want one", got)
 	}
 }
 

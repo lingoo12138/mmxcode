@@ -486,6 +486,10 @@ git commit -m "feat(manager): 记着谁刚被用过"
 
 ### Task 3: 该读哪些账号
 
+该读的是四类账号：签到待补的、标记到期的、从没读过的、热的。其余的（冷的）不读：它的数是旧的，读它只是把旧的数再读一遍。它自己会醒过来 —— 旧的数是高估（积分只会往下走），轮转会挑它，它被用到就变热，热了才进名单。
+
+排在前面的先读：签到待补 → 标记到期 → 从没读过的 → 热。
+
 **Files:**
 - Create: `internal/usage/round.go`
 - Create: `internal/usage/round_test.go`
@@ -605,23 +609,18 @@ import (
 // accounts that need a reading, in the order they should be read.
 //
 // 该读的 = 从没读过的 ∪ 热的 ∪ 签到待补的 ∪ 标记到期的。没读过的排
-// 在热的前面：它是一次性的活儿，排在后面就永远排在后面。
+// 在热的前面：它是一次性的活儿，排在后面就永远排在后面。冷的账号不
+// 在名单里：它的数是旧的，读它也是把旧的数再读一遍。
 func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 	s := newStore(t)
 	now := time.Now()
-	mk(t, s, "acc_old", now.Add(-time.Hour))
-	mk(t, s, "acc_new", now.Add(-time.Minute))
+	mk(t, s, "acc_cold", now.Add(-time.Minute))
 	mk(t, s, "acc_never", time.Time{})
 	mk(t, s, "acc_hot", now.Add(-time.Hour))
 	mk(t, s, "acc_pending", now.Add(-time.Hour))
 	mk(t, s, "acc_due", now.Add(-time.Hour))
 
-	// 签到待补：签到比快照新，而且那次读没读到账本。
-	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
-		AccountID: "acc_pending", HasAmounts: false, CreatedAt: now.Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("save snapshot: %v", err)
-	}
+	// 签到待补：签到比快照新，卡上还是签到前的旧数。
 	if err := s.SaveCheckin(context.Background(), store.Checkin{
 		AccountID: "acc_pending", Day: "2026-11-15", Outcome: "claimed",
 		Credit: 10, CreatedAt: now,
@@ -639,7 +638,7 @@ func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("targets: %v", err)
 	}
-	want := []string{"acc_pending", "acc_due", "acc_never", "acc_hot", "acc_old", "acc_new"}
+	want := []string{"acc_pending", "acc_due", "acc_never", "acc_hot"}
 	if len(got) != len(want) {
 		t.Fatalf("the accounts to read = %v, want %v", got, want)
 	}
@@ -647,6 +646,168 @@ func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("the accounts to read = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestTheColdAccountsAreLeftAlone says a cold account is not read.
+//
+// 冷账号的数是旧的，读它也是把旧的数再读一遍。它自己会醒过来：旧的
+// 数是高估（积分只会往下走），轮转会挑它，它就热了，热了就该读。
+func TestTheColdAccountsAreLeftAlone(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_cold", now.Add(-time.Minute))
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheDueAccountIsReadOnceAfterItsMarkExpires says a spent mark
+// that has expired is read once, and then the account is left alone.
+//
+// 标记自然过期 → 到期读一次 → 数变新，账号回轮转（规格 §4.5 的恢复
+// 点 A）。一次就好：读过的账号不到期了，不然六个到期的账号就把一趟
+// 的批次占满，从来没读过的账号永远读不到。
+func TestTheDueAccountIsReadOnceAfterItsMarkExpires(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_due", now.Add(-time.Hour))
+	if err := s.SetExhausted(context.Background(), "acc_due", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_due" {
+		t.Fatalf("the accounts to read = %v, want the due one", got)
+	}
+	// 读过了：数变新了，它不到期了。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_due", Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheAccountThatIsStillSpentIsNotDue says an account that is
+// still spent for one group is not read.
+//
+// 它还有一个组欠着额度：读它只是把用完的那一组再读一遍。标记全过期
+// 了它才轮到——没过期的那一个说明它还欠着，回不了轮转。
+func TestTheAccountThatIsStillSpentIsNotDue(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_spent", now.Add(-time.Hour))
+	mk(t, s, "acc_waiting", now.Add(-time.Hour))
+	// 一个过期了，另一个还没有。
+	if err := s.SetExhausted(context.Background(), "acc_spent", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	if err := s.SetExhausted(context.Background(), "acc_spent", "other",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	// 标记还没到：它还欠着，不该读。
+	if err := s.SetExhausted(context.Background(), "acc_waiting", "general",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheFailedReadingIsNotRetriedForever says a reading that failed is
+// tried again for a while, and then the account is left alone.
+//
+// 读失败的账号要再读（签到给的积分还在账本里等着），可是不能一直重
+// 试：一个永远读不回来的账号就占着待补那一位，一趟的批次全被它拿
+// 走，从来没读过的账号再也读不到——而每个账号至少读一次是硬要求。
+func TestTheFailedReadingIsNotRetriedForever(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_failed", now.Add(-time.Hour))
+	// 那次读失败了：没有数。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_failed", HasAmounts: false, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	// 签到不久之前：还再读一遍。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_failed" {
+		t.Fatalf("the accounts to read = %v, want the failed one", got)
+	}
+	// 十一分钟以后：不再重读了，把它放下。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheCheckInThatIsNotOnTheCardIsStillPending says a check-in that
+// is newer than the reading is pending, whatever the retry window says.
+//
+// 签到给的积分卡上还没有，那是要补的：规格 §5.3 的那条规则跟重试的
+// 期限是两回事。
+func TestTheCheckInThatIsNotOnTheCardIsStillPending(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_checked", now.Add(-time.Hour))
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_checked", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_checked" {
+		t.Fatalf("the accounts to read = %v, want the pending one", got)
 	}
 }
 
@@ -770,6 +931,16 @@ func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
 
 创建 `internal/usage/round.go`：
 
+名单里的四类各是一档（`rankPending` / `rankDue` / `rankNever` / `rankHot`）。排序是一个全序：先看档，档里按它自己的次序（等得最久的先，热的按用得多的先），最后按 id —— 每次跑出来的名单都是同一个。
+
+三件事在名单里是要算出来的：
+
+- **签到待补**：签到比这个账号最新的快照还新（规格 §5.3）；或者那次读失败了（快照里没有数）—— 后者只重试 `retryWindow`（十分钟）：不限次数地重试，一个永远读不回来的账号就把整趟的批次占住了，从来没读过的账号再也读不到。
+- **标记到期**：标记过了时刻，而且这个账号没有还没过时刻的标记（那个组还欠着，回不了轮转），而且标记过期之后没人读过它（最新的快照比标记的时刻还旧）。到期读一次就好：读过了，数变新，账号回轮转（规格 §4.5 的恢复点 A）。
+- **从没读过的**：没有快照。**每个账号至少读一次**是硬要求（规格 §3.5），它必须排在热的前面。
+
+冷账号不在名单里。
+
 ```go
 package usage
 
@@ -815,14 +986,26 @@ func NewRound(s *store.Store, r Reader, hot func() []string, cfg config.Config) 
 //
 // 排在前面的先读：签到待补的卡上现在是错的，到期的马上要回轮转，从
 // 没读过的排在热的前面（它是一次性的活儿，排在后面就永远排在后
-// 面），热的刚变过，晚一轮没关系，其余的最久没读的先。
+// 面），热的刚变过，晚一轮没关系。
 const (
 	rankPending = iota
 	rankDue
 	rankNever
 	rankHot
-	rankCold
 )
+
+// retryWindow is how long a reading that failed is tried again.
+//
+// 读失败的账号要再读一遍（签到给的积分还在账本里等着），可是不能一
+// 直重试：一个永远读不回来的账号（账本的批次没有期限、上游在挂）
+// 会一直占着待补那一位，一趟的批次全被它拿走，从来没读过的账号就再
+// 也读不到——而每个账号至少读一次是硬要求。
+//
+// 所以重试是有期限的：失败之后的一段时间里还再读（上游多半是暂时
+// 的），过了这段时间就把这个账号放下，让别的账号先读。
+//
+// 它是一个常数，不是一个配置项：配置的键是规格定死了的。
+const retryWindow = 10 * time.Minute
 
 // target is one account to read, and where it stands in the order.
 type target struct {
@@ -832,14 +1015,16 @@ type target struct {
 	rank int
 	// order is what breaks a tie inside the rank.
 	order int
+	// since is when it began to wait, for the ranks that wait.
+	since time.Time
 }
 
 // Targets gives the accounts to read now, in the order they should be
 // read.
 //
-// 该读的排在前面：签到待补的、标记到期的、从没读过的、热的。冷账号也
-// 在名单里，排在最后：一趟最多读几个（批次），排在前面的是该读的，
-// 冷账号排在后面——它被读到的时候读到的数也是旧的。
+// 该读的就是那四类：签到待补的、标记到期的、从没读过的、热的。冷账号
+// 不在名单里：它的数是旧的，读它只是把旧的数再读一遍——它被用到的时候
+// 自己会醒过来（旧的数是高估，轮转会挑它），那时候它就热了。
 func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	accounts, err := r.Store.ListAccounts(ctx)
 	if err != nil {
@@ -869,13 +1054,20 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	for _, c := range checkins {
 		checkAt[c.AccountID] = c.CreatedAt
 	}
-	// 标记到期：标记的时刻到了，账号回到轮转里，但没有人读过它。
-	due := map[string]bool{}
+	// 标记到期：标记过了时刻，账号该回轮转里读一次了。
+	//
+	// 到期读一次就好：读过了（数变新了）它就不再到期。还有一个标记没
+	// 过时刻的，那个组还欠着额度，账号回不了轮转。
+	expiredAt := map[string]time.Time{}
+	stillSpent := map[string]bool{}
 	for _, e := range exhausted {
 		if e.Until.After(now) {
+			stillSpent[e.AccountID] = true
 			continue
 		}
-		due[e.AccountID] = true
+		if at, ok := expiredAt[e.AccountID]; !ok || e.Until.After(at) {
+			expiredAt[e.AccountID] = e.Until
+		}
 	}
 	hotAt := map[string]int{}
 	if r.Hot != nil {
@@ -895,38 +1087,57 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 		// 签到待补：签到过了，账本还没读到。
 		//
 		// 签到是把它放进这个名单的那一件事：签到给了积分，可账本还没
-		// 读到（没读到，或者读到的那次失败了），卡上就还是旧的。
-		pending := !checked.IsZero() &&
-			(!hasSnap || checked.After(read) || !snapHas[a.ID])
+		// 读到，卡上就还是旧的。
+		//
+		// 读到的那次失败了也要再读，可是只再读一会儿（retryWindow）：
+		// 不限次数地重试，一个一直读不回来的账号就把整趟的批次占住
+		// 了，从来没读过的账号再也读不到。
+		pending := false
+		if !checked.IsZero() {
+			pending = !hasSnap || checked.After(read)
+			if !pending && !snapHas[a.ID] && now.Sub(checked) < retryWindow {
+				pending = true
+			}
+		}
+		// 标记到期：标记过了时刻，而且没人读过它。
+		//
+		// 读过了就不到期了：到期读一次，数变新，账号回轮转。
+		due := false
+		if until, ok := expiredAt[a.ID]; ok && !stillSpent[a.ID] {
+			due = !hasSnap || read.Before(until)
+		}
 		switch {
 		case pending:
-			ts = append(ts, target{id: a.ID, rank: rankPending})
-		case due[a.ID]:
-			ts = append(ts, target{id: a.ID, rank: rankDue})
+			ts = append(ts, target{id: a.ID, rank: rankPending, since: checked})
+		case due:
+			ts = append(ts, target{id: a.ID, rank: rankDue, since: expiredAt[a.ID]})
 		case !hasSnap:
 			// 从没读过的：卡上没有它，而且它永远排在最后就永远读不到。
 			ts = append(ts, target{id: a.ID, rank: rankNever})
 		default:
 			if at, ok := hotAt[a.ID]; ok {
 				ts = append(ts, target{id: a.ID, rank: rankHot, order: at})
-				continue
 			}
-			ts = append(ts, target{id: a.ID, rank: rankCold})
+			// 冷的：不读。它的数是旧的，被用到的时候它自己会醒过来。
 		}
 	}
 
-	// 排在前面的先读。同一组里：冷账号最久没读的先（越旧越可能过期），
-	// 热的按用得多的先，其余按 id 分出来——结果每次一样。
-	sort.SliceStable(ts, func(i, j int) bool {
+	// 排在前面的先读。同一组里：等得最久的先（签到待补的按签到的时
+	// 刻，标记到期的按到期的时刻），热的按用得多的先，其余按 id 分出
+	// 来——结果每次一样。
+	sort.Slice(ts, func(i, j int) bool {
 		if ts[i].rank != ts[j].rank {
 			return ts[i].rank < ts[j].rank
 		}
-		if ts[i].rank == rankCold {
-			if !snapAt[ts[i].id].Equal(snapAt[ts[j].id]) {
-				return snapAt[ts[i].id].Before(snapAt[ts[j].id])
+		switch ts[i].rank {
+		case rankPending, rankDue:
+			if !ts[i].since.Equal(ts[j].since) {
+				return ts[i].since.Before(ts[j].since)
 			}
-		} else if ts[i].order != ts[j].order {
-			return ts[i].order < ts[j].order
+		case rankHot:
+			if ts[i].order != ts[j].order {
+				return ts[i].order < ts[j].order
+			}
 		}
 		return ts[i].id < ts[j].id
 	})
@@ -1034,6 +1245,41 @@ func TestOneRoundKeepsToItsBatch(t *testing.T) {
 	}
 }
 
+// TestABatchOfZeroMeansOne says a batch of zero reads one account.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+func TestABatchOfZeroMeansOne(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: time.Second, Batch: 0})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want the one the batch left out", res.Skipped)
+	}
+}
+
+// TestTheBatchOfZeroIsOneInTheControls says the two rounds' controls
+// say one account when the config says zero.
+//
+// 卡片那一趟也是：card: 0 不该是"全都读"，该是"读一个"。
+func TestTheBatchOfZeroIsOneInTheControls(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.Batch = 0
+	cfg.Usage.Refresh.Card = 0
+	r := NewRound(nil, nil, nil, cfg)
+	if got := r.Options().Batch; got != 1 {
+		t.Errorf("the periodic batch = %d, want one", got)
+	}
+	if got := r.CardOptions().Batch; got != 1 {
+		t.Errorf("the card's batch = %d, want one", got)
+	}
+}
+
 // TestOneRoundKeepsToItsConcurrency says a round reads so many at once.
 //
 // 并发是读得快，不是读得多：上游不是只给我们用。
@@ -1102,6 +1348,8 @@ go test ./internal/usage/
 
 `internal/usage/round.go` 里加：
 
+批次配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了（跟 0 并发一个道理）。卡片那一趟也一样：`card: 0` 是「读一个」，不是「全都读」。
+
 ```go
 // Options holds the controls of one round of readings.
 type Options struct {
@@ -1139,7 +1387,8 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 	if len(ids) == 0 {
 		return out, nil
 	}
-	if opts.Batch > 0 && len(ids) > opts.Batch {
+	opts.Batch = batch(opts.Batch)
+	if len(ids) > opts.Batch {
 		out.Skipped = len(ids) - opts.Batch
 		ids = ids[:opts.Batch]
 	}
@@ -1230,7 +1479,7 @@ func (r *Round) Options() Options {
 		Concurrency: f.Concurrency,
 		Timeout:     f.Timeout.Duration(),
 		Budget:      f.Budget.Duration(),
-		Batch:       f.Batch,
+		Batch:       batch(f.Batch),
 	}
 }
 
@@ -1248,8 +1497,19 @@ func (r *Round) CardOptions() Options {
 		Concurrency: f.Concurrency,
 		Timeout:     timeout,
 		Budget:      f.CardBudget.Duration(),
-		Batch:       f.Card,
+		Batch:       batch(f.Card),
 	}
+}
+
+// batch gives how many accounts one round reads at most.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+// 卡片那一趟也一样：card: 0 该是"读一个"，不是"全都读"。
+func batch(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
 }
 
 // dedupe takes the repeated ids out of a list, keeping the order.
@@ -3211,7 +3471,7 @@ git commit -m "feat(scheduler): 一趟读额度读的是该读的账号"
 
 README 里加一节「读额度」：
 
-- 额度只读该读的账号：签到待补的、标记到期的、从没读过的、还有热的。
+- 额度只读该读的账号：签到待补的、标记到期的、从没读过的、还有热的。冷账号不读（它的数是旧的，它被用到的时候自己会醒过来）；标记到期的是读一次就好，读过了就不再到期；读失败的只重试十分钟。
 - 一趟读的控：并发、每个账号的时限、一趟的预算、一趟最多读几个（配在 `usage.refresh` 下面）。
 - 多久算热（`usage.refresh.hot_window`）。
 - 额度用完的账号：立刻标记，后台读一次把标记改准；签到给了积分就读一次，读到的数说有额度就清掉标记。
@@ -3261,6 +3521,563 @@ concurrency:
 ```
 git add README.md config.example.yaml config.docker.yaml
 git commit -m "docs(readme): 读额度只碰该碰的账号"
+```
+
+---
+
+### Task 12: 该读的名单收窄
+
+这一节记的是复查改掉的东西：名单里多出来的那些账号，以及多出来的那几件事。
+
+改之前，名单是「所有活着的账号」，冷账号排在最后。一趟最多读几个（批次）把它们截掉，于是每 30 秒就有六个冷账号被读一遍——一年下来比原来「每 15 分钟读一遍所有账号」多二十倍的流量，而这一趟读到的数还是旧的（冷账号的数只会更旧，不会更新）。规格 §3.2 写的该读的是四类：签到待补的、标记到期的、从没读过的、热的。
+
+另外三件事也是同一根病根 —— 一个账号可以永远占着名单的第一位：
+
+- 过期的「用完」标记没有人收，账号永远「到期」，六个这样的账号就把一整趟的批次占满，从来没读过的账号再也读不到（规格 §3.5 的「每个账号至少读一次」是硬要求）。
+- 读失败的账号永远「签到待补」（规格 §5.3），一个一直读不回来的账号就把批次占住。
+- 批次配 0 是「全都读」而不是「读一个」：配置里写着「配 0 的时候按 1 算」（`internal/config/config.go`），代码只照做了并发那一半。
+
+还有一件是读出来的东西不对：`LatestUsageSnapshots` 按 id 排（最后写进去的那一行），而读额度的时候时刻是在读的开头盖的、插入是在读完之后 —— 两次读撞在一起的时候，先读到的那一次反而是后写进去的。卡上于是摆着旧的数。
+
+**Files:**
+- Modify: `internal/usage/round.go`
+- Modify: `internal/usage/round_test.go`
+- Modify: `internal/store/store.go`
+- Modify: `internal/store/store_test.go`
+- Modify: `README.md`
+- Modify: `docs/superpowers/plans/2026-11-15-mmxcode-hot-usage.md`
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/usage/round_test.go` 里加：
+
+```go
+// TestTheColdAccountsAreLeftAlone says a cold account is not read.
+//
+// 冷账号的数是旧的，读它也是把旧的数再读一遍。它自己会醒过来：旧的
+// 数是高估（积分只会往下走），轮转会挑它，它就热了，热了就该读。
+func TestTheColdAccountsAreLeftAlone(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_cold", now.Add(-time.Minute))
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheDueAccountIsReadOnceAfterItsMarkExpires says a spent mark
+// that has expired is read once, and then the account is left alone.
+//
+// 标记自然过期 → 到期读一次 → 数变新，账号回轮转（规格 §4.5 的恢复
+// 点 A）。一次就好：读过的账号不到期了，不然六个到期的账号就把一趟
+// 的批次占满，从来没读过的账号永远读不到。
+func TestTheDueAccountIsReadOnceAfterItsMarkExpires(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_due", now.Add(-time.Hour))
+	if err := s.SetExhausted(context.Background(), "acc_due", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_due" {
+		t.Fatalf("the accounts to read = %v, want the due one", got)
+	}
+	// 读过了：数变新了，它不到期了。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_due", Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheAccountThatIsStillSpentIsNotDue says an account that is
+// still spent for one group is not read.
+//
+// 它还有一个组欠着额度：读它只是把用完的那一组再读一遍。标记全过期
+// 了它才轮到——没过期的那一个说明它还欠着，回不了轮转。
+func TestTheAccountThatIsStillSpentIsNotDue(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_spent", now.Add(-time.Hour))
+	mk(t, s, "acc_waiting", now.Add(-time.Hour))
+	// 一个过期了，另一个还没有。
+	if err := s.SetExhausted(context.Background(), "acc_spent", "general",
+		now.Add(-time.Minute), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	if err := s.SetExhausted(context.Background(), "acc_spent", "other",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	// 标记还没到：它还欠着，不该读。
+	if err := s.SetExhausted(context.Background(), "acc_waiting", "general",
+		now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheFailedReadingIsNotRetriedForever says a reading that failed is
+// tried again for a while, and then the account is left alone.
+//
+// 读失败的账号要再读（签到给的积分还在账本里等着），可是不能一直重
+// 试：一个永远读不回来的账号就占着待补那一位，一趟的批次全被它拿
+// 走，从来没读过的账号再也读不到——而每个账号至少读一次是硬要求。
+func TestTheFailedReadingIsNotRetriedForever(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_failed", now.Add(-time.Hour))
+	// 那次读失败了：没有数。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_failed", HasAmounts: false, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	// 签到不久之前：还再读一遍。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_failed" {
+		t.Fatalf("the accounts to read = %v, want the failed one", got)
+	}
+	// 十一分钟以后：不再重读了，把它放下。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_failed", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	got, err = r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
+	}
+}
+
+// TestTheCheckInThatIsNotOnTheCardIsStillPending says a check-in that
+// is newer than the reading is pending, whatever the retry window says.
+//
+// 签到给的积分卡上还没有，那是要补的：规格 §5.3 的那条规则跟重试的
+// 期限是两回事。
+func TestTheCheckInThatIsNotOnTheCardIsStillPending(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_checked", now.Add(-time.Hour))
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_checked", Day: "2026-11-15", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.Add(-11 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "acc_checked" {
+		t.Fatalf("the accounts to read = %v, want the pending one", got)
+	}
+}
+
+// TestABatchOfZeroMeansOne says a batch of zero reads one account.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+func TestABatchOfZeroMeansOne(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: time.Second, Batch: 0})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want the one the batch left out", res.Skipped)
+	}
+}
+
+// TestTheBatchOfZeroIsOneInTheControls says the two rounds' controls
+// say one account when the config says zero.
+//
+// 卡片那一趟也是：card: 0 不该是"全都读"，该是"读一个"。
+func TestTheBatchOfZeroIsOneInTheControls(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.Batch = 0
+	cfg.Usage.Refresh.Card = 0
+	r := NewRound(nil, nil, nil, cfg)
+	if got := r.Options().Batch; got != 1 {
+		t.Errorf("the periodic batch = %d, want one", got)
+	}
+	if got := r.CardOptions().Batch; got != 1 {
+		t.Errorf("the card's batch = %d, want one", got)
+	}
+}
+```
+
+`internal/store/store_test.go` 里加：
+
+```go
+// TestTheNewestUsageSnapshotIsTheOneReadLast says the newest reading
+// of an account is the one that was read last, not the one that was
+// written last.
+//
+// 读额度的时候时刻是在读的开头盖的，插入是在读完之后：两次读撞在
+// 一起的时候，先读到的那一次反而是后写进去的（id 更大）。只按 id
+// 排，卡上就摆着旧的数。
+//
+// 时刻说哪一次读是最新的，id 只在时刻一样时分出先后——跟签到那边
+// 一个样。
+func TestTheNewestUsageSnapshotIsTheOneReadLast(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+	readFirst := time.UnixMilli(1763000000000)
+	readLater := readFirst.Add(time.Minute)
+	// 先写进去的那一次读，是更晚读到的那一次。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Consumed: 0, Remaining: 100,
+		ExpiresAt: readLater.Add(time.Hour), CreatedAt: readLater,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 后写进去的那一次读，是更早读到的那一次：id 更大，读到的更早。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Consumed: 0, Remaining: 300,
+		ExpiresAt: readFirst.Add(time.Hour), CreatedAt: readFirst,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", got[0])
+	}
+	one, err := s.LatestUsageSnapshot(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", one)
+	}
+}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```
+go test ./internal/store/ ./internal/usage/
+```
+
+失败：冷账号在名单里；过期的标记让账号永远到期；读失败的账号永远待补；批次配 0 读的是全部；库里最新的一次读是最后写进去的那一次。
+
+- [ ] **Step 3: 名单里只留该读的那些**
+
+`internal/usage/round.go` 里改：冷账号不进名单（它被用到的时候自己会醒过来：旧的数是高估，轮转会挑它）；过期的标记只读一次（要没有还没过时刻的标记，而且标记过期之后没人读过它）；读失败的只重试 `retryWindow`；批次配 0 按 1 算。
+
+```go
+// The ranks the accounts are read in.
+//
+// 排在前面的先读：签到待补的卡上现在是错的，到期的马上要回轮转，从
+// 没读过的排在热的前面（它是一次性的活儿，排在后面就永远排在后
+// 面），热的刚变过，晚一轮没关系。
+const (
+	rankPending = iota
+	rankDue
+	rankNever
+	rankHot
+)
+
+// retryWindow is how long a reading that failed is tried again.
+//
+// 读失败的账号要再读一遍（签到给的积分还在账本里等着），可是不能一
+// 直重试：一个永远读不回来的账号（账本的批次没有期限、上游在挂）
+// 会一直占着待补那一位，一趟的批次全被它拿走，从来没读过的账号就再
+// 也读不到——而每个账号至少读一次是硬要求。
+//
+// 所以重试是有期限的：失败之后的一段时间里还再读（上游多半是暂时
+// 的），过了这段时间就把这个账号放下，让别的账号先读。
+//
+// 它是一个常数，不是一个配置项：配置的键是规格定死了的。
+const retryWindow = 10 * time.Minute
+
+// target is one account to read, and where it stands in the order.
+type target struct {
+	// id is the account.
+	id string
+	// rank is the group it belongs to.
+	rank int
+	// order is what breaks a tie inside the rank.
+	order int
+	// since is when it began to wait, for the ranks that wait.
+	since time.Time
+}
+
+// Targets gives the accounts to read now, in the order they should be
+// read.
+//
+// 该读的就是那四类：签到待补的、标记到期的、从没读过的、热的。冷账号
+// 不在名单里：它的数是旧的，读它只是把旧的数再读一遍——它被用到的时候
+// 自己会醒过来（旧的数是高估，轮转会挑它），那时候它就热了。
+func (r *Round) Targets(ctx context.Context) ([]string, error) {
+	accounts, err := r.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snaps, err := r.Store.LatestUsageSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	checkins, err := r.Store.LatestCheckins(ctx)
+	if err != nil {
+		return nil, err
+	}
+	exhausted, err := r.Store.ListExhausted(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+
+	snapAt := map[string]time.Time{}
+	snapHas := map[string]bool{}
+	for _, s := range snaps {
+		snapAt[s.AccountID] = s.CreatedAt
+		snapHas[s.AccountID] = s.HasAmounts
+	}
+	checkAt := map[string]time.Time{}
+	for _, c := range checkins {
+		checkAt[c.AccountID] = c.CreatedAt
+	}
+	// 标记到期：标记过了时刻，账号该回轮转里读一次了。
+	//
+	// 到期读一次就好：读过了（数变新了）它就不再到期。还有一个标记没
+	// 过时刻的，那个组还欠着额度，账号回不了轮转。
+	expiredAt := map[string]time.Time{}
+	stillSpent := map[string]bool{}
+	for _, e := range exhausted {
+		if e.Until.After(now) {
+			stillSpent[e.AccountID] = true
+			continue
+		}
+		if at, ok := expiredAt[e.AccountID]; !ok || e.Until.After(at) {
+			expiredAt[e.AccountID] = e.Until
+		}
+	}
+	hotAt := map[string]int{}
+	if r.Hot != nil {
+		for i, id := range r.Hot() {
+			hotAt[id] = i
+		}
+	}
+
+	ts := make([]target, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Status != store.StatusActive {
+			// 签出的账号读不到：读了也是白读。
+			continue
+		}
+		read, hasSnap := snapAt[a.ID]
+		checked := checkAt[a.ID]
+		// 签到待补：签到过了，账本还没读到。
+		//
+		// 签到是把它放进这个名单的那一件事：签到给了积分，可账本还没
+		// 读到，卡上就还是旧的。
+		//
+		// 读到的那次失败了也要再读，可是只再读一会儿（retryWindow）：
+		// 不限次数地重试，一个一直读不回来的账号就把整趟的批次占住
+		// 了，从来没读过的账号再也读不到。
+		pending := false
+		if !checked.IsZero() {
+			pending = !hasSnap || checked.After(read)
+			if !pending && !snapHas[a.ID] && now.Sub(checked) < retryWindow {
+				pending = true
+			}
+		}
+		// 标记到期：标记过了时刻，而且没人读过它。
+		//
+		// 读过了就不到期了：到期读一次，数变新，账号回轮转。
+		due := false
+		if until, ok := expiredAt[a.ID]; ok && !stillSpent[a.ID] {
+			due = !hasSnap || read.Before(until)
+		}
+		switch {
+		case pending:
+			ts = append(ts, target{id: a.ID, rank: rankPending, since: checked})
+		case due:
+			ts = append(ts, target{id: a.ID, rank: rankDue, since: expiredAt[a.ID]})
+		case !hasSnap:
+			// 从没读过的：卡上没有它，而且它永远排在最后就永远读不到。
+			ts = append(ts, target{id: a.ID, rank: rankNever})
+		default:
+			if at, ok := hotAt[a.ID]; ok {
+				ts = append(ts, target{id: a.ID, rank: rankHot, order: at})
+			}
+			// 冷的：不读。它的数是旧的，被用到的时候它自己会醒过来。
+		}
+	}
+
+	// 排在前面的先读。同一组里：等得最久的先（签到待补的按签到的时
+	// 刻，标记到期的按到期的时刻），热的按用得多的先，其余按 id 分出
+	// 来——结果每次一样。
+	sort.Slice(ts, func(i, j int) bool {
+		if ts[i].rank != ts[j].rank {
+			return ts[i].rank < ts[j].rank
+		}
+		switch ts[i].rank {
+		case rankPending, rankDue:
+			if !ts[i].since.Equal(ts[j].since) {
+				return ts[i].since.Before(ts[j].since)
+			}
+		case rankHot:
+			if ts[i].order != ts[j].order {
+				return ts[i].order < ts[j].order
+			}
+		}
+		return ts[i].id < ts[j].id
+	})
+
+	out := make([]string, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.id)
+	}
+	return out, nil
+}
+```
+
+`internal/usage/round.go` 里加：
+
+```go
+// batch gives how many accounts one round reads at most.
+//
+// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
+// 卡片那一趟也一样：card: 0 该是"读一个"，不是"全都读"。
+func batch(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
+```
+
+- [ ] **Step 4: 库里「最新的一次读」按时刻排**
+
+`internal/store/store.go` 里改：时刻说哪一次读是最新的，id 只在时刻一样时分出先后 —— 跟签到那边一个样（签到那一行是就地改的，id 不动，只有时刻往前走）。
+
+```go
+// LatestUsageSnapshots gives each account's newest usage reading.
+//
+// The newest is the one that was read last: the time says when the
+// reading was made, and the id only breaks a tie between two readings
+// of the same millisecond.
+//
+// The id alone is not enough. A reading stamps its time when it starts
+// and writes it down when it ends, so two readings of one account that
+// overlap leave the older reading with the greater id -- and the card
+// would then show the older numbers. The check-ins have the same shape
+// and the same rule.
+func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+usageSnapshotColumns("s")+`
+		FROM usage_snapshots s
+		WHERE s.id = (
+			SELECT s2.id FROM usage_snapshots s2
+			WHERE s2.account_id = s.account_id
+			ORDER BY s2.created_at DESC, s2.id DESC
+			LIMIT 1
+		)
+		ORDER BY s.account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("latest usage snapshots: %w", err)
+	}
+	defer rows.Close()
+	var out []UsageSnapshot
+	for rows.Next() {
+		u, err := scanUsageSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("latest usage snapshots: %w", err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("latest usage snapshots: %w", err)
+	}
+	return out, nil
+}
+
+// LatestUsageSnapshot gives one account's newest usage reading.
+//
+// It is the reading that was made last, for the same reason as in
+// LatestUsageSnapshots: the time says which reading is the newest and
+// the id only breaks a tie.
+//
+// An account that was never read has no reading and no error.
+func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (UsageSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+usageSnapshotColumns("")+`
+		FROM usage_snapshots WHERE account_id=?
+		ORDER BY created_at DESC, id DESC LIMIT 1`, accountID)
+	u, err := scanUsageSnapshot(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UsageSnapshot{}, nil
+	}
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("latest usage snapshot %s: %w", accountID, err)
+	}
+	return u, nil
+}
+```
+
+- [ ] **Step 5: README 改掉那两句**
+
+「读额度」那一节里「排在前面的先读：签到待补 → 标记到期 → 从没读过 → 热 → 冷」和冷账号排在最后的那一句都错了：冷账号不在名单里。
+
+- [ ] **Step 6: 提交**
+
+```
+git add internal/usage internal/store README.md docs/superpowers/plans
+git commit -m "fix(usage): 该读的是该读的那些账号"
 ```
 
 ---
