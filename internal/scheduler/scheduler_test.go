@@ -107,6 +107,84 @@ func TestUsageRefresh(t *testing.T) {
 	}
 }
 
+// TestTheUsageRoundReadsTheAccountsThatNeedIt says the round reads the
+// accounts that need a reading first, and stops at the batch.
+//
+// 账号多起来以后，冷账号的额度没有必要读：读了也是旧的。批次满了就
+// 停，剩下的下一趟接着读——排在前面的是该读的。
+func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	// acc_never 一次也没读过：它得读一次，不然卡上没有它。
+	// acc_cold 很久以前读过：它排在后面，这一趟轮不到它。
+	for _, id := range []string{"acc_never", "acc_cold"} {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_cold", Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: now.Add(-2 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	// The account API is pointed at the test server. Without this the
+	// test asks MiniMax for the numbers and waits for an answer that
+	// never comes.
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	cfg := config.Default()
+	// 一趟只读一个：读谁由排在前面的说了算。
+	cfg.Usage.Refresh.Batch = 1
+	sc := New(mgr, cfg)
+	sc.RefreshUsage(ctx)
+
+	snaps, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有那个从没读过的被读了。
+	fresh := []string{}
+	for _, snap := range snaps {
+		if snap.CreatedAt.After(now) {
+			fresh = append(fresh, snap.AccountID)
+		}
+	}
+	if len(fresh) != 1 || fresh[0] != "acc_never" {
+		t.Fatalf("the accounts read = %v, want only acc_never: %+v", fresh, snaps)
+	}
+}
+
 func TestCheckinAll(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

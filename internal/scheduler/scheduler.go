@@ -116,7 +116,7 @@ func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	round := usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
+	round := s.round()
 	res, err := round.Run(ctx, ids, round.Options())
 	if err != nil {
 		fmt.Printf("checkin: the credits could not be read: %v\n", err)
@@ -136,18 +136,27 @@ func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 	}
 }
 
-// RefreshUsage reads every account's credits.
+// RefreshUsage reads the credits of the accounts that should be read.
+//
+// 它不再是"把所有账号读一遍"：账号多起来以后，冷账号的额度没有必要
+// 读 —— 读了也是旧的。要读的是那些该读的：签到待补的、标记到期的、
+// 从没读过的、还有热的。
 func (s *Scheduler) RefreshUsage(ctx context.Context) {
-	accounts, err := s.Mgr.Accounts(ctx)
+	res, err := s.round().RefreshDue(ctx)
 	if err != nil {
+		fmt.Printf("usage: the round failed: %v\n", err)
 		return
 	}
-	for _, a := range accounts {
-		if _, err := s.Mgr.RefreshUsage(ctx, a.ID); err != nil {
-			// 一个账号读不到不影响别的
-			continue
-		}
+	for _, reason := range res.Reasons {
+		fmt.Printf("usage: %s\n", reason)
 	}
+}
+
+// round makes the reader of the credits.
+//
+// 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
+func (s *Scheduler) round() *usage.Round {
+	return usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
 }
 
 // RenewTokens renews the tokens that are about to end.
@@ -216,7 +225,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 	if err != nil {
 		at = time.Date(0, 1, 1, 9, 0, 0, 0, time.Local)
 	}
-	usageEvery := s.Cfg.Schedule.UsageRefresh.Duration()
+	usageEvery := s.Cfg.Usage.Refresh.ScanEvery.Duration()
+	if usageEvery <= 0 {
+		usageEvery = s.Cfg.Schedule.UsageRefresh.Duration()
+	}
 	if usageEvery <= 0 {
 		usageEvery = 15 * time.Minute
 	}

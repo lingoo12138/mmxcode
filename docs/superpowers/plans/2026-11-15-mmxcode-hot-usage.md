@@ -2087,7 +2087,7 @@ func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	round := usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
+	round := s.round()
 	res, err := round.Run(ctx, ids, round.Options())
 	if err != nil {
 		fmt.Printf("checkin: the credits could not be read: %v\n", err)
@@ -3064,7 +3064,7 @@ func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
 		case "/minimax-cloud/api/v1/credit/details":
 			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
 		default:
-			w.Write([]byte(`{}`)
+			w.Write([]byte(`{}`))
 		}
 	}))
 	defer srv.Close()
@@ -3074,25 +3074,33 @@ func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Migrate(ctx)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
 	now := time.Now()
 	// acc_never 一次也没读过：它得读一次，不然卡上没有它。
 	// acc_cold 很久以前读过：它排在后面，这一趟轮不到它。
 	for _, id := range []string{"acc_never", "acc_cold"} {
-		s.CreateAccount(ctx, store.Account{
+		if err := s.CreateAccount(ctx, store.Account{
 			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
 			CreatedAt: now, UpdatedAt: now,
-		})
-		s.SaveToken(ctx, store.Token{
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveToken(ctx, store.Token{
 			AccountID: id, Access: "tok", Refresh: "ref",
 			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+	if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
 		AccountID: "acc_cold", Granted: 100, Consumed: 10, Remaining: 90,
 		HasAmounts: true, CreatedAt: now.Add(-2 * time.Hour),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	// The account API is pointed at the test server. Without this the
@@ -3112,14 +3120,14 @@ func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 只有那个从没读过的被读了。
-	fresh := 0
+	fresh := []string{}
 	for _, snap := range snaps {
 		if snap.CreatedAt.After(now) {
-			fresh++
+			fresh = append(fresh, snap.AccountID)
 		}
 	}
-	if fresh != 1 {
-		t.Fatalf("the accounts read = %d, want only the one that needed it: %+v", fresh, snaps)
+	if len(fresh) != 1 || fresh[0] != "acc_never" {
+		t.Fatalf("the accounts read = %v, want only acc_never: %+v", fresh, snaps)
 	}
 }
 ```
@@ -3158,6 +3166,8 @@ func (s *Scheduler) RefreshUsage(ctx context.Context) {
 
 ```go
 // round makes the reader of the credits.
+//
+// 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
 func (s *Scheduler) round() *usage.Round {
 	return usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
 }
