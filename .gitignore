@@ -12,6 +12,7 @@ config.yaml
 
 # 编译出来的二进制和运行日志
 /mmxcode.exe
+/mmxcode.exe~
 /serve.log
 
 # 审查临时目录
