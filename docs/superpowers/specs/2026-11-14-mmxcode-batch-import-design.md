@@ -129,14 +129,31 @@ body: {"loginType":"20","email":"…","authToken":"<base64(RSA(密码))>",
 ```
 GET https://account.minimax.io/oauth2/device/authorize?user_code=…&app_id=3001
 Cookie: _sid=…
--> 200 {…设备信息…, groups:[{id:…, is_default:true}, …]}
+-> 200 {"code":0,"data":{"status":"pending",
+                        "groups":[{"group_id":"…","name":"…","identifier":"…",
+                                   "is_default":true,"can_authorize":true}, …],
+                        "client_info":{…}}}
 ```
 
 `group_id` 取 `is_default` 的那一组。
 
-- `is_default` 的真假有三种写法（真的布尔、`1`、`"true"`），三种都认。站
-  点到底回哪一种，原先没人验过（§11 待实测第 3 条）；认错一个组和认不出
-  一个组，后果一样：账号批不了设备码
+**组的 id 字段叫 `group_id`，不是 `id`**（2026-11-16 实测：站点自己的代码
+`chunks/app/oauth-authorize/page-fa92bc4f8bc755a1.js`，站点版本
+`prod-web-va-0.1.45`）：
+
+```js
+j = e => {let i = e.filter(e => e.is_default); return 1===i.length ? i[0] : null}
+k = (e,t,i) => {"approve"===t ? {user_code:e,decision:t,group_id:i} : {user_code:e,decision:t}}
+// 批准时调的是：k(user_code, "approve", S.group_id)
+```
+
+`id` 是我们照着规格臆想的字段，站点根本没回它：认它就等于一个组也认不出
+来，于是每个号都死在「没有默认组」上 —— 真账号上一跑就露馅了。`id` 留着
+当第二个名字。
+
+- 站点自己只认**一个**默认组（`1===i.length ? i[0] : null`）：有两个默认组
+  的时候我们也不猜，报错 —— 猜错了就是把账号批进别的组里去了
+- `is_default` 的真假有三种写法（真的布尔、`1`、`"true"`），三种都认
 - 没有默认组、但**只有一个组**的时候，就用那一个：没得选的时候不猜。站点
   后头收不收是站点的事，让它答，比我们先拒了好
 - 没有默认组、**有好几个组**的时候报错（前端也是这么处理的：「A default
@@ -521,7 +538,9 @@ docker compose exec mmxcode mmxcode import --file /data/accounts.txt
 1. **拿真账号跑通整条链**（只有人能做）
 2. `statusInfo.code` 在「密码错」这件事上的**确切**码值（笔记里只列了常量名，没有实测对照表）
 3. `group_id` 的默认组规则：`is_default` 的那组在真实账号上是否唯一 —— 现
-   在错里带着站点答的原文了，再跑一次导入就能看见（2026-11-16 改）
+   在错里带着站点答的原文了，再跑一次导入就能看见（2026-11-16 改）。
+   **组的形状已经验过**（站点自己的代码 §2.4：字段叫 `group_id`；站点自己
+   只认一个默认组），剩下的是真账号上 `is_default` 是不是真的布尔
 4. 大陆出口下 `account.minimax.io` 是否也被 307 到 `.cn`（笔记里只记了 `agent.minimax.io`）
 5. Akamai 的 `_abck` / `bm_sz` 在批量登录时会不会真的拦（笔记里的实测是单账号直连通过）
 6. 批量到多少个号会触发风控

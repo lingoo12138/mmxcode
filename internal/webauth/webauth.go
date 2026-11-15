@@ -323,22 +323,55 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 		return "", fmt.Errorf("device authorize: %w", err)
 	}
 	groups := findGroups(answer)
+	// 站点自己只认一个默认组：它的前端是 `1===i.length ? i[0] : null`，
+	// 两个默认组它自己也不知道该用哪个。我们也不猜：猜错了就是把账号
+	// 批进别的组里去了。
+	var defaultID string
+	defaults := 0
 	for _, g := range groups {
 		if !isDefaultGroup(g) {
 			continue
 		}
-		if id, ok := g["id"].(string); ok && id != "" {
-			return id, nil
+		defaults++
+		if id, ok := groupID(g); ok && defaultID == "" {
+			defaultID = id
 		}
+	}
+	if defaults == 1 && defaultID != "" {
+		return defaultID, nil
+	}
+	if defaults > 1 {
+		return "", noDefaultGroupError{raw: rawAnswer(answer)}
 	}
 	// 没有默认组的时候，只有一个组的话就用它：没得选的时候不猜。站点
 	// 收不收是站点的事，让它答 —— 我们先拒了，就把人挡在门外了。
 	if len(groups) == 1 {
-		if id, ok := groups[0]["id"].(string); ok && id != "" {
+		if id, ok := groupID(groups[0]); ok {
 			return id, nil
 		}
 	}
 	return "", noDefaultGroupError{raw: rawAnswer(answer)}
+}
+
+// groupID says which group an entry is, and what its id is.
+//
+// 站点自己的代码（app/oauth-authorize 页，prod-web-va-0.1.45）：
+//
+//	j = e => {let i = e.filter(e => e.is_default); return 1===i.length ? i[0] : null}
+//	k = (e,t,i) => {"approve"===t ? {user_code:e,decision:t,group_id:i} : ...}
+//	k(t, "approve", S.group_id)
+//
+// 组的形状是 {group_id, name, identifier, is_default, can_authorize} ——
+// 里面根本没有 id。id 是我们照着规格臆想的，认它就等于一个组也认不出
+// 来。group_id 是站点真的那个字段；id 留着是认老样子：认错了总比认不
+// 出强。
+func groupID(g map[string]any) (string, bool) {
+	for _, key := range []string{"group_id", "id"} {
+		if id, ok := g[key].(string); ok && id != "" {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // isDefaultGroup says whether a group is the site's default one.
@@ -400,10 +433,12 @@ func (e noDefaultGroupError) Is(target error) bool { return target == ErrNoDefau
 // findGroups finds the groups in the site's answer.
 //
 // The shape of the answer is not documented, so the groups are looked
-// for anywhere in it: any array whose entries have an "id" and an
-// "is_default".
+// for anywhere in it: any array whose entries carry a group id.
+//
+// 站点写的那个名字（group_id）是先找的：别的数组里也可能有 id，那不是
+// 组。id 是我们照着规格臆想的形状，留着当第二个名字。
 func findGroups(v any) []map[string]any {
-	var out []map[string]any
+	var byGroupID, byID []map[string]any
 	var walk func(any)
 	walk = func(v any) {
 		switch t := v.(type) {
@@ -415,24 +450,34 @@ func findGroups(v any) []map[string]any {
 			for _, child := range t {
 				walk(child)
 			}
-			items := make([]map[string]any, 0, len(t))
+			grouped := make([]map[string]any, 0, len(t))
+			plain := make([]map[string]any, 0, len(t))
 			for _, item := range t {
 				m, ok := item.(map[string]any)
 				if !ok {
 					return
 				}
-				if _, hasID := m["id"]; !hasID {
-					return
+				if _, has := m["group_id"]; has {
+					grouped = append(grouped, m)
+					continue
 				}
-				items = append(items, m)
+				if _, has := m["id"]; has {
+					plain = append(plain, m)
+				}
 			}
-			if len(items) > 0 {
-				out = append(out, items...)
+			if len(grouped) > 0 {
+				byGroupID = append(byGroupID, grouped...)
+			}
+			if len(plain) > 0 {
+				byID = append(byID, plain...)
 			}
 		}
 	}
 	walk(v)
-	return out
+	if len(byGroupID) > 0 {
+		return byGroupID
+	}
+	return byID
 }
 
 // sign makes a signed request for the web flavour.

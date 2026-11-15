@@ -227,6 +227,69 @@ func TestTheOnlyGroupIsApprovedWhenNoneIsTheDefault(t *testing.T) {
 	}
 }
 
+// TestTheGroupIsFoundByTheNameTheSiteUses says the group id is read
+// from the field the site really sends.
+//
+// 站点自己的代码（app/oauth-authorize 页，prod-web-va-0.1.45）：
+//
+//	j = e => {let i = e.filter(e => e.is_default); return 1===i.length ? i[0] : null}
+//	k = (e,t,i) => {"approve"===t ? {user_code:e,decision:t,group_id:i} : ...}
+//	k(t, "approve", S.group_id)
+//
+// 组的形状是 {group_id, name, identifier, is_default, can_authorize} ——
+// 里面根本没有 id。我们照着规格里那个 {id, is_default} 去认，一个组也
+// 认不出来，于是每个号都死在「没有默认组」上。
+func TestTheGroupIsFoundByTheNameTheSiteUses(t *testing.T) {
+	f := newFakeSite(t)
+	f.groups = `{"code":0,"data":{"status":"pending","groups":[` +
+		`{"group_id":"g1","name":"我的组","identifier":"my-group","is_default":true,"can_authorize":true},` +
+		`{"group_id":"g2","name":"别的组","identifier":"other","is_default":false,"can_authorize":true}` +
+		`]}}`
+	c := f.client(t)
+	f.login(t, c)
+	if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if f.approved["group_id"] != "g1" {
+		t.Fatalf("group_id = %v, want the default group", f.approved["group_id"])
+	}
+}
+
+// TestTheOnlyGroupIsApprovedWhenItIsWrittenTheSitesWay says the one
+// group is used even when it is written the way the site writes it.
+func TestTheOnlyGroupIsApprovedWhenItIsWrittenTheSitesWay(t *testing.T) {
+	f := newFakeSite(t)
+	f.groups = `{"code":0,"data":{"groups":[{"group_id":"g1","name":"我的组","is_default":false}]}}`
+	c := f.client(t)
+	f.login(t, c)
+	if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if f.approved["group_id"] != "g1" {
+		t.Fatalf("group_id = %v, want the only group", f.approved["group_id"])
+	}
+}
+
+// TestTwoDefaultGroupsAreAnError says two default groups is an error.
+//
+// 站点只认一个默认组：它的前端是 `1===i.length ? i[0] : null`，两个默
+// 认组它自己也不知道该用哪个。我们也不猜：猜错了就是把账号批进别的组里
+// 去了。
+func TestTwoDefaultGroupsAreAnError(t *testing.T) {
+	f := newFakeSite(t)
+	f.groups = `{"code":0,"data":{"groups":[` +
+		`{"group_id":"g1","is_default":true},{"group_id":"g2","is_default":true}]}}`
+	c := f.client(t)
+	f.login(t, c)
+	err := c.Approve(context.Background(), "ABCD-1234")
+	if err == nil {
+		t.Fatal("no error with two default groups")
+	}
+	if !errors.Is(err, ErrNoDefaultGroup) {
+		t.Fatalf("err = %v, want the no-default-group error", err)
+	}
+}
+
 // TestSeveralGroupsWithoutADefaultAreAnError says several groups and
 // no default among them is an error.
 //
