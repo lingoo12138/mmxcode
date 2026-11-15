@@ -2,6 +2,8 @@ package card
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,8 +84,9 @@ func TestAnAccountThatWasNeverReadIsNotCounted(t *testing.T) {
 	if c.Balance != "400 credits" {
 		t.Errorf("balance = %q, want %q", c.Balance, "400 credits")
 	}
-	if c.Extra == nil || c.Extra.Unread != 1 {
-		t.Fatalf("extra = %+v, want one unread account", c.Extra)
+	// 没读过的那个，摆在卡片上看得见：账号那一行说了有几个没读到。
+	if got := summaryText(c); got != "2 个账号 · 1 有读数 · 1 没读过" {
+		t.Errorf("the summary says %q, want %q", got, "2 个账号 · 1 有读数 · 1 没读过")
 	}
 }
 
@@ -139,7 +142,7 @@ func TestAnAccountWithoutAPlanIsFree(t *testing.T) {
 // TestThePlanIsLeftOutWhenItIsNotKnown says a plan that could not be
 // read is not named.
 //
-// 读不到的计划不是一个没有计划：说 Free 是说它没有，说都��说才是真的
+// 读不到的计划不是一个没有计划：说 Free 是说它没有，说都不说才是真的
 // 不知道。
 func TestThePlanIsLeftOutWhenItIsNotKnown(t *testing.T) {
 	c := Of(
@@ -169,8 +172,9 @@ func TestTheCreditsAreAWindowOfTheirOwn(t *testing.T) {
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
 		nil,
 	)
-	if len(c.Windows) != 1 {
-		t.Fatalf("windows = %d, want 1", len(c.Windows))
+	// 积分那一行，协议那一行。
+	if len(c.Windows) != 2 {
+		t.Fatalf("windows = %d, want 2", len(c.Windows))
 	}
 	w := c.Windows[0]
 	if w.Name != "Credits" {
@@ -235,8 +239,9 @@ func TestAnUnlimitedWindowIsSaidSo(t *testing.T) {
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
 		nil,
 	)
-	if len(c.Windows) != 2 {
-		t.Fatalf("windows = %d, want 2", len(c.Windows))
+	// 积分那一行、Unlimited 那一行、协议那一行。
+	if len(c.Windows) != 3 {
+		t.Fatalf("windows = %d, want 3", len(c.Windows))
 	}
 	found := false
 	for _, w := range c.Windows {
@@ -369,8 +374,8 @@ func TestAWindowThatReallyUsedNothingSaysZero(t *testing.T) {
 func TestTheAccountsAreNamedOnTheWindows(t *testing.T) {
 	c := Of(
 		[]store.UsageSnapshot{
-			{AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 400},
-			{AccountID: "acc_02", HasAmounts: true, Granted: 300, Remaining: 250},
+			{AccountID: "acc_01", HasAmounts: true, Granted: 500, Consumed: 50, Remaining: 450},
+			{AccountID: "acc_02", HasAmounts: true, Granted: 300, Consumed: 50, Remaining: 250},
 		},
 		[]store.Account{
 			{ID: "acc_01", Name: "主号"},
@@ -378,11 +383,176 @@ func TestTheAccountsAreNamedOnTheWindows(t *testing.T) {
 		},
 		nil,
 	)
-	if len(c.Windows) != 2 {
-		t.Fatalf("windows = %d, want 2", len(c.Windows))
+	names := map[string]bool{}
+	for _, w := range c.Windows {
+		names[w.Name] = true
 	}
-	if c.Windows[0].Name != "主号 · Credits" {
-		t.Errorf("name = %q, want %q", c.Windows[0].Name, "主号 · Credits")
+	for _, want := range []string{"主号 · Credits", "副号 · Credits"} {
+		if !names[want] {
+			t.Errorf("windows = %+v, want a %q window", c.Windows, want)
+		}
+	}
+}
+
+// TestThePoolIsOnOneWindow says the whole pool's credits are one window.
+//
+// 98 个号各摆一行，卡片就没法看了：全池的积分摆一行，别的账号在「账号」
+// 那一行里说清楚。
+func TestThePoolIsOnOneWindow(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{
+			{AccountID: "acc_01", HasAmounts: true, Granted: 500, Consumed: 100, Remaining: 400},
+			{AccountID: "acc_02", HasAmounts: true, Granted: 300, Consumed: 50, Remaining: 250},
+		},
+		[]store.Account{
+			{ID: "acc_01", Name: "主号"},
+			{ID: "acc_02", Name: "副号"},
+		},
+		nil,
+	)
+	w, ok := windowOf(c, "Credits")
+	if !ok {
+		t.Fatalf("windows = %+v, want a Credits window", c.Windows)
+	}
+	if w.Display != "150 / 800" {
+		t.Errorf("display = %q, want %q", w.Display, "150 / 800")
+	}
+	if w.Used == nil || *w.Used != 18.75 {
+		t.Errorf("used = %v, want 18.75", w.Used)
+	}
+}
+
+// TestTheAccountsThatUsedNothingAreNotOnTheCard says an account that used
+// nothing is not a window of its own.
+//
+// 一行「xxx@hotmail.com · Credits 0 / 400」没有话可说：98 个号全是这
+// 样的，卡片就没法看了。
+func TestTheAccountsThatUsedNothingAreNotOnTheCard(t *testing.T) {
+	snaps := []store.UsageSnapshot{}
+	accts := []store.Account{}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		snaps = append(snaps, store.UsageSnapshot{
+			AccountID: id, HasAmounts: true, Granted: 400, Remaining: 400,
+		})
+		accts = append(accts, store.Account{ID: id, Name: fmt.Sprintf("号%02d", i)})
+	}
+	c := Of(snaps, accts, nil)
+	for _, w := range c.Windows {
+		if strings.HasPrefix(w.Name, "号") && w.Display == "0 / 400" {
+			t.Errorf("the card has a window for an account that used nothing: %+v", c.Windows)
+		}
+	}
+	// 摆着的只有三行：全池的积分，账号那一句，协议那一句。
+	if len(c.Windows) != 3 {
+		t.Fatalf("windows = %d, want 3: %+v", len(c.Windows), c.Windows)
+	}
+}
+
+// TestTheAccountsThatUsedSomethingAreOnTheCard says an account that used
+// something gets a window of its own.
+func TestTheAccountsThatUsedSomethingAreOnTheCard(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{
+			{AccountID: "acc_01", HasAmounts: true, Granted: 400, Remaining: 400},
+			{AccountID: "acc_02", HasAmounts: true, Granted: 400, Consumed: 31.5, Remaining: 368.5},
+		},
+		[]store.Account{
+			{ID: "acc_01", Name: "号01"},
+			{ID: "acc_02", Name: "号02"},
+		},
+		nil,
+	)
+	w, ok := windowOf(c, "号02 · Credits")
+	if !ok {
+		t.Fatalf("windows = %+v, want a window for the account that used something", c.Windows)
+	}
+	if w.Display != "31.5 / 400" {
+		t.Errorf("display = %q, want %q", w.Display, "31.5 / 400")
+	}
+	if w.Used == nil || *w.Used != 7.88 {
+		t.Errorf("used = %v, want 7.88", w.Used)
+	}
+}
+
+// TestAtMostTenAccountsAreOnTheCard says the card does not put every
+// account on it.
+//
+// 账号多的时候，卡上摆的账号是有限的：摆用得最多的那几个，其余的在
+// 「账号」那一行里说清楚有几个没摆上。
+func TestAtMostTenAccountsAreOnTheCard(t *testing.T) {
+	snaps := []store.UsageSnapshot{}
+	accts := []store.Account{}
+	for i := 0; i < 15; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		snaps = append(snaps, store.UsageSnapshot{
+			AccountID: id, HasAmounts: true, Granted: 400,
+			Consumed: float64(i + 1), Remaining: 400 - float64(i+1),
+		})
+		accts = append(accts, store.Account{ID: id, Name: fmt.Sprintf("号%02d", i)})
+	}
+	c := Of(snaps, accts, nil)
+	own := 0
+	for _, w := range c.Windows {
+		if strings.HasPrefix(w.Name, "号") {
+			own++
+		}
+	}
+	if own != 10 {
+		t.Errorf("the card has %d account windows, want 10: %+v", own, c.Windows)
+	}
+	// 用得最多的那个摆着，用得最少的那个没摆。
+	if _, ok := windowOf(c, "号14 · Credits"); !ok {
+		t.Errorf("windows = %+v, want the account that used the most", c.Windows)
+	}
+	if _, ok := windowOf(c, "号00 · Credits"); ok {
+		t.Errorf("windows = %+v, want the account that used the least to be left out", c.Windows)
+	}
+}
+
+// TestTheSummarySaysHowManyAccountsThereAre says the card says how many
+// accounts are behind it.
+func TestTheSummarySaysHowManyAccountsThereAre(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{
+			{AccountID: "acc_01", HasAmounts: true, Granted: 400, Remaining: 400},
+			{AccountID: "acc_02", HasAmounts: true, Granted: 400, Remaining: 400},
+		},
+		[]store.Account{
+			{ID: "acc_01", Name: "号01"},
+			{ID: "acc_02", Name: "号02"},
+			{ID: "acc_03", Name: "号03"},
+		},
+		nil,
+	)
+	if got := summaryText(c); got != "3 个账号 · 2 有读数 · 1 没读过" {
+		t.Errorf("the summary says %q, want %q", got, "3 个账号 · 2 有读数 · 1 没读过")
+	}
+}
+
+// TestTheProtocolsAreOnTheCard says the card says which protocols the
+// gateway speaks.
+//
+// 「能用哪些协议」这件事要摆在明处：客户端（Claude Code、Codex、脚本）
+// 直接指网关的时候按自己的协议说话，magpie 跟网关讲的是 Anthropic。
+func TestTheProtocolsAreOnTheCard(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{{AccountID: "acc_01", HasAmounts: true, Granted: 400, Remaining: 400}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	w, ok := windowOf(c, "协议")
+	if !ok {
+		t.Fatalf("windows = %+v, want a 协议 window", c.Windows)
+	}
+	if w.Display != "Anthropic · Chat Completions · Responses" {
+		t.Errorf("display = %q, want %q", w.Display, "Anthropic · Chat Completions · Responses")
+	}
+	if !w.Aside {
+		t.Error("the 协议 window is not aside: it has no share of its own")
+	}
+	if w.Used != nil {
+		t.Errorf("the 协议 window says it used %v: it does not know", *w.Used)
 	}
 }
 
@@ -433,19 +603,39 @@ func TestTheNumbersAreNotFullOfNoise(t *testing.T) {
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
 		nil,
 	)
-	if len(c.Windows) != 1 {
-		t.Fatalf("windows = %d, want 1", len(c.Windows))
+	if len(c.Windows) != 2 {
+		t.Fatalf("windows = %d, want 2", len(c.Windows))
 	}
 	w := c.Windows[0]
 	if w.Amount == nil || *w.Amount != 0.05 {
 		t.Errorf("amount = %v, want 0.05", w.Amount)
 	}
-	if w.RunsOut == nil || *w.RunsOut != 399.95 {
-		t.Errorf("runsOut = %v, want 399.95", w.RunsOut)
-	}
 	if w.Used == nil || *w.Used != 0.01 {
 		t.Errorf("used = %v, want 0.01", w.Used)
 	}
+	if w.RunsOutAt == nil {
+		t.Error("the window says when the credits run out: it does not")
+	}
+}
+
+// summaryText gives the text of the card's 账号 window.
+func summaryText(c Card) string {
+	for _, w := range c.Windows {
+		if w.Name == "账号" {
+			return w.Display
+		}
+	}
+	return ""
+}
+
+// windowOf gives the window of that name, if the card has one.
+func windowOf(c Card, name string) (Window, bool) {
+	for _, w := range c.Windows {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return Window{}, false
 }
 
 // TestTheCardSaysTheAccountIsUsedUp says an account that is marked
@@ -474,6 +664,9 @@ func TestTheCardSaysTheAccountIsUsedUp(t *testing.T) {
 			c.Balance, "0 credits")
 	}
 	for _, w := range c.Windows {
+		if w.Name == "协议" {
+			continue
+		}
 		if w.Display != "用完" {
 			t.Errorf("the window %q says %q, want %q", w.Name, w.Display, "用完")
 		}

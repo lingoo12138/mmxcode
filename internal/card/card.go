@@ -9,11 +9,22 @@
 //
 // 这个包照着那张卡片做：网关的积分是所有账号加起来，计划是账号里最重
 // 的那个，窗口每一个都说清是哪个账号的。
+//
+// 卡上摆的行是有限的。网关后面有 98 个号，每个号摆一行「xxx · Credits
+// 0 / 400」，卡片就没法看了 —— 一片一样的行，什么话也没说。所以：
+//
+//   - 全池的积分摆一行（Credits）；
+//   - 账号有几个、有几个读到、协议是哪几个，各摆一行（账号、协议）；
+//   - 只有「有话说」的账号才各有自己的窗口（用过积分的、用完的），
+//     用得最多的排前面，最多十个；
+//   - 账号的计划窗口照旧摆着（有计划的账号才有）。
 package card
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,10 +33,24 @@ import (
 	"mmxcode/internal/store"
 )
 
+// shownAccounts is how many accounts get a window of their own.
+//
+// 卡上摆的账号是有限的：98 个号各摆一行，卡片就没法看了。只摆「有话说」
+// 的 —— 用过积分的、用完的 —— 用得最多的排前面。
+const shownAccounts = 10
+
+// protocols are the protocols the gateway speaks.
+//
+// 网关三扇门都收：Claude Code 的 Anthropic、多数 agent 的 OpenAI Chat
+// Completions、Codex 的 OpenAI Responses。这件事要摆在卡片上：直接指网关
+// 的客户端按自己的协议说话，magpie 跟网关讲的是 Anthropic（别的客户端
+// magpie 自己翻译）。
+const protocols = "Anthropic · Chat Completions · Responses"
+
 // Card is the gateway's usage as magpie reads it.
 //
-// 上面四个字段是 magpie 的：它照着这些名字读。mmxcode 那块是我们自己
-// 的（读数是什么时候的、几个账号在后面），magpie 不认识它，也不会把它
+// 上面四个字段是 magpie 的：它照着这些名字读。mmxcode 那块是我们自己的
+// （读数是什么时候的、几个账号在后面），magpie 不认识它，也不会把它
 // 当成自己的字段。
 type Card struct {
 	// Plan is the plan the accounts are on.
@@ -39,8 +64,9 @@ type Card struct {
 	//
 	// "437.5 credits"：magpie 的卡片就是这么写的。
 	Balance string `json:"balance,omitempty"`
-	// Windows are the windows of the accounts: the credits of each one
-	// and the windows of its plan.
+	// Windows are the windows of the card: the pool's credits, how many
+	// accounts there are, the protocols the gateway speaks, and the
+	// windows of the accounts that have something to say.
 	Windows []Window `json:"windows"`
 	// Extra is what mmxcode knows about the card.
 	Extra *Extra `json:"mmxcode,omitempty"`
@@ -61,12 +87,6 @@ type Extra struct {
 	ReadAt *time.Time `json:"read_at,omitempty"`
 	// Accounts is how many accounts are behind the card.
 	Accounts int `json:"accounts"`
-	// Readings is how many of them have a reading.
-	Readings int `json:"readings"`
-	// Unread is how many have never been read.
-	Unread int `json:"unread"`
-	// Unreadable is how many had a reading that failed.
-	Unreadable int `json:"unreadable"`
 }
 
 // Window is one window of the card.
@@ -79,10 +99,10 @@ type Window struct {
 	//
 	// 它是一个指针，为的是分清「不知道」和「真的是 0」：
 	//
-	// - nil 是不知道：这个窗口没有 count（Unlimited 的窗口就是这样）。
-	//   magpie 的规矩是「vendor 没说就别写 used，绝不要拿 0 冒充不知道」
-	//   —— 路由拿 used 给账号算权重，一个「不知道」的窗口报 0，就被
-	//   当成「还剩 100%」。
+	// - nil 是不知道：这个窗口没有 count（Unlimited 的窗口、协议那一
+	//   行就是这样）。magpie 的规矩是「vendor 没说就别写 used，绝不要拿 0
+	//   冒充不知道」—— 路由拿 used 给账号算权重，一个「不知道」的窗口
+	//   报 0，就被当成「还剩 100%」。
 	// - 指向 0 是真的是 0：这个窗口有 count，用量就是零。
 	//
 	// 所以指针是空的才不写这个字段，指向 0 照写。
@@ -127,25 +147,53 @@ func Of(snaps []store.UsageSnapshot, accounts []store.Account, spent []store.Exh
 	marks := spentOf(spent, time.Now())
 	c := Card{Windows: []Window{}}
 	read := map[string]bool{}
+
+	// 每个账号一块：它自己的积分窗口、它自己的计划窗口。
+	type piece struct {
+		name string
+		// credit 是它自己的积分窗口（读不到就是没有）。
+		credit *Window
+		plans  []Window
+		// used 是它用掉的最大份额（%）。
+		used float64
+	}
+	pieces := map[string]*piece{}
+	var order []string
+
+	var granted, used float64
+	var expires *time.Time
+
 	for _, s := range snaps {
 		read[s.AccountID] = true
 		name := accountName(byAccount[s.AccountID], s.AccountID)
-		// 一个账号的窗口上带它的名字：网关是轮转的，不说清是谁的，
-		// 卡片上就分不出哪个窗口是谁的。
-		prefix := ""
-		if len(snaps) > 1 {
-			prefix = name + " · "
+		p := pieces[s.AccountID]
+		if p == nil {
+			p = &piece{name: name}
+			pieces[s.AccountID] = p
+			order = append(order, s.AccountID)
 		}
 		mark := marks[s.AccountID]
-		c.Windows = append(c.Windows, creditWindow(s, prefix, mark)...)
-		c.Windows = append(c.Windows, planWindows(s, prefix, mark)...)
+		if w, ok := creditWindow(s, mark); ok {
+			p.credit = &w
+			p.used = bigger(p.used, shareOf(w))
+		}
+		p.plans = append(p.plans, planWindows(s, mark)...)
+		for _, w := range p.plans {
+			p.used = bigger(p.used, shareOf(w))
+		}
 		if s.HasAmounts {
 			if !mark.out {
 				// 用完的账号没有积分可以花：网关不会把它给客户端，卡上
 				// 不能还摆着它的数。
+				granted += s.Granted
+				used += s.Consumed
 				c.remaining += s.Remaining
 			}
 			c.readable = true
+			if !mark.out && !s.ExpiresAt.IsZero() && (expires == nil || s.ExpiresAt.Before(*expires)) {
+				t := s.ExpiresAt
+				expires = &t
+			}
 		}
 		if p, ok := planOf(s); ok {
 			if c.Plan == "" || planRank(p) > planRank(c.Plan) {
@@ -159,6 +207,65 @@ func Of(snaps []store.UsageSnapshot, accounts []store.Account, spent []store.Exh
 			}
 		}
 	}
+
+	// 一个账号的时候，它自己的窗口就是全池的窗口；账号多了，全池的积
+	// 分单独摆一行，账号各自的窗口另摆。
+	several := len(accounts) > 1
+	if several && c.readable && granted > 0 {
+		c.Windows = append(c.Windows, poolWindow(granted, used, expires))
+	}
+
+	// 有话说的账号：用过积分的、用完的。
+	//
+	// 只有一个账号的时候，它的窗口就是全池的窗口，都摆着。
+	var notable []*piece
+	for _, id := range order {
+		p := pieces[id]
+		if p == nil {
+			continue
+		}
+		if several && p.used <= 0 && !marks[id].out {
+			continue
+		}
+		notable = append(notable, p)
+	}
+	sort.SliceStable(notable, func(i, j int) bool {
+		if notable[i].used != notable[j].used {
+			return notable[i].used > notable[j].used
+		}
+		return notable[i].name < notable[j].name
+	})
+	hidden := 0
+	if len(notable) > shownAccounts {
+		hidden = len(notable) - shownAccounts
+		notable = notable[:shownAccounts]
+	}
+
+	// 账号那一行：几个账号、有几个读到、有几个没上卡。
+	summary, ok := summaryWindow(accounts, snaps, read, hidden)
+	if ok {
+		c.Windows = append(c.Windows, summary)
+	}
+
+	for _, p := range notable {
+		prefix := ""
+		if several {
+			prefix = p.name + " · "
+		}
+		if p.credit != nil {
+			w := *p.credit
+			w.Name = prefix + "Credits"
+			c.Windows = append(c.Windows, w)
+		}
+		for _, w := range p.plans {
+			w.Name = prefix + w.Name
+			c.Windows = append(c.Windows, w)
+		}
+	}
+
+	// 协议那一行：网关讲哪几个协议。
+	c.Windows = append(c.Windows, Window{Name: "协议", Display: protocols, Aside: true})
+
 	unread := 0
 	for _, a := range accounts {
 		if !read[a.ID] {
@@ -166,11 +273,8 @@ func Of(snaps []store.UsageSnapshot, accounts []store.Account, spent []store.Exh
 		}
 	}
 	c.Extra = &Extra{
-		Accounts:   len(accounts),
-		Readings:   len(snaps),
-		Unread:     unread,
-		Unreadable: unreadable(snaps),
-		ReadAt:     readAt(snaps),
+		Accounts: len(accounts),
+		ReadAt:   readAt(snaps),
 	}
 	if c.readable {
 		c.Balance = creditsText(c.remaining)
@@ -214,12 +318,61 @@ func planRank(plan string) int {
 	}
 }
 
+// poolWindow gives the whole pool's credits as one window.
+//
+// 全池的积分摆一行：98 个号各摆一行，卡片就没法看了。用了多少、共给了
+// 多少，是所有读得到数的账号加起来。
+func poolWindow(granted, used float64, expires *time.Time) Window {
+	usedR := round2(used)
+	limitR := round2(granted)
+	share := round2(100 * used / granted)
+	return Window{
+		Name:    "Credits",
+		Used:    &share,
+		Display: strconv.FormatFloat(usedR, 'f', -1, 64) + " / " + strconv.FormatFloat(limitR, 'f', -1, 64),
+		Amount:  &usedR,
+		Limit:   &limitR,
+		Unit:    "credits",
+		// 积分什么时候过期：账号里最早的那个。
+		RunsOutAt: expires,
+	}
+}
+
+// summaryWindow gives the card's 账号 window: how many accounts are behind
+// it, how many of them have a reading, and how many were left off.
+//
+// 只有一个账号的时候不用摆：它自己的窗口已经说了。
+func summaryWindow(accounts []store.Account, snaps []store.UsageSnapshot, read map[string]bool, hidden int) (Window, bool) {
+	unread := 0
+	for _, a := range accounts {
+		if !read[a.ID] {
+			unread++
+		}
+	}
+	unreadable := unreadableCount(snaps)
+	if len(accounts) <= 1 && unread == 0 && unreadable == 0 && hidden == 0 {
+		return Window{}, false
+	}
+	text := fmt.Sprintf("%d 个账号 · %d 有读数", len(accounts), len(snaps))
+	if unread > 0 {
+		text += fmt.Sprintf(" · %d 没读过", unread)
+	}
+	if unreadable > 0 {
+		text += fmt.Sprintf(" · %d 没读到数", unreadable)
+	}
+	if hidden > 0 {
+		text += fmt.Sprintf(" · %d 没上卡", hidden)
+	}
+	// 没有 used：这不是一个「用掉了多少」的窗口，是一句话。
+	return Window{Name: "账号", Display: text, Aside: true}, true
+}
+
 // creditWindow gives the credits as a window.
 //
 // magpie 的卡片上，积分是一个窗口：共给了多少、用了多少、什么时候用完。
-func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+func creditWindow(s store.UsageSnapshot, spent spentInfo) (Window, bool) {
 	if !s.HasAmounts || s.Granted <= 0 {
-		return nil
+		return Window{}, false
 	}
 	// 账本给的是十进制的小数，加起来会带出一串小数点后头的零头。
 	// 四舍五入到两位：卡片上的数是给人看的。
@@ -228,7 +381,7 @@ func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Windo
 	left := round2(s.Remaining)
 	share := round2(100 * used / limit)
 	w := Window{
-		Name:    prefix + "Credits",
+		Name:    "Credits",
 		Used:    &share,
 		Display: strconv.FormatFloat(used, 'f', -1, 64) + " / " + strconv.FormatFloat(limit, 'f', -1, 64),
 		Amount:  &used,
@@ -239,18 +392,18 @@ func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Windo
 		// 用完的账号没有积分可以花：网关不会把它给客户端。卡上摆着
 		// 「437.5 / 500」就是骗人 —— 它说了就要兑现。
 		w.Display = "用完"
-		return []Window{w}
+		return w, true
 	}
 	if !s.ExpiresAt.IsZero() {
 		t := s.ExpiresAt
 		w.RunsOutAt = &t
 		w.RunsOut = &left
 	}
-	return []Window{w}
+	return w, true
 }
 
 // planWindows gives the plan's windows.
-func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+func planWindows(s store.UsageSnapshot, spent spentInfo) []Window {
 	if strings.TrimSpace(s.WindowsJSON) == "" {
 		return nil
 	}
@@ -262,7 +415,7 @@ func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window
 	}
 	out := make([]Window, 0, len(ws))
 	for _, w := range ws {
-		cw := Window{Name: prefix + w.Name}
+		cw := Window{Name: w.Name}
 		if w.Unlimited {
 			// Unlimited 的窗口没有 count：不知道用了多少，就不给它写
 			// used。写 0 是拿 0 冒充「不知道」—— magpie 的路由拿 used
@@ -361,8 +514,24 @@ func accountName(a store.Account, id string) string {
 	return id
 }
 
-// unreadable counts the readings that failed.
-func unreadable(snaps []store.UsageSnapshot) int {
+// shareOf gives the window's share used, if it says one.
+func shareOf(w Window) float64 {
+	if w.Used == nil {
+		return 0
+	}
+	return *w.Used
+}
+
+// bigger gives the bigger of the two.
+func bigger(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// unreadableCount counts the readings that failed.
+func unreadableCount(snaps []store.UsageSnapshot) int {
 	n := 0
 	for _, s := range snaps {
 		if !s.HasAmounts {
