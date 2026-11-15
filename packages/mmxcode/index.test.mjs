@@ -110,6 +110,57 @@ test("the sign-in without a key is fine", async (t) => {
   assert.equal(res.key, undefined)
 })
 
+// TestTheAccountIsNamedAfterTheAddress says an account with no name of
+// its own is named after the gateway's address.
+//
+// magpie 给账号起名字用的是 accountId，没有就 metadata.email。不给名字
+// 的时候，地址就是那个名字 —— magpie 的账号列表里就看得见是哪个网关。
+test("the account is named after the address", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ object: "list", data: [] }))
+  })
+  const plugin = await thePlugin()
+  const res = await plugin.auth.methods[0].authorize({ base })
+  assert.equal(res.type, "success")
+  assert.equal(res.metadata.email, base)
+})
+
+// TestTheAccountIsNamedAfterTheNameTheUserGave says the name the user
+// gave is the account's name.
+test("the account is named after the name the user gave", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ object: "list", data: [] }))
+  })
+  const plugin = await thePlugin()
+  const res = await plugin.auth.methods[0].authorize({ base, label: "自建网关" })
+  assert.equal(res.type, "success")
+  assert.equal(res.metadata.email, "自建网关")
+})
+
+// TestTheSignInAsksForTheAccountsId says the sign-in asks for the
+// account's id.
+//
+// 「加接口地址和 id」：地址是网关在哪儿，id 是这个账号在 magpie 里叫什么。
+// 两个都在签入表单里问。
+test("the sign-in asks for the account's id", async () => {
+  const plugin = await thePlugin()
+  const method = plugin.auth.methods[0]
+  const label = method.prompts.find((p) => p.key === "label")
+  assert.ok(label, "the account's id is not asked for")
+  assert.match(label.message, /账号/)
+  assert.equal(label.required, false)
+})
+
+// TestTheProviderSaysItIsTheGateway says the provider says what it is.
+test("the provider says it is the gateway", async () => {
+  const plugin = await thePlugin()
+  const config = {}
+  await plugin.config(config)
+  assert.equal(config.provider.mmxcode.name, "MMXCode 网关")
+})
+
 // TestTheCardIsHandedOverAsItIs says the card comes from the gateway
 // as it is.
 //

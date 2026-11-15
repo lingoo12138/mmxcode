@@ -193,7 +193,7 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
       config.provider ??= {}
       config.provider[PROVIDER] ??= {}
       const p = config.provider[PROVIDER]
-      p.name ??= "MMXCode"
+      p.name ??= "MMXCode 网关"
       // 网关讲 Anthropic 的 /v1/messages
       p.npm ??= NPM
       p.api ??= DEFAULT_BASE + "/v1"
@@ -239,7 +239,7 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
           prompts: [
             { type: "text", key: "base", message: "网关地址（默认 http://127.0.0.1:8080）" },
             { type: "password", key: "key", required: false, message: "聊天用的 key（后台 /keys 申请的；网关一把 key 都没有的时候可以留空）" },
-            { type: "text", key: "label", required: false, message: "这个名字（magpie 里认这个账号用）" },
+            { type: "text", key: "label", required: false, message: "账号 id（magpie 里显示的名字；留空就用网关地址）" },
           ],
           async authorize(inputs = {}) {
             const base = baseOf(inputs)
@@ -250,8 +250,9 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
             // magpie names an account by accountId, else by metadata.email:
             // the label the user gave is the name it will know it by.
             // magpie 给账号起名字用的是 accountId，没有就 metadata.email
-            // —— 用户给的那个名字得落在 email 上，账号才认得出来。
-            return { ...res, metadata: { ...res.metadata, ...(label ? { email: label } : {}) } }
+            // —— 用户给的那个名字得落在 email 上，账号才认得出来。没给
+            // 名字就用网关地址：账号列表里一眼看得见是哪个网关。
+            return { ...res, metadata: { ...res.metadata, email: label || base } }
           },
         },
       ],
