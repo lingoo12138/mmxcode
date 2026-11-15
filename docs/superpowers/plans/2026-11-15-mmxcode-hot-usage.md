@@ -6154,7 +6154,7 @@ go test ./internal/gateway/ -run TestTheTotalConcurrencyIsCached
 
 **六、零碎。**
 
-- `internal/gateway/usage.go`、`cmd/mmxcode/login.go`、`internal/webui/webui.go` 和那两个测试里的注释还在说「调度器每 15 分钟读一遍」：调度器现在每 `usage.refresh.scan_every`（默认 30 秒）扫一遍，老的 `schedule.usage_refresh` 只是没配它的时候的兜底。注释照着改。
+- `internal/gateway/usage.go`、`cmd/mmxcode/login.go`、`internal/webui/webui.go` 和那两个测试里的注释还在说「调度器每 15 分钟读一遍」：调度器现在每 `usage.refresh.scan_every`（默认 30 秒）扫一遍，老的 `schedule.usage_refresh` 只在 `scan_every` 写成 0 的时候才是兜底（不写就是默认的 30 秒）。注释照着改。
 - `internal/usage/usage.go` 的 `newestPerAccount` 和 `newer` 没人用了：每一个调用方给的都是每个账号一条读数（`LatestUsageSnapshots` 就是那么给的）。去重的那两句挪进 `Aggregate` 里，行为不变。
 - `internal/store/store.go` 的 `PruneExpiredWindows` 不接：过了时刻的标记不是垃圾，它是「这个账号该去读一次」的信号（规格 §4.5 的恢复点 A）。删掉它，那个账号就再也等不到那一趟读。它的注释里写清楚了这一点。
 
