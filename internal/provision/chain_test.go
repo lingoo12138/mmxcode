@@ -32,6 +32,9 @@ type fakeStore struct {
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
+	// lockFailures is how many times the library says it is busy before
+	// it lets the write through.
+	lockFailures int
 	// rows are the accounts themselves.
 	rows []store.Account
 	// names are the names that were written.
@@ -129,6 +132,12 @@ func (s *fakeStore) restore(before snapshot) {
 func (s *fakeStore) Tx(ctx context.Context, fn func(store.Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// 库忙：真库上两个写碰上了就是这样（SQLITE_BUSY）。这一趟没写进去
+	// 任何东西，等一下再来一趟就行。
+	if s.lockFailures > 0 {
+		s.lockFailures--
+		return errors.New("database is locked")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -402,6 +411,10 @@ type fakeWeb struct {
 	password   string
 	redirect   string
 	approveErr error
+	// probeErrs are the errors the probe step gives, one per call.
+	probeErrs []error
+	// passwordErrs are the errors the password step gives, one per call.
+	passwordErrs []error
 }
 
 func (w *fakeWeb) RegisterDevice(ctx context.Context) (string, error) {
@@ -410,6 +423,11 @@ func (w *fakeWeb) RegisterDevice(ctx context.Context) (string, error) {
 
 func (w *fakeWeb) Probe(ctx context.Context, email, deviceID, redirect string) error {
 	w.probed = append(w.probed, email)
+	if len(w.probeErrs) > 0 {
+		err := w.probeErrs[0]
+		w.probeErrs = w.probeErrs[1:]
+		return err
+	}
 	w.email = email
 	w.redirect = redirect
 	return nil
@@ -417,6 +435,11 @@ func (w *fakeWeb) Probe(ctx context.Context, email, deviceID, redirect string) e
 
 func (w *fakeWeb) Password(ctx context.Context, email, password, deviceID, redirect string) error {
 	w.signed = append(w.signed, email)
+	if len(w.passwordErrs) > 0 {
+		err := w.passwordErrs[0]
+		w.passwordErrs = w.passwordErrs[1:]
+		return err
+	}
 	w.email = email
 	w.password = password
 	w.redirect = redirect
@@ -698,9 +721,14 @@ func pollErrorOf(t *testing.T, err error) *Error {
 }
 
 func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
-	// 轮询时的一次连接断了，整个链要重来一次：这个账号最后是进来了的。
+	// 轮询时的一次连接断了：补轮询那一步就行，整条链不用重来。
 	st := &fakeStore{}
 	c := aChain(st)
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
 	polls := 0
 	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
 		polls++
@@ -726,6 +754,232 @@ func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
 	}
 	if polls != 2 {
 		t.Fatalf("polled %d times, want 2", polls)
+	}
+	// 整条链没有重来：重来一遍等于重新登一次密码，站点那边看得到。
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+}
+
+// TestTheStepThatJittersIsTriedAgainAndOnlyThatStep says a step that
+// hiccups is tried again, and only that step.
+//
+// 网络抖一下不该把整条链重跑一遍：重跑一遍意味着重新登一次密码，站点那
+// 边看得到（密码错了会算尝试次数，可能锁号）。
+func TestTheStepThatJittersIsTriedAgainAndOnlyThatStep(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{errors.New("connection reset by peer")}
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	// 密码那一步试了两次。
+	if len(web.signed) != 2 {
+		t.Fatalf("signed = %v, want the password step tried twice", web.signed)
+	}
+	// 前面那几步没有跟着重来：整条链只跑了一遍。
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+	if len(web.probed) != 1 {
+		t.Fatalf("probed = %v, want the probe step not to run again", web.probed)
+	}
+	if len(web.approved) != 1 {
+		t.Fatalf("approved = %v, want the approve step not to run again", web.approved)
+	}
+}
+
+// TestTheStepIsNotTriedEndlessly says a step is tried at most three
+// times.
+//
+// 试一次加两次：网络抖一下值得再来一次，密码错了不值得，三次足够把这两
+// 种分开，又不至于把站点敲烦。
+func TestTheStepIsNotTriedEndlessly(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	for i := 0; i < 5; i++ {
+		web.passwordErrs = append(web.passwordErrs, errors.New("connection reset"))
+	}
+	c.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if len(web.signed) != 3 {
+		t.Fatalf("signed = %v, want the step tried 3 times", web.signed)
+	}
+}
+
+// TestTheWaitsAreTheOnesTheDesignSays says the step waits a second and
+// then four.
+//
+// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
+func TestTheWaitsAreTheOnesTheDesignSays(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{errors.New("connection reset"), errors.New("connection reset")}
+	var waits []time.Duration
+	c.Sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 4*time.Second {
+		t.Fatalf("waits = %v, want 1s then 4s", waits)
+	}
+}
+
+// TestASiteThatIsLimitingIsWaitedForOnce says a site that is limiting is
+// waited for and tried once more.
+//
+// 429：等久一点（30s）再来一次，试一次就够 —— 再去问只是让它更烦。
+func TestASiteThatIsLimitingIsWaitedForOnce(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		return nil, &oauth.Error{Code: "too_many_requests", HTTPStatus: 429, What: oauth.WhatSignIn}
+	}
+	var waits []time.Duration
+	c.Sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if polls != 2 {
+		t.Fatalf("polled %d times, want 2", polls)
+	}
+	if len(waits) != 1 || waits[0] != 30*time.Second {
+		t.Fatalf("waits = %v, want one wait of 30s", waits)
+	}
+}
+
+// TestTheChainIsRunAgainWhenTheDeviceCodeIsDead says the whole chain is
+// run again when the device code is dead.
+//
+// 设备码废了（过期、被拒）的时候，换一张新码才有意义 —— 这是唯一一处整
+// 条链重来的地方。别的地方都是补那一步：整条链重来是「重登」那个动作的
+// 事（mmxcode relogin、调度器），不是导入链内部的兜底。
+func TestTheChainIsRunAgainWhenTheDeviceCodeIsDead(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		if polls == 1 {
+			return nil, &oauth.Error{Code: "expired_token", What: oauth.WhatSignIn}
+		}
+		return &oauth.Token{Access: "acc", Refresh: "ref", Subject: "sub"}, nil
+	}
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return c.Import(ctx, email, password)
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || !out[0].OK {
+		t.Fatalf("out = %+v", out)
+	}
+	if starts != 2 {
+		t.Fatalf("the chain ran %d times, want 2", starts)
+	}
+}
+
+// TestTheChainIsNotRunAgainWhenTheSiteRefuses says a refusal is not run
+// again.
+//
+// 密码错、账号要设密码、没绑手机：再来一次还是这个答案，而且整条链重来等
+// 于重新登一次密码 —— 站点那边会记尝试次数。
+func TestTheChainIsNotRunAgainWhenTheSiteRefuses(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{&webauth.SiteError{Code: 1200046}}
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return c.Import(ctx, email, password)
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].OK {
+		t.Fatalf("out = %+v", out)
+	}
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+	if len(web.signed) != 1 {
+		t.Fatalf("signed = %v, want the password step tried once", web.signed)
+	}
+}
+
+// TestTheWritingIsTriedAgainWhenTheLibraryIsBusy says the writing is
+// tried again when the library is busy.
+//
+// 真跑出来过：令牌换新了，库说「database is locked」，写不进去。那是写库
+// 那一步的事 —— 补写库那一步就行，不用把登录重来一遍。
+func TestTheWritingIsTriedAgainWhenTheLibraryIsBusy(t *testing.T) {
+	st := &fakeStore{lockFailures: 1}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v", st.accounts)
+	}
+	if len(st.tokens) != 1 {
+		t.Fatalf("tokens = %v", st.tokens)
+	}
+	// 登录没有重来：重来一遍是重登那个动作的事。
+	if len(web.signed) != 1 {
+		t.Fatalf("signed = %v, want the sign-in done once", web.signed)
 	}
 }
 

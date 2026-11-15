@@ -135,16 +135,19 @@ func TestOneBadAccountDoesNotStopTheRest(t *testing.T) {
 	}
 }
 
-func TestANetworkErrorIsTriedAgain(t *testing.T) {
-	var tries int
+// TestTheRunnerDoesNotRunTheChainAgain says the runner runs the chain
+// once and lets the chain deal with the flakiness.
+//
+// 抖的是哪一步就补哪一步（internal/provision/chain.go 的 step）：整条链
+// 重来是「重登」那个动作的事，不是导入链内部的兜底。唯一一处整链重来是
+// 设备码自己废了的时候（Error.Restart）。
+func TestTheRunnerDoesNotRunTheChainAgain(t *testing.T) {
+	var runs int
 	r := &Runner{
 		Importer: &Importer{
 			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				if tries < 3 {
-					return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true, Wait: time.Millisecond}
-				}
-				return Result{Email: email, OK: true}, nil
+				runs++
+				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true}
 			},
 		},
 		Sleep: func(context.Context, time.Duration) error { return nil },
@@ -153,20 +156,20 @@ func TestANetworkErrorIsTriedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tries != 3 {
-		t.Fatalf("tried %d times, want 3", tries)
+	if runs != 1 {
+		t.Fatalf("ran the chain %d times, want 1", runs)
 	}
-	if !out[0].OK {
-		t.Fatalf("out = %+v", out)
+	if out[0].OK {
+		t.Fatalf("out = %+v", out[0])
 	}
 }
 
 func TestAWrongPasswordIsNotTriedAgain(t *testing.T) {
-	var tries int
+	var runs int
 	r := &Runner{
 		Importer: &Importer{
 			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
+				runs++
 				return Result{Email: email}, &Error{Stage: StagePassword, Code: 1200046}
 			},
 		},
@@ -175,34 +178,8 @@ func TestAWrongPasswordIsNotTriedAgain(t *testing.T) {
 	if _, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}}); err != nil {
 		t.Fatal(err)
 	}
-	if tries != 1 {
-		t.Fatalf("tried %d times, want 1", tries)
-	}
-}
-
-func TestTheTriesAreNotEndless(t *testing.T) {
-	var tries int
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				return Result{Email: email}, &Error{Stage: StageToken, Code: 1200007, Message: "not logged in", Retry: true}
-			},
-		},
-		Sleep: func(context.Context, time.Duration) error { return nil },
-	}
-	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tries != 3 {
-		t.Fatalf("tried %d times, want 3", tries)
-	}
-	if out[0].OK {
-		t.Fatalf("out = %+v", out[0])
-	}
-	if out[0].Code != 1200007 {
-		t.Fatalf("the site's own code is gone: %+v", out[0])
+	if runs != 1 {
+		t.Fatalf("ran the chain %d times, want 1", runs)
 	}
 }
 
@@ -249,53 +226,6 @@ func TestTheResultsAreTheTextTheDatabaseKeeps(t *testing.T) {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("%s is not in %s", want, raw)
 		}
-	}
-}
-
-func TestTheWaitsAreTheOnesTheDesignSays(t *testing.T) {
-	// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
-	var waits []time.Duration
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true}
-			},
-		},
-		Sleep: func(ctx context.Context, d time.Duration) error {
-			waits = append(waits, d)
-			return nil
-		},
-	}
-	if _, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}}); err != nil {
-		t.Fatal(err)
-	}
-	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 4*time.Second {
-		t.Fatalf("waits = %v, want 1s then 4s", waits)
-	}
-}
-
-func TestASiteThatIsLimitingIsTriedOnlyOnceMore(t *testing.T) {
-	// 429：退避 30s 重试 1 次。
-	var tries int
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				return Result{Email: email}, &Error{Stage: StageToken, Message: "too many requests",
-					Retry: true, Wait: time.Millisecond, Tries: 2}
-			},
-		},
-		Sleep: func(context.Context, time.Duration) error { return nil },
-	}
-	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tries != 2 {
-		t.Fatalf("tried %d times, want 2", tries)
-	}
-	if out[0].OK {
-		t.Fatalf("out = %+v", out[0])
 	}
 }
 

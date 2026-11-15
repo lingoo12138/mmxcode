@@ -3393,16 +3393,19 @@ func TestOneBadAccountDoesNotStopTheRest(t *testing.T) {
 	}
 }
 
-func TestANetworkErrorIsTriedAgain(t *testing.T) {
-	var tries int
+// TestTheRunnerDoesNotRunTheChainAgain says the runner runs the chain
+// once and lets the chain deal with the flakiness.
+//
+// 抖的是哪一步就补哪一步（internal/provision/chain.go 的 step）：整条链
+// 重来是「重登」那个动作的事，不是导入链内部的兜底。唯一一处整链重来是
+// 设备码自己废了的时候（Error.Restart）。
+func TestTheRunnerDoesNotRunTheChainAgain(t *testing.T) {
+	var runs int
 	r := &Runner{
 		Importer: &Importer{
 			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				if tries < 3 {
-					return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true, Wait: time.Millisecond}
-				}
-				return Result{Email: email, OK: true}, nil
+				runs++
+				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true}
 			},
 		},
 		Sleep: func(context.Context, time.Duration) error { return nil },
@@ -3411,20 +3414,20 @@ func TestANetworkErrorIsTriedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tries != 3 {
-		t.Fatalf("tried %d times, want 3", tries)
+	if runs != 1 {
+		t.Fatalf("ran the chain %d times, want 1", runs)
 	}
-	if !out[0].OK {
-		t.Fatalf("out = %+v", out)
+	if out[0].OK {
+		t.Fatalf("out = %+v", out[0])
 	}
 }
 
 func TestAWrongPasswordIsNotTriedAgain(t *testing.T) {
-	var tries int
+	var runs int
 	r := &Runner{
 		Importer: &Importer{
 			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
+				runs++
 				return Result{Email: email}, &Error{Stage: StagePassword, Code: 1200046}
 			},
 		},
@@ -3433,34 +3436,8 @@ func TestAWrongPasswordIsNotTriedAgain(t *testing.T) {
 	if _, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}}); err != nil {
 		t.Fatal(err)
 	}
-	if tries != 1 {
-		t.Fatalf("tried %d times, want 1", tries)
-	}
-}
-
-func TestTheTriesAreNotEndless(t *testing.T) {
-	var tries int
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				return Result{Email: email}, &Error{Stage: StageToken, Code: 1200007, Message: "not logged in", Retry: true}
-			},
-		},
-		Sleep: func(context.Context, time.Duration) error { return nil },
-	}
-	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tries != 3 {
-		t.Fatalf("tried %d times, want 3", tries)
-	}
-	if out[0].OK {
-		t.Fatalf("out = %+v", out[0])
-	}
-	if out[0].Code != 1200007 {
-		t.Fatalf("the site's own code is gone: %+v", out[0])
+	if runs != 1 {
+		t.Fatalf("ran the chain %d times, want 1", runs)
 	}
 }
 
@@ -3507,53 +3484,6 @@ func TestTheResultsAreTheTextTheDatabaseKeeps(t *testing.T) {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("%s is not in %s", want, raw)
 		}
-	}
-}
-
-func TestTheWaitsAreTheOnesTheDesignSays(t *testing.T) {
-	// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
-	var waits []time.Duration
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				return Result{Email: email}, &Error{Stage: StageToken, Message: "connection reset", Retry: true}
-			},
-		},
-		Sleep: func(ctx context.Context, d time.Duration) error {
-			waits = append(waits, d)
-			return nil
-		},
-	}
-	if _, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}}); err != nil {
-		t.Fatal(err)
-	}
-	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 4*time.Second {
-		t.Fatalf("waits = %v, want 1s then 4s", waits)
-	}
-}
-
-func TestASiteThatIsLimitingIsTriedOnlyOnceMore(t *testing.T) {
-	// 429：退避 30s 重试 1 次。
-	var tries int
-	r := &Runner{
-		Importer: &Importer{
-			Import: func(ctx context.Context, email, password string) (Result, error) {
-				tries++
-				return Result{Email: email}, &Error{Stage: StageToken, Message: "too many requests",
-					Retry: true, Wait: time.Millisecond, Tries: 2}
-			},
-		},
-		Sleep: func(context.Context, time.Duration) error { return nil },
-	}
-	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "p"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tries != 2 {
-		t.Fatalf("tried %d times, want 2", tries)
-	}
-	if out[0].OK {
-		t.Fatalf("out = %+v", out[0])
 	}
 }
 
@@ -3717,6 +3647,10 @@ type Error struct {
 	// Message says what happened.
 	Message string
 	// Retry says whether trying again could work.
+	//
+	// 这是**这一步**值不值得再试：网络抖了一下、站点说了 5xx、它在限流。
+	// 链里那一步自己就补了（internal/provision/chain.go 的 step）——补一步
+	// 不等于把整条链重跑一遍。
 	Retry bool
 	// Wait is how long to wait before trying again.
 	//
@@ -3727,6 +3661,14 @@ type Error struct {
 	// Zero means the standard number of tries. A site that is limiting
 	// how much it answers is not worth three goes: the design says one.
 	Tries int
+	// Restart says whether the whole chain is worth running again.
+	//
+	// 只有一件事：设备码自己废了（过期、被拒）。那时候换一张新码才有意
+	// 思 —— 别的地方都是补那一步。
+	//
+	// 整条链重来是「重登」那个动作的事（mmxcode relogin、调度器），不是
+	// 导入链内部的兜底。
+	Restart bool
 }
 
 func (e *Error) Error() string {
@@ -3758,13 +3700,6 @@ type Runner struct {
 	// Sleep waits. A nil one waits with the context.
 	Sleep func(ctx context.Context, d time.Duration) error
 }
-
-// tries is how many times one account is tried at most.
-//
-// The first try and two more: a network hiccup is worth another go, a
-// password that is wrong is not, and three tries is enough to tell the
-// two apart without hammering the site.
-const tries = 3
 
 // backoff is how long to wait before the second and the third try.
 //
@@ -3819,45 +3754,38 @@ func (r *Runner) Run(ctx context.Context, entries []Entry) ([]Result, error) {
 	return out, nil
 }
 
-// one brings one account in, trying again when it is worth it.
+// one brings one account in.
+//
+// 链里那一步自己扛住网络抖动（internal/provision/chain.go 的 step）：所以
+// 这里不重试整条链。唯一一处整条链重来，是设备码自己废了的时候——换一
+// 张新码才有可能成。
+//
+// 整条链重来是「重登」那个动作的事（mmxcode relogin、调度器）：账号已经
+// 在池子里、令牌掉了，才轮到它。导入的时候账号还没进池子，没有「重登」
+// 可言。
 func (r *Runner) one(ctx context.Context, e Entry) Result {
-	var last *Error
-	attempts := 0
-	for attempt := 0; attempt < tries; attempt++ {
-		attempts++
-		res, err := r.Importer.Import(ctx, e.Email, e.Password)
-		if err == nil {
-			if res.Email == "" {
-				res.Email = e.Email
-			}
-			return res
+	res, err := r.Importer.Import(ctx, e.Email, e.Password)
+	if err == nil {
+		if res.Email == "" {
+			res.Email = e.Email
 		}
-		var pe *Error
-		if !errors.As(err, &pe) || !pe.Retry {
-			return resultOf(e, err)
-		}
-		last = pe
-		if attempt == tries-1 {
-			// The last try is the last one: waiting after it only
-			// makes the answer come later.
-			break
-		}
-		if pe.Tries > 0 && pe.Tries <= attempt+1 {
-			// 有些错值不值得试三次：站点在限流的时候，试一次就够，
-			// 再去问只是让它更烦。
-			break
-		}
-		wait := pe.Wait
-		if wait <= 0 {
-			wait = backoffWait(attempt)
-		}
-		if err := r.wait(ctx, wait); err != nil {
-			return resultOf(e, err)
-		}
+		return res
 	}
-	res := resultOf(e, last)
-	res.Message = fmt.Sprintf("试了 %d 次都不成：%s", attempts, res.Message)
-	return res
+	var pe *Error
+	if !errors.As(err, &pe) || !pe.Restart {
+		return resultOf(e, err)
+	}
+	// 设备码废了：换一张新码，整条链再来一次。就这一次。
+	res, err = r.Importer.Import(ctx, e.Email, e.Password)
+	if err == nil {
+		if res.Email == "" {
+			res.Email = e.Email
+		}
+		return res
+	}
+	out := resultOf(e, err)
+	out.Message = "换了设备码再来一次还是不成：" + out.Message
+	return out
 }
 
 // resultOf turns an error into a result.
@@ -4002,6 +3930,9 @@ type fakeStore struct {
 	password []string
 	// failToken makes the token refuse to be saved.
 	failToken bool
+	// lockFailures is how many times the library says it is busy before
+	// it lets the write through.
+	lockFailures int
 	// rows are the accounts themselves.
 	rows []store.Account
 	// names are the names that were written.
@@ -4099,6 +4030,12 @@ func (s *fakeStore) restore(before snapshot) {
 func (s *fakeStore) Tx(ctx context.Context, fn func(store.Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// 库忙：真库上两个写碰上了就是这样（SQLITE_BUSY）。这一趟没写进去
+	// 任何东西，等一下再来一趟就行。
+	if s.lockFailures > 0 {
+		s.lockFailures--
+		return errors.New("database is locked")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -4372,6 +4309,10 @@ type fakeWeb struct {
 	password   string
 	redirect   string
 	approveErr error
+	// probeErrs are the errors the probe step gives, one per call.
+	probeErrs []error
+	// passwordErrs are the errors the password step gives, one per call.
+	passwordErrs []error
 }
 
 func (w *fakeWeb) RegisterDevice(ctx context.Context) (string, error) {
@@ -4380,6 +4321,11 @@ func (w *fakeWeb) RegisterDevice(ctx context.Context) (string, error) {
 
 func (w *fakeWeb) Probe(ctx context.Context, email, deviceID, redirect string) error {
 	w.probed = append(w.probed, email)
+	if len(w.probeErrs) > 0 {
+		err := w.probeErrs[0]
+		w.probeErrs = w.probeErrs[1:]
+		return err
+	}
 	w.email = email
 	w.redirect = redirect
 	return nil
@@ -4387,6 +4333,11 @@ func (w *fakeWeb) Probe(ctx context.Context, email, deviceID, redirect string) e
 
 func (w *fakeWeb) Password(ctx context.Context, email, password, deviceID, redirect string) error {
 	w.signed = append(w.signed, email)
+	if len(w.passwordErrs) > 0 {
+		err := w.passwordErrs[0]
+		w.passwordErrs = w.passwordErrs[1:]
+		return err
+	}
 	w.email = email
 	w.password = password
 	w.redirect = redirect
@@ -4668,9 +4619,14 @@ func pollErrorOf(t *testing.T, err error) *Error {
 }
 
 func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
-	// 轮询时的一次连接断了，整个链要重来一次：这个账号最后是进来了的。
+	// 轮询时的一次连接断了：补轮询那一步就行，整条链不用重来。
 	st := &fakeStore{}
 	c := aChain(st)
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
 	polls := 0
 	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
 		polls++
@@ -4696,6 +4652,232 @@ func TestTheChainIsTriedAgainWhenThePollLosesTheConnection(t *testing.T) {
 	}
 	if polls != 2 {
 		t.Fatalf("polled %d times, want 2", polls)
+	}
+	// 整条链没有重来：重来一遍等于重新登一次密码，站点那边看得到。
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+}
+
+// TestTheStepThatJittersIsTriedAgainAndOnlyThatStep says a step that
+// hiccups is tried again, and only that step.
+//
+// 网络抖一下不该把整条链重跑一遍：重跑一遍意味着重新登一次密码，站点那
+// 边看得到（密码错了会算尝试次数，可能锁号）。
+func TestTheStepThatJittersIsTriedAgainAndOnlyThatStep(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{errors.New("connection reset by peer")}
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	// 密码那一步试了两次。
+	if len(web.signed) != 2 {
+		t.Fatalf("signed = %v, want the password step tried twice", web.signed)
+	}
+	// 前面那几步没有跟着重来：整条链只跑了一遍。
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+	if len(web.probed) != 1 {
+		t.Fatalf("probed = %v, want the probe step not to run again", web.probed)
+	}
+	if len(web.approved) != 1 {
+		t.Fatalf("approved = %v, want the approve step not to run again", web.approved)
+	}
+}
+
+// TestTheStepIsNotTriedEndlessly says a step is tried at most three
+// times.
+//
+// 试一次加两次：网络抖一下值得再来一次，密码错了不值得，三次足够把这两
+// 种分开，又不至于把站点敲烦。
+func TestTheStepIsNotTriedEndlessly(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	for i := 0; i < 5; i++ {
+		web.passwordErrs = append(web.passwordErrs, errors.New("connection reset"))
+	}
+	c.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if len(web.signed) != 3 {
+		t.Fatalf("signed = %v, want the step tried 3 times", web.signed)
+	}
+}
+
+// TestTheWaitsAreTheOnesTheDesignSays says the step waits a second and
+// then four.
+//
+// 设计文档 §5.3：网络错误、5xx、超时退避重试 2 次（1s、4s）。
+func TestTheWaitsAreTheOnesTheDesignSays(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{errors.New("connection reset"), errors.New("connection reset")}
+	var waits []time.Duration
+	c.Sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 4*time.Second {
+		t.Fatalf("waits = %v, want 1s then 4s", waits)
+	}
+}
+
+// TestASiteThatIsLimitingIsWaitedForOnce says a site that is limiting is
+// waited for and tried once more.
+//
+// 429：等久一点（30s）再来一次，试一次就够 —— 再去问只是让它更烦。
+func TestASiteThatIsLimitingIsWaitedForOnce(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		return nil, &oauth.Error{Code: "too_many_requests", HTTPStatus: 429, What: oauth.WhatSignIn}
+	}
+	var waits []time.Duration
+	c.Sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err == nil {
+		t.Fatal("no error")
+	}
+	if polls != 2 {
+		t.Fatalf("polled %d times, want 2", polls)
+	}
+	if len(waits) != 1 || waits[0] != 30*time.Second {
+		t.Fatalf("waits = %v, want one wait of 30s", waits)
+	}
+}
+
+// TestTheChainIsRunAgainWhenTheDeviceCodeIsDead says the whole chain is
+// run again when the device code is dead.
+//
+// 设备码废了（过期、被拒）的时候，换一张新码才有意义 —— 这是唯一一处整
+// 条链重来的地方。别的地方都是补那一步：整条链重来是「重登」那个动作的
+// 事（mmxcode relogin、调度器），不是导入链内部的兜底。
+func TestTheChainIsRunAgainWhenTheDeviceCodeIsDead(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+	polls := 0
+	c.Poll = func(ctx context.Context, d *oauth.Device) (*oauth.Token, error) {
+		polls++
+		if polls == 1 {
+			return nil, &oauth.Error{Code: "expired_token", What: oauth.WhatSignIn}
+		}
+		return &oauth.Token{Access: "acc", Refresh: "ref", Subject: "sub"}, nil
+	}
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return c.Import(ctx, email, password)
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || !out[0].OK {
+		t.Fatalf("out = %+v", out)
+	}
+	if starts != 2 {
+		t.Fatalf("the chain ran %d times, want 2", starts)
+	}
+}
+
+// TestTheChainIsNotRunAgainWhenTheSiteRefuses says a refusal is not run
+// again.
+//
+// 密码错、账号要设密码、没绑手机：再来一次还是这个答案，而且整条链重来等
+// 于重新登一次密码 —— 站点那边会记尝试次数。
+func TestTheChainIsNotRunAgainWhenTheSiteRefuses(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{&webauth.SiteError{Code: 1200046}}
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+	r := &Runner{
+		Importer: &Importer{
+			Import: func(ctx context.Context, email, password string) (Result, error) {
+				return c.Import(ctx, email, password)
+			},
+		},
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+	out, err := r.Run(context.Background(), []Entry{{Email: "a@example.com", Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].OK {
+		t.Fatalf("out = %+v", out)
+	}
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+	if len(web.signed) != 1 {
+		t.Fatalf("signed = %v, want the password step tried once", web.signed)
+	}
+}
+
+// TestTheWritingIsTriedAgainWhenTheLibraryIsBusy says the writing is
+// tried again when the library is busy.
+//
+// 真跑出来过：令牌换新了，库说「database is locked」，写不进去。那是写库
+// 那一步的事 —— 补写库那一步就行，不用把登录重来一遍。
+func TestTheWritingIsTriedAgainWhenTheLibraryIsBusy(t *testing.T) {
+	st := &fakeStore{lockFailures: 1}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %v", st.accounts)
+	}
+	if len(st.tokens) != 1 {
+		t.Fatalf("tokens = %v", st.tokens)
+	}
+	// 登录没有重来：重来一遍是重登那个动作的事。
+	if len(web.signed) != 1 {
+		t.Fatalf("signed = %v, want the sign-in done once", web.signed)
 	}
 }
 
@@ -5405,6 +5587,81 @@ type Chain struct {
 	Now func() time.Time
 	// NewID makes an account id.
 	NewID func() string
+	// Sleep waits between two tries of the same step. A nil one waits
+	// with the context.
+	Sleep func(ctx context.Context, d time.Duration) error
+}
+
+// stepTries is how many times one step of the chain is tried at most.
+//
+// 一次网络抖动不该把整条链重跑一遍 —— 重跑一遍意味着重新登一次密码，站
+// 点那边看得到（密码错了会算尝试次数，可能锁号）。所以抖的是哪一步，就
+// 补哪一步。
+const stepTries = 3
+
+// step runs one step of the chain and tries it again when it is worth
+// trying again.
+//
+// 只补失败的那一步。整条链重来是「重登」那个动作的事（mmxcode relogin、
+// 调度器），不是导入链内部的兜底：唯一一处整链重来是设备码自己废了的时候
+// （见 Error.Restart），那是换一张新码，不是重登。
+func step[T any](ctx context.Context, c *Chain, fn func() (T, error)) (T, error) {
+	var zero T
+	var last error
+	for attempt := 0; attempt < stepTries; attempt++ {
+		v, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		last = err
+		var pe *Error
+		if !errors.As(err, &pe) || !pe.Retry {
+			return zero, err
+		}
+		if attempt == stepTries-1 {
+			// 最后一趟了：再等下去只是让答案来得更晚。
+			break
+		}
+		if pe.Tries > 0 && pe.Tries <= attempt+1 {
+			// 有些错值不值得试三次：站点在限流的时候，试一次就够，再去问
+			// 只是让它更烦。
+			break
+		}
+		wait := pe.Wait
+		if wait <= 0 {
+			wait = backoffWait(attempt)
+		}
+		if werr := c.wait(ctx, wait); werr != nil {
+			return zero, werr
+		}
+	}
+	return zero, last
+}
+
+// stepErr is step for a step that has nothing to give back.
+func stepErr(ctx context.Context, c *Chain, fn func() error) error {
+	_, err := step(ctx, c, func() (struct{}, error) {
+		return struct{}{}, fn()
+	})
+	return err
+}
+
+// wait waits, and gives up when the run is over.
+func (c *Chain) wait(ctx context.Context, d time.Duration) error {
+	if c.Sleep != nil {
+		return c.Sleep(ctx, d)
+	}
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // SignIn signs one account in and gives back the token.
@@ -5422,13 +5679,25 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	if c.Start == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有设备码可等"}
 	}
-	d, err := c.Start(ctx)
+	d, err := step(ctx, c, func() (*oauth.Device, error) {
+		dev, err := c.Start(ctx)
+		if err != nil {
+			return nil, c.startError(ctx, err)
+		}
+		return dev, nil
+	})
 	if err != nil {
-		return nil, &Error{Stage: StageToken, Message: err.Error(), Retry: true}
+		return nil, err
 	}
-	deviceID, err := c.Web.RegisterDevice(ctx)
+	deviceID, err := step(ctx, c, func() (string, error) {
+		id, err := c.Web.RegisterDevice(ctx)
+		if err != nil {
+			return "", c.registerError(ctx, err)
+		}
+		return id, nil
+	})
 	if err != nil {
-		return nil, &Error{Stage: StageProbe, Message: err.Error(), Retry: true}
+		return nil, err
 	}
 	// The page the sign-in sends the browser back to is the page that
 	// shows the code. The site builds this path itself when it says a
@@ -5436,27 +5705,48 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	redirect := "/oauth-authorize?client_id=" + url.QueryEscape(site.ClientID) +
 		"&user_code=" + url.QueryEscape(d.UserCode)
 
-	if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
-		return nil, c.webError(ctx, StageProbe, err)
-	}
-	if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
-		return nil, c.webError(ctx, StagePassword, err)
-	}
-	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
-		if errors.Is(err, webauth.ErrNoDefaultGroup) {
-			// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
-			// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
-			// 才知道是去站点上设默认组，还是我们没认出来。
-			return nil, &Error{Stage: StageApprove, Message: err.Error()}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
+			return c.webError(ctx, StageProbe, err)
 		}
-		return nil, c.webError(ctx, StageApprove, err)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
+			return c.webError(ctx, StagePassword, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Approve(ctx, d.UserCode); err != nil {
+			if errors.Is(err, webauth.ErrNoDefaultGroup) {
+				// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
+				// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
+				// 才知道是去站点上设默认组，还是我们没认出来。
+				return &Error{Stage: StageApprove, Message: err.Error()}
+			}
+			return c.webError(ctx, StageApprove, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if c.Poll == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有地方等这个令牌"}
 	}
-	tok, err := c.Poll(ctx, d)
+	tok, err := step(ctx, c, func() (*oauth.Token, error) {
+		t, err := c.Poll(ctx, d)
+		if err != nil {
+			return nil, c.pollError(ctx, err)
+		}
+		return t, nil
+	})
 	if err != nil {
-		return nil, c.pollError(ctx, err)
+		return nil, err
 	}
 	return tok, nil
 }
@@ -5510,100 +5800,116 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	// 读者不会看见一行没有令牌的账号。
 	var existed bool
 	var row store.Account
-	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
-		if err != nil {
-			return err
-		}
-		notes = append(notes, found...)
-		// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
-		// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
-		// 地址更靠得住：那个地址是站点自己认的。
-		wantMail := id.Email
-		if wantMail == "" {
-			wantMail = email
+	err = stepErr(ctx, c, func() error {
+		// 写库这一步自己也是一步：库忙的时候（locked、busy）补这一趟就
+		// 行，不用把登录重来一遍——重来一遍是重登那个动作的事。
+		//
+		// 这一趟的留言等写成功了才算数：写失败的时候下一趟重新来，留言
+		// 也就不能留两份。
+		var said []string
+		if err := c.Store.Tx(ctx, func(tx store.Tx) error {
+			existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
+			if err != nil {
+				return err
+			}
+			said = append(said, found...)
+			// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
+			// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
+			// 地址更靠得住：那个地址是站点自己认的。
+			wantMail := id.Email
+			if wantMail == "" {
+				wantMail = email
+				if existing.ID != "" {
+					wantMail = existing.Email
+				}
+			}
+			wantUserID := id.RealUserID
+			if wantUserID == "" {
+				wantUserID = tok.Subject
+				if existing.ID != "" && existing.UserID != "" {
+					wantUserID = existing.UserID
+				}
+			}
 			if existing.ID != "" {
-				wantMail = existing.Email
-			}
-		}
-		wantUserID := id.RealUserID
-		if wantUserID == "" {
-			wantUserID = tok.Subject
-			if existing.ID != "" && existing.UserID != "" {
-				wantUserID = existing.UserID
-			}
-		}
-		if existing.ID != "" {
-			existed = true
-			row = existing
-			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
-			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
-			// 账号当成新账号，再插一行。
-			if wantMail != row.Email {
-				// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
-				// 以后重登就分不清该登谁了——密码是对着其中一个的。
-				other, err := tx.AccountByEmail(ctx, wantMail)
-				switch {
-				case err == nil && other.ID != row.ID:
-					notes = append(notes, "另一个账号（"+other.ID+
-						"）也在用这个地址，地址没有换过去："+wantMail)
-					wantMail = row.Email
-				case err != nil && !errors.Is(err, store.ErrNotFound):
-					notes = append(notes, "没能查这个地址有没有别人在用，地址没有换过去："+
-						wantMail+"（"+err.Error()+"）")
-					wantMail = row.Email
-				}
-			}
-			if wantMail != row.Email || wantUserID != row.UserID {
-				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
-					return err
-				}
+				existed = true
+				row = existing
+				// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
+				// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
+				// 账号当成新账号，再插一行。
 				if wantMail != row.Email {
-					// 换了地址要说：那是从清单上写的那个，换成了站点自己
-					// 认的那个。掉线以后重登用的是这一栏，地址换了人得
-					// 知道。
-					notes = append(notes, "这个账号的邮箱换成了站点那边的："+wantMail)
+					// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
+					// 以后重登就分不清该登谁了——密码是对着其中一个的。
+					other, err := tx.AccountByEmail(ctx, wantMail)
+					switch {
+					case err == nil && other.ID != row.ID:
+						said = append(said, "另一个账号（"+other.ID+
+							"）也在用这个地址，地址没有换过去："+wantMail)
+						wantMail = row.Email
+					case err != nil && !errors.Is(err, store.ErrNotFound):
+						said = append(said, "没能查这个地址有没有别人在用，地址没有换过去："+
+							wantMail+"（"+err.Error()+"）")
+						wantMail = row.Email
+					}
 				}
-				row.Email = wantMail
-				row.UserID = wantUserID
+				if wantMail != row.Email || wantUserID != row.UserID {
+					if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
+						return err
+					}
+					if wantMail != row.Email {
+						// 换了地址要说：那是从清单上写的那个，换成了站点自己
+						// 认的那个。掉线以后重登用的是这一栏，地址换了人得
+						// 知道。
+						said = append(said, "这个账号的邮箱换成了站点那边的："+wantMail)
+					}
+					row.Email = wantMail
+					row.UserID = wantUserID
+				}
+				return tx.SaveToken(ctx, store.Token{
+					AccountID: row.ID,
+					Access:    tok.Access,
+					Refresh:   tok.Refresh,
+					ExpiresAt: tok.Expires,
+					Subject:   tok.Subject,
+					UpdatedAt: now,
+				})
 			}
-			return tx.SaveToken(ctx, store.Token{
-				AccountID: row.ID,
+			acc := store.Account{
+				ID:         c.newID(),
+				Name:       mail,
+				UserID:     wantUserID,
+				Email:      wantMail,
+				Status:     store.StatusActive,
+				ProxyGroup: c.ProxyGroup,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			if err := tx.SaveToken(ctx, store.Token{
+				AccountID: acc.ID,
 				Access:    tok.Access,
 				Refresh:   tok.Refresh,
 				ExpiresAt: tok.Expires,
 				Subject:   tok.Subject,
 				UpdatedAt: now,
-			})
-		}
-		acc := store.Account{
-			ID:         c.newID(),
-			Name:       mail,
-			UserID:     wantUserID,
-			Email:      wantMail,
-			Status:     store.StatusActive,
-			ProxyGroup: c.ProxyGroup,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
-		if err := tx.CreateAccount(ctx, acc); err != nil {
-			return err
-		}
-		if err := tx.SaveToken(ctx, store.Token{
-			AccountID: acc.ID,
-			Access:    tok.Access,
-			Refresh:   tok.Refresh,
-			ExpiresAt: tok.Expires,
-			Subject:   tok.Subject,
-			UpdatedAt: now,
+			}); err != nil {
+				return err
+			}
+			row = acc
+			return nil
 		}); err != nil {
-			return err
+			return c.storeError(ctx, err)
 		}
-		row = acc
+		notes = append(notes, said...)
 		return nil
 	})
 	if err != nil {
 		msg := err.Error()
+		var pe *Error
+		if errors.As(err, &pe) {
+			msg = pe.Message
+		}
 		if existed {
 			// 原来那一行没动过：它还带着一条能用的链，报错就是，不用
 			// 把这一行删掉——删掉就是毁掉一个还能用的账号。
@@ -5753,6 +6059,68 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 	return notes, true
 }
 
+// startError turns what the device code request said into what the chain
+// needs to know.
+//
+// 设备码开不出来，多半是连接那边的事：再问一次就好（补这一步，不是把整
+// 条链重跑一遍）。
+func (c *Chain) startError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageToken, Message: err.Error()}
+	}
+	return &Error{Stage: StageToken, Message: err.Error(), Retry: transient(err)}
+}
+
+// registerError turns what the device registration said into what the
+// chain needs to know.
+func (c *Chain) registerError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageProbe, Message: err.Error()}
+	}
+	return &Error{Stage: StageProbe, Message: err.Error(), Retry: transient(err)}
+}
+
+// storeError turns what the library said into what the chain needs to
+// know.
+//
+// 库忙（locked、busy）是它自己的事：等一下再写就是了 —— 补写库那一步就
+// 够，不用把登录重来一遍（重来一遍是重登那个动作的事）。
+func (c *Chain) storeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageStore, Message: err.Error()}
+	}
+	return &Error{Stage: StageStore, Message: err.Error(), Retry: busyLibrary(err)}
+}
+
+// transient says whether a failure is worth another go at the same step.
+//
+// 站点明确拒绝的（密码错、账号要设密码、没绑手机）不值得：再来一次还是
+// 这个答案。站点自己出了毛病（5xx、限流）和连接上的问题值得。
+func transient(err error) bool {
+	var se *webauth.SiteError
+	if errors.As(err, &se) {
+		return retryableCode(se.Code)
+	}
+	var oe *oauth.Error
+	if errors.As(err, &oe) {
+		switch oe.Code {
+		case "expired_token", "access_denied", "invalid_grant":
+			// 这个设备码废了：再问也是这个答案，而且换一张新码才有意
+			// 思（那是整条链重来，见 Error.Restart）。
+			return false
+		}
+		return oe.HTTPStatus == http.StatusTooManyRequests || oe.HTTPStatus >= 500
+	}
+	// 传输上的问题：连接断了、读超时了。
+	return true
+}
+
+// busyLibrary says whether the library was busy.
+func busyLibrary(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "locked") || strings.Contains(s, "busy")
+}
+
 // webError turns what the site said into what the runner needs to
 // know: the stage, the site's own code, and whether trying again could
 // work.
@@ -5803,10 +6171,10 @@ func (c *Chain) pollError(ctx context.Context, err error) error {
 	var oe *oauth.Error
 	if errors.As(err, &oe) {
 		switch oe.Code {
-		case "expired_token", "access_denied":
-			// 设备码过期了，或者站点不让这个码进来：再来一次也是这个
-			// 答案，下一个账号重新开一个设备码就是了。
-			return &Error{Stage: StageToken, Message: oe.Error()}
+		case "expired_token", "access_denied", "invalid_grant":
+			// 这个设备码废了：再问也是这个答案。整条链重来一次（换一张新
+			// 码）—— 这是唯一一处整条链重来的地方。
+			return &Error{Stage: StageToken, Message: oe.Error(), Restart: true}
 		case "missing_refresh_token":
 			// 没有刷新令牌的账号活不过一小时：这是账号的事，不是连接
 			// 的事，再来一次也是没有。
@@ -8968,6 +9336,155 @@ func groupID(g map[string]any) (string, bool) {
 挑默认组的那段改成先数一遍：站点只认**一个**默认组，有两个就报错（猜错了
 就是把账号批进别的组里去了）；一个就用它；一个都没有、但总共只有一组，还是
 用那一组（没得选的时候不猜，让站点答）。
+
+- [x] **Step 4: 验收**
+
+```bash
+gofmt -l . && go build ./... && go vet ./... && go test ./... -count=1
+```
+
+---
+
+### Task 16: 两层重试 —— 抖的是哪一步就补哪一步，整链重来是重登
+
+**Files:**
+- Modify: `internal/provision/chain.go`
+- Modify: `internal/provision/provision.go`
+- Modify: `internal/provision/chain_test.go`
+- Modify: `internal/provision/provision_test.go`
+- Modify: `docs/superpowers/specs/2026-11-14-mmxcode-batch-import-design.md`
+
+重试原来只有一层，而且是**整条链**那一层：runner 拿着一个「值得再试」的错就
+把整条链重跑一遍，最多三次。
+
+这是粗的：一遍整链 = 一次新的设备码 + **一次新的密码登录**。密码登录重跑三遍
+意味着站点那边看到三次密码尝试（密码错了会算尝试次数，可能锁号）。而且真正
+该被补的往往只是**一步**：轮询时抖了一下、探的时候抖了一下。
+
+重试该分两层：
+
+- **单步重试（链内）**：抖的是哪一步就补哪一步。写库那一步也是一步。
+- **整条链重来 = 重登**：账号已经在池子里、令牌掉了 → `mmxcode relogin`、
+  调度器。导入的时候账号还没进池子，没有「重登」可言。
+
+唯一保留的整链重来：**设备码自己废了**（过期、被拒）——换一张新码有意义，
+整条链再来一次（就一次）。
+
+- [x] **Step 1: 先写测试（红的）**
+
+```go
+// TestTheStepThatJittersIsTriedAgainAndOnlyThatStep says a step that
+// hiccups is tried again, and only that step.
+//
+// 网络抖一下不该把整条链重跑一遍：重跑一遍意味着重新登一次密码，站点那
+// 边看得到（密码错了会算尝试次数，可能锁号）。
+func TestTheStepThatJittersIsTriedAgainAndOnlyThatStep(t *testing.T) {
+	st := &fakeStore{}
+	c := aChain(st)
+	web := c.Web.(*fakeWeb)
+	web.passwordErrs = []error{errors.New("connection reset by peer")}
+	starts := 0
+	c.Start = func(ctx context.Context) (*oauth.Device, error) {
+		starts++
+		return &oauth.Device{UserCode: "ABCD"}, nil
+	}
+
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("res = %+v", res)
+	}
+	// 密码那一步试了两次。
+	if len(web.signed) != 2 {
+		t.Fatalf("signed = %v, want the password step tried twice", web.signed)
+	}
+	// 前面那几步没有跟着重来：整条链只跑了一遍。
+	if starts != 1 {
+		t.Fatalf("the chain ran %d times, want 1", starts)
+	}
+	if len(web.probed) != 1 {
+		t.Fatalf("probed = %v, want the probe step not to run again", web.probed)
+	}
+	if len(web.approved) != 1 {
+		t.Fatalf("approved = %v, want the approve step not to run again", web.approved)
+	}
+}
+
+```
+
+另外三条：设备码废了的时候整链重来一次；站点拒绝的时候整链**不**重来；库忙的
+时候补写库那一步（登录不重来）。
+
+- [x] **Step 2: 看它红**
+
+```bash
+go test ./internal/provision/ -count=1
+```
+
+红的样子：密码那一步一抖，整个账号就失败了（`password：connection reset by
+peer`）；库说 locked 的时候也是直接失败。
+
+- [x] **Step 3: 链里加 step，runner 不再重跑整链**
+
+`internal/provision/chain.go`：
+
+```go
+// stepTries is how many times one step of the chain is tried at most.
+//
+// 一次网络抖动不该把整条链重跑一遍 —— 重跑一遍意味着重新登一次密码，站
+// 点那边看得到（密码错了会算尝试次数，可能锁号）。所以抖的是哪一步，就
+// 补哪一步。
+const stepTries = 3
+
+// step runs one step of the chain and tries it again when it is worth
+// trying again.
+//
+// 只补失败的那一步。整条链重来是「重登」那个动作的事（mmxcode relogin、
+// 调度器），不是导入链内部的兜底：唯一一处整链重来是设备码自己废了的时候
+// （见 Error.Restart），那是换一张新码，不是重登。
+func step[T any](ctx context.Context, c *Chain, fn func() (T, error)) (T, error) {
+	var zero T
+	var last error
+	for attempt := 0; attempt < stepTries; attempt++ {
+		v, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		last = err
+		var pe *Error
+		if !errors.As(err, &pe) || !pe.Retry {
+			return zero, err
+		}
+		if attempt == stepTries-1 {
+			// 最后一趟了：再等下去只是让答案来得更晚。
+			break
+		}
+		if pe.Tries > 0 && pe.Tries <= attempt+1 {
+			// 有些错值不值得试三次：站点在限流的时候，试一次就够，再去问
+			// 只是让它更烦。
+			break
+		}
+		wait := pe.Wait
+		if wait <= 0 {
+			wait = backoffWait(attempt)
+		}
+		if werr := c.wait(ctx, wait); werr != nil {
+			return zero, werr
+		}
+	}
+	return zero, last
+}
+
+```
+
+`SignIn` 的每一步都裹上它：设备码、设备注册、探、密码登录、批准、轮询。
+写库那一步也是（`Import` 里那个事务）：库说 locked 的时候补这一趟，登录不动。
+
+`internal/provision/provision.go`：`Error` 多一个 `Restart`（整条链值不值得再
+来一次，只有设备码废了的时候是），`Runner.one` 只在 `Restart` 的时候把整条链
+再来一次。
 
 - [x] **Step 4: 验收**
 

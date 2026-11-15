@@ -136,6 +136,10 @@ type Error struct {
 	// Message says what happened.
 	Message string
 	// Retry says whether trying again could work.
+	//
+	// 这是**这一步**值不值得再试：网络抖了一下、站点说了 5xx、它在限流。
+	// 链里那一步自己就补了（internal/provision/chain.go 的 step）——补一步
+	// 不等于把整条链重跑一遍。
 	Retry bool
 	// Wait is how long to wait before trying again.
 	//
@@ -146,6 +150,14 @@ type Error struct {
 	// Zero means the standard number of tries. A site that is limiting
 	// how much it answers is not worth three goes: the design says one.
 	Tries int
+	// Restart says whether the whole chain is worth running again.
+	//
+	// 只有一件事：设备码自己废了（过期、被拒）。那时候换一张新码才有意
+	// 思 —— 别的地方都是补那一步。
+	//
+	// 整条链重来是「重登」那个动作的事（mmxcode relogin、调度器），不是
+	// 导入链内部的兜底。
+	Restart bool
 }
 
 func (e *Error) Error() string {
@@ -177,13 +189,6 @@ type Runner struct {
 	// Sleep waits. A nil one waits with the context.
 	Sleep func(ctx context.Context, d time.Duration) error
 }
-
-// tries is how many times one account is tried at most.
-//
-// The first try and two more: a network hiccup is worth another go, a
-// password that is wrong is not, and three tries is enough to tell the
-// two apart without hammering the site.
-const tries = 3
 
 // backoff is how long to wait before the second and the third try.
 //
@@ -238,45 +243,38 @@ func (r *Runner) Run(ctx context.Context, entries []Entry) ([]Result, error) {
 	return out, nil
 }
 
-// one brings one account in, trying again when it is worth it.
+// one brings one account in.
+//
+// 链里那一步自己扛住网络抖动（internal/provision/chain.go 的 step）：所以
+// 这里不重试整条链。唯一一处整条链重来，是设备码自己废了的时候——换一
+// 张新码才有可能成。
+//
+// 整条链重来是「重登」那个动作的事（mmxcode relogin、调度器）：账号已经
+// 在池子里、令牌掉了，才轮到它。导入的时候账号还没进池子，没有「重登」
+// 可言。
 func (r *Runner) one(ctx context.Context, e Entry) Result {
-	var last *Error
-	attempts := 0
-	for attempt := 0; attempt < tries; attempt++ {
-		attempts++
-		res, err := r.Importer.Import(ctx, e.Email, e.Password)
-		if err == nil {
-			if res.Email == "" {
-				res.Email = e.Email
-			}
-			return res
+	res, err := r.Importer.Import(ctx, e.Email, e.Password)
+	if err == nil {
+		if res.Email == "" {
+			res.Email = e.Email
 		}
-		var pe *Error
-		if !errors.As(err, &pe) || !pe.Retry {
-			return resultOf(e, err)
-		}
-		last = pe
-		if attempt == tries-1 {
-			// The last try is the last one: waiting after it only
-			// makes the answer come later.
-			break
-		}
-		if pe.Tries > 0 && pe.Tries <= attempt+1 {
-			// 有些错值不值得试三次：站点在限流的时候，试一次就够，
-			// 再去问只是让它更烦。
-			break
-		}
-		wait := pe.Wait
-		if wait <= 0 {
-			wait = backoffWait(attempt)
-		}
-		if err := r.wait(ctx, wait); err != nil {
-			return resultOf(e, err)
-		}
+		return res
 	}
-	res := resultOf(e, last)
-	res.Message = fmt.Sprintf("试了 %d 次都不成：%s", attempts, res.Message)
-	return res
+	var pe *Error
+	if !errors.As(err, &pe) || !pe.Restart {
+		return resultOf(e, err)
+	}
+	// 设备码废了：换一张新码，整条链再来一次。就这一次。
+	res, err = r.Importer.Import(ctx, e.Email, e.Password)
+	if err == nil {
+		if res.Email == "" {
+			res.Email = e.Email
+		}
+		return res
+	}
+	out := resultOf(e, err)
+	out.Message = "换了设备码再来一次还是不成：" + out.Message
+	return out
 }
 
 // resultOf turns an error into a result.

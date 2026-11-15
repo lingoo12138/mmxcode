@@ -87,6 +87,81 @@ type Chain struct {
 	Now func() time.Time
 	// NewID makes an account id.
 	NewID func() string
+	// Sleep waits between two tries of the same step. A nil one waits
+	// with the context.
+	Sleep func(ctx context.Context, d time.Duration) error
+}
+
+// stepTries is how many times one step of the chain is tried at most.
+//
+// 一次网络抖动不该把整条链重跑一遍 —— 重跑一遍意味着重新登一次密码，站
+// 点那边看得到（密码错了会算尝试次数，可能锁号）。所以抖的是哪一步，就
+// 补哪一步。
+const stepTries = 3
+
+// step runs one step of the chain and tries it again when it is worth
+// trying again.
+//
+// 只补失败的那一步。整条链重来是「重登」那个动作的事（mmxcode relogin、
+// 调度器），不是导入链内部的兜底：唯一一处整链重来是设备码自己废了的时候
+// （见 Error.Restart），那是换一张新码，不是重登。
+func step[T any](ctx context.Context, c *Chain, fn func() (T, error)) (T, error) {
+	var zero T
+	var last error
+	for attempt := 0; attempt < stepTries; attempt++ {
+		v, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		last = err
+		var pe *Error
+		if !errors.As(err, &pe) || !pe.Retry {
+			return zero, err
+		}
+		if attempt == stepTries-1 {
+			// 最后一趟了：再等下去只是让答案来得更晚。
+			break
+		}
+		if pe.Tries > 0 && pe.Tries <= attempt+1 {
+			// 有些错值不值得试三次：站点在限流的时候，试一次就够，再去问
+			// 只是让它更烦。
+			break
+		}
+		wait := pe.Wait
+		if wait <= 0 {
+			wait = backoffWait(attempt)
+		}
+		if werr := c.wait(ctx, wait); werr != nil {
+			return zero, werr
+		}
+	}
+	return zero, last
+}
+
+// stepErr is step for a step that has nothing to give back.
+func stepErr(ctx context.Context, c *Chain, fn func() error) error {
+	_, err := step(ctx, c, func() (struct{}, error) {
+		return struct{}{}, fn()
+	})
+	return err
+}
+
+// wait waits, and gives up when the run is over.
+func (c *Chain) wait(ctx context.Context, d time.Duration) error {
+	if c.Sleep != nil {
+		return c.Sleep(ctx, d)
+	}
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // SignIn signs one account in and gives back the token.
@@ -104,13 +179,25 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	if c.Start == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有设备码可等"}
 	}
-	d, err := c.Start(ctx)
+	d, err := step(ctx, c, func() (*oauth.Device, error) {
+		dev, err := c.Start(ctx)
+		if err != nil {
+			return nil, c.startError(ctx, err)
+		}
+		return dev, nil
+	})
 	if err != nil {
-		return nil, &Error{Stage: StageToken, Message: err.Error(), Retry: true}
+		return nil, err
 	}
-	deviceID, err := c.Web.RegisterDevice(ctx)
+	deviceID, err := step(ctx, c, func() (string, error) {
+		id, err := c.Web.RegisterDevice(ctx)
+		if err != nil {
+			return "", c.registerError(ctx, err)
+		}
+		return id, nil
+	})
 	if err != nil {
-		return nil, &Error{Stage: StageProbe, Message: err.Error(), Retry: true}
+		return nil, err
 	}
 	// The page the sign-in sends the browser back to is the page that
 	// shows the code. The site builds this path itself when it says a
@@ -118,27 +205,48 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	redirect := "/oauth-authorize?client_id=" + url.QueryEscape(site.ClientID) +
 		"&user_code=" + url.QueryEscape(d.UserCode)
 
-	if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
-		return nil, c.webError(ctx, StageProbe, err)
-	}
-	if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
-		return nil, c.webError(ctx, StagePassword, err)
-	}
-	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
-		if errors.Is(err, webauth.ErrNoDefaultGroup) {
-			// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
-			// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
-			// 才知道是去站点上设默认组，还是我们没认出来。
-			return nil, &Error{Stage: StageApprove, Message: err.Error()}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Probe(ctx, email, deviceID, redirect); err != nil {
+			return c.webError(ctx, StageProbe, err)
 		}
-		return nil, c.webError(ctx, StageApprove, err)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Password(ctx, email, password, deviceID, redirect); err != nil {
+			return c.webError(ctx, StagePassword, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := stepErr(ctx, c, func() error {
+		if err := c.Web.Approve(ctx, d.UserCode); err != nil {
+			if errors.Is(err, webauth.ErrNoDefaultGroup) {
+				// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
+				// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
+				// 才知道是去站点上设默认组，还是我们没认出来。
+				return &Error{Stage: StageApprove, Message: err.Error()}
+			}
+			return c.webError(ctx, StageApprove, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if c.Poll == nil {
 		return nil, &Error{Stage: StageToken, Message: "没有地方等这个令牌"}
 	}
-	tok, err := c.Poll(ctx, d)
+	tok, err := step(ctx, c, func() (*oauth.Token, error) {
+		t, err := c.Poll(ctx, d)
+		if err != nil {
+			return nil, c.pollError(ctx, err)
+		}
+		return t, nil
+	})
 	if err != nil {
-		return nil, c.pollError(ctx, err)
+		return nil, err
 	}
 	return tok, nil
 }
@@ -192,100 +300,116 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 	// 读者不会看见一行没有令牌的账号。
 	var existed bool
 	var row store.Account
-	err = c.Store.Tx(ctx, func(tx store.Tx) error {
-		existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
-		if err != nil {
-			return err
-		}
-		notes = append(notes, found...)
-		// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
-		// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
-		// 地址更靠得住：那个地址是站点自己认的。
-		wantMail := id.Email
-		if wantMail == "" {
-			wantMail = email
+	err = stepErr(ctx, c, func() error {
+		// 写库这一步自己也是一步：库忙的时候（locked、busy）补这一趟就
+		// 行，不用把登录重来一遍——重来一遍是重登那个动作的事。
+		//
+		// 这一趟的留言等写成功了才算数：写失败的时候下一趟重新来，留言
+		// 也就不能留两份。
+		var said []string
+		if err := c.Store.Tx(ctx, func(tx store.Tx) error {
+			existing, found, err := findIn(ctx, tx, mail, email, tok.Subject, id.RealUserID)
+			if err != nil {
+				return err
+			}
+			said = append(said, found...)
+			// 这一行该有的地址和用户 id：站点那边报出来的最准，问不出来就
+			// 拿手里有的那个顶上。已经在库里那一行原来就有的，比清单上的
+			// 地址更靠得住：那个地址是站点自己认的。
+			wantMail := id.Email
+			if wantMail == "" {
+				wantMail = email
+				if existing.ID != "" {
+					wantMail = existing.Email
+				}
+			}
+			wantUserID := id.RealUserID
+			if wantUserID == "" {
+				wantUserID = tok.Subject
+				if existing.ID != "" && existing.UserID != "" {
+					wantUserID = existing.UserID
+				}
+			}
 			if existing.ID != "" {
-				wantMail = existing.Email
-			}
-		}
-		wantUserID := id.RealUserID
-		if wantUserID == "" {
-			wantUserID = tok.Subject
-			if existing.ID != "" && existing.UserID != "" {
-				wantUserID = existing.UserID
-			}
-		}
-		if existing.ID != "" {
-			existed = true
-			row = existing
-			// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
-			// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
-			// 账号当成新账号，再插一行。
-			if wantMail != row.Email {
-				// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
-				// 以后重登就分不清该登谁了——密码是对着其中一个的。
-				other, err := tx.AccountByEmail(ctx, wantMail)
-				switch {
-				case err == nil && other.ID != row.ID:
-					notes = append(notes, "另一个账号（"+other.ID+
-						"）也在用这个地址，地址没有换过去："+wantMail)
-					wantMail = row.Email
-				case err != nil && !errors.Is(err, store.ErrNotFound):
-					notes = append(notes, "没能查这个地址有没有别人在用，地址没有换过去："+
-						wantMail+"（"+err.Error()+"）")
-					wantMail = row.Email
-				}
-			}
-			if wantMail != row.Email || wantUserID != row.UserID {
-				if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
-					return err
-				}
+				existed = true
+				row = existing
+				// 站点那边报出来的真邮箱和真用户 id 知道了，就把这一行对齐：
+				// 邮箱是去重的键之一，键停在旧的地方，下一次导入就会把这个
+				// 账号当成新账号，再插一行。
 				if wantMail != row.Email {
-					// 换了地址要说：那是从清单上写的那个，换成了站点自己
-					// 认的那个。掉线以后重登用的是这一栏，地址换了人得
-					// 知道。
-					notes = append(notes, "这个账号的邮箱换成了站点那边的："+wantMail)
+					// 别处已经有这个地址了就别拿：两个账号共用一个地址，掉线
+					// 以后重登就分不清该登谁了——密码是对着其中一个的。
+					other, err := tx.AccountByEmail(ctx, wantMail)
+					switch {
+					case err == nil && other.ID != row.ID:
+						said = append(said, "另一个账号（"+other.ID+
+							"）也在用这个地址，地址没有换过去："+wantMail)
+						wantMail = row.Email
+					case err != nil && !errors.Is(err, store.ErrNotFound):
+						said = append(said, "没能查这个地址有没有别人在用，地址没有换过去："+
+							wantMail+"（"+err.Error()+"）")
+						wantMail = row.Email
+					}
 				}
-				row.Email = wantMail
-				row.UserID = wantUserID
+				if wantMail != row.Email || wantUserID != row.UserID {
+					if err := tx.SetAccountIdentity(ctx, row.ID, wantMail, wantUserID, now); err != nil {
+						return err
+					}
+					if wantMail != row.Email {
+						// 换了地址要说：那是从清单上写的那个，换成了站点自己
+						// 认的那个。掉线以后重登用的是这一栏，地址换了人得
+						// 知道。
+						said = append(said, "这个账号的邮箱换成了站点那边的："+wantMail)
+					}
+					row.Email = wantMail
+					row.UserID = wantUserID
+				}
+				return tx.SaveToken(ctx, store.Token{
+					AccountID: row.ID,
+					Access:    tok.Access,
+					Refresh:   tok.Refresh,
+					ExpiresAt: tok.Expires,
+					Subject:   tok.Subject,
+					UpdatedAt: now,
+				})
 			}
-			return tx.SaveToken(ctx, store.Token{
-				AccountID: row.ID,
+			acc := store.Account{
+				ID:         c.newID(),
+				Name:       mail,
+				UserID:     wantUserID,
+				Email:      wantMail,
+				Status:     store.StatusActive,
+				ProxyGroup: c.ProxyGroup,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			if err := tx.SaveToken(ctx, store.Token{
+				AccountID: acc.ID,
 				Access:    tok.Access,
 				Refresh:   tok.Refresh,
 				ExpiresAt: tok.Expires,
 				Subject:   tok.Subject,
 				UpdatedAt: now,
-			})
-		}
-		acc := store.Account{
-			ID:         c.newID(),
-			Name:       mail,
-			UserID:     wantUserID,
-			Email:      wantMail,
-			Status:     store.StatusActive,
-			ProxyGroup: c.ProxyGroup,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
-		if err := tx.CreateAccount(ctx, acc); err != nil {
-			return err
-		}
-		if err := tx.SaveToken(ctx, store.Token{
-			AccountID: acc.ID,
-			Access:    tok.Access,
-			Refresh:   tok.Refresh,
-			ExpiresAt: tok.Expires,
-			Subject:   tok.Subject,
-			UpdatedAt: now,
+			}); err != nil {
+				return err
+			}
+			row = acc
+			return nil
 		}); err != nil {
-			return err
+			return c.storeError(ctx, err)
 		}
-		row = acc
+		notes = append(notes, said...)
 		return nil
 	})
 	if err != nil {
 		msg := err.Error()
+		var pe *Error
+		if errors.As(err, &pe) {
+			msg = pe.Message
+		}
 		if existed {
 			// 原来那一行没动过：它还带着一条能用的链，报错就是，不用
 			// 把这一行删掉——删掉就是毁掉一个还能用的账号。
@@ -435,6 +559,68 @@ func (c *Chain) keep(ctx context.Context, id, password string, now time.Time, no
 	return notes, true
 }
 
+// startError turns what the device code request said into what the chain
+// needs to know.
+//
+// 设备码开不出来，多半是连接那边的事：再问一次就好（补这一步，不是把整
+// 条链重跑一遍）。
+func (c *Chain) startError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageToken, Message: err.Error()}
+	}
+	return &Error{Stage: StageToken, Message: err.Error(), Retry: transient(err)}
+}
+
+// registerError turns what the device registration said into what the
+// chain needs to know.
+func (c *Chain) registerError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageProbe, Message: err.Error()}
+	}
+	return &Error{Stage: StageProbe, Message: err.Error(), Retry: transient(err)}
+}
+
+// storeError turns what the library said into what the chain needs to
+// know.
+//
+// 库忙（locked、busy）是它自己的事：等一下再写就是了 —— 补写库那一步就
+// 够，不用把登录重来一遍（重来一遍是重登那个动作的事）。
+func (c *Chain) storeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &Error{Stage: StageStore, Message: err.Error()}
+	}
+	return &Error{Stage: StageStore, Message: err.Error(), Retry: busyLibrary(err)}
+}
+
+// transient says whether a failure is worth another go at the same step.
+//
+// 站点明确拒绝的（密码错、账号要设密码、没绑手机）不值得：再来一次还是
+// 这个答案。站点自己出了毛病（5xx、限流）和连接上的问题值得。
+func transient(err error) bool {
+	var se *webauth.SiteError
+	if errors.As(err, &se) {
+		return retryableCode(se.Code)
+	}
+	var oe *oauth.Error
+	if errors.As(err, &oe) {
+		switch oe.Code {
+		case "expired_token", "access_denied", "invalid_grant":
+			// 这个设备码废了：再问也是这个答案，而且换一张新码才有意
+			// 思（那是整条链重来，见 Error.Restart）。
+			return false
+		}
+		return oe.HTTPStatus == http.StatusTooManyRequests || oe.HTTPStatus >= 500
+	}
+	// 传输上的问题：连接断了、读超时了。
+	return true
+}
+
+// busyLibrary says whether the library was busy.
+func busyLibrary(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "locked") || strings.Contains(s, "busy")
+}
+
 // webError turns what the site said into what the runner needs to
 // know: the stage, the site's own code, and whether trying again could
 // work.
@@ -485,10 +671,10 @@ func (c *Chain) pollError(ctx context.Context, err error) error {
 	var oe *oauth.Error
 	if errors.As(err, &oe) {
 		switch oe.Code {
-		case "expired_token", "access_denied":
-			// 设备码过期了，或者站点不让这个码进来：再来一次也是这个
-			// 答案，下一个账号重新开一个设备码就是了。
-			return &Error{Stage: StageToken, Message: oe.Error()}
+		case "expired_token", "access_denied", "invalid_grant":
+			// 这个设备码废了：再问也是这个答案。整条链重来一次（换一张新
+			// 码）—— 这是唯一一处整条链重来的地方。
+			return &Error{Stage: StageToken, Message: oe.Error(), Restart: true}
 		case "missing_refresh_token":
 			// 没有刷新令牌的账号活不过一小时：这是账号的事，不是连接
 			// 的事，再来一次也是没有。
