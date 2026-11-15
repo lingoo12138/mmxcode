@@ -43,7 +43,9 @@ func (s *Server) liveModels(ctx context.Context) ([]site.Model, error) {
 	if len(ms) == 0 {
 		return nil, errors.New("models: the site's answer has no models in it")
 	}
-	return ms, nil
+	// 站点声明的数是保守的，报真的数：照声明的数用，代理会在历史还没
+	// 满一半的时候就去压缩它。
+	return site.ApplyVerifiedLimits(ms), nil
 }
 
 // modelsFor gives the models the site has.

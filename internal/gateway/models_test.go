@@ -36,6 +36,51 @@ const oneModelAnswer = `{"providers":[{"providerId":"minimax","config":{` +
 	`"effort_options":["default","low","medium","high","xhigh","max"]}},` +
 	`"model_order":["MiniMax-M3.1-Flash"]}}]}`
 
+// m3Answer is the site's model config for the M3, with the limits
+// MiniMax Code declares.
+const m3Answer = `{"providers":[{"providerId":"minimax","config":{` +
+	`"models":{"MiniMax-M3":{"name":"M3","limit":{"context":512000,"output":128000},` +
+	`"modalities":{"input":["text","image","video"]},"thinking_config":{"mode":"switchable"},` +
+	`"effort_options":["none","high"]}},` +
+	`"model_order":["MiniMax-M3"]}}]}`
+
+// TestTheRealLimitsAreServedNotTheAdvertisedOnes says the gateway
+// serves the limits the endpoint really allows.
+//
+// 站点的 model config 对 M3 那一族说 512000/128000，那是 MiniMax Code
+// 自己声明的一份保守说法：接口其实收 1048576 个输入 token 和 524288 个
+// 输出 token。照声明的数报，代理会在历史还没满一半的时候就去压缩它。
+func TestTheRealLimitsAreServedNotTheAdvertisedOnes(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(m3Answer))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID    string                        `json:"id"`
+			Limit struct{ Context, Output int } `json:"limit"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) != 1 {
+		t.Fatalf("the list is not what the site answered: %s", w.Body.String())
+	}
+	m := body.Data[0]
+	if m.ID != "MiniMax-M3" {
+		t.Fatalf("the model = %q, want MiniMax-M3", m.ID)
+	}
+	if m.Limit.Context != 1048576 || m.Limit.Output != 524288 {
+		t.Fatalf("the limits = %d/%d, want 1048576/524288", m.Limit.Context, m.Limit.Output)
+	}
+}
+
 // TestTheModelListIsTheSitesOwn says the list comes from the site.
 //
 // 网关原来给的是它自己知道的那一份 —— 那是照着参考实现抄下来的，抄的

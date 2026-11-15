@@ -66,6 +66,43 @@ func TestCloneModelsIsIndependent(t *testing.T) {
 	}
 }
 
+// TestTheVerifiedLimitsWinOverTheAdvertisedOnes says the limits the
+// endpoint really allows win over the ones the site declares.
+//
+// 站点的 model config 对 M3 那一族说的是 512000/128000，那是 MiniMax
+// Code 自己声明的一份保守说法：接口其实收 1048576 个输入 token 和
+// 524288 个输出 token。照声明的数用，代理会在历史还没满一半的时候就去
+// 压缩它。
+func TestTheVerifiedLimitsWinOverTheAdvertisedOnes(t *testing.T) {
+	for _, id := range []string{"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview", "MiniMax-M3"} {
+		in := []Model{{ID: id, Context: 512000, Output: 128000}}
+		out := ApplyVerifiedLimits(in)
+		if len(out) != 1 {
+			t.Fatalf("%s: got %d models, want 1", id, len(out))
+		}
+		if out[0].Context != 1048576 || out[0].Output != 524288 {
+			t.Fatalf("%s limits = %d/%d, want 1048576/524288", id, out[0].Context, out[0].Output)
+		}
+		// 调用方自己那份不能被改：改自己的不能影响别人。
+		if in[0].Context != 512000 || in[0].Output != 128000 {
+			t.Fatalf("%s: the caller's own list changed to %d/%d", id, in[0].Context, in[0].Output)
+		}
+	}
+}
+
+// TestAModelThatIsNotVerifiedKeepsItsOwnLimits says a model that is not
+// in the verified table keeps the limits the site gave it.
+func TestAModelThatIsNotVerifiedKeepsItsOwnLimits(t *testing.T) {
+	in := []Model{{ID: "MiniMax-M2.7", Context: 200000, Output: 128000}}
+	out := ApplyVerifiedLimits(in)
+	if len(out) != 1 {
+		t.Fatalf("got %d models, want 1", len(out))
+	}
+	if out[0].Context != 200000 || out[0].Output != 128000 {
+		t.Fatalf("limits = %d/%d, want 200000/128000", out[0].Context, out[0].Output)
+	}
+}
+
 func TestM3ThinkingVariants(t *testing.T) {
 	var m Model
 	for _, x := range FallbackModels() {

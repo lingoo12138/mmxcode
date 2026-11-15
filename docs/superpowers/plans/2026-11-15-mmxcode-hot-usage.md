@@ -3278,13 +3278,111 @@ git commit -m "feat(gateway): 一个账号同时一个请求"
 ### Task 8: 模型名单补上元数据
 
 **Files:**
+- Modify: `internal/site/models.go`
+- Modify: `internal/site/models_test.go`
 - Modify: `internal/gateway/models.go`
 - Modify: `internal/gateway/models_test.go`
 - Modify: `internal/gateway/gateway.go`
 
+**要修的是什么**
+
+网关的 `GET /v1/models` 报的是 MiniMax Code 自己声明的限额：M3 那一族是 context 512000 / output 128000。接口其实收 1048576 个输入 token 和 524288 个输出 token —— 这是实测出来的：1048140 个输入 token 的请求是答的，1048700 个被拒（"context window exceeds limit (2013)"）；max_tokens 524288 收，600000 拒（"does not support max tokens > 524288"）。声明的数对签了名的账号和没签名的账号是一个样，所以它不是哪个套餐的限额，只是站点自己的一份保守说法。
+
+照声明的数用，代理会在历史还没满一半的时候就去压缩它。所以网关报的是真的数。内置的那份兜底名单本来就是真的数，两份自相矛盾：客户端拿到哪一份，取决于站点当时答不答得上来。这一步把真的数套到活着的那份名单上。
+
 - [ ] **Step 1: 写失败的测试**
 
-`internal/gateway/models_test.go` 里加：
+`internal/site/models_test.go` 里加（真的数压过站点声明的数；表里没有的模型照旧用它自己的数）：
+
+```go
+// TestTheVerifiedLimitsWinOverTheAdvertisedOnes says the limits the
+// endpoint really allows win over the ones the site declares.
+//
+// 站点的 model config 对 M3 那一族说的是 512000/128000，那是 MiniMax
+// Code 自己声明的一份保守说法：接口其实收 1048576 个输入 token 和
+// 524288 个输出 token。照声明的数用，代理会在历史还没满一半的时候就去
+// 压缩它。
+func TestTheVerifiedLimitsWinOverTheAdvertisedOnes(t *testing.T) {
+	for _, id := range []string{"MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-Preview", "MiniMax-M3"} {
+		in := []Model{{ID: id, Context: 512000, Output: 128000}}
+		out := ApplyVerifiedLimits(in)
+		if len(out) != 1 {
+			t.Fatalf("%s: got %d models, want 1", id, len(out))
+		}
+		if out[0].Context != 1048576 || out[0].Output != 524288 {
+			t.Fatalf("%s limits = %d/%d, want 1048576/524288", id, out[0].Context, out[0].Output)
+		}
+		// 调用方自己那份不能被改：改自己的不能影响别人。
+		if in[0].Context != 512000 || in[0].Output != 128000 {
+			t.Fatalf("%s: the caller's own list changed to %d/%d", id, in[0].Context, in[0].Output)
+		}
+	}
+}
+
+// TestAModelThatIsNotVerifiedKeepsItsOwnLimits says a model that is not
+// in the verified table keeps the limits the site gave it.
+func TestAModelThatIsNotVerifiedKeepsItsOwnLimits(t *testing.T) {
+	in := []Model{{ID: "MiniMax-M2.7", Context: 200000, Output: 128000}}
+	out := ApplyVerifiedLimits(in)
+	if len(out) != 1 {
+		t.Fatalf("got %d models, want 1", len(out))
+	}
+	if out[0].Context != 200000 || out[0].Output != 128000 {
+		t.Fatalf("limits = %d/%d, want 200000/128000", out[0].Context, out[0].Output)
+	}
+}
+```
+
+`internal/gateway/models_test.go` 里加（站点答 512000/128000，网关答 1048576/524288）：
+
+```go
+// m3Answer is the site's model config for the M3, with the limits
+// MiniMax Code declares.
+const m3Answer = `{"providers":[{"providerId":"minimax","config":{` +
+	`"models":{"MiniMax-M3":{"name":"M3","limit":{"context":512000,"output":128000},` +
+	`"modalities":{"input":["text","image","video"]},"thinking_config":{"mode":"switchable"},` +
+	`"effort_options":["none","high"]}},` +
+	`"model_order":["MiniMax-M3"]}}]}`
+
+// TestTheRealLimitsAreServedNotTheAdvertisedOnes says the gateway
+// serves the limits the endpoint really allows.
+//
+// 站点的 model config 对 M3 那一族说 512000/128000，那是 MiniMax Code
+// 自己声明的一份保守说法：接口其实收 1048576 个输入 token 和 524288 个
+// 输出 token。照声明的数报，代理会在历史还没满一半的时候就去压缩它。
+func TestTheRealLimitsAreServedNotTheAdvertisedOnes(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(m3Answer))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID    string                        `json:"id"`
+			Limit struct{ Context, Output int } `json:"limit"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) != 1 {
+		t.Fatalf("the list is not what the site answered: %s", w.Body.String())
+	}
+	m := body.Data[0]
+	if m.ID != "MiniMax-M3" {
+		t.Fatalf("the model = %q, want MiniMax-M3", m.ID)
+	}
+	if m.Limit.Context != 1048576 || m.Limit.Output != 524288 {
+		t.Fatalf("the limits = %d/%d, want 1048576/524288", m.Limit.Context, m.Limit.Output)
+	}
+}
+```
+
+`internal/gateway/models_test.go` 里再加一个（名单要带上元数据，magpie 要 context/output、能不能读图、思考档位）：
 
 ```go
 // TestTheModelListCarriesWhatMagpieNeeds says the list says what the
@@ -3337,44 +3435,88 @@ func TestTheModelListCarriesWhatMagpieNeeds(t *testing.T) {
 - [ ] **Step 2: 运行测试确认失败**
 
 ```
-go test ./internal/gateway/ -run Magpie
+go test ./internal/site/ ./internal/gateway/ -run "Verified|RealLimits|Magpie"
 ```
 
-失败：名单里没有那些字段。
+失败：`ApplyVerifiedLimits` 还不存在；网关答的还是站点声明的 512000/128000。
 
-- [ ] **Step 3: 写那一行**
+- [ ] **Step 3: 写实现**
 
-`internal/gateway/models.go` 里加：
+`internal/site/models.go` 里加（真的数放在站点的那一份上；兜底的那份本来就是真的数，不用再套一次）：
+
+```go
+// verifiedLimit is one model's input and output limits.
+type verifiedLimit struct {
+	context int
+	output  int
+}
+
+// verifiedLimits 是接口真的收的数，给那些站点声明得保守的模型用。
+//
+// 站点的 model config 对 M3 那一族说的是 context 512000 / output
+// 128000，那是 MiniMax Code 自己声明的一份保守说法：接口其实收
+// 1048576 个输入 token 和 524288 个输出 token。这是实测出来的 ——
+// 1048140 个输入 token 的请求是答的，1048700 个被拒（"context window
+// exceeds limit (2013)"）；max_tokens 524288 收，600000 拒（"does not
+// support max tokens > 524288"）。声明的数对签了名的账号和没签名的账号
+// 是一个样，所以它不是哪个套餐的限额。
+//
+// 照声明的数用，代理会在历史还没满一半的时候就去压缩它。
+var verifiedLimits = map[string]verifiedLimit{
+	"MiniMax-M3.1-Flash":         {context: 1048576, output: 524288},
+	"MiniMax-M3.1-Flash-Preview": {context: 1048576, output: 524288},
+	"MiniMax-M3":                 {context: 1048576, output: 524288},
+}
+
+// ApplyVerifiedLimits gives the list with the limits the endpoint really
+// allows.
+//
+// 表里有的模型换成实测的数，表里没有的照旧用它自己的数。
+//
+// 调用方拿到的是一份新的名单：改自己的那份不影响别人。
+func ApplyVerifiedLimits(ms []Model) []Model {
+	out := CloneModels(ms)
+	for i := range out {
+		if v, ok := verifiedLimits[out[i].ID]; ok {
+			out[i].Context = v.context
+			out[i].Output = v.output
+		}
+	}
+	return out
+}
+```
+
+`internal/gateway/models.go` 的 `liveModels` 改成（读到的那份名单先过一遍真的数）：
+
+```go
+// liveModels reads the site's own model list.
+//
+// 问的时候不带账号的令牌：站点没有令牌也答，而带令牌去问有可能在路上
+// 把令牌续了 —— 一份模型名单不值得换一把新令牌。
+func (s *Server) liveModels(ctx context.Context) ([]site.Model, error) {
+	if s.Mgr == nil || s.Mgr.Up == nil {
+		return nil, errors.New("models: there is no upstream client")
+	}
+	ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
+	defer cancel()
+	body, err := s.Mgr.Up.Models(ctx, s.UpstreamBase, "")
+	if err != nil {
+		return nil, err
+	}
+	ms := account.ParseModels(body)
+	if len(ms) == 0 {
+		return nil, errors.New("models: the site's answer has no models in it")
+	}
+	// 站点声明的数是保守的，报真的数：照声明的数用，代理会在历史还没
+	// 满一半的时候就去压缩它。
+	return site.ApplyVerifiedLimits(ms), nil
+}
+```
+
+`internal/gateway/models.go` 里加（名单要带上元数据）：
 
 ```go
 // modelEntry gives one model as the API tells it.
-//
-// magpie 还要 context/output、能不能读图、思考档位，所以这些字段都
-// 给上：别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
-func modelEntry(m site.Model) map[string]any {
-	inputs := m.Inputs
-	if len(inputs) == 0 {
-		inputs = []string{"text"}
-	}
-	efforts := m.Efforts
-	if efforts == nil {
-		efforts = []string{}
-	}
-	return map[string]any{
-		"id": m.ID, "object": "model", "owned_by": "minimax",
-		"limit": map[string]any{
-			"context": m.Context,
-			"output":  m.Output,
-		},
-		"modalities": map[string]any{
-			"input":  inputs,
-			"output": []string{"text"},
-		},
-		"reasoning": m.Thinking != site.ThinkingOff,
-		"thinking":  string(m.Thinking),
-		"efforts":   efforts,
-	}
-}
 ```
 
 `internal/gateway/gateway.go` 的 `handleModels` 改成：
@@ -3396,14 +3538,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 - [ ] **Step 4: 运行测试确认通过**
 
 ```
-go test ./internal/gateway/
+go test ./internal/site/ ./internal/gateway/ -count=1
 ```
 
 - [ ] **Step 5: 提交**
 
 ```
-git add internal/gateway
-git commit -m "feat(gateway): 模型名单带上元数据"
+git add internal/site internal/gateway
+git commit -m "feat(gateway): 模型名单报接口真的收的限额"
 ```
 
 ---
