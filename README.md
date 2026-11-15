@@ -407,6 +407,34 @@ WARP 是额外的出口选项，跟按账号单独指定的代理并列。
 - 打开：把 `.env` 里那行的注释去掉。宿主机的 `/dev/net/tun` 要可用，容器需要 `NET_ADMIN` 权限（compose 里已经写好）。
 - 起了以后，出口组 `warp` 指向 `socks5h://warp:4000`，账号用 `mmxcode accounts proxy <id> --group warp` 就走 WARP。
 
+## magpie 插件
+
+仓库里带一个 magpie 的 provider 插件，在 `packages/mmxcode/`：把 magpie 指到自己的网关上来。
+
+```bash
+magpie plugin add ./packages/mmxcode
+```
+
+装完在 magpie 里签入 `MMXCode 网关`，要答两样东西：
+
+| 提示 | 是什么 |
+|---|---|
+| 网关地址 | 默认 `http://127.0.0.1:8080`。网关在别的机器上就写那个地址 |
+| 聊天用的 key | 后台 `/keys` 申请的那把。网关一把 key 都没有的时候可以留空（那就不鉴权） |
+
+插件做的事：
+
+- **聊天**走网关的 `/v1/messages`（Anthropic 那条路）。一段对话的会话 id 顺着 `X-Session-Id` 交给网关 —— 网关把它黏在一个账号上，同一段对话不会换号。
+- **模型名单**问网关要（`GET /v1/models`），所以 context、能不能读图、思考档位都是网关那边真的。
+- **额度卡片**问网关要一次（`GET /v1/usage?refresh=1`），答的是整个网关的样子：所有账号剩下的积分加起来、最重的那个计划、每个账号的窗口。
+
+跟 magpie 自带的 `minimax-code-global` 的分别：那个插件自己拿着 MiniMax 的账号，卡片是逐个账号去问 MiniMax 的 —— 账号一多就卡；这个插件一个账号都不拿，查询全留在网关里，网关答一次就完了。两个 provider 可以并存（id 是 `mmxcode` 和 `minimax-code-global`），用不用得卸掉前者是用户的事。
+
+网关那一侧要配的两处：
+
+- `usage.refresh.*`：多久读一次额度（`scan_every`）、哪些账号算热（`hot_window`）、一趟读几个（`batch`）、现读的预算（`budget`）、一次读超时多久（`timeout`）。卡片上的数是**上一次读到的**，只有该读的账号会被读（热的、没读过的、签到待补的、标记到期的），冷账号等它被用到再说。
+- `concurrency.*`：一个账号同时接几个请求（`per_account`，默认 1）、整个网关同时接几个（`total_ratio` / `total_min`）、等得到多久（`wait`）。等不到的时候网关回 429 和 `Retry-After`，不假装忙。
+
 ## 协议对齐
 
 上游行为对齐社区插件 [`@magpie-community/opencode-minimax-auth`](https://github.com/magpie-community/plugins/tree/main/packages/minimax) 的 `packages/minimax/index.mjs`：端点、请求签名、刷新语义、签到语义、配额拒绝的判定，都以它为准。
