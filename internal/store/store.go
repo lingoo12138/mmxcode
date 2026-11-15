@@ -1816,6 +1816,47 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 	return out, nil
 }
 
+// LatestCheckins gives each account's newest check-in.
+//
+// The newest is the row with the greatest id: two check-ins of one
+// account can share a day, and the day alone would then name two rows.
+// The id grows with every row written, so it tells them apart, and
+// there is one row per account, always.
+func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.account_id, c.day, c.outcome, c.credit, c.streak, c.message, c.created_at
+		FROM checkins c
+		JOIN (SELECT account_id, MAX(id) AS mid FROM checkins GROUP BY account_id)
+			m ON m.account_id = c.account_id AND m.mid = c.id
+		ORDER BY c.account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("latest checkins: %w", err)
+	}
+	defer rows.Close()
+	var out []Checkin
+	for rows.Next() {
+		var (
+			c         Checkin
+			credit    sql.NullFloat64
+			streak    sql.NullInt64
+			message   sql.NullString
+			createdAt int64
+		)
+		if err := rows.Scan(&c.ID, &c.AccountID, &c.Day, &c.Outcome, &credit, &streak, &message, &createdAt); err != nil {
+			return nil, fmt.Errorf("latest checkins: %w", err)
+		}
+		c.Credit = credit.Float64
+		c.Streak = int(streak.Int64)
+		c.Message = message.String
+		c.CreatedAt = fromMS(createdAt)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("latest checkins: %w", err)
+	}
+	return out, nil
+}
+
 // SaveUsageSnapshot writes a usage reading.
 //
 // A reading that could not be made is not a reading of zero. Without
