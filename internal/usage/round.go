@@ -65,7 +65,9 @@ type target struct {
 // Targets gives the accounts to read now, in the order they should be
 // read.
 //
-// 该读的 = 从没读过的 ∪ 热的 ∪ 签到待补的 ∪ 标记到期的。
+// 该读的排在前面：签到待补的、标记到期的、从没读过的、热的。冷账号也
+// 在名单里，排在最后：一趟最多读几个（批次），排在前面的是该读的，
+// 冷账号排在后面——它被读到的时候读到的数也是旧的。
 func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	accounts, err := r.Store.ListAccounts(ctx)
 	if err != nil {
@@ -141,30 +143,20 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	// 其余的最久没读的先：越旧越可能过期。
-	cold := []string{}
-	for _, t := range ts {
-		if t.rank == rankCold {
-			cold = append(cold, t.id)
-		}
-	}
-	sort.SliceStable(cold, func(i, j int) bool {
-		return snapAt[cold[i]].Before(snapAt[cold[j]])
-	})
-	coldAt := map[string]int{}
-	for i, id := range cold {
-		coldAt[id] = i
-	}
-	for i := range ts {
-		if ts[i].rank == rankCold {
-			ts[i].order = coldAt[ts[i].id]
-		}
-	}
+	// 排在前面的先读。同一组里：冷账号最久没读的先（越旧越可能过期），
+	// 热的按用得多的先，其余按 id 分出来——结果每次一样。
 	sort.SliceStable(ts, func(i, j int) bool {
 		if ts[i].rank != ts[j].rank {
 			return ts[i].rank < ts[j].rank
 		}
-		return ts[i].order < ts[j].order
+		if ts[i].rank == rankCold {
+			if !snapAt[ts[i].id].Equal(snapAt[ts[j].id]) {
+				return snapAt[ts[i].id].Before(snapAt[ts[j].id])
+			}
+		} else if ts[i].order != ts[j].order {
+			return ts[i].order < ts[j].order
+		}
+		return ts[i].id < ts[j].id
 	})
 
 	out := make([]string, 0, len(ts))
