@@ -1818,16 +1818,20 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 
 // LatestCheckins gives each account's newest check-in.
 //
-// The newest is the row with the greatest id: two check-ins of one
-// account can share a day, and the day alone would then name two rows.
-// The id grows with every row written, so it tells them apart, and
-// there is one row per account, always.
+// The newest is the one written last: a day is unique for an account,
+// but the same day's row is updated in place — its id stays the one it
+// was given and only its time moves. So the id does not say which
+// check-in is the latest; the time does. Ties go to the greater id.
 func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT c.id, c.account_id, c.day, c.outcome, c.credit, c.streak, c.message, c.created_at
 		FROM checkins c
-		JOIN (SELECT account_id, MAX(id) AS mid FROM checkins GROUP BY account_id)
-			m ON m.account_id = c.account_id AND m.mid = c.id
+		WHERE c.id = (
+			SELECT c2.id FROM checkins c2
+			WHERE c2.account_id = c.account_id
+			ORDER BY c2.created_at DESC, c2.id DESC
+			LIMIT 1
+		)
 		ORDER BY c.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("latest checkins: %w", err)

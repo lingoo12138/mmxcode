@@ -33,6 +33,14 @@ func TestTheLatestCheckinsOfEveryAccount(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save checkin: %v", err)
 	}
+	// 同一天再签一次是改那一行，不是插第二行：id 不变，时刻往前走。
+	// 于是"id 最大的那条"不是最新的那条。
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_1", Day: "2026-11-14", Outcome: "claimed",
+		Credit: 40, Streak: 1, CreatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
 	got, err := s.LatestCheckins(context.Background())
 	if err != nil {
 		t.Fatalf("latest checkins: %v", err)
@@ -40,10 +48,15 @@ func TestTheLatestCheckinsOfEveryAccount(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("the check-ins = %d, want one per account", len(got))
 	}
+	byAccount := map[string]store.Checkin{}
 	for _, c := range got {
-		if c.AccountID == "acc_1" && c.Credit != 20 {
-			t.Errorf("acc_1's check-in = %v, want the newest one", c.Credit)
-		}
+		byAccount[c.AccountID] = c
+	}
+	if byAccount["acc_1"].Credit != 40 {
+		t.Errorf("acc_1's check-in = %v, want the newest one", byAccount["acc_1"])
+	}
+	if byAccount["acc_2"].Credit != 30 {
+		t.Errorf("acc_2's check-in = %v, want its own", byAccount["acc_2"])
 	}
 }
 
