@@ -8803,6 +8803,79 @@ func makeAKey(t *testing.T, s *store.Store) string {
 	}
 	return plain
 }
+
+// TestTheUsageCardIsMagpiesShape says the gateway has an endpoint that
+// says the usage in magpie's card shape.
+//
+// magpie 的 provider 插件有一个 usage() 钩子，卡片就是从那里来的。我们
+// ��自己端点，所以这个钩子得由网关自己顶上来：给 magpie 一个 magpie
+// 认得的形状。
+func TestTheUsageCardIsMagpiesShape(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
+	if err := h.store.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 500, Consumed: 62.5, Remaining: 437.5,
+		Plan: "Token Plan M3", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage", nil)
+	rec := httptest.NewRecorder()
+	h.gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Plan    string `json:"plan"`
+		Balance string `json:"balance"`
+		Windows []struct {
+			Name string `json:"name"`
+		} `json:"windows"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Plan != "Token Plan M3" {
+		t.Errorf("plan = %q, want %q", out.Plan, "Token Plan M3")
+	}
+	if out.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q", out.Balance, "437.5 credits")
+	}
+	if len(out.Windows) == 0 {
+		t.Error("the card has no windows")
+	}
+}
+
+// TestTheUsageCardNeedsAKey says the card is behind the key.
+//
+// 卡片说的是这个网关还剩多少积分：那不是给路人看的。
+func TestTheUsageCardNeedsAKey(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
+	h.gw.Cfg.Server.APIKeys = []string{"sk-admin"}
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage", nil)
+	rec := httptest.NewRecorder()
+	h.gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", rec.Code)
+	}
+}
+
+// TestAKeyMadeInTheConsoleOpensTheUsageCard says a chat key opens the
+// card.
+//
+// magpie 是拿着聊天那把 key 来问卡片的：它问的时候手里有的就是这一把。
+func TestAKeyMadeInTheConsoleOpensTheUsageCard(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
+	h.gw.Cfg.Server.APIKeys = []string{"sk-admin"}
+	plain := makeAKey(t, h.store)
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage", nil)
+	req.Header.Set("x-api-key", plain)
+	rec := httptest.NewRecorder()
+	h.gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -9456,6 +9529,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/v1/models":
 		s.handleModels(w, r)
+		return
+	case "/v1/usage":
+		// magpie 的卡片：这个网关还剩多少额度。
+		s.usageCard(w, r)
 		return
 	}
 	if s.WebUI != nil && strings.HasPrefix(r.URL.Path, "/api/") {

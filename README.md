@@ -171,6 +171,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses` | Codex Responses |
 | `GET /v1/models` | 模型列表 |
+| `GET /v1/usage` | magpie 的额度卡片：这个网关还剩多少积分 |
 
 管理接口，都在 `/api/` 下：
 
@@ -244,6 +245,40 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 - 客户端用它：`x-api-key: sk-...` 或者 `Authorization: Bearer sk-...`。
 - 撤销：`DELETE /api/keys/{id}`。撤销之后它就不开门了，但那一行还在列表里 —— 看得到它曾经有过、什么时候没的。删掉的话，人会以为这把 key 从来没有存在过。
 - 撤销过的 key 不再算「申请过」：一把都没有的时候聊天接口还是不鉴权。
+
+### magpie 的额度卡片
+
+`GET /v1/usage` 给的是 magpie 的**卡片形状**：magpie 的 provider 插件有一个 `usage()` 钩子，卡片就是从那里来的（参考实现 `packages/minimax/index.mjs` 的 `usageOf`）。我们不是 magpie 的插件，是 magpie 里的一个端点，所以那个钩子由网关自己顶上来。
+
+卡片长这样：
+
+```json
+{
+  "plan": "Token Plan M3",
+  "until": "2026-12-01T00:00:00Z",
+  "balance": "437.5 credits",
+  "windows": [
+    {"name": "Credits", "used": 12.5, "display": "62.5 / 500", "amount": 62.5, "limit": 500, "unit": "credits", "runsOutAt": "2026-12-14T16:00:00Z", "runsOut": 437.5},
+    {"name": "7 days", "used": 24, "resetsAt": "2026-11-18T00:00:00Z"}
+  ],
+  "mmxcode": {"read_at": "2026-11-15T01:50:23Z", "accounts": 2, "readings": 2, "unread": 0, "unreadable": 0}
+}
+```
+
+上面四个字段（`plan`、`until`、`balance`、`windows`）是 magpie 的，magpie 照着这几个名字读。`mmxcode` 那块是我们自己的（读数是什么时候的、几个账号在后面），magpie 不认识它。
+
+网关是轮转的，所以卡片说的是**整个网关**：
+
+| 字段 | 是什么 |
+|---|---|
+| `balance` | 所有账号剩下的积分加起来（`"437.5 credits"`，跟参考实现一样的写法） |
+| `plan` | 账号里最重的那个计划（有名字的 > `M Plan` > `Free`）。计划读不到的时候这个字段没有 —— 读不到不是一个「没有计划」 |
+| `until` | 有计划的那些账号里最早到期的一个 |
+| `windows` | 每个账号的积分是一个窗口（`Credits`），它的计划的窗口也在里面。账号不止一个的时候，窗口名字前面带账号名（`主号 · Credits`），不然分不出是谁的 |
+
+数字是**上一次读到的**：调度器每 15 分钟读一遍账本，后台页面上也有一个「刷新」按钮。要现读一遍就在地址上加 `refresh=1`（`GET /v1/usage?refresh=1`）。
+
+这个接口在聊天那扇门后面：手里有聊天那把 key（或者后台登录那把）才能问。
 
 ### 轮转
 
