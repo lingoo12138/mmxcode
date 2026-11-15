@@ -102,6 +102,13 @@ type Manager struct {
 	reloginLocks reloginLocks
 	// hot counts the accounts that were used lately.
 	hot *hotCounter
+	// readMu guards the accounts that are being read.
+	readMu sync.Mutex
+	// reading holds the accounts that are being read right now.
+	//
+	// 它是这一份进程里的账：签到那一趟、周期那一趟和卡片那一趟共用
+	// 一个管理器，所以这把锁是三趟共用的（规格 §3.3）。
+	reading map[string]bool
 	// HotWindow is how long an account counts as hot after it was used.
 	//
 	// 它是配置说了算，所以它是公开的：网关起的时候会把它设成配置里的
@@ -145,8 +152,40 @@ func New(s *store.Store, up *upstream.Client, acc *account.Client, egr *egress.R
 		Store: s, Up: up, Acc: acc, Egress: egr, Renewer: rw,
 		TokenURL:  site.AccountURL(site.TokenPath),
 		hot:       newHotCounter(),
+		reading:   map[string]bool{},
 		HotWindow: defaultHotWindow,
 	}
+}
+
+// BeginReading says a round is about to read an account, and whether it
+// may.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可
+// 能撞上，两边都去读，读的是同一次。已经在读的那个账号，这一趟就不
+// 读了——另一趟正在读它。
+//
+// It says whether the account was claimed: false means another round is
+// reading it right now.
+func (m *Manager) BeginReading(accountID string) bool {
+	m.readMu.Lock()
+	defer m.readMu.Unlock()
+	if m.reading == nil {
+		m.reading = map[string]bool{}
+	}
+	if m.reading[accountID] {
+		return false
+	}
+	m.reading[accountID] = true
+	return true
+}
+
+// EndReading says the reading of an account is done.
+//
+// 读失败了也要还回来：不然那个账号再也读不到了。
+func (m *Manager) EndReading(accountID string) {
+	m.readMu.Lock()
+	defer m.readMu.Unlock()
+	delete(m.reading, accountID)
 }
 
 // Accounts gives every account.

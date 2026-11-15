@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mmxcode/internal/config"
+	"mmxcode/internal/manager"
 	"mmxcode/internal/store"
 )
 
@@ -502,5 +503,124 @@ func TestAFailedReadingKeepsTheSpentMark(t *testing.T) {
 	}
 	if len(left) != 1 {
 		t.Fatalf("the spent marks = %v, want the one", left)
+	}
+}
+
+// heldReader reads the credits and can be held in the air.
+//
+// 它能把一次读吊在半空：另一趟就是在这时候撞上来的。它拿的是管理器
+// 的那把锁——这一节看的就是管理器跟那一趟的配合。
+type heldReader struct {
+	// mgr keeps the rounds from reading the same account at once.
+	mgr *manager.Manager
+	// started says which account a reading is about.
+	started chan string
+	// release lets the held reading finish.
+	release chan struct{}
+	// mu guards read.
+	mu sync.Mutex
+	// read are the accounts that were read.
+	read []string
+}
+
+// RefreshUsage reads the credits of an account.
+func (h *heldReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	h.mu.Lock()
+	h.read = append(h.read, accountID)
+	h.mu.Unlock()
+	if h.started != nil {
+		h.started <- accountID
+	}
+	if h.release != nil {
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+			return store.UsageSnapshot{}, ctx.Err()
+		}
+	}
+	return store.UsageSnapshot{
+		AccountID: accountID, Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: time.Now(),
+	}, nil
+}
+
+// BeginReading keeps two rounds from reading the same account at once.
+func (h *heldReader) BeginReading(accountID string) bool {
+	return h.mgr.BeginReading(accountID)
+}
+
+// EndReading says the reading of an account is done.
+func (h *heldReader) EndReading(accountID string) {
+	h.mgr.EndReading(accountID)
+}
+
+// count says how many readings were asked for.
+func (h *heldReader) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.read)
+}
+
+// TestTwoRoundsDoNotReadTheSameAccountAtTheSameTime says two rounds
+// over the same accounts read one of them once between them.
+//
+// 签到那一趟和热的那一趟可能撞上同一个账号：同一个账号同一时刻只读
+// 一次（规格 §3.3）。撞上的那个账号不是读失败，也不是没轮上：另一趟
+// 正在读它。
+func TestTwoRoundsDoNotReadTheSameAccountAtTheSameTime(t *testing.T) {
+	mgr := manager.New(nil, nil, nil, nil, nil)
+	reader := &heldReader{
+		mgr:     mgr,
+		started: make(chan string, 4),
+		release: make(chan struct{}),
+	}
+	r := &Round{Reader: reader}
+	opts := Options{Concurrency: 1, Timeout: 5 * time.Second, Budget: 10 * time.Second, Batch: 6}
+
+	first := make(chan Result, 1)
+	go func() {
+		res, err := r.Run(context.Background(), []string{"acc_1"}, opts)
+		if err != nil {
+			t.Errorf("run: %v", err)
+		}
+		first <- res
+	}()
+	// 第一趟的那一次读已经在半空了。
+	if got := <-reader.started; got != "acc_1" {
+		t.Fatalf("the reading is about %q, want the one account", got)
+	}
+
+	// 第二趟撞上来了：这个账号正在读，它不读。
+	res, err := r.Run(context.Background(), []string{"acc_1"}, opts)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 0 || res.Failed != 0 || res.Skipped != 0 {
+		t.Fatalf("the second round = %+v, want nothing read, failed or skipped", res)
+	}
+	if len(res.Reasons) != 0 {
+		t.Fatalf("the second round said %v, want nothing: it is normal", res.Reasons)
+	}
+
+	close(reader.release)
+	<-first
+	if n := reader.count(); n != 1 {
+		t.Fatalf("the account was read %d times, want once", n)
+	}
+}
+
+// TestAReaderWithoutTheGuardIsUnaffected says a reader that cannot keep
+// the rounds apart is read as it was.
+//
+// 没有那把锁的读者：每一趟都读它名单上的账号，规则没有变。
+func TestAReaderWithoutTheGuardIsUnaffected(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: time.Second, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
 	}
 }

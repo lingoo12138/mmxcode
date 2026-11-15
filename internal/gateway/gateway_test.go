@@ -444,7 +444,7 @@ func TestRemainingAllReadsTheCreditsOfEveryAccountAtOnce(t *testing.T) {
 	})
 
 	c := &countingStore{Store: h.store}
-	p := poolAdapter{c}
+	p := poolAdapter{s: c}
 	got := p.RemainingAll(ctx, []string{"acc_01", "acc_02", "acc_03"})
 	if c.readings != 1 {
 		t.Fatalf("the readings were read %d times, want 1", c.readings)
@@ -490,7 +490,7 @@ func TestPickReadsTheCreditsOfTheAccountsAtOnce(t *testing.T) {
 		})
 	}
 	c := &countingStore{Store: h.store}
-	rot := rotator.New(poolAdapter{c}, rotator.Options{MaxAttempts: 3, WindowGroup: manager.WindowGroup})
+	rot := rotator.New(poolAdapter{s: c}, rotator.Options{MaxAttempts: 3, WindowGroup: manager.WindowGroup})
 	if _, err := rot.Pick(ctx, "sess-1", "m", map[string]bool{}); err != nil {
 		t.Fatal(err)
 	}

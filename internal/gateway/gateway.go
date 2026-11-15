@@ -140,7 +140,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		limit = 1
 	}
 	g.bgSem = make(chan struct{}, limit)
-	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
+	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
 		WindowGroup: manager.WindowGroup,
@@ -210,7 +210,11 @@ type poolStore interface {
 }
 
 // poolAdapter makes the store into a rotator pool.
-type poolAdapter struct{ s poolStore }
+type poolAdapter struct {
+	s poolStore
+	// busy counts the requests in the air per account.
+	busy *busyAccounts
+}
 
 func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
 	return p.s.ListAccounts(ctx)
@@ -286,6 +290,17 @@ func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, 
 		return 0, false
 	}
 	return rem.Left, true
+}
+
+// Busy says whether a request is in the air on an account.
+//
+// 网关把在飞的计数报给 rotator，rotator 挑账号的时候避开在飞的那些
+// （规格 §6.3）。这个账是网关自己的：它不用问数据库。
+func (p poolAdapter) Busy(ctx context.Context, accountID string) bool {
+	if p.busy == nil {
+		return false
+	}
+	return p.busy.isBusy(accountID)
 }
 
 // ServeHTTP routes a request.
@@ -434,9 +449,30 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	if attempts <= 0 {
 		attempts = 3
 	}
-	for attempt := 0; attempt < attempts; attempt++ {
+	// busyDeadline is when this request stops waiting for a free account.
+	// 它是整个请求的一份：等一个账号空出来，等不到就 429（规格 §6.2）。
+	var busyDeadline time.Time
+	// waitForFree waits for an account to come free.
+	waitForFree := func() bool {
+		if busyDeadline.IsZero() {
+			busyDeadline = time.Now().Add(s.Cfg.Concurrency.Wait.Duration())
+		}
+		return s.busy.waitForFree(ctx, busyDeadline)
+	}
+	for {
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
+			if errors.Is(err, rotator.ErrAllBusy) {
+				// 能答的账号都在飞：等前面的请求结束，而不是报错
+				// （规格 §6.4）。等不到就是等不到：客户端自己超时了。
+				if !waitForFree() {
+					w.Header().Set("Retry-After", "5")
+					writeError(w, proto, http.StatusTooManyRequests,
+						"every account is busy right now: too many requests are in the air")
+					return
+				}
+				continue
+			}
 			if lastErr != nil {
 				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 				return
@@ -444,12 +480,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		used[plan.AccountID] = true
 		if !s.busy.take(plan.AccountID) {
-			// 这个账号正忙着：另一个请求在飞。换一个账号来答这一
-			// 次，绑定不动 —— 忙不是它不能答了的理由。
+			// 刚挑中的那个账号在挑的时候还是闲的，现在被人抢了：等它
+			// 空出来。这一次不算一次失败：它没有坏，它只是忙。
+			if !waitForFree() {
+				w.Header().Set("Retry-After", "5")
+				writeError(w, proto, http.StatusTooManyRequests,
+					"every account is busy right now: too many requests are in the air")
+				return
+			}
 			continue
 		}
+		// 抢到了：这个账号归这个请求了。这一次算一次尝试：它真的被问
+		// 过上游了。
+		used[plan.AccountID] = true
 		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
 		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
 		// 结束的。
@@ -624,10 +668,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			return
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("the request could not be served")
-	}
-	s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 }
 
 // failure says what went wrong upstream.

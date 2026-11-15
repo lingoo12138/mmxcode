@@ -1350,33 +1350,9 @@ go test ./internal/usage/
 
 批次配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了（跟 0 并发一个道理）。卡片那一趟也一样：`card: 0` 是「读一个」，不是「全都读」。
 
+读一个账号之前先问一句「有人正在读它吗」：正在读的那一个不读（规格 §3.3 的单账号去重，Task 13 加上）。撞上的那个账号不是读失败，也不是没轮上，所以不算也不记一笔理由。
+
 ```go
-// Options holds the controls of one round of readings.
-type Options struct {
-	// Concurrency is how many accounts are read at once.
-	Concurrency int
-	// Timeout is how long one account's reading may take.
-	Timeout time.Duration
-	// Budget is how long the whole round may take.
-	Budget time.Duration
-	// Batch is how many accounts the round reads at most.
-	Batch int
-}
-
-// Result says what one round of readings came to.
-type Result struct {
-	// Read are the readings that came back.
-	Read []store.UsageSnapshot
-	// Refreshed counts the accounts whose credits were read.
-	Refreshed int
-	// Failed counts the accounts whose credits could not be read.
-	Failed int
-	// Skipped counts the accounts the round did not get to.
-	Skipped int
-	// Reasons says why, one line per account.
-	Reasons []string
-}
-
 // Run reads the given accounts' credits, within a budget.
 //
 // 同一个账号同一时刻只读一次：一个账号在名单里出现两遍，读它一遍就
@@ -1400,6 +1376,8 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 		ctx, cancel = context.WithTimeout(ctx, opts.Budget)
 		defer cancel()
 	}
+	// guard 是读者跟别的那一趟之间的那把锁：没有它，就跟从前一样。
+	guard, hasGuard := r.Reader.(ReadingGuard)
 	sem := make(chan struct{}, opts.Concurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -1429,6 +1407,18 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 				skipped()
 				return
 			}
+			if hasGuard && !guard.BeginReading(id) {
+				// 别的这一趟正在读这个账号：这一趟不读它。读的是同
+				// 一次，读两遍是白读（规格 §3.3）。
+				//
+				// 这不是失败，也不是没轮上：它很正常，所以不算，也不
+				// 记一笔理由。
+				return
+			}
+			if hasGuard {
+				// 读完了（读失败也是读完了）就把账号还回去。
+				defer guard.EndReading(id)
+			}
 			one := ctx
 			if opts.Timeout > 0 {
 				var cancel context.CancelFunc
@@ -1449,81 +1439,6 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 	}
 	wg.Wait()
 	return out, nil
-}
-
-// RefreshDue reads the credits of the accounts that should be read.
-func (r *Round) RefreshDue(ctx context.Context) (Result, error) {
-	ids, err := r.Targets(ctx)
-	if err != nil {
-		return Result{}, err
-	}
-	return r.Run(ctx, ids, r.Options())
-}
-
-// RefreshHot reads the credits of the accounts that were used lately.
-//
-// 卡片那条路：只现读最热的几个，其余用上一次读到的数。卡片因此永远
-// 几秒内回来。
-func (r *Round) RefreshHot(ctx context.Context) (Result, error) {
-	var ids []string
-	if r.Hot != nil {
-		ids = r.Hot()
-	}
-	return r.Run(ctx, ids, r.CardOptions())
-}
-
-// Options gives the controls of the periodic round.
-func (r *Round) Options() Options {
-	f := r.Cfg.Usage.Refresh
-	return Options{
-		Concurrency: f.Concurrency,
-		Timeout:     f.Timeout.Duration(),
-		Budget:      f.Budget.Duration(),
-		Batch:       batch(f.Batch),
-	}
-}
-
-// CardOptions gives the controls of the card's own round.
-//
-// 卡片有自己的一份预算：它不能等。它读的那些账号的时限也是这份预算
-// 说了算，不然一个卡住的账号会把卡片拖到超时。
-func (r *Round) CardOptions() Options {
-	f := r.Cfg.Usage.Refresh
-	timeout := f.Timeout.Duration()
-	if b := f.CardBudget.Duration(); b > 0 && (timeout <= 0 || b < timeout) {
-		timeout = b
-	}
-	return Options{
-		Concurrency: f.Concurrency,
-		Timeout:     timeout,
-		Budget:      f.CardBudget.Duration(),
-		Batch:       batch(f.Card),
-	}
-}
-
-// batch gives how many accounts one round reads at most.
-//
-// 配 0 的时候按 1 算：0 个一批是一趟也读不了，那不是关掉，是坏了。
-// 卡片那一趟也一样：card: 0 该是"读一个"，不是"全都读"。
-func batch(n int) int {
-	if n <= 0 {
-		return 1
-	}
-	return n
-}
-
-// dedupe takes the repeated ids out of a list, keeping the order.
-func dedupe(ids []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	return out
 }
 ```
 
@@ -2414,6 +2329,12 @@ git commit -m "feat(usage): 签到之后读一次，读到的数说话"
 
 ### Task 7: 每个账号同时一个请求
 
+一个账号同时只跑一个请求。挑账号的时候要避开在飞的账号：不然第二个请求又落它身上，用的是同一份额度，额度掉得快一倍（规格 §6.1）。
+
+**忙不是它不能答了的理由。** 绑定的那个账号在飞的时候，另一个账号答这一次的请求，绑定不动 —— 绑定是「这个会话的家」，不能因为一次忙就搬走（规格 §6.1）。
+
+**能答的账号都忙的时候，等，不报错**（规格 §6.4）：等前面的请求结束，等的时候不占一次尝试。等不到（客户端自己超时了）就 429 带 `Retry-After`（规格 §6.2）—— 账号只是忙，不是坏了，客户端不该拿到一个 502。
+
 **Files:**
 - Create: `internal/gateway/busy.go`
 - Create: `internal/gateway/busy_test.go`
@@ -2428,10 +2349,14 @@ package gateway
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"mmxcode/internal/config"
+	"mmxcode/internal/store"
 )
 
 // TestAnAccountTakesOneRequestAtATime says an account takes one
@@ -2506,15 +2431,140 @@ func TestTheGateWaitsForAPlace(t *testing.T) {
 	}
 	g.give()
 }
+
+// TestTheBusyAccountIsNotTaken says an account with a request in the
+// air on it is not taken.
+//
+// 在飞的账号再接一个请求，额度掉得就快一倍：它们用的是同一份额度。
+func TestTheBusyAccountIsNotTaken(t *testing.T) {
+	b := newBusyAccounts(1)
+	if !b.take("acc_1") {
+		t.Fatal("the account did not take the request")
+	}
+	if !b.isBusy("acc_1") {
+		t.Fatal("the account does not say it is busy")
+	}
+	if b.isBusy("acc_2") {
+		t.Fatal("the account that is not in the air says it is busy")
+	}
+	b.give("acc_1")
+	if b.isBusy("acc_1") {
+		t.Fatal("the account still says it is busy")
+	}
+}
+
+// TestTheRequestIsAnsweredByTheAccountThatIsNotBusy says a request goes
+// to an account that has nothing in the air on it.
+//
+// 三个账号上都有请求在飞，第四个空着：请求要落到第四个身上，不是 502。
+// 忙不是它不能答了的理由（规格 §6.1、§6.4）。
+func TestTheRequestIsAnsweredByTheAccountThatIsNotBusy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	ctx := context.Background()
+	now := time.Now()
+	for _, id := range []string{"acc_02", "acc_03", "acc_04"} {
+		if err := h.store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok" + id, Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 前三个账号上都有一个请求在飞。
+	for _, id := range []string{"acc_01", "acc_02", "acc_03"} {
+		if !h.gw.busy.take(id) {
+			t.Fatalf("the account %s did not take the request", id)
+		}
+		defer h.gw.busy.give(id)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	// 答的是那个空着的账号。
+	h.mu.Lock()
+	tokens := append([]string(nil), h.tokens...)
+	h.mu.Unlock()
+	if len(tokens) != 1 {
+		t.Fatalf("the upstream was asked %d times, want once", len(tokens))
+	}
+	if !strings.Contains(tokens[0], "tokacc_04") {
+		t.Fatalf("the upstream was asked with %q, want the account that is not busy", tokens[0])
+	}
+}
+
+// TestTheSecondRequestWaitsForTheBusyAccount says the second request
+// waits for the busy account instead of being given up on.
+//
+// 只有一个账号的时候它忙，第二个请求要等它做完，而不是报错（规格
+// §6.4）。等到了就答上，等不到才是 429。
+func TestTheSecondRequestWaitsForTheBusyAccount(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	// 唯一的账号上有一个请求在飞：它一会儿就做完。
+	if !h.gw.busy.take("acc_01") {
+		t.Fatal("the account did not take the request")
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		h.gw.busy.give("acc_01")
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTheRequestIsToldToWaitWhenEveryAccountIsBusy says a request that
+// cannot get a free account is told to come back.
+//
+// 等不到就是等不到：客户端自己超时了，网关不该把它吊着（规格 §6.2）。
+// 那个答案是 429 带 Retry-After，不是 502：账号只是忙，不是坏了。
+func TestTheRequestIsToldToWaitWhenEveryAccountIsBusy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	// 等不了多久：这个测试等的是那个「等不到」。
+	h.gw.Cfg.Concurrency.Wait = config.Duration(100 * time.Millisecond)
+	// 唯一的账号上有一个请求在飞，它一直不来。
+	if !h.gw.busy.take("acc_01") {
+		t.Fatal("the account did not take the request")
+	}
+	defer h.gw.busy.give("acc_01")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("no Retry-After was given")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 ```
-go test ./internal/gateway/ -run "Busy|Concurrency|Gate"
+go test ./internal/gateway/ -run "Busy|Concurrency|Gate|NotBusy|SecondRequest|Wait"
 ```
 
-失败：`undefined: newBusyAccounts`。
+失败：`undefined: newBusyAccounts`、`undefined: isBusy`。
 
 - [ ] **Step 3: 写「谁在飞」**
 
@@ -2574,6 +2624,52 @@ func (b *busyAccounts) give(accountID string) {
 		return
 	}
 	b.at[accountID]--
+}
+
+// isBusy says whether a request is in the air on an account.
+//
+// 它是 rotator 问的那一句：这个账号现在忙不忙（规格 §6.3）。
+func (b *busyAccounts) isBusy(accountID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.at[accountID] >= b.per
+}
+
+// anyFree says whether some account is free right now.
+//
+// 一个账号都没在飞的时候，当然有空的：账本上是空的。
+func (b *busyAccounts) anyFree() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.at) == 0 {
+		return true
+	}
+	for _, n := range b.at {
+		if n < b.per {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForFree waits until an account is free, or the deadline is over.
+//
+// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
+// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+	for {
+		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
+		// 抢走了，一醒就轮着看会转不停。
+		if !sleepCtx(ctx, 25*time.Millisecond) {
+			return false
+		}
+		if b.anyFree() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
 }
 
 // gate counts the requests in the air and lets the ones that do not
@@ -2698,7 +2794,102 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 }
 ```
 
-- [ ] **Step 4: 网关拿上这两样**
+- [ ] **Step 4: 池子多一个查询：这个账号现在忙不忙**
+
+规格 §6.3：挑账号要避开在飞的账号 —— rotator 要能问一句「这个账号现在忙不忙」—— 跟现有的 `RemainingFor` 一个路子：**池接口加一个查询**，网关把在飞的计数报给它。
+
+`internal/rotator/rotator.go` 里加：
+
+```go
+// BusyFor is an optional part of a Pool: it says whether an account
+// is busy right now — a request is in the air on it.
+//
+// The accounts that are busy are not picked: a second request on one of
+// them spends the same credits twice as fast. A request that finds
+// every account that could answer busy gets ErrAllBusy, and waits for
+// one of them to come free.
+//
+// A pool without it is asked nothing: no account is ever busy as far as
+// the rotator knows, and everything works as it did before.
+type BusyFor interface {
+	Busy(ctx context.Context, accountID string) bool
+}
+
+// ErrAllBusy says every account that could answer is busy right now.
+//
+// 它跟「都花完了」是两件事：花完的账号等不来（在飞的会空出来）。网关
+// 认得它，就知道该等，而不是报错。
+var ErrAllBusy = errors.New("every account that could answer is busy right now")
+```
+
+「都忙」也有它自己的一句话，别的路认得出它：
+
+`internal/rotator/rotator.go` 里，`Pick` 挑账号的时候先问一句谁在飞：
+
+```go
+	// The accounts that are not busy: a request is in the air on the
+	// other ones, and they are not picked.
+	free, err := r.freeAccounts(ctx, usable)
+	if err != nil {
+		return Plan{}, err
+	}
+```
+
+在飞的账号不挑，绑定的那个账号在飞的时候是另一回事（规格 §6.1：忙不是它不能答了的理由）：
+
+```go
+			case r.isBusy(ctx, boundID):
+				// The bound account is busy: another account answers
+				// this request, and the conversation stays where it
+				// is. A busy account is not one that cannot answer.
+				a, err := r.bestAccount(ctx, free)
+				if err != nil {
+					return Plan{}, err
+				}
+				r.markUsed(a.ID)
+				return r.plan(a, group, false, true), nil
+```
+
+`internal/rotator/rotator.go` 里加这两个：
+
+```go
+// freeAccounts gives the accounts that are not busy right now.
+//
+// 在飞的账号不挑：第二个请求落在它身上，额度掉得就快一倍。
+//
+// 它们都忙的时候是 ErrAllBusy：那是「等一等」的事，不是「坏了」的事。
+func (r *Rotator) freeAccounts(ctx context.Context, usable []store.Account) ([]store.Account, error) {
+	busy, ok := r.pool.(BusyFor)
+	if !ok {
+		// 这个池子说不了谁在飞：跟从前一样，一个都不算忙。
+		return usable, nil
+	}
+	free := make([]store.Account, 0, len(usable))
+	for _, a := range usable {
+		if busy.Busy(ctx, a.ID) {
+			continue
+		}
+		free = append(free, a)
+	}
+	if len(free) == 0 {
+		return nil, ErrAllBusy
+	}
+	return free, nil
+}
+
+// isBusy says whether a request is in the air on an account.
+//
+// 池子说不了谁在飞的时候，谁也不忙。
+func (r *Rotator) isBusy(ctx context.Context, accountID string) bool {
+	busy, ok := r.pool.(BusyFor)
+	if !ok {
+		return false
+	}
+	return busy.Busy(ctx, accountID)
+}
+```
+
+- [ ] **Step 5: 网关拿上这两样**
 
 `internal/gateway/gateway.go` 的 `Server` 里加：
 
@@ -2716,7 +2907,24 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 	g.gate = &gate{}
 ```
 
-- [ ] **Step 5: 聊天那条路多两道门**
+网关是那个池子：它把在飞的计数报给 rotator。
+
+`internal/gateway/gateway.go` 里，`poolAdapter` 加一个方法：
+
+```go
+// Busy says whether a request is in the air on an account.
+//
+// 网关把在飞的计数报给 rotator，rotator 挑账号的时候避开在飞的那些
+// （规格 §6.3）。这个账是网关自己的：它不用问数据库。
+func (p poolAdapter) Busy(ctx context.Context, accountID string) bool {
+	if p.busy == nil {
+		return false
+	}
+	return p.busy.isBusy(accountID)
+}
+```
+
+- [ ] **Step 6: 聊天那条路多两道门**
 
 `internal/gateway/gateway.go` 的 `handleChat` 里：
 
@@ -2734,12 +2942,49 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 	defer s.gate.give()
 ```
 
-账号那一圈里，`used[plan.AccountID] = true` 之后加：
+账号那一圈：挑到账号之后先抢，抢不到就等 —— 等的时候不占一次尝试，因为忙不是一次失败。等不到就 429 带 `Retry-After`（规格 §6.2、§6.4）：
 
 ```go
+	// busyDeadline is when this request stops waiting for a free account.
+	// 它是整个请求的一份：等一个账号空出来，等不到就 429（规格 §6.2）。
+	var busyDeadline time.Time
+	// waitForFree waits for an account to come free.
+	waitForFree := func() bool {
+		if busyDeadline.IsZero() {
+			busyDeadline = time.Now().Add(s.Cfg.Concurrency.Wait.Duration())
+		}
+		return s.busy.waitForFree(ctx, busyDeadline)
+	}
+	for {
+		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
+		if err != nil {
+			if errors.Is(err, rotator.ErrAllBusy) {
+				// 能答的账号都在飞：等前面的请求结束，而不是报错
+				// （规格 §6.4）。等不到就是等不到：客户端自己超时了。
+				if !waitForFree() {
+					w.Header().Set("Retry-After", "5")
+					writeError(w, proto, http.StatusTooManyRequests,
+						"every account is busy right now: too many requests are in the air")
+					return
+				}
+				continue
+			}
+			if lastErr != nil {
+				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
+				return
+			}
+			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		if !s.busy.take(plan.AccountID) {
-			// 这个账号正忙着：另一个请求在飞。换一个账号来答这一
-			// 次，绑定不动 —— 忙不是它不能答了的理由。
+			// 刚挑中的那个账号在挑的时候还是闲的，现在被人抢了：等它
+			// 空出来。这一次不算一次失败：它没有坏，它只是忙。
+			if !waitForFree() {
+				w.Header().Set("Retry-After", "5")
+				writeError(w, proto, http.StatusTooManyRequests,
+					"every account is busy right now: too many requests are in the air")
+				return
+			}
 			continue
 		}
 ```
@@ -2764,9 +3009,30 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 	if attempts <= 0 {
 		attempts = 3
 	}
-	for attempt := 0; attempt < attempts; attempt++ {
+	// busyDeadline is when this request stops waiting for a free account.
+	// 它是整个请求的一份：等一个账号空出来，等不到就 429（规格 §6.2）。
+	var busyDeadline time.Time
+	// waitForFree waits for an account to come free.
+	waitForFree := func() bool {
+		if busyDeadline.IsZero() {
+			busyDeadline = time.Now().Add(s.Cfg.Concurrency.Wait.Duration())
+		}
+		return s.busy.waitForFree(ctx, busyDeadline)
+	}
+	for {
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
+			if errors.Is(err, rotator.ErrAllBusy) {
+				// 能答的账号都在飞：等前面的请求结束，而不是报错
+				// （规格 §6.4）。等不到就是等不到：客户端自己超时了。
+				if !waitForFree() {
+					w.Header().Set("Retry-After", "5")
+					writeError(w, proto, http.StatusTooManyRequests,
+						"every account is busy right now: too many requests are in the air")
+					return
+				}
+				continue
+			}
 			if lastErr != nil {
 				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 				return
@@ -2774,12 +3040,20 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		used[plan.AccountID] = true
 		if !s.busy.take(plan.AccountID) {
-			// 这个账号正忙着：另一个请求在飞。换一个账号来答这一
-			// 次，绑定不动 —— 忙不是它不能答了的理由。
+			// 刚挑中的那个账号在挑的时候还是闲的，现在被人抢了：等它
+			// 空出来。这一次不算一次失败：它没有坏，它只是忙。
+			if !waitForFree() {
+				w.Header().Set("Retry-After", "5")
+				writeError(w, proto, http.StatusTooManyRequests,
+					"every account is busy right now: too many requests are in the air")
+				return
+			}
 			continue
 		}
+		// 抢到了：这个账号归这个请求了。这一次算一次尝试：它真的被问
+		// 过上游了。
+		used[plan.AccountID] = true
 		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
 		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
 		// 结束的。
@@ -2954,10 +3228,7 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 			return
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("the request could not be served")
-	}
-	s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
+}
 ```
 
 改这一段的时候有五处要一起改，漏了哪一个都编译不过或者行为变了：
@@ -2969,14 +3240,17 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 | `break accountLoop` | `return true` | 客户端走了：请求到此为止，不再往一个已经走了的客户端写东西。 |
 | 写完答案之后的 `return` | `return true` | 客户端拿到东西了，请求到此为止。 |
 | `lastErr = err` 之后的 `continue` | `return false` | 这个账号这一轮没答上，换一个。 |
+| `for attempt := 0; attempt < attempts; attempt++` | `for {` | 忙的那一圈不算一次尝试：次数由 rotator 那份账算，它算的是真的问过上游的次数。 |
+| `used[plan.AccountID] = true` 放在抢之前 | 放在抢之后 | 抢不到的那个账号没有坏，它只是忙：它不算这一次被试过。 |
+| 循环后面那句 `the request could not be served` | 删掉 | 循环里每一条路都自己回答客户端了，那句永远轮不到；留着 Go 会说「这段代码到不了」。 |
 
-- [ ] **Step 6: 运行测试确认通过**
+- [ ] **Step 7: 运行测试确认通过**
 
 ```
 go test ./internal/gateway/
 ```
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 8: 提交**
 
 ```
 git add internal/gateway
@@ -4078,6 +4352,464 @@ func (s *Store) LatestUsageSnapshot(ctx context.Context, accountID string) (Usag
 ```
 git add internal/usage internal/store README.md docs/superpowers/plans
 git commit -m "fix(usage): 该读的是该读的那些账号"
+```
+
+---
+
+### Task 13: 忙的账号等一等
+
+这一节记的是复查改掉的两件事：一件是忙的账号，一件是同一个账号被两趟同时读。
+
+**一、忙的账号等一等。**
+
+轮转挑的是余额最多的那个 —— 正是几个请求都在飞的时候最常被挑到的那个。它在飞，而网关自己那份「谁在飞」的账是在挑完之后才说话的：挑中的那个账号抢不到，这一圈就白费了。三次尝试用完了，客户端拿到的是 502「这个请求没法服务」，而账号不过是忙，不是坏了。
+
+规格里那三句话就是改法：
+
+- §6.3：挑账号要避开在飞的账号 —— rotator 要能问一句「这个账号现在忙不忙」—— 跟现有的 `RemainingFor` 一个路子：**池接口加一个查询**，网关把在飞的计数报给它。
+- §6.4：可用账号都忙（比如只有 1 个账号）→ **等前面的请求结束，而不是报错**。
+- §6.1：满了怎么办：**换号，但不改绑**。绑定是「这个会话的家」，不能因为一次忙就搬走。
+
+于是有三处：
+
+- **池接口多一个可选的查询**（`BusyFor`，Task 7 的 Step 4）：有它的池子被问一句，没它的池子跟从前一样 —— 一个账号都不算忙。
+- **rotator 避开在飞的账号**，而且说得出「它们都忙」：`ErrAllBusy`。那是跟「都花完了」分开的一句话：花完的账号等不来，在飞的会空出来。绑定的账号在飞的时候，另一个账号答这一次的请求，绑定不动。
+- **网关等，不报错**：等一个账号空出来，等的时候不占一次尝试（忙不是一次失败）。等不到（`concurrency.wait`，默认十秒）就 429 带 `Retry-After` —— 客户端自己超时了，网关不该把它吊着。
+
+**二、一个账号同一时刻只读一次。**
+
+这个进程里有三趟读额度：签到之后那一趟、周期那一趟、卡片现读那一趟。`Round.Run` 只在**一趟之内**去重（同一个账号在名单里出现两遍，读它一遍就够了），两趟撞上的时候两边都去读，读的是同一次。
+
+规格 §3.3 说：「**单账号去重**：同一个账号同一时刻只读一次（签到那一趟和热的那一趟可能撞上）」。守这一条的是管理器：这个进程里三趟读额度共用一个 `*manager.Manager`，所以那把锁放在它身上。
+
+`Round.Run` 读一个账号之前先问一句「有人正在读它吗」：正在读就不读。那不是失败，也不是「预算用完了没轮上」，所以不算，也不记一笔理由 —— 它很正常。
+
+**Files:**
+- Modify: `internal/rotator/rotator.go`
+- Modify: `internal/rotator/rotator_test.go`
+- Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/busy.go`
+- Modify: `internal/gateway/busy_test.go`
+- Modify: `internal/manager/manager.go`
+- Modify: `internal/manager/manager_test.go`
+- Modify: `internal/usage/round.go`
+- Modify: `internal/usage/round_test.go`
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/rotator/rotator_test.go` 里加：
+
+```go
+// TestTheBusyAccountIsNotPicked says an account with a request in the
+// air on it is not picked.
+//
+// 在飞的账号再接一个请求，额度掉得就快一倍：它们用的是同一份额度。
+// 挑账号的时候要避开在飞的那些（规格 §6.3）。
+func TestTheBusyAccountIsNotPicked(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("picked %s, want the one that is not busy", got.AccountID)
+	}
+}
+
+// TestEveryAccountBusyIsSaidSo says the rotator says the accounts are
+// busy, and not that they are spent.
+//
+// 都忙跟都花完是两件事：忙的等一等就空出来了，花完的等不来。网关要
+// 认得这个差别，才知道该等，而不是报错（规格 §6.4）。
+func TestEveryAccountBusyIsSaidSo(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+
+	_, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if !errors.Is(err, ErrAllBusy) {
+		t.Fatalf("the error = %v, want the all-busy one", err)
+	}
+}
+
+// TestTheBindingStaysWhenTheBoundAccountIsBusy says a busy bound
+// account does not move the binding.
+//
+// 绑定是"这个会话的家"：忙不是它不能答了的理由（规格 §6.1）。忙的时候
+// 换一个账号答这一次，绑定还在原来那个账号上。
+func TestTheBindingStaysWhenTheBoundAccountIsBusy(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	p.sessions["sess-1"] = "acc_01"
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("picked %s, want the one that is not busy", got.AccountID)
+	}
+	if p.sessions["sess-1"] != "acc_01" {
+		t.Fatalf("the binding moved to %s", p.sessions["sess-1"])
+	}
+	if len(p.bound) != 0 {
+		t.Fatalf("bound %v", p.bound)
+	}
+	if got.Rebound {
+		t.Fatal("the plan says the session was rebound")
+	}
+	if !got.Retried {
+		t.Fatal("the plan does not say the request was answered by another account")
+	}
+}
+
+// TestAPoolThatCannotSayIsNotAsked says a pool that cannot say which
+// accounts are busy is not asked.
+//
+// 没有那个说法的池子：跟从前一样，一个账号都不算忙（规格 §6.3 的那
+// 个查询是可选的）。
+func TestAPoolThatCannotSayIsNotAsked(t *testing.T) {
+	p := newFakePool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_01" {
+		t.Fatalf("picked %s", got.AccountID)
+	}
+}
+```
+
+`internal/manager/manager_test.go` 里加：
+
+```go
+// TestTheSameAccountIsNotReadTwiceAtTheSameTime says the manager keeps
+// one account from being read twice at once.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可能
+// 撞上，两边都去读，读的是同一次。
+func TestTheSameAccountIsNotReadTwiceAtTheSameTime(t *testing.T) {
+	m := New(nil, nil, nil, nil, nil)
+
+	if !m.BeginReading("acc_1") {
+		t.Fatal("the account was not claimed")
+	}
+	if m.BeginReading("acc_1") {
+		t.Fatal("the account was claimed twice")
+	}
+	// 别的账号不受影响。
+	if !m.BeginReading("acc_2") {
+		t.Fatal("the other account was not claimed")
+	}
+	m.EndReading("acc_1")
+	if !m.BeginReading("acc_1") {
+		t.Fatal("the account was not claimed again")
+	}
+	m.EndReading("acc_1")
+	m.EndReading("acc_2")
+}
+```
+
+`internal/usage/round_test.go` 里加：
+
+```go
+// heldReader reads the credits and can be held in the air.
+//
+// 它能把一次读吊在半空：另一趟就是在这时候撞上来的。它拿的是管理器
+// 的那把锁——这一节看的就是管理器跟那一趟的配合。
+type heldReader struct {
+	// mgr keeps the rounds from reading the same account at once.
+	mgr *manager.Manager
+	// started says which account a reading is about.
+	started chan string
+	// release lets the held reading finish.
+	release chan struct{}
+	// mu guards read.
+	mu sync.Mutex
+	// read are the accounts that were read.
+	read []string
+}
+
+// RefreshUsage reads the credits of an account.
+func (h *heldReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	h.mu.Lock()
+	h.read = append(h.read, accountID)
+	h.mu.Unlock()
+	if h.started != nil {
+		h.started <- accountID
+	}
+	if h.release != nil {
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+			return store.UsageSnapshot{}, ctx.Err()
+		}
+	}
+	return store.UsageSnapshot{
+		AccountID: accountID, Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: time.Now(),
+	}, nil
+}
+
+// BeginReading keeps two rounds from reading the same account at once.
+func (h *heldReader) BeginReading(accountID string) bool {
+	return h.mgr.BeginReading(accountID)
+}
+
+// EndReading says the reading of an account is done.
+func (h *heldReader) EndReading(accountID string) {
+	h.mgr.EndReading(accountID)
+}
+
+// count says how many readings were asked for.
+func (h *heldReader) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.read)
+}
+
+// TestTwoRoundsDoNotReadTheSameAccountAtTheSameTime says two rounds
+// over the same accounts read one of them once between them.
+//
+// 签到那一趟和热的那一趟可能撞上同一个账号：同一个账号同一时刻只读
+// 一次（规格 §3.3）。撞上的那个账号不是读失败，也不是没轮上：另一趟
+// 正在读它。
+func TestTwoRoundsDoNotReadTheSameAccountAtTheSameTime(t *testing.T) {
+	mgr := manager.New(nil, nil, nil, nil, nil)
+	reader := &heldReader{
+		mgr:     mgr,
+		started: make(chan string, 4),
+		release: make(chan struct{}),
+	}
+	r := &Round{Reader: reader}
+	opts := Options{Concurrency: 1, Timeout: 5 * time.Second, Budget: 10 * time.Second, Batch: 6}
+
+	first := make(chan Result, 1)
+	go func() {
+		res, err := r.Run(context.Background(), []string{"acc_1"}, opts)
+		if err != nil {
+			t.Errorf("run: %v", err)
+		}
+		first <- res
+	}()
+	// 第一趟的那一次读已经在半空了。
+	if got := <-reader.started; got != "acc_1" {
+		t.Fatalf("the reading is about %q, want the one account", got)
+	}
+
+	// 第二趟撞上来了：这个账号正在读，它不读。
+	res, err := r.Run(context.Background(), []string{"acc_1"}, opts)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 0 || res.Failed != 0 || res.Skipped != 0 {
+		t.Fatalf("the second round = %+v, want nothing read, failed or skipped", res)
+	}
+	if len(res.Reasons) != 0 {
+		t.Fatalf("the second round said %v, want nothing: it is normal", res.Reasons)
+	}
+
+	close(reader.release)
+	<-first
+	if n := reader.count(); n != 1 {
+		t.Fatalf("the account was read %d times, want once", n)
+	}
+}
+
+// TestAReaderWithoutTheGuardIsUnaffected says a reader that cannot keep
+// the rounds apart is read as it was.
+//
+// 没有那把锁的读者：每一趟都读它名单上的账号，规则没有变。
+func TestAReaderWithoutTheGuardIsUnaffected(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: time.Second, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+}
+```
+
+`internal/gateway/busy_test.go` 里加的那几条（Task 7 的 Step 1 那一整个文件）说的是同一件事：忙的账号等一等，等不到就 429，不是 502。
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```
+go test ./internal/rotator/ ./internal/gateway/ ./internal/manager/ ./internal/usage/
+```
+
+失败：`undefined: ErrAllBusy`、`undefined: isBusy`、`undefined: BeginReading`；网关那条是 502「the request could not be served」和 503「no account can answer」。
+
+- [ ] **Step 3: 池子多一个查询**
+
+Task 7 的 Step 4 已经写了：`BusyFor` 是池接口多出来的那个可选的部分，`ErrAllBusy` 是「它们都忙」那一句，`freeAccounts` 是挑之前的那一问。网关是那个池子，它把在飞的计数报给 rotator：
+
+```go
+// isBusy says whether a request is in the air on an account.
+//
+// 它是 rotator 问的那一句：这个账号现在忙不忙（规格 §6.3）。
+func (b *busyAccounts) isBusy(accountID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.at[accountID] >= b.per
+}
+
+// anyFree says whether some account is free right now.
+//
+// 一个账号都没在飞的时候，当然有空的：账本上是空的。
+func (b *busyAccounts) anyFree() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.at) == 0 {
+		return true
+	}
+	for _, n := range b.at {
+		if n < b.per {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForFree waits until an account is free, or the deadline is over.
+//
+// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
+// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+	for {
+		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
+		// 抢走了，一醒就轮着看会转不停。
+		if !sleepCtx(ctx, 25*time.Millisecond) {
+			return false
+		}
+		if b.anyFree() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+}
+```
+
+`internal/gateway/busy.go` 里加的是那把账上的两个读法：现在忙不忙（rotator 问的），有没有空出来的（网关等的）。
+
+- [ ] **Step 4: 网关等一等**
+
+Task 7 的 Step 6 那一段就是：挑到账号之后先抢，抢不到就等；rotator 说「它们都忙」的时候也是等。等的时候不占一次尝试，等不到就 429 带 `Retry-After`。
+
+- [ ] **Step 5: 一个账号同一时刻只读一次**
+
+`internal/manager/manager.go` 的 `Manager` 里加那份账：
+
+```go
+	// readMu guards the accounts that are being read.
+	readMu sync.Mutex
+	// reading holds the accounts that are being read right now.
+	//
+	// 它是这一份进程里的账：签到那一趟、周期那一趟和卡片那一趟共用
+	// 一个管理器，所以这把锁是三趟共用的（规格 §3.3）。
+	reading map[string]bool
+```
+
+`internal/manager/manager.go` 里加这两个方法：
+
+```go
+// BeginReading says a round is about to read an account, and whether it
+// may.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可
+// 能撞上，两边都去读，读的是同一次。已经在读的那个账号，这一趟就不
+// 读了——另一趟正在读它。
+//
+// It says whether the account was claimed: false means another round is
+// reading it right now.
+func (m *Manager) BeginReading(accountID string) bool {
+	m.readMu.Lock()
+	defer m.readMu.Unlock()
+	if m.reading == nil {
+		m.reading = map[string]bool{}
+	}
+	if m.reading[accountID] {
+		return false
+	}
+	m.reading[accountID] = true
+	return true
+}
+
+// EndReading says the reading of an account is done.
+//
+// 读失败了也要还回来：不然那个账号再也读不到了。
+func (m *Manager) EndReading(accountID string) {
+	m.readMu.Lock()
+	defer m.readMu.Unlock()
+	delete(m.reading, accountID)
+}
+```
+
+`internal/usage/round.go` 里，`Reader` 旁边多一个可选的部分：
+
+```go
+// ReadingGuard is an optional part of a Reader: it keeps two rounds
+// from reading the same account at the same time.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可能
+// 撞上，两边都去读，读的是同一次。
+//
+// A reader that has it is asked before every reading; a reader that has
+// not is asked nothing, and every reading is read as it was before.
+type ReadingGuard interface {
+	// BeginReading says a round is about to read an account, and
+	// whether it may. It says false when another round is reading that
+	// account right now.
+	BeginReading(accountID string) bool
+	// EndReading says the reading of an account is done.
+	EndReading(accountID string)
+}
+```
+
+`internal/usage/round.go` 的 `Run` 里，读之前先问一句：
+
+```go
+			if hasGuard && !guard.BeginReading(id) {
+				// 别的这一趟正在读这个账号：这一趟不读它。读的是同
+				// 一次，读两遍是白读（规格 §3.3）。
+				//
+				// 这不是失败，也不是没轮上：它很正常，所以不算，也不
+				// 记一笔理由。
+				return
+			}
+			if hasGuard {
+				// 读完了（读失败也是读完了）就把账号还回去。
+				defer guard.EndReading(id)
+			}
+```
+
+- [ ] **Step 6: 运行测试确认通过**
+
+```
+go test ./...
+```
+
+- [ ] **Step 7: 提交**
+
+```
+git add internal/rotator internal/gateway internal/manager internal/usage
+git commit -m "fix(gateway): 忙的账号等一等，不算一次失败"
 ```
 
 ---

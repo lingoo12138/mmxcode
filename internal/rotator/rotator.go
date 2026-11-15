@@ -38,6 +38,7 @@ package rotator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -92,6 +93,26 @@ type RemainingFor interface {
 type UpstreamIDs interface {
 	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 }
+
+// BusyFor is an optional part of a Pool: it says whether an account
+// is busy right now — a request is in the air on it.
+//
+// The accounts that are busy are not picked: a second request on one of
+// them spends the same credits twice as fast. A request that finds
+// every account that could answer busy gets ErrAllBusy, and waits for
+// one of them to come free.
+//
+// A pool without it is asked nothing: no account is ever busy as far as
+// the rotator knows, and everything works as it did before.
+type BusyFor interface {
+	Busy(ctx context.Context, accountID string) bool
+}
+
+// ErrAllBusy says every account that could answer is busy right now.
+//
+// 它跟「都花完了」是两件事：花完的账号等不来（在飞的会空出来）。网关
+// 认得它，就知道该等，而不是报错。
+var ErrAllBusy = errors.New("every account that could answer is busy right now")
 
 // Remaining is what is left of an account's credits.
 type Remaining struct {
@@ -270,11 +291,18 @@ func (r *Rotator) WindowKey(model string) string {
 //   - a conversation bound to an account that has already been tried in
 //     this request is answered by another account, and the binding is
 //     left alone: one failure does not move the conversation;
+//   - a conversation bound to a busy account is answered by another
+//     account, and the binding is left alone as well: a busy account is
+//     not one that cannot answer;
 //   - a conversation with no binding takes the account with the most
 //     credits left, and the least recently used one when those are
 //     equal, and is bound to it;
 //   - a request with no conversation at all rotates: the next account
 //     in turn, so the load is spread.
+//
+// The accounts that are busy right now are not picked. When every
+// account that could answer is busy, the error is ErrAllBusy: the
+// caller waits for one of them to come free.
 //
 // The "round-robin" strategy skips the first three cases and rotates
 // always.
@@ -298,7 +326,6 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	// The accounts that can answer: they are signed in, their group
 	// is not spent, and they have not been tried yet.
 	usable := make([]store.Account, 0, len(accounts))
-	usableIDs := make(map[string]bool, len(accounts))
 	for _, a := range accounts {
 		if a.Status != store.StatusActive {
 			continue
@@ -307,10 +334,16 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 			continue
 		}
 		usable = append(usable, a)
-		usableIDs[a.ID] = true
 	}
 	if len(usable) == 0 {
 		return Plan{}, fmt.Errorf("no account can answer: every account is spent for the %s group or has already been tried", group)
+	}
+
+	// The accounts that are not busy: a request is in the air on the
+	// other ones, and they are not picked.
+	free, err := r.freeAccounts(ctx, usable)
+	if err != nil {
+		return Plan{}, err
 	}
 
 	sticky := r.opts.Strategy != StrategyRoundRobin
@@ -335,7 +368,17 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 				// The bound account has already been tried in this
 				// request and failed. Another account answers this
 				// request, and the conversation stays where it is.
-				a, err := r.bestAccount(ctx, usable)
+				a, err := r.bestAccount(ctx, free)
+				if err != nil {
+					return Plan{}, err
+				}
+				r.markUsed(a.ID)
+				return r.plan(a, group, false, true), nil
+			case r.isBusy(ctx, boundID):
+				// The bound account is busy: another account answers
+				// this request, and the conversation stays where it
+				// is. A busy account is not one that cannot answer.
+				a, err := r.bestAccount(ctx, free)
 				if err != nil {
 					return Plan{}, err
 				}
@@ -352,7 +395,7 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	// No binding, or the bound account cannot answer: another account
 	// is picked and the conversation is bound to it.
 	if sticky && sessionKey != "" {
-		a, err := r.bestAccount(ctx, usable)
+		a, err := r.bestAccount(ctx, free)
 		if err != nil {
 			return Plan{}, err
 		}
@@ -367,12 +410,51 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 
 	// No conversation, or the round-robin strategy: the next account
 	// in the rotation.
+	usableIDs := make(map[string]bool, len(free))
+	for _, a := range free {
+		usableIDs[a.ID] = true
+	}
 	a, err := r.nextAccount(accounts, usableIDs)
 	if err != nil {
 		return Plan{}, err
 	}
 	r.markUsed(a.ID)
 	return r.plan(a, group, false, false), nil
+}
+
+// freeAccounts gives the accounts that are not busy right now.
+//
+// 在飞的账号不挑：第二个请求落在它身上，额度掉得就快一倍。
+//
+// 它们都忙的时候是 ErrAllBusy：那是「等一等」的事，不是「坏了」的事。
+func (r *Rotator) freeAccounts(ctx context.Context, usable []store.Account) ([]store.Account, error) {
+	busy, ok := r.pool.(BusyFor)
+	if !ok {
+		// 这个池子说不了谁在飞：跟从前一样，一个都不算忙。
+		return usable, nil
+	}
+	free := make([]store.Account, 0, len(usable))
+	for _, a := range usable {
+		if busy.Busy(ctx, a.ID) {
+			continue
+		}
+		free = append(free, a)
+	}
+	if len(free) == 0 {
+		return nil, ErrAllBusy
+	}
+	return free, nil
+}
+
+// isBusy says whether a request is in the air on an account.
+//
+// 池子说不了谁在飞的时候，谁也不忙。
+func (r *Rotator) isBusy(ctx context.Context, accountID string) bool {
+	busy, ok := r.pool.(BusyFor)
+	if !ok {
+		return false
+	}
+	return busy.Busy(ctx, accountID)
 }
 
 // plan gives the plan of a request that goes to an account.

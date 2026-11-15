@@ -2428,3 +2428,29 @@ func TestAFailedReloginDoesNotUndoTheOneThatWorked(t *testing.T) {
 		t.Fatalf("status = %q, want active: the one that worked must not be undone", acc.Status)
 	}
 }
+
+// TestTheSameAccountIsNotReadTwiceAtTheSameTime says the manager keeps
+// one account from being read twice at once.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可能
+// 撞上，两边都去读，读的是同一次。
+func TestTheSameAccountIsNotReadTwiceAtTheSameTime(t *testing.T) {
+	m := New(nil, nil, nil, nil, nil)
+
+	if !m.BeginReading("acc_1") {
+		t.Fatal("the account was not claimed")
+	}
+	if m.BeginReading("acc_1") {
+		t.Fatal("the account was claimed twice")
+	}
+	// 别的账号不受影响。
+	if !m.BeginReading("acc_2") {
+		t.Fatal("the other account was not claimed")
+	}
+	m.EndReading("acc_1")
+	if !m.BeginReading("acc_1") {
+		t.Fatal("the account was not claimed again")
+	}
+	m.EndReading("acc_1")
+	m.EndReading("acc_2")
+}

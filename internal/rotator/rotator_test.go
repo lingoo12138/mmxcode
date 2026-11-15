@@ -97,6 +97,20 @@ func (p *batchPool) RemainingAll(_ context.Context, ids []string) map[string]Rem
 	return out
 }
 
+// busyPool is a pool that knows which accounts are busy.
+//
+// 池子知道谁在飞：网关把在飞的计数报给它，rotator 挑账号的时候避开它。
+type busyPool struct {
+	*fakePool
+	// busy holds the accounts that have a request in the air on them.
+	busy map[string]bool
+}
+
+// Busy says whether a request is in the air on an account.
+func (p *busyPool) Busy(_ context.Context, accountID string) bool {
+	return p.busy[accountID]
+}
+
 func acc(id string) store.Account {
 	return store.Account{ID: id, Name: id, Status: store.StatusActive}
 }
@@ -211,6 +225,96 @@ func TestPickKeepsTheBindingWhenTheBoundAccountWasAlreadyTried(t *testing.T) {
 	}
 	if !got.Retried {
 		t.Fatal("the plan does not say the request was answered by another account")
+	}
+}
+
+// TestTheBusyAccountIsNotPicked says an account with a request in the
+// air on it is not picked.
+//
+// 在飞的账号再接一个请求，额度掉得就快一倍：它们用的是同一份额度。
+// 挑账号的时候要避开在飞的那些（规格 §6.3）。
+func TestTheBusyAccountIsNotPicked(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("picked %s, want the one that is not busy", got.AccountID)
+	}
+}
+
+// TestEveryAccountBusyIsSaidSo says the rotator says the accounts are
+// busy, and not that they are spent.
+//
+// 都忙跟都花完是两件事：忙的等一等就空出来了，花完的等不来。网关要
+// 认得这个差别，才知道该等，而不是报错（规格 §6.4）。
+func TestEveryAccountBusyIsSaidSo(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+
+	_, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if !errors.Is(err, ErrAllBusy) {
+		t.Fatalf("the error = %v, want the all-busy one", err)
+	}
+}
+
+// TestTheBindingStaysWhenTheBoundAccountIsBusy says a busy bound
+// account does not move the binding.
+//
+// 绑定是"这个会话的家"：忙不是它不能答了的理由（规格 §6.1）。忙的时候
+// 换一个账号答这一次，绑定还在原来那个账号上。
+func TestTheBindingStaysWhenTheBoundAccountIsBusy(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{"acc_01": true},
+	}
+	p.sessions["sess-1"] = "acc_01"
+	r := New(p, Options{MaxAttempts: 3})
+
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_02" {
+		t.Fatalf("picked %s, want the one that is not busy", got.AccountID)
+	}
+	if p.sessions["sess-1"] != "acc_01" {
+		t.Fatalf("the binding moved to %s", p.sessions["sess-1"])
+	}
+	if len(p.bound) != 0 {
+		t.Fatalf("bound %v", p.bound)
+	}
+	if got.Rebound {
+		t.Fatal("the plan says the session was rebound")
+	}
+	if !got.Retried {
+		t.Fatal("the plan does not say the request was answered by another account")
+	}
+}
+
+// TestAPoolThatCannotSayIsNotAsked says a pool that cannot say which
+// accounts are busy is not asked.
+//
+// 没有那个说法的池子：跟从前一样，一个账号都不算忙（规格 §6.3 的那
+// 个查询是可选的）。
+func TestAPoolThatCannotSayIsNotAsked(t *testing.T) {
+	p := newFakePool(acc("acc_01"))
+	r := New(p, Options{MaxAttempts: 3})
+	got, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != "acc_01" {
+		t.Fatalf("picked %s", got.AccountID)
 	}
 }
 

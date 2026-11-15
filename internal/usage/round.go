@@ -21,6 +21,23 @@ type Reader interface {
 	RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error)
 }
 
+// ReadingGuard is an optional part of a Reader: it keeps two rounds
+// from reading the same account at the same time.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：签到那一趟和热的那一趟可能
+// 撞上，两边都去读，读的是同一次。
+//
+// A reader that has it is asked before every reading; a reader that has
+// not is asked nothing, and every reading is read as it was before.
+type ReadingGuard interface {
+	// BeginReading says a round is about to read an account, and
+	// whether it may. It says false when another round is reading that
+	// account right now.
+	BeginReading(accountID string) bool
+	// EndReading says the reading of an account is done.
+	EndReading(accountID string)
+}
+
 // Round reads the credits of the accounts that should be read.
 //
 // 一趟读额度有四道控：并发、每个账号的时限、一趟的预算、一趟最多读几
@@ -257,6 +274,8 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 		ctx, cancel = context.WithTimeout(ctx, opts.Budget)
 		defer cancel()
 	}
+	// guard 是读者跟别的那一趟之间的那把锁：没有它，就跟从前一样。
+	guard, hasGuard := r.Reader.(ReadingGuard)
 	sem := make(chan struct{}, opts.Concurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -285,6 +304,18 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 				// 便挑一个，于是同一个账号有时算跳过，有时算失败。
 				skipped()
 				return
+			}
+			if hasGuard && !guard.BeginReading(id) {
+				// 别的这一趟正在读这个账号：这一趟不读它。读的是同
+				// 一次，读两遍是白读（规格 §3.3）。
+				//
+				// 这不是失败，也不是没轮上：它很正常，所以不算，也不
+				// 记一笔理由。
+				return
+			}
+			if hasGuard {
+				// 读完了（读失败也是读完了）就把账号还回去。
+				defer guard.EndReading(id)
 			}
 			one := ctx
 			if opts.Timeout > 0 {

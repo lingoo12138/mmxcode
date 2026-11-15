@@ -53,6 +53,52 @@ func (b *busyAccounts) give(accountID string) {
 	b.at[accountID]--
 }
 
+// isBusy says whether a request is in the air on an account.
+//
+// 它是 rotator 问的那一句：这个账号现在忙不忙（规格 §6.3）。
+func (b *busyAccounts) isBusy(accountID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.at[accountID] >= b.per
+}
+
+// anyFree says whether some account is free right now.
+//
+// 一个账号都没在飞的时候，当然有空的：账本上是空的。
+func (b *busyAccounts) anyFree() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.at) == 0 {
+		return true
+	}
+	for _, n := range b.at {
+		if n < b.per {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForFree waits until an account is free, or the deadline is over.
+//
+// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
+// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+	for {
+		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
+		// 抢走了，一醒就轮着看会转不停。
+		if !sleepCtx(ctx, 25*time.Millisecond) {
+			return false
+		}
+		if b.anyFree() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+}
+
 // gate counts the requests in the air and lets the ones that do not
 // fit wait.
 type gate struct {
