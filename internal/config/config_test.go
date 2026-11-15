@@ -461,6 +461,59 @@ func TestLoadAcceptsAKeyWithSpacesInIt(t *testing.T) {
 	}
 }
 
+// TestTheUsageDefaults says what a round of reading the credits does
+// when nothing is said about it.
+//
+// 读额度有几道控：多久算热、多久扫一遍、并发几个、每个账号的时限、
+// 一趟的预算、一趟最多读几个、卡片现读读几个。这些数是配的，配不
+// 着的时候也有一个说得过去的数。
+func TestTheUsageDefaults(t *testing.T) {
+	c := Default()
+	if c.Usage.Refresh.HotWindow.Duration() != 5*time.Minute {
+		t.Errorf("hot_window = %s, want 5m", c.Usage.Refresh.HotWindow)
+	}
+	if c.Usage.Refresh.ScanEvery.Duration() != 30*time.Second {
+		t.Errorf("scan_every = %s, want 30s", c.Usage.Refresh.ScanEvery)
+	}
+	if c.Usage.Refresh.Concurrency != 4 {
+		t.Errorf("concurrency = %d, want 4", c.Usage.Refresh.Concurrency)
+	}
+	if c.Usage.Refresh.Timeout.Duration() != 15*time.Second {
+		t.Errorf("timeout = %s, want 15s", c.Usage.Refresh.Timeout)
+	}
+	if c.Usage.Refresh.Budget.Duration() != 30*time.Second {
+		t.Errorf("budget = %s, want 30s", c.Usage.Refresh.Budget)
+	}
+	if c.Usage.Refresh.Batch != 6 {
+		t.Errorf("batch = %d, want 6", c.Usage.Refresh.Batch)
+	}
+	if c.Usage.Refresh.Card != 2 {
+		t.Errorf("card = %d, want 2", c.Usage.Refresh.Card)
+	}
+	if c.Usage.Refresh.CardBudget.Duration() != 5*time.Second {
+		t.Errorf("card_budget = %s, want 5s", c.Usage.Refresh.CardBudget)
+	}
+}
+
+// TestTheConcurrencyDefaults says how many requests may be in the air.
+//
+// 每个账号同时一个请求；总并发是账号数的五分之一，小规模至少三个。
+func TestTheConcurrencyDefaults(t *testing.T) {
+	c := Default()
+	if c.Concurrency.PerAccount != 1 {
+		t.Errorf("per_account = %d, want 1", c.Concurrency.PerAccount)
+	}
+	if c.Concurrency.TotalRatio != 5 {
+		t.Errorf("total_ratio = %d, want 5", c.Concurrency.TotalRatio)
+	}
+	if c.Concurrency.TotalMin != 3 {
+		t.Errorf("total_min = %d, want 3", c.Concurrency.TotalMin)
+	}
+	if c.Concurrency.Wait.Duration() != 10*time.Second {
+		t.Errorf("wait = %s, want 10s", c.Concurrency.Wait)
+	}
+}
+
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }

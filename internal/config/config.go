@@ -156,6 +156,58 @@ type Relogin struct {
 	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
 }
 
+// Usage holds how the credits are read.
+type Usage struct {
+	// Refresh holds how one round of reading the credits goes.
+	Refresh Refresh `yaml:"refresh" json:"refresh"`
+}
+
+// Refresh holds the controls of one round of reading the credits.
+//
+// 一趟读额度有四道控：并发（读得快，不是读得多）、每个账号的时限
+// （一个卡住的账号不能拖住整趟）、一趟的预算（预算用完就停）、一趟
+// 最多读几个（剩下的下一趟接着读）。
+//
+// 配 0 的时候按 1 算：0 并发、0 个一批都是一趟也读不了，那不是关掉，
+// 是坏了。
+type Refresh struct {
+	// HotWindow is how long an account counts as hot after it was used.
+	HotWindow Duration `yaml:"hot_window" json:"hot_window"`
+	// ScanEvery is how often the accounts that should be read are read.
+	ScanEvery Duration `yaml:"scan_every" json:"scan_every"`
+	// Concurrency is how many accounts one round reads at once.
+	Concurrency int `yaml:"concurrency" json:"concurrency"`
+	// Timeout is how long one account's reading may take.
+	Timeout Duration `yaml:"timeout" json:"timeout"`
+	// Budget is how long one round may take.
+	Budget Duration `yaml:"budget" json:"budget"`
+	// Batch is how many accounts one round reads at most.
+	Batch int `yaml:"batch" json:"batch"`
+	// Card is how many accounts the card's own refresh reads.
+	Card int `yaml:"card" json:"card"`
+	// CardBudget is how long the card's own refresh may take.
+	CardBudget Duration `yaml:"card_budget" json:"card_budget"`
+}
+
+// Concurrency holds how many requests may be in the air at once.
+//
+// 配 0 的时候按 1 算：0 并发是一个请求也进不来，那不是关掉，是坏了。
+type Concurrency struct {
+	// PerAccount is how many requests one account takes at once.
+	PerAccount int `yaml:"per_account" json:"per_account"`
+	// TotalRatio is how many accounts share one place (5 = one in five).
+	//
+	// 五分之一：100 个账号同时只用 20 个，这 20 个把额度用完了，还有
+	// 80 个是满的可以接。一个接一个地烧，而不是所有账号一起烧到没。
+	TotalRatio int `yaml:"total_ratio" json:"total_ratio"`
+	// TotalMin is the floor for a small number of accounts.
+	//
+	// 5 个账号只跑 1 个太憋屈：小规模的时候用 min(账号数, 3)。
+	TotalMin int `yaml:"total_min" json:"total_min"`
+	// Wait is how long a request waits for a free place.
+	Wait Duration `yaml:"wait" json:"wait"`
+}
+
 // Config is the whole configuration.
 type Config struct {
 	Server   Server   `yaml:"server" json:"server"`
@@ -165,6 +217,11 @@ type Config struct {
 	Schedule Schedule `yaml:"schedule" json:"schedule"`
 	Batch    Batch    `yaml:"batch" json:"batch"`
 	DB       string   `yaml:"db" json:"db"`
+
+	// Usage holds how the credits are read.
+	Usage Usage `yaml:"usage" json:"usage"`
+	// Concurrency holds how many requests may be in the air at once.
+	Concurrency Concurrency `yaml:"concurrency" json:"concurrency"`
 }
 
 // Default is the configuration a file starts from.
@@ -186,6 +243,22 @@ func Default() Config {
 				Cooldown:    Duration(time.Hour),
 				MaxAccounts: 20,
 			},
+		},
+		Usage: Usage{Refresh: Refresh{
+			HotWindow:   Duration(5 * time.Minute),
+			ScanEvery:   Duration(30 * time.Second),
+			Concurrency: 4,
+			Timeout:     Duration(15 * time.Second),
+			Budget:      Duration(30 * time.Second),
+			Batch:       6,
+			Card:        2,
+			CardBudget:  Duration(5 * time.Second),
+		}},
+		Concurrency: Concurrency{
+			PerAccount: 1,
+			TotalRatio: 5,
+			TotalMin:   3,
+			Wait:       Duration(10 * time.Second),
 		},
 		DB: "/data/mmxcode.db",
 	}
