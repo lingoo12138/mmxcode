@@ -1053,8 +1053,8 @@ func TestOneRoundStopsWhenTheBudgetIsOut(t *testing.T) {
 	if res.Refreshed != 0 {
 		t.Fatalf("the readings = %d, want none", res.Refreshed)
 	}
-	if res.Skipped == 0 {
-		t.Fatalf("the skipped = %d, want the ones the budget left out", res.Skipped)
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want the one the budget left out", res.Skipped)
 	}
 }
 
@@ -1149,16 +1149,28 @@ func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, er
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
+			skipped := func() {
 				mu.Lock()
 				out.Skipped++
 				out.Reasons = append(out.Reasons, id+": the budget is used up")
 				mu.Unlock()
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				skipped()
 				return
 			}
 			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				// 抢到了位置，可是预算刚好在这时候用完了：这个账号没读
+				// 成，算没轮上，不算读失败。
+				//
+				// 不查这一下就说不准：select 的两个都成了的时候，Go 随
+				// 便挑一个，于是同一个账号有时算跳过，有时算失败。
+				skipped()
+				return
+			}
 			one := ctx
 			if opts.Timeout > 0 {
 				var cancel context.CancelFunc
