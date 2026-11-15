@@ -77,3 +77,32 @@ func (s *Server) modelsFor(ctx context.Context) []site.Model {
 	s.modelsAt = time.Now()
 	return ms
 }
+
+// modelEntry gives one model as the API tells it.
+//
+// magpie 还要 context/output、能不能读图、思考档位，所以这些字段都
+// 给上：别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
+func modelEntry(m site.Model) map[string]any {
+	inputs := m.Inputs
+	if len(inputs) == 0 {
+		inputs = []string{"text"}
+	}
+	efforts := m.Efforts
+	if efforts == nil {
+		efforts = []string{}
+	}
+	return map[string]any{
+		"id": m.ID, "object": "model", "owned_by": "minimax",
+		"limit": map[string]any{
+			"context": m.Context,
+			"output":  m.Output,
+		},
+		"modalities": map[string]any{
+			"input":  inputs,
+			"output": []string{"text"},
+		},
+		"reasoning": m.Thinking != site.ThinkingOff,
+		"thinking":  string(m.Thinking),
+		"efforts":   efforts,
+	}
+}

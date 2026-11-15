@@ -1010,9 +1010,7 @@ func backConvert(body []byte, proto protocol, model string) ([]byte, error) {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
 	for _, m := range s.modelsFor(r.Context()) {
-		data = append(data, map[string]any{
-			"id": m.ID, "object": "model", "owned_by": "minimax",
-		})
+		data = append(data, modelEntry(m))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

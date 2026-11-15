@@ -2340,8 +2340,8 @@ func TestTheModelListCarriesWhatMagpieNeeds(t *testing.T) {
 	h.gw.ServeHTTP(w, req)
 	var body struct {
 		Data []struct {
-			ID        string `json:"id"`
-			Limit     struct{ Context, Output int } `json:"limit"`
+			ID         string                        `json:"id"`
+			Limit      struct{ Context, Output int } `json:"limit"`
 			Modalities struct {
 				Input  []string `json:"input"`
 				Output []string `json:"output"`

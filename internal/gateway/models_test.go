@@ -86,6 +86,52 @@ func TestTheSiteIsAskedOnceForTheList(t *testing.T) {
 	}
 }
 
+// TestTheModelListCarriesWhatMagpieNeeds says the list says what the
+// models are like, and not only their names.
+//
+// magpie 要 context/output、能不能读图、思考档位，所以这些字段都
+// 给上。别的客户端（OpenAI 形状的那些）会忽略多出来的字段。
+func TestTheModelListCarriesWhatMagpieNeeds(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"whatever"}]}`))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	var body struct {
+		Data []struct {
+			ID         string                        `json:"id"`
+			Limit      struct{ Context, Output int } `json:"limit"`
+			Modalities struct {
+				Input  []string `json:"input"`
+				Output []string `json:"output"`
+			} `json:"modalities"`
+			Reasoning bool     `json:"reasoning"`
+			Thinking  string   `json:"thinking"`
+			Efforts   []string `json:"efforts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if len(body.Data) == 0 {
+		t.Fatalf("the list is empty: %s", w.Body.String())
+	}
+	m := body.Data[0]
+	if m.Limit.Context == 0 || m.Limit.Output == 0 {
+		t.Errorf("the limits = %+v, want them said", m.Limit)
+	}
+	if len(m.Modalities.Input) == 0 {
+		t.Errorf("the input modalities = %v, want them said", m.Modalities.Input)
+	}
+	if !m.Reasoning {
+		t.Errorf("the model does not reason: %+v", m)
+	}
+	if m.Thinking == "" {
+		t.Errorf("the thinking is not said: %+v", m)
+	}
+}
+
 // TestTheBuiltInListIsServedWhenTheSiteIsSilent says the built-in list
 // is what is served when the site cannot be reached.
 func TestTheBuiltInListIsServedWhenTheSiteIsSilent(t *testing.T) {
