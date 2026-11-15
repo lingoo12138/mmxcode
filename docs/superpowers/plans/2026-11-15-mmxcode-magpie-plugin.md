@@ -437,10 +437,16 @@ import http from "node:http"
 import { MMXCodePlugin } from "./index.mjs"
 
 // aGateway starts a fake gateway and gives its address.
+//
+// 关的时候要把还开着的连接掐掉：fetch 的连接是留着的，不掐的话
+// close() 等着它们，这个测试就挂着不走了。
 async function aGateway(t, handler) {
   const srv = http.createServer(handler)
   await new Promise((r) => srv.listen(0, "127.0.0.1", r))
-  t.after(() => new Promise((r) => srv.close(r)))
+  t.after(() => new Promise((r) => {
+    srv.closeAllConnections()
+    srv.close(r)
+  }))
   return `http://127.0.0.1:${srv.address().port}`
 }
 
@@ -453,7 +459,7 @@ async function thePlugin() {
 // said in words.
 //
 // 签入不成功要说清楚，不留一个半签入的账号。
-test("the sign-in says the gateway is not there", async () => {
+test("the sign-in says the gateway is not there", async (t) => {
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base: "http://127.0.0.1:1" })
   assert.equal(res.type, "failed")
@@ -464,10 +470,10 @@ test("the sign-in says the gateway is not there", async () => {
 // words.
 //
 // 网关开的是哪扇门：聊天接口要聊天 key，后台登录 key 也行。
-test("the sign-in says the key was refused", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(401)
-    w.end("{}")
+test("the sign-in says the key was refused", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(401)
+    res.end("{}")
   })
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base, key: "sk-wrong" })
@@ -477,10 +483,10 @@ test("the sign-in says the key was refused", async () => {
 
 // TestTheSignInSaysTheOtherAnswers says an unexpected answer is said
 // as it is.
-test("the sign-in says the other answers", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(503)
-    w.end("{}")
+test("the sign-in says the other answers", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(503)
+    res.end("{}")
   })
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base })
@@ -492,10 +498,10 @@ test("the sign-in says the other answers", async () => {
 // address.
 //
 // 地址是签到的一部分：没有它，插件不知道往哪儿发请求。
-test("the sign-in keeps the address", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(200, { "content-type": "application/json" })
-    w.end(JSON.stringify({ object: "list", data: [] }))
+test("the sign-in keeps the address", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ object: "list", data: [] }))
   })
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base })
@@ -507,10 +513,10 @@ test("the sign-in keeps the address", async () => {
 // not a failed sign-in.
 //
 // 那把 key 是 magpie 自己问用户要的：它还没有，所以 401 不是失败。
-test("the sign-in without a key is fine", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(401)
-    w.end("{}")
+test("the sign-in without a key is fine", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(401)
+    res.end("{}")
   })
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base })
@@ -522,16 +528,16 @@ test("the sign-in without a key is fine", async () => {
 //
 // 插件不自己算，也不在卡上写读到的时间：多出来的东西塞进去只会让
 // magpie 认错字段。
-test("the card is handed over as it is", async () => {
+test("the card is handed over as it is", async (t) => {
   const card = {
     plan: "Token Plan M3",
     until: "2026-12-01T00:00:00Z",
     balance: "437.5 credits",
     windows: [{ name: "主号 · Credits", used: 12.5, display: "62.5 / 500", amount: 62.5, limit: 500, unit: "credits" }],
   }
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(200, { "content-type": "application/json" })
-    w.end(JSON.stringify(card))
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify(card))
   })
   const plugin = await thePlugin()
   const got = await plugin.auth.usage(async () => ({ type: "api", key: "sk-x", metadata: { base } }))
@@ -543,10 +549,10 @@ test("the card is handed over as it is", async () => {
 
 // TestTheModelsAreTheGateways says the models are the gateway's own,
 // with what magpie needs to know about them.
-test("the models are the gateway's", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(200, { "content-type": "application/json" })
-    w.end(
+test("the models are the gateway's", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(
       JSON.stringify({
         object: "list",
         data: [
@@ -580,10 +586,10 @@ test("the models are the gateway's", async () => {
 // is used when the gateway cannot be asked.
 //
 // 跟参考插件一个做法：magpie 手里那份名单留着。
-test("the models fall back when the gateway is silent", async () => {
-  const base = await aGateway(t, (w, r) => {
-    w.writeHead(500)
-    w.end("{}")
+test("the models fall back when the gateway is silent", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(500)
+    res.end("{}")
   })
   const plugin = await thePlugin()
   const provider = { id: "mmxcode", models: { "MiniMax-M3.1-Flash": { id: "MiniMax-M3.1-Flash" } } }
@@ -593,7 +599,7 @@ test("the models fall back when the gateway is silent", async () => {
 
 // TestTheConfigPutsTheProvider says the config hook puts the provider
 // there, with the built-in list.
-test("the config puts the provider there", async () => {
+test("the config puts the provider there", async (t) => {
   const plugin = await thePlugin()
   const config = {}
   await plugin.config(config)
@@ -609,7 +615,7 @@ test("the config puts the provider there", async () => {
 //
 // 有了它，一段对话黏在一个账号上；没有它，两个用户的第一句话一样就
 // 会撞成一个会话。
-test("the session id is given to the gateway", async () => {
+test("the session id is given to the gateway", async (t) => {
   const plugin = await thePlugin()
   const out = { headers: {} }
   await plugin["chat.headers"]({ model: { providerID: "mmxcode" }, sessionID: "sess-1" }, out)
@@ -618,7 +624,7 @@ test("the session id is given to the gateway", async () => {
 
 // TestTheSessionIdIsOnlyForOurProvider says another provider's request
 // is left alone.
-test("the session id is only for our provider", async () => {
+test("the session id is only for our provider", async (t) => {
   const plugin = await thePlugin()
   const out = { headers: {} }
   await plugin["chat.headers"]({ model: { providerID: "somebody-else" }, sessionID: "sess-1" }, out)
@@ -627,7 +633,7 @@ test("the session id is only for our provider", async () => {
 
 // TestTheLoaderGivesTheGateway says the loader points at the gateway
 // with the key.
-test("the loader gives the gateway", async () => {
+test("the loader gives the gateway", async (t) => {
   const plugin = await thePlugin()
   const got = await plugin.auth.loader(async () => ({
     type: "api",

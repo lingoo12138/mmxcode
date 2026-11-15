@@ -526,6 +526,11 @@ func TestTheAccountsToReadAreTheOnesThatNeedIt(t *testing.T) {
 	mk(t, s, "acc_due", now.Add(-time.Hour))
 
 	// 签到待补：签到比快照新，而且那次读没读到账本。
+	if err := s.SaveUsageSnapshot(context.Background(), store.UsageSnapshot{
+		AccountID: "acc_pending", HasAmounts: false, CreatedAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
 	if err := s.SaveCheckin(context.Background(), store.Checkin{
 		AccountID: "acc_pending", Day: "2026-11-15", Outcome: "claimed",
 		Credit: 10, CreatedAt: now,
@@ -789,9 +794,15 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 			continue
 		}
 		read, hasSnap := snapAt[a.ID]
+		checked := checkAt[a.ID]
+		// 签到待补：签到过了，账本还没读到。
+		//
+		// 签到是把它放进这个名单的那一件事：签到给了积分，可账本还没
+		// 读到（没读到，或者读到的那次失败了），卡上就还是旧的。
+		pending := !checked.IsZero() &&
+			(!hasSnap || checked.After(read) || !snapHas[a.ID])
 		switch {
-		case hasSnap && checkAt[a.ID].After(read) && !snapHas[a.ID]:
-			// 签到待补：签到过了，账本还没读到。
+		case pending:
 			ts = append(ts, target{id: a.ID, rank: rankPending})
 		case due[a.ID]:
 			ts = append(ts, target{id: a.ID, rank: rankDue})
@@ -1560,15 +1571,28 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 
 // readCheckedIn reads the credits of the accounts that were checked in.
 //
-// 它不挡签到：读不到就留着（账号进"待补"名单，下一趟再读）。
+// 一趟读完不完都没关系：没读到的那些在"签到待补"名单里，下一趟接着
+// 读（待补排在最前面，所以几分钟内就清完了）。
 func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
 	round := usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
-	for _, id := range ids {
-		if _, err := round.Settle(ctx, id); err != nil {
-			fmt.Printf("checkin %s: the credits could not be read: %v\n", id, err)
+	res, err := round.Run(ctx, ids, round.Options())
+	if err != nil {
+		fmt.Printf("checkin: the credits could not be read: %v\n", err)
+		return
+	}
+	for _, reason := range res.Reasons {
+		fmt.Printf("checkin: %s\n", reason)
+	}
+	// 读到的数说话：说有额度就清掉"用完"的标记。
+	for _, snap := range res.Read {
+		if !usage.HasRoom(snap) {
+			continue
+		}
+		if err := round.ClearSpent(ctx, snap.AccountID); err != nil {
+			fmt.Printf("checkin %s: the spent mark could not be taken off: %v\n", snap.AccountID, err)
 		}
 	}
 }
@@ -1957,33 +1981,227 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 		}
 ```
 
-然后这一圈剩下的活儿要在一个闭包里做，闭包结束时把账号还回去：
+然后这一圈剩下的活儿要在一个闭包里做，闭包结束时把账号还回去。闭包返回 `true` 的意思是「请求到此为止，客户端已经拿到东西了」，返回 `false` 是「换一个账号再来」。
+
+`internal/gateway/gateway.go` 的 `handleChat` 里，从 `used := map[string]bool{}` 到函数末尾，全部换成：
 
 ```go
+	used := map[string]bool{}
+	var lastErr error
+	// quota 说最后一次失败是“额度用完了”，quotaMsg 是上游自己说的那句。
+	// 客户端最后看到的是上游的话，不是网关自己编的一句。
+	var quota bool
+	var quotaMsg string
+	// lastStatus 是上游最后一次给的状态，lastMsg 是它自己说的那句。
+	// 客户端最后看到的是上游的状态，不是网关编出来的一个 429：上游说
+	// 503 就是 503，客户端才知道是上游坏了，而不是自己被限流了。
+	var lastStatus int
+	var lastMsg string
+	attempts := s.Cfg.Rotation.MaxAttempts
+	if attempts <= 0 {
+		attempts = 3
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
+		if err != nil {
+			if lastErr != nil {
+				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
+				return
+			}
+			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		used[plan.AccountID] = true
+		if !s.busy.take(plan.AccountID) {
+			// 这个账号正忙着：另一个请求在飞。换一个账号来答这一
+			// 次，绑定不动 —— 忙不是它不能答了的理由。
+			continue
+		}
 		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
 		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
 		// 结束的。
 		answered := func() bool {
 			defer s.busy.give(plan.AccountID)
-			... 这一圈原来的活儿，return 改成 ...
+
+			tok, err := s.Mgr.Token(ctx, plan.AccountID)
+			if err != nil {
+				lastErr = err
+				return false
+			}
+			client, _, err := s.Mgr.Client(ctx, plan.AccountID)
+			if err != nil {
+				lastErr = err
+				return false
+			}
+
+			upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
+			if err != nil {
+				writeError(w, proto, http.StatusBadRequest, err.Error())
+				return true
+			}
+			chatReq := upstream.ChatRequest{
+				BaseURL:   s.UpstreamBase,
+				Path:      upPath,
+				Access:    tok.Access,
+				SessionID: upstreamID,
+				// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
+				// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
+				// 方法，Zone() 的第二个返回值就是它。
+				TZOffset: nowOffset(),
+				Body:     upBody,
+				Stream:   stream,
+				Extra:    clientHeaders(r),
+			}
+
+			// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
+			// 只能用一次，续第二次会把账号签死。
+			renewed := false
+			// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
+			// 再来一次就好。
+			for try := 0; try < attempts; try++ {
+				resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
+				if err != nil {
+					var oe *upstream.OtherSiteError
+					if errors.As(err, &oe) {
+						// 跨站：不换号、不消耗 refresh token
+						writeError(w, proto, http.StatusBadGateway, oe.Error())
+						return true
+					}
+					// 网络没通：还是这个账号，等一等再来。上游没有给出
+					// 状态：这是网关自己的问题。
+					lastErr = err
+					lastStatus = 0
+					lastMsg = ""
+					if !sleepCtx(ctx, backoff(try)) {
+						return true
+					}
+					continue
+				}
+
+				// 上游没有这条路：改用本地转换，同一个账号再来一次。
+				//
+				// 开放平台对 MiniMax Code 的账号答的也是「没有这条路」：503
+				// 加一句 direct_route_not_configured。那不是站点坏了，是那条
+				// 路对这个账号不通 —— 该走 Anthropic 那条。
+				if resp.StatusCode == http.StatusNotFound || openPlatformNotConfigured(raw) {
+					fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
+					if ok {
+						upBody, upPath, convertBack = fb, fp, fback
+						chatReq.Body = upBody
+						chatReq.Path = upPath
+						resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+						if err != nil {
+							var oe *upstream.OtherSiteError
+							if errors.As(err, &oe) {
+								writeError(w, proto, http.StatusBadGateway, oe.Error())
+								return true
+							}
+							lastErr = err
+							lastStatus = 0
+							lastMsg = ""
+							if !sleepCtx(ctx, backoff(try)) {
+								return true
+							}
+							continue
+						}
+					}
+				}
+
+				// 200 且是流：直接转出去
+				if resp.StatusCode == http.StatusOK && raw == nil {
+					s.writeStream(w, resp, proto, convertBack, model)
+					return true
+				}
+
+				// 200 但身体里有业务错误
+				if resp.StatusCode == http.StatusOK {
+					if err := upstream.CheckEnvelope("chat", raw); err == nil {
+						s.writeJSON(w, resp, raw, proto, convertBack, model)
+						return true
+					}
+				}
+
+				failure := s.failure(resp.StatusCode, raw)
+				lastStatus = resp.StatusCode
+				lastMsg = failure.Message
+				if lastMsg == "" {
+					// 上游自己说的话要给客户端和运维看：只知道一个状态码，
+					// 谁也说不清到底是哪一件事坏了。
+					lastMsg = upstreamMessage(raw)
+				}
+				switch s.action(failure) {
+				case rotator.ActionFailover:
+					// 额度用完了：这个账号的窗口记成用完，换一个账号。
+					s.markSpent(ctx, plan.AccountID, plan.GroupKey)
+					lastErr = fmt.Errorf("the account's credits or plan are used up")
+					quota = true
+					quotaMsg = failure.Message
+					return false
+				case rotator.ActionRenew:
+					if renewed {
+						// 续过一次还是被拒：这个账号先放着，换一个。
+						lastErr = fmt.Errorf("the sign-in was refused (HTTP %d)", resp.StatusCode)
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
+					if rerr != nil {
+						// 跨站：不换号、不消耗 refresh token
+						var oe *upstream.OtherSiteError
+						// 续签自己的错要看 rerr：err 是上一次尝试的，
+						// 那时候它是空的，看它永远看不出来。
+						if errors.As(rerr, &oe) {
+							writeError(w, proto, http.StatusBadGateway, oe.Error())
+							return true
+						}
+						lastErr = rerr
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					// 用新 token 再来一次，还是这个账号
+					renewed = true
+					chatReq.Access = newTok.Access
+					quota = false
+					quotaMsg = ""
+					continue
+				case rotator.ActionRetrySame:
+					// 限流、5xx：这个账号等一等，再问它一次。
+					lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+					quota = false
+					quotaMsg = ""
+					if !sleepCtx(ctx, backoff(try)) {
+						return true
+					}
+					continue
+				default:
+					// 给不出别的说法：上游的状态原样给客户端。
+					s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
+					return true
+				}
+			}
+			return false
 		}()
 		if answered {
 			return
 		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("the request could not be served")
+	}
+	s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
 ```
 
-这一圈原来的活儿（从 `tok, err := s.Mgr.Token(...)` 到这一圈的最后）在闭包里要改的 return：
+改这一段的时候有五处要一起改，漏了哪一个都编译不过或者行为变了：
 
-| 原来 | 改成 |
-|---|---|
-| `writeError(...); return` | `writeError(...); return true` |
-| `s.writeFailure(...); return` | `s.writeFailure(...); return true` |
-| `s.writeStream(...); return` | `s.writeStream(...); return true` |
-| `s.writeJSON(...); return` | `s.writeJSON(...); return true` |
-| `continue accountLoop` | `return false` |
-| `break accountLoop` | `return true` |
-
-（`accountLoop` 这个标号在闭包里没有了，所以 `continue accountLoop` 要变成 `return false`：外层那一圈会再挑一个账号。`break accountLoop` 是客户端走了，改成 `return true`：请求到此为止，不再往一个已经走了的客户端写东西。）
+| 原来 | 改成 | 为什么 |
+|---|---|---|
+| `accountLoop:` 这个标号 | 删掉 | 闭包里没有标号可跳；留着 Go 会说「这个标号没有用」。 |
+| `continue accountLoop` | `return false` | 换一个账号再来：外层那一圈会再挑一个。 |
+| `break accountLoop` | `return true` | 客户端走了：请求到此为止，不再往一个已经走了的客户端写东西。 |
+| 写完答案之后的 `return` | `return true` | 客户端拿到东西了，请求到此为止。 |
+| `lastErr = err` 之后的 `continue` | `return false` | 这个账号这一轮没答上，换一个。 |
 
 - [ ] **Step 6: 运行测试确认通过**
 
