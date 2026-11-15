@@ -1337,7 +1337,8 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 		w.page(rw, r, "import.html", w.importData)
 	case "/relogin":
-		// 重登页不受上传那个闸限制：它不接触明文密码。
+		// 重登页不接触明文密码：它登的是已经签出的账号，用的是库里
+		// 存着的那一份。
 		w.page(rw, r, "relogin.html", w.reloginData)
 	case "/keys":
 		w.page(rw, r, "keys.html", w.keysData)

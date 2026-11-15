@@ -678,27 +678,59 @@ func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
 	}
 }
 
-// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
-// shut when the gateway has a key.
+// TestTheImportPageIsThereWhenAPIKeysAreSet says the import page is
+// there even when the gateway has a key.
 //
-// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
-func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
+// 配了 key 就把上传关掉，是从前的规矩，现在不关了：那把 key 就是后台
+// 登录的那把，能登录的人就是管这个网关的人。明文密码走不走内网，是他
+// 自己的选择。
+func TestTheImportPageIsThereWhenAPIKeysAreSet(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.APIKeys = []string{"sk-x"}
 	w, _ := newTestWebUIWithConfig(t, cfg)
 	req := httptest.NewRequest(http.MethodGet, "/import", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
-	if rec.Code == http.StatusOK {
-		t.Fatal("the import page is open with API keys set")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "批量导入") {
+		t.Fatalf("body = %q", body)
+	}
+	// 上传的口子得在页面上：只剩一句「这里不开放」不算数。
+	if !strings.Contains(body, "import-form") {
+		t.Fatalf("the upload form is not on the page: %q", body)
+	}
+	if strings.Contains(body, "不开放上传") {
+		t.Fatalf("the page still says the upload is shut: %q", body)
 	}
 }
 
-// TestTheImportIsNotTakenWithAPIKeysAreSet says the upload itself is
-// shut too, not only the page.
+// TestTheImportLinkIsInTheNavWhenAPIKeysAreSet says the nav has the
+// import link even when the gateway has a key.
 //
-// 页面关着而接口开着，那道闸就没有意义。
-func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
+// 导航里没有那个链接，页面上就等于没有这个功能：人得自己敲地址。
+func TestTheImportLinkIsInTheNavWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `href="/import"`) {
+		t.Fatalf("the nav has no import link: %q", rec.Body.String())
+	}
+}
+
+// TestTheImportIsTakenWithAPIKeysAreSet says the upload itself is
+// taken even when the gateway has a key.
+//
+// 页面开着而接口关着，那个功能等于没有。
+func TestTheImportIsTakenWithAPIKeysAreSet(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.APIKeys = []string{"sk-x"}
 	w, _ := newTestWebUIWithConfig(t, cfg)
@@ -715,7 +747,7 @@ func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
 	req.Header.Set("Content-Type", part.FormDataContentType())
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
 	}
 }

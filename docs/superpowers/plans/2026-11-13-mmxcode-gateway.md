@@ -10719,6 +10719,39 @@ func TestTheUsageCanBeRefreshedNow(t *testing.T) {
 	}
 }
 
+// TestTheUsageRefreshSaysHowManyWereSkipped says the answer says how
+// many accounts were skipped because another round was reading them.
+//
+// 跳过的不是读失败：那个账号没有坏，它正在被读。但人要看得见这一趟
+// 少读了几个。
+func TestTheUsageRefreshSaysHowManyWereSkipped(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	// 别的这一趟正在读这个账号。
+	if !w.Mgr.BeginReading("acc_01") {
+		t.Fatal("the account could not be claimed")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/usage/refresh", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Refreshed int `json:"refreshed"`
+		Failed    int `json:"failed"`
+		Skipped   int `json:"skipped"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Skipped != 1 {
+		t.Errorf("skipped = %d, body = %s", out.Skipped, rec.Body.String())
+	}
+	if out.Failed != 0 {
+		t.Errorf("failed = %d, want 0: it is being read, not broken", out.Failed)
+	}
+}
+
 // TestTheUsagePageHasARefreshButton says the page offers the refresh.
 func TestTheUsagePageHasARefreshButton(t *testing.T) {
 	w, _ := newTestWebUI(t)
@@ -11120,27 +11153,59 @@ func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
 	}
 }
 
-// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
-// shut when the gateway has a key.
+// TestTheImportPageIsThereWhenAPIKeysAreSet says the import page is
+// there even when the gateway has a key.
 //
-// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
-func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
+// 配了 key 就把上传关掉，是从前的规矩，现在不关了：那把 key 就是后台
+// 登录的那把，能登录的人就是管这个网关的人。明文密码走不走内网，是他
+// 自己的选择。
+func TestTheImportPageIsThereWhenAPIKeysAreSet(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.APIKeys = []string{"sk-x"}
 	w, _ := newTestWebUIWithConfig(t, cfg)
 	req := httptest.NewRequest(http.MethodGet, "/import", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
-	if rec.Code == http.StatusOK {
-		t.Fatal("the import page is open with API keys set")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "批量导入") {
+		t.Fatalf("body = %q", body)
+	}
+	// 上传的口子得在页面上：只剩一句「这里不开放」不算数。
+	if !strings.Contains(body, "import-form") {
+		t.Fatalf("the upload form is not on the page: %q", body)
+	}
+	if strings.Contains(body, "不开放上传") {
+		t.Fatalf("the page still says the upload is shut: %q", body)
 	}
 }
 
-// TestTheImportIsNotTakenWithAPIKeysAreSet says the upload itself is
-// shut too, not only the page.
+// TestTheImportLinkIsInTheNavWhenAPIKeysAreSet says the nav has the
+// import link even when the gateway has a key.
 //
-// 页面关着而接口开着，那道闸就没有意义。
-func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
+// 导航里没有那个链接，页面上就等于没有这个功能：人得自己敲地址。
+func TestTheImportLinkIsInTheNavWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `href="/import"`) {
+		t.Fatalf("the nav has no import link: %q", rec.Body.String())
+	}
+}
+
+// TestTheImportIsTakenWithAPIKeysAreSet says the upload itself is
+// taken even when the gateway has a key.
+//
+// 页面开着而接口关着，那个功能等于没有。
+func TestTheImportIsTakenWithAPIKeysAreSet(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.APIKeys = []string{"sk-x"}
 	w, _ := newTestWebUIWithConfig(t, cfg)
@@ -11157,7 +11222,7 @@ func TestTheImportIsNotTakenWithAPIKeysAreSet(t *testing.T) {
 	req.Header.Set("Content-Type", part.FormDataContentType())
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
 	}
 }
@@ -11574,8 +11639,8 @@ func TestTheUploadAnswerIsJSONOnTheWire(t *testing.T) {
 // TestTheWebImportReadsTheCreditsOfTheNewAccount says an account that
 // just came in through the page has its credits read.
 //
-// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
-// 来的账号马上就读一次账本。
+// 导入完了要等上一趟扫描（usage.refresh.scan_every，默认 30 秒）才看
+// 得到积分，是不让人话的：刚进来的账号马上就读一次账本。
 func TestTheWebImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	w, s := newTestWebUI(t)
 	ctx := context.Background()
@@ -12368,15 +12433,13 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/login":
 		w.page(rw, r, "login.html", w.loginData)
 	case "/import":
-		// 只有没配 key 的网关才开放上传：配了 key 就说明别的机器能
-		// 进来，明文密码不该从那儿过。
-		if len(w.Cfg.Server.APIKeys) > 0 {
-			http.NotFound(rw, r)
-			return
-		}
+		// 上传不再因为配了 key 就关着：那把 key 就是后台登录的那把，
+		// 能登录的人就是管这个网关的人，明文密码走不走内网是他自己
+		// 的选择。上传这个口子跟后台的其它页面一样，钥匙管着。
 		w.page(rw, r, "import.html", w.importData)
 	case "/relogin":
-		// 重登页不受上传那个闸限制：它不接触明文密码。
+		// 重登页不接触明文密码：它登的是已经签出的账号，用的是库里
+		// 存着的那一份。
 		w.page(rw, r, "relogin.html", w.reloginData)
 	case "/keys":
 		w.page(rw, r, "keys.html", w.keysData)
@@ -12657,8 +12720,9 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
-	// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人
-	// 才看得到它有多少积分。读不到不算登录失败——账号是进来了的。
+	// 刚登进来的账号马上读一次账本：不等调度器那一趟
+	// （usage.refresh.scan_every，默认 30 秒），人才看得到它有多少
+	// 积分。读不到不算登录失败——账号是进来了的。
 	w.refreshUsage(ctx, acc.ID)
 	w.mu.Lock()
 	delete(w.pending, id)
@@ -12760,7 +12824,8 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 // apiUsageRefresh reads every account's credits now.
 //
 // 页面上那些数是上一次读数时的数。这一趟是现读的：不等调度器，也不
-// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。
+// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。正在被别的
+// 那一趟读着的账号被跳过了 —— 跳过的也要说得出来。
 func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
 	res, err := w.Mgr.RefreshAllUsage(r.Context())
 	if err != nil {
@@ -12770,9 +12835,13 @@ func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
 	for _, reason := range res.Reasons {
 		log.Printf("usage: %s", reason)
 	}
+	if res.Skipped > 0 {
+		log.Printf("usage: %d account(s) are being read by another round and were skipped", res.Skipped)
+	}
 	writeJSON(rw, map[string]any{
 		"refreshed": res.Refreshed,
 		"failed":    res.Failed,
+		"skipped":   res.Skipped,
 		"reasons":   res.Reasons,
 	})
 }
@@ -12921,6 +12990,12 @@ func (w *WebUI) apiCheckin(rw http.ResponseWriter, r *http.Request, id string) {
 		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// 签到给的积分是账本池里的：读完这一账号的额度，卡上的余额才是
+	// 签到之后的数。人在等，所以只读这一个。
+	round := usage.NewRound(w.Store, w.Mgr, w.Mgr.HotAccounts, w.Cfg)
+	if _, err := round.Settle(r.Context(), id); err != nil {
+		fmt.Printf("checkin %s: the credits could not be read: %v\n", id, err)
+	}
 	writeJSON(rw, map[string]any{
 		"outcome": out.Outcome, "credit": out.Credit,
 		"streak": out.Streak, "message": out.Message,
@@ -12998,7 +13073,6 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
 	}
 	return map[string]any{
-		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
 		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
 	}, nil
@@ -13041,11 +13115,10 @@ func wholeReason(results string) string {
 //
 // The file is read into memory and thrown away afterwards: it holds
 // passwords in the clear, and it must not land on the disk.
+//
+// 配了 key 也不关这个口子了：那把 key 就是后台登录的那把，能进来的人
+// 就是管这个网关的人。明文密码走不走内网，是他自己的选择。
 func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
-	if len(w.Cfg.Server.APIKeys) > 0 {
-		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
-		return
-	}
 	if w.Import == nil {
 		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
 		return

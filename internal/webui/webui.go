@@ -174,15 +174,13 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/login":
 		w.page(rw, r, "login.html", w.loginData)
 	case "/import":
-		// 只有没配 key 的网关才开放上传：配了 key 就说明别的机器能
-		// 进来，明文密码不该从那儿过。
-		if len(w.Cfg.Server.APIKeys) > 0 {
-			http.NotFound(rw, r)
-			return
-		}
+		// 上传不再因为配了 key 就关着：那把 key 就是后台登录的那把，
+		// 能登录的人就是管这个网关的人，明文密码走不走内网是他自己
+		// 的选择。上传这个口子跟后台的其它页面一样，钥匙管着。
 		w.page(rw, r, "import.html", w.importData)
 	case "/relogin":
-		// 重登页不受上传那个闸限制：它不接触明文密码。
+		// 重登页不接触明文密码：它登的是已经签出的账号，用的是库里
+		// 存着的那一份。
 		w.page(rw, r, "relogin.html", w.reloginData)
 	case "/keys":
 		w.page(rw, r, "keys.html", w.keysData)
@@ -816,7 +814,6 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
 	}
 	return map[string]any{
-		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
 		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
 	}, nil
@@ -859,11 +856,10 @@ func wholeReason(results string) string {
 //
 // The file is read into memory and thrown away afterwards: it holds
 // passwords in the clear, and it must not land on the disk.
+//
+// 配了 key 也不关这个口子了：那把 key 就是后台登录的那把，能进来的人
+// 就是管这个网关的人。明文密码走不走内网，是他自己的选择。
 func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
-	if len(w.Cfg.Server.APIKeys) > 0 {
-		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
-		return
-	}
 	if w.Import == nil {
 		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
 		return

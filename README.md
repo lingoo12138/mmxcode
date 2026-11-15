@@ -148,9 +148,10 @@ mmxcode relogin --account acc_123  # 只登这一个
 **页面上也能导。** WebUI 里有一页「导入」，上传同一个格式的清单就行；旁边
 还有一页「重登」，列出签出的账号，一键登回去。
 
-上传这一页**只在没配 `server.api_keys` 的时候开放**：配了 key 就说明别的机器
-能连进来，明文密码不该从那儿过。配了 key 的时候页面上没有上传入口，用命令
-行导。
+上传这一页**一直开着**，配不配 `server.api_keys` 都一样：能不能传看的是有没有
+登录后台（那把 key 就是后台登录密钥）。明文密码走不走网络，是登录的人自己的
+选择 —— 不想让它出本机，就在服务器上跑 `mmxcode import --file accounts.txt`，
+格式跟上传的一样。
 
 ### 批量导入的配置
 
@@ -190,7 +191,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
 | `/api/events` | GET | SSE，每 30 秒一个心跳 |
 | `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
-| `/api/import` | POST | 批量导入（上传清单；配了 key 就关着） |
+| `/api/import` | POST | 批量导入（上传清单；要先登录后台） |
 | `/api/import/{id}` | GET | 某一次批量导入走到哪儿了 |
 | `/api/relogin` | POST | 把签出的账号登回去 |
 | `/api/keys` | GET / POST | 列出聊天用的 key / 申请一把新的 |
@@ -204,7 +205,7 @@ WebUI 页面：
 | `/login` | 登录 |
 | `/egress` | 出口 |
 | `/usage` | 用量 |
-| `/import` | 批量导入（没配 key 时才开） |
+| `/import` | 批量导入 |
 | `/relogin` | 重登 |
 | `/keys` | 密钥：申请聊天用的 api key |
 | `/signin` | 交 key 的登录页 |

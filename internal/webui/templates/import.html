@@ -4,21 +4,18 @@
   {{if .PasswordNote}}
     <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
   {{end}}
-  {{if .UploadOpen}}
-    <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
-    <form id="import-form" enctype="multipart/form-data">
-      <input type="file" name="file" accept=".txt" required>
-      <button type="submit">开始</button>
-    </form>
-    <p class="muted" id="import-status"></p>
-    <table id="import-results" hidden>
-      <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  {{else}}
-    <p class="muted">已经配了 API key，出于安全考虑这里不开放上传。请在服务器上跑
-      <code>mmxcode import --file accounts.txt</code>。</p>
-  {{end}}
+  <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。
+     不想让明文密码走网络的话，在服务器上跑
+     <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+  <form id="import-form" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".txt" required>
+    <button type="submit">开始</button>
+  </form>
+  <p class="muted" id="import-status"></p>
+  <table id="import-results" hidden>
+    <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+    <tbody></tbody>
+  </table>
   {{if .Runs}}
   <h2>最近的导入</h2>
   <table>

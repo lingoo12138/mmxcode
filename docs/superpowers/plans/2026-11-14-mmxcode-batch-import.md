@@ -5730,8 +5730,8 @@ func aFakeEnv(t *testing.T) *env {
 // TestTheImportReadsTheCreditsOfTheNewAccount says an account that
 // just came in has its credits read.
 //
-// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
-// 来的账号马上就读一次账本。
+// 导入完了要等上一趟扫描（usage.refresh.scan_every，默认 30 秒）才看
+// 得到积分，是不让人话的：刚进来的账号马上就读一次账本。
 func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	var reads atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -7208,23 +7208,11 @@ func TestTheImportPageIsThereWhenNoAPIKeysAreSet(t *testing.T) {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 }
+```
 
-// TestTheImportPageIsNotThereWhenAPIKeysAreSet says the import page is
-// shut when the gateway has a key.
-//
-// 配了 key 就说明别的机器能进来，明文密码不该从那儿过。
-func TestTheImportPageIsNotThereWhenAPIKeysAreSet(t *testing.T) {
-	cfg := config.Default()
-	cfg.Server.APIKeys = []string{"sk-x"}
-	w, _ := newTestWebUIWithConfig(t, cfg)
-	req := httptest.NewRequest(http.MethodGet, "/import", nil)
-	rec := httptest.NewRecorder()
-	w.ServeHTTP(rec, req)
-	if rec.Code == http.StatusOK {
-		t.Fatal("the import page is open with API keys set")
-	}
-}
+（后来那道闸拆了，见 Task 12：配了 key 的时候页面也是开着的。）
 
+```go
 // TestUploadingAFileAnswersWithAJobID says an upload gets an answer
 // that says which run to watch.
 //
@@ -7305,12 +7293,9 @@ Expected: FAIL
 
 ```go
 	case "/import":
-		// 只有没配 key 的网关才开放上传：配了 key 就说明别的机器能
-		// 进来，明文密码不该从那儿过。
-		if len(w.Cfg.Server.APIKeys) > 0 {
-			http.NotFound(rw, r)
-			return
-		}
+		// 上传不再因为配了 key 就关着：那把 key 就是后台登录的那把，
+		// 能登录的人就是管这个网关的人，明文密码走不走内网是他自己
+		// 的选择。上传这个口子跟后台的其它页面一样，钥匙管着。
 		w.page(rw, r, "import.html", w.importData)
 ```
 
@@ -7378,7 +7363,6 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 		views = append(views, importRunView{ImportRun: r, Whole: wholeReason(r.Results)})
 	}
 	return map[string]any{
-		"UploadOpen":   len(w.Cfg.Server.APIKeys) == 0,
 		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
 	}, nil
@@ -7391,11 +7375,10 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 //
 // The file is read into memory and thrown away afterwards: it holds
 // passwords in the clear, and it must not land on the disk.
+//
+// 配了 key 也不关这个口子了：那把 key 就是后台登录的那把，能进来的人
+// 就是管这个网关的人。明文密码走不走内网，是他自己的选择。
 func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
-	if len(w.Cfg.Server.APIKeys) > 0 {
-		http.Error(rw, "这个网关配了 API key，不开放上传", http.StatusForbidden)
-		return
-	}
 	if w.Import == nil {
 		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
 		return
@@ -7536,11 +7519,10 @@ func writeJSONStatus(rw http.ResponseWriter, status int, v any) {
 
 4. 页面的模板 `internal/webui/templates/import.html`：
 
-先在 `internal/webui/templates/layout.html` 的导航里加一个入口——配了 API
-key 的网关不开上传，那边就不该有这个链接：
+先在 `internal/webui/templates/layout.html` 的导航里加一个入口：
 
 ```html
-    {{if not .HasKeys}}<a href="/import">导入</a>{{end}}
+    <a href="/import">导入</a>
 ```
 
 ```html
@@ -7550,21 +7532,18 @@ key 的网关不开上传，那边就不该有这个链接：
   {{if .PasswordNote}}
     <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
   {{end}}
-  {{if .UploadOpen}}
-    <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
-    <form id="import-form" enctype="multipart/form-data">
-      <input type="file" name="file" accept=".txt" required>
-      <button type="submit">开始</button>
-    </form>
-    <p class="muted" id="import-status"></p>
-    <table id="import-results" hidden>
-      <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  {{else}}
-    <p class="muted">已经配了 API key，出于安全考虑这里不开放上传。请在服务器上跑
-      <code>mmxcode import --file accounts.txt</code>。</p>
-  {{end}}
+  <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。
+     不想让明文密码走网络的话，在服务器上跑
+     <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+  <form id="import-form" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".txt" required>
+    <button type="submit">开始</button>
+  </form>
+  <p class="muted" id="import-status"></p>
+  <table id="import-results" hidden>
+    <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+    <tbody></tbody>
+  </table>
   {{if .Runs}}
   <h2>最近的导入</h2>
   <table>
@@ -7695,7 +7674,8 @@ func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 
 ```go
 	case "/relogin":
-		// 重登页不受上传那个闸限制：它不接触明文密码。
+		// 重登页不接触明文密码：它登的是已经签出的账号，用的是库里
+		// 存着的那一份。
 		w.page(rw, r, "relogin.html", w.reloginData)
 ```
 
@@ -8049,6 +8029,241 @@ git add README.md docs/
 git commit -m "docs: 批量导入怎么用
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
+```
+
+---
+
+### Task 12: 上传的那个闸：配了 key 也照样开着
+
+**Files:**
+- Modify: `internal/webui/webui.go`
+- Modify: `internal/webui/webui_test.go`
+- Modify: `internal/webui/templates/import.html`
+- Modify: `internal/webui/templates/layout.html`
+- Modify: `docs/superpowers/specs/2026-11-14-mmxcode-batch-import-design.md`
+- Modify: `README.md`
+
+Task 9 给上传那道闸定的规矩是「配了 API key 就关上传」（规格 §8.3）。那时的想法是：配了 key 就说明别的机器能进来，明文密码不该从那儿过。
+
+后来那把 key 的意思变了：它是**后台登录密钥**，是「只有拿着它的人能进后台」，不是「我想让整条街都用这个网关」。规矩跟着变 —— 上传一直开着，能不能传看的是有没有登录。
+
+为什么反过来了：后台登录密钥自己也是明文走同一个 HTTP 口过去的。它过去了，明文密码就不算「不该过」的东西 —— 关上传而放密钥过去，是拿一个已经过去的票去挡另一个。
+
+- [x] **Step 1: 先写测试（红的）**
+
+三处都要开：页面、导航里的链接、上传本身。原来的两条测试是反着写的（页面 404、上传 403），把它们改成「开着」。
+
+```go
+// TestTheImportPageIsThereWhenAPIKeysAreSet says the import page is
+// there even when the gateway has a key.
+//
+// 配了 key 就把上传关掉，是从前的规矩，现在不关了：那把 key 就是后台
+// 登录的那把，能登录的人就是管这个网关的人。明文密码走不走内网，是他
+// 自己的选择。
+func TestTheImportPageIsThereWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "批量导入") {
+		t.Fatalf("body = %q", body)
+	}
+	// 上传的口子得在页面上：只剩一句「这里不开放」不算数。
+	if !strings.Contains(body, "import-form") {
+		t.Fatalf("the upload form is not on the page: %q", body)
+	}
+	if strings.Contains(body, "不开放上传") {
+		t.Fatalf("the page still says the upload is shut: %q", body)
+	}
+}
+
+```
+
+```go
+// TestTheImportLinkIsInTheNavWhenAPIKeysAreSet says the nav has the
+// import link even when the gateway has a key.
+//
+// 导航里没有那个链接，页面上就等于没有这个功能：人得自己敲地址。
+func TestTheImportLinkIsInTheNavWhenAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `href="/import"`) {
+		t.Fatalf("the nav has no import link: %q", rec.Body.String())
+	}
+}
+
+```
+
+```go
+// TestTheImportIsTakenWithAPIKeysAreSet says the upload itself is
+// taken even when the gateway has a key.
+//
+// 页面开着而接口关着，那个功能等于没有。
+func TestTheImportIsTakenWithAPIKeysAreSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.APIKeys = []string{"sk-x"}
+	w, _ := newTestWebUIWithConfig(t, cfg)
+	body := &bytes.Buffer{}
+	part := multipart.NewWriter(body)
+	fw, err := part.CreateFormFile("file", "accounts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write([]byte("a@example.com|pw\n"))
+	part.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", part.FormDataContentType())
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+```
+
+- [x] **Step 2: 看它们红**
+
+```bash
+go test ./internal/webui/ -count=1 -run "TestTheImport"
+```
+
+红的原因有三条，各对各的：页面 404、导航里没有链接、上传 403。
+
+- [x] **Step 3: 拆掉那三道闸**
+
+`internal/webui/webui.go` 的路由里，页面不再 404：
+
+```go
+	case "/import":
+		// 上传不再因为配了 key 就关着：那把 key 就是后台登录的那把，
+		// 能登录的人就是管这个网关的人，明文密码走不走内网是他自己
+		// 的选择。上传这个口子跟后台的其它页面一样，钥匙管着。
+		w.page(rw, r, "import.html", w.importData)
+```
+
+同一个文件里，`apiImport` 不再 403：
+
+```go
+// apiImport takes a list of accounts and brings them in.
+//
+// The list is a file: every line is an account. The work goes on in
+// the background, and the answer says which run to watch.
+//
+// The file is read into memory and thrown away afterwards: it holds
+// passwords in the clear, and it must not land on the disk.
+//
+// 配了 key 也不关这个口子了：那把 key 就是后台登录的那把，能进来的人
+// 就是管这个网关的人。明文密码走不走内网，是他自己的选择。
+func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
+	if w.Import == nil {
+		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
+		return
+	}
+	// The request has a size limit, and the memory that ParseMultipartForm
+	// is given is bigger than it: the list therefore never reaches a
+	// temporary file, it stays in memory.
+	r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
+	if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(rw, "没有文件", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	entries, bad := provision.Parse(file)
+	for _, b := range bad {
+		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了。
+		log.Printf("import: 第 %d 行：%s", b.Line, b.Reason)
+	}
+	if len(entries) == 0 {
+		http.Error(rw, "清单里没有能用的账号", http.StatusBadRequest)
+		return
+	}
+	runID := newImportRunID()
+	now := time.Now()
+	if err := w.Store.CreateImportRun(r.Context(), store.ImportRun{
+		ID: runID, Source: "web", StartedAt: now, Total: len(entries),
+	}); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	go w.runImport(runID, entries)
+	// 202：导入在后台跑着，这个回答只说这一次导入的号。
+	writeJSONStatus(rw, http.StatusAccepted, map[string]any{"id": runID})
+}
+
+```
+
+页面的数据里那个 `UploadOpen` 没有用了（它只用来分开两段模板），去掉：
+
+```go
+	return map[string]any{
+		"Runs":         views,
+		"PasswordNote": w.PasswordNote,
+	}, nil
+```
+
+`internal/webui/templates/import.html`：上传的口子一直摆着，命令行那条留在旁边当另一个选择：
+
+```html
+{{define "content"}}
+<section>
+  <h1>批量导入</h1>
+  {{if .PasswordNote}}
+    <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
+  {{end}}
+  <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。
+     不想让明文密码走网络的话，在服务器上跑
+     <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+  <form id="import-form" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".txt" required>
+    <button type="submit">开始</button>
+  </form>
+  <p class="muted" id="import-status"></p>
+  <table id="import-results" hidden>
+    <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  {{if .Runs}}
+```
+
+`internal/webui/templates/layout.html`：导航里那个链接不再按 key 藏：
+
+```html
+    <a href="/import">导入</a>
+```
+
+- [x] **Step 4: 规格和 README 跟着改**
+
+规格 §8.3 改成「上传的闸：登录过的人就能传」，把为什么反过来说清楚。README 里那两句「配了 key 的时候页面上没有上传入口」和「`/import` 批量导入（没配 key 时才开）」都要改掉。
+
+- [x] **Step 5: 验收**
+
+```bash
+gofmt -l . && go build ./... && go vet ./... && go test ./... -count=1
 ```
 
 ---
