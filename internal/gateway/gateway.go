@@ -91,6 +91,11 @@ type Server struct {
 	// modelsLive says the list is the site's own, and not the built-in
 	// one that is served when the site cannot be reached.
 	modelsLive bool
+
+	// busy counts the requests in the air per account.
+	busy *busyAccounts
+	// gate counts the requests in the air in the whole gateway.
+	gate *gate
 }
 
 // New makes a gateway.
@@ -105,6 +110,8 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	// 原生路径先开着：上游说它没有 /responses 的时候再关。
 	g.NativeResponses.Store(true)
 	g.NativeChatCompletions.Store(true)
+	g.busy = newBusyAccounts(cfg.Concurrency.PerAccount)
+	g.gate = &gate{}
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -313,6 +320,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 上游请求的时限就是配的那一个。流式对话也吃这份预算：想要更长的
 	// 就把 upstream.timeout 调大。
 	ctx := r.Context()
+	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
+	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
+	// 着。
+	if !s.gate.waitFor(ctx, s.totalConcurrency(ctx), s.Cfg.Concurrency.Wait.Duration()) {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, proto, http.StatusTooManyRequests, "the gateway is busy: too many requests are in the air")
+		return
+	}
+	defer s.gate.give()
 	if d := s.Cfg.Upstream.Timeout.Duration(); d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
@@ -345,7 +361,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	if attempts <= 0 {
 		attempts = 3
 	}
-accountLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
 		if err != nil {
@@ -357,164 +372,183 @@ accountLoop:
 			return
 		}
 		used[plan.AccountID] = true
-
-		tok, err := s.Mgr.Token(ctx, plan.AccountID)
-		if err != nil {
-			lastErr = err
+		if !s.busy.take(plan.AccountID) {
+			// 这个账号正忙着：另一个请求在飞。换一个账号来答这一
+			// 次，绑定不动 —— 忙不是它不能答了的理由。
 			continue
 		}
-		client, _, err := s.Mgr.Client(ctx, plan.AccountID)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
+		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
+		// 结束的。
+		answered := func() bool {
+			defer s.busy.give(plan.AccountID)
 
-		upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
-		if err != nil {
-			writeError(w, proto, http.StatusBadRequest, err.Error())
-			return
-		}
-		chatReq := upstream.ChatRequest{
-			BaseURL:   s.UpstreamBase,
-			Path:      upPath,
-			Access:    tok.Access,
-			SessionID: upstreamID,
-			// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
-			// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
-			// 方法，Zone() 的第二个返回值就是它。
-			TZOffset: nowOffset(),
-			Body:     upBody,
-			Stream:   stream,
-			Extra:    clientHeaders(r),
-		}
-
-		// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
-		// 只能用一次，续第二次会把账号签死。
-		renewed := false
-		// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
-		// 再来一次就好。
-		for try := 0; try < attempts; try++ {
-			resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
+			tok, err := s.Mgr.Token(ctx, plan.AccountID)
 			if err != nil {
-				var oe *upstream.OtherSiteError
-				if errors.As(err, &oe) {
-					// 跨站：不换号、不消耗 refresh token
-					writeError(w, proto, http.StatusBadGateway, oe.Error())
-					return
-				}
-				// 网络没通：还是这个账号，等一等再来。上游没有给出
-				// 状态：这是网关自己的问题。
 				lastErr = err
-				lastStatus = 0
-				lastMsg = ""
-				if !sleepCtx(ctx, backoff(try)) {
-					break accountLoop
-				}
-				continue
+				return false
+			}
+			client, _, err := s.Mgr.Client(ctx, plan.AccountID)
+			if err != nil {
+				lastErr = err
+				return false
 			}
 
-			// 上游没有这条路：改用本地转换，同一个账号再来一次。
-			//
-			// 开放平台对 MiniMax Code 的账号答的也是「没有这条路」：503
-			// 加一句 direct_route_not_configured。那不是站点坏了，是那条
-			// 路对这个账号不通 —— 该走 Anthropic 那条。
-			if resp.StatusCode == http.StatusNotFound || openPlatformNotConfigured(raw) {
-				fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
-				if ok {
-					upBody, upPath, convertBack = fb, fp, fback
-					chatReq.Body = upBody
-					chatReq.Path = upPath
-					resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
-					if err != nil {
-						var oe *upstream.OtherSiteError
-						if errors.As(err, &oe) {
-							writeError(w, proto, http.StatusBadGateway, oe.Error())
-							return
-						}
-						lastErr = err
-						lastStatus = 0
-						lastMsg = ""
-						if !sleepCtx(ctx, backoff(try)) {
-							break accountLoop
-						}
-						continue
-					}
-				}
+			upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
+			if err != nil {
+				writeError(w, proto, http.StatusBadRequest, err.Error())
+				return true
+			}
+			chatReq := upstream.ChatRequest{
+				BaseURL:   s.UpstreamBase,
+				Path:      upPath,
+				Access:    tok.Access,
+				SessionID: upstreamID,
+				// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
+				// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
+				// 方法，Zone() 的第二个返回值就是它。
+				TZOffset: nowOffset(),
+				Body:     upBody,
+				Stream:   stream,
+				Extra:    clientHeaders(r),
 			}
 
-			// 200 且是流：直接转出去
-			if resp.StatusCode == http.StatusOK && raw == nil {
-				s.writeStream(w, resp, proto, convertBack, model)
-				return
-			}
-
-			// 200 但身体里有业务错误
-			if resp.StatusCode == http.StatusOK {
-				if err := upstream.CheckEnvelope("chat", raw); err == nil {
-					s.writeJSON(w, resp, raw, proto, convertBack, model)
-					return
-				}
-			}
-
-			failure := s.failure(resp.StatusCode, raw)
-			lastStatus = resp.StatusCode
-			lastMsg = failure.Message
-			if lastMsg == "" {
-				// 上游自己说的话要给客户端和运维看：只知道一个状态码，
-				// 谁也说不清到底是哪一件事坏了。
-				lastMsg = upstreamMessage(raw)
-			}
-			switch s.action(failure) {
-			case rotator.ActionFailover:
-				// 额度用完了：这个账号的窗口记成用完，换一个账号。
-				s.markSpent(ctx, plan.AccountID, plan.GroupKey)
-				lastErr = fmt.Errorf("the account's credits or plan are used up")
-				quota = true
-				quotaMsg = failure.Message
-				continue accountLoop
-			case rotator.ActionRenew:
-				if renewed {
-					// 续过一次还是被拒：这个账号先放着，换一个。
-					lastErr = fmt.Errorf("the sign-in was refused (HTTP %d)", resp.StatusCode)
-					quota = false
-					quotaMsg = ""
-					continue accountLoop
-				}
-				newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
-				if rerr != nil {
-					// 跨站：不换号、不消耗 refresh token
+			// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
+			// 只能用一次，续第二次会把账号签死。
+			renewed := false
+			// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
+			// 再来一次就好。
+			for try := 0; try < attempts; try++ {
+				resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
+				if err != nil {
 					var oe *upstream.OtherSiteError
-					// 续签自己的错要看 rerr：err 是上一次尝试的，
-					// 那时候它是空的，看它永远看不出来。
-					if errors.As(rerr, &oe) {
+					if errors.As(err, &oe) {
+						// 跨站：不换号、不消耗 refresh token
 						writeError(w, proto, http.StatusBadGateway, oe.Error())
-						return
+						return true
 					}
-					lastErr = rerr
+					// 网络没通：还是这个账号，等一等再来。上游没有给出
+					// 状态：这是网关自己的问题。
+					lastErr = err
+					lastStatus = 0
+					lastMsg = ""
+					if !sleepCtx(ctx, backoff(try)) {
+						return true
+					}
+					continue
+				}
+
+				// 上游没有这条路：改用本地转换，同一个账号再来一次。
+				//
+				// 开放平台对 MiniMax Code 的账号答的也是「没有这条路」：503
+				// 加一句 direct_route_not_configured。那不是站点坏了，是那条
+				// 路对这个账号不通 —— 该走 Anthropic 那条。
+				if resp.StatusCode == http.StatusNotFound || openPlatformNotConfigured(raw) {
+					fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
+					if ok {
+						upBody, upPath, convertBack = fb, fp, fback
+						chatReq.Body = upBody
+						chatReq.Path = upPath
+						resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+						if err != nil {
+							var oe *upstream.OtherSiteError
+							if errors.As(err, &oe) {
+								writeError(w, proto, http.StatusBadGateway, oe.Error())
+								return true
+							}
+							lastErr = err
+							lastStatus = 0
+							lastMsg = ""
+							if !sleepCtx(ctx, backoff(try)) {
+								return true
+							}
+							continue
+						}
+					}
+				}
+
+				// 200 且是流：直接转出去
+				if resp.StatusCode == http.StatusOK && raw == nil {
+					// 答上了：这个账号刚刚被用过，它变热了。
+					s.Mgr.MarkUsed(plan.AccountID)
+					s.writeStream(w, resp, proto, convertBack, model)
+					return true
+				}
+
+				// 200 但身体里有业务错误
+				if resp.StatusCode == http.StatusOK {
+					if err := upstream.CheckEnvelope("chat", raw); err == nil {
+						// 答上了：这个账号刚刚被用过，它变热了。
+						s.Mgr.MarkUsed(plan.AccountID)
+						s.writeJSON(w, resp, raw, proto, convertBack, model)
+						return true
+					}
+				}
+
+				failure := s.failure(resp.StatusCode, raw)
+				lastStatus = resp.StatusCode
+				lastMsg = failure.Message
+				if lastMsg == "" {
+					// 上游自己说的话要给客户端和运维看：只知道一个状态码，
+					// 谁也说不清到底是哪一件事坏了。
+					lastMsg = upstreamMessage(raw)
+				}
+				switch s.action(failure) {
+				case rotator.ActionFailover:
+					// 额度用完了：这个账号的窗口记成用完，换一个账号。
+					s.markSpent(ctx, plan.AccountID, plan.GroupKey)
+					lastErr = fmt.Errorf("the account's credits or plan are used up")
+					quota = true
+					quotaMsg = failure.Message
+					return false
+				case rotator.ActionRenew:
+					if renewed {
+						// 续过一次还是被拒：这个账号先放着，换一个。
+						lastErr = fmt.Errorf("the sign-in was refused (HTTP %d)", resp.StatusCode)
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
+					if rerr != nil {
+						// 跨站：不换号、不消耗 refresh token
+						var oe *upstream.OtherSiteError
+						// 续签自己的错要看 rerr：err 是上一次尝试的，
+						// 那时候它是空的，看它永远看不出来。
+						if errors.As(rerr, &oe) {
+							writeError(w, proto, http.StatusBadGateway, oe.Error())
+							return true
+						}
+						lastErr = rerr
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					// 用新 token 再来一次，还是这个账号
+					renewed = true
+					chatReq.Access = newTok.Access
 					quota = false
 					quotaMsg = ""
-					continue accountLoop
+					continue
+				case rotator.ActionRetrySame:
+					// 限流、5xx：这个账号等一等，再问它一次。
+					lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+					quota = false
+					quotaMsg = ""
+					if !sleepCtx(ctx, backoff(try)) {
+						return true
+					}
+					continue
+				default:
+					// 给不出别的说法：上游的状态原样给客户端。
+					s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
+					return true
 				}
-				// 用新 token 再来一次，还是这个账号
-				renewed = true
-				chatReq.Access = newTok.Access
-				quota = false
-				quotaMsg = ""
-				continue
-			case rotator.ActionRetrySame:
-				// 限流、5xx：这个账号等一等，再问它一次。
-				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-				quota = false
-				quotaMsg = ""
-				if !sleepCtx(ctx, backoff(try)) {
-					break accountLoop
-				}
-				continue
-			default:
-				// 给不出别的说法：上游的状态原样给客户端。
-				s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
-				return
 			}
+			return false
+		}()
+		if answered {
+			return
 		}
 	}
 	if lastErr == nil {
