@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -880,6 +881,103 @@ func TestTheBadLinesAreLoggedWithoutTheirPasswords(t *testing.T) {
 	}
 	if strings.Contains(logged.String(), "secretpassword") {
 		t.Fatalf("the password is in the log: %s", logged.String())
+	}
+}
+
+// TestTheImportTakesAPastedList says a list that is pasted in is
+// taken as well as one that is uploaded.
+//
+// 页面上有两种交法：上传一个文件，或者贴一段清单。交的是同一件事：
+// 每行 邮箱|密码。
+func TestTheImportTakesAPastedList(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	body := strings.NewReader(`{"list":"a@example.com|pw\nb@example.com|pw\n"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The import goes on in the background, so the run is waited for.
+	var run store.ImportRun
+	var err error
+	for i := 0; i < 100; i++ {
+		run, err = s.GetImportRun(context.Background(), out.ID)
+		if err == nil && !run.FinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Fatalf("the run did not finish: %+v", run)
+	}
+	if run.Total != 2 || run.OK != 2 {
+		t.Fatalf("run = %+v", run)
+	}
+}
+
+// TestTheImportTakesAHundredPastedLines says a list of exactly a
+// hundred lines is taken.
+//
+// 上限是「最多 100 行」，100 行本身得收。
+func TestTheImportTakesAHundredPastedLines(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	list := strings.Repeat("a@example.com|pw\n", 100)
+	body := strings.NewReader(`{"list":` + strconv.Quote(list) + `}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheImportRefusesALongerPastedList says a pasted list that is
+// longer than a hundred lines is refused.
+//
+// 贴的那段是给人手写的那一份：超过 100 行就说不清了，宁可拒掉。
+func TestTheImportRefusesALongerPastedList(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	list := strings.Repeat("a@example.com|pw\n", 101)
+	body := strings.NewReader(`{"list":` + strconv.Quote(list) + `}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/import", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "100") {
+		t.Fatalf("the body does not say the limit: %q", rec.Body.String())
+	}
+}
+
+// TestTheImportPageHasAPlaceToPasteTheList says the page has a box to
+// paste the list into.
+//
+// 两种交法都要在页面上看得见：上传文件那一个口子，和贴清单那一个。
+func TestTheImportPageHasAPlaceToPasteTheList(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "import-text") {
+		t.Fatalf("the page has no box to paste the list into: %q", body)
+	}
+	if !strings.Contains(body, "100") {
+		t.Fatalf("the page does not say the limit: %q", body)
 	}
 }
 

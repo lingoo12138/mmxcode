@@ -267,6 +267,63 @@ document.addEventListener('submit', async (ev) => {
   }
 });
 
+// 贴清单：把那段文字交上去。跟上传文件是同一件事，格式也一样。
+//
+// 贴的那一段最多一百行：那是给人手写的那一份。超过就不交了 —— 服务端
+// 也会拒，两边一样。
+document.addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#import-text-form');
+  if (!form) return;
+  ev.preventDefault();
+  const status = document.getElementById('import-status');
+  const box = document.getElementById('import-text');
+  const list = box ? box.value : '';
+  const lines = countListLines(list);
+  if (lines > importTextLimit) {
+    status.textContent = '失败：这段清单有 ' + lines + ' 行，最多 ' + importTextLimit + ' 行';
+    return;
+  }
+  status.textContent = '导入中……';
+  try {
+    const res = await fetch('/api/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ list: list }),
+    });
+    const answer = await readAnswer(res);
+    if (!answer.ok) throw new Error(messageOf(answer));
+    watchImport(answer.json.id);
+  } catch (e) {
+    status.textContent = '失败：' + e.message;
+  }
+});
+
+// 贴的那一段有多少行：写的时候就把数摆出来，超了也当场不让人交。
+document.addEventListener('input', (ev) => {
+  const box = ev.target.closest('#import-text');
+  if (!box) return;
+  const lines = countListLines(box.value);
+  const counter = document.getElementById('import-text-count');
+  if (counter) counter.textContent = lines + ' 行';
+  const button = document.getElementById('import-text-button');
+  if (button) button.disabled = lines > importTextLimit;
+});
+
+// countListLines counts the lines of a pasted list.
+//
+// 末尾那几个空行不算：粘贴的时候多带一个换行是常事，那不该把一行算
+// 成两行。跟服务端那个算法一样。
+function countListLines(text) {
+  const trimmed = (text || '').replace(/[\r\n]+$/, '');
+  if (trimmed === '') return 0;
+  return trimmed.split('\n').length;
+}
+
+// importTextLimit is how many lines a pasted list may have.
+//
+// 页面上写死的那个数跟服务端的是同一个：服务端是 maxImportTextLines。
+const importTextLimit = 100;
+
 function watchImport(id) {
   const timer = setInterval(async () => {
     try {

@@ -816,6 +816,7 @@ func (w *WebUI) importData(ctx context.Context) (map[string]any, error) {
 	return map[string]any{
 		"Runs":         views,
 		"PasswordNote": w.PasswordNote,
+		"TextLines":    maxImportTextLines,
 	}, nil
 }
 
@@ -851,10 +852,15 @@ func wholeReason(results string) string {
 
 // apiImport takes a list of accounts and brings them in.
 //
-// The list is a file: every line is an account. The work goes on in
-// the background, and the answer says which run to watch.
+// 两种交法，交的是同一份清单（每行 邮箱|密码）：
 //
-// The file is read into memory and thrown away afterwards: it holds
+//   - 上传一个文件（multipart 的 file 那一栏）
+//   - 贴一段清单（JSON 的 {"list": "…"}）
+//
+// The work goes on in the background, and the answer says which run to
+// watch.
+//
+// The list is read into memory and thrown away afterwards: it holds
 // passwords in the clear, and it must not land on the disk.
 //
 // 配了 key 也不关这个口子了：那把 key 就是后台登录的那把，能进来的人
@@ -864,26 +870,50 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "这个网关没有批量导入", http.StatusNotImplemented)
 		return
 	}
-	// The request has a size limit, and the memory that ParseMultipartForm
-	// is given is bigger than it: the list therefore never reaches a
-	// temporary file, it stays in memory.
-	r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
-	if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+	var (
+		entries []provision.Entry
+		bad     []provision.BadLine
+	)
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		// 贴过来的一段清单。
+		var body struct {
+			List string `json:"list"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(rw, "这个请求不是一段清单", http.StatusBadRequest)
 			return
 		}
-		http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
-		return
+		if n := countLines(body.List); n > maxImportTextLines {
+			http.Error(rw, fmt.Sprintf("这段清单有 %d 行，最多 %d 行", n, maxImportTextLines),
+				http.StatusBadRequest)
+			return
+		}
+		entries, bad = provision.Parse(strings.NewReader(body.List))
+	} else {
+		// 上传的一个文件。
+		//
+		// The request has a size limit, and the memory that
+		// ParseMultipartForm is given is bigger than it: the list
+		// therefore never reaches a temporary file, it stays in
+		// memory.
+		r.Body = http.MaxBytesReader(rw, r.Body, maxImportBytes)
+		if err := r.ParseMultipartForm(maxImportBytes * 2); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(rw, "这个清单太大了", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(rw, "这个请求不是文件上传", http.StatusBadRequest)
+			return
+		}
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			http.Error(rw, "没有文件", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		entries, bad = provision.Parse(file)
 	}
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		http.Error(rw, "没有文件", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-	entries, bad := provision.Parse(file)
 	for _, b := range bad {
 		// 坏行的那句话里没有密码：清单的解析器把密码摘掉了。
 		log.Printf("import: 第 %d 行：%s", b.Line, b.Reason)
@@ -903,6 +933,25 @@ func (w *WebUI) apiImport(rw http.ResponseWriter, r *http.Request) {
 	go w.runImport(runID, entries)
 	// 202：导入在后台跑着，这个回答只说这一次导入的号。
 	writeJSONStatus(rw, http.StatusAccepted, map[string]any{"id": runID})
+}
+
+// maxImportTextLines is how many lines a pasted list may have.
+//
+// 贴的那一段是给人手写的那一份：一百行够写一百个账号，再多就该上传一
+// 个文件了。上传的那一份是批量那一份，它自己的大小上限是
+// maxImportBytes，行数不管。
+const maxImportTextLines = 100
+
+// countLines counts the lines of a pasted list.
+//
+// 末尾那几个空行不算：粘贴的时候多带一个换行是常事，那不该把一行算
+// 成两行。
+func countLines(text string) int {
+	text = strings.TrimRight(text, "\r\n")
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
 }
 
 // newImportRunID makes the name of one import run.

@@ -7,10 +7,23 @@
   <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。
      不想让明文密码走网络的话，在服务器上跑
      <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+
+  <h2>上传文件</h2>
   <form id="import-form" enctype="multipart/form-data">
     <input type="file" name="file" accept=".txt" required>
     <button type="submit">开始</button>
   </form>
+
+  <h2>或者直接贴清单</h2>
+  <form id="import-text-form">
+    <p>
+      <textarea id="import-text" rows="10" cols="60"
+        placeholder="a@example.com|pw&#10;b@example.com|pw"></textarea>
+    </p>
+    <p class="muted">最多 {{.TextLines}} 行。<span id="import-text-count">0 行</span></p>
+    <button type="submit" id="import-text-button">开始</button>
+  </form>
+
   <p class="muted" id="import-status"></p>
   <table id="import-results" hidden>
     <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
