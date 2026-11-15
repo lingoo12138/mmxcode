@@ -187,17 +187,66 @@ func TestTheCodeIsApprovedWithTheSession(t *testing.T) {
 	}
 }
 
-func TestAGroupThatIsNotThereIsAnError(t *testing.T) {
+// TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool says a default
+// group that is written as a number or as a string is found too.
+//
+// is_default 到底回的是不是真的布尔，没人验过（设计文档「待实测」第
+// 3 条）。认错一个组和认不出一个组，后果一样：账号批不了设备码。
+func TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool(t *testing.T) {
+	for _, written := range []string{`1`, `"true"`, `true`} {
+		f := newFakeSite(t)
+		f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":` + written + `}]}}`
+		c := f.client(t)
+		f.login(t, c)
+		if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+			t.Fatalf("is_default = %s: %v", written, err)
+		}
+		if f.approved["group_id"] != "g1" {
+			t.Fatalf("is_default = %s: group_id = %v", written, f.approved["group_id"])
+		}
+	}
+}
+
+// TestTheOnlyGroupIsApprovedWhenNoneIsTheDefault says a group is used
+// even when none of them is marked the default, as long as there is
+// only one.
+//
+// 没有默认组的时候，站点的前端是拒绝的（它自己会写「A default group
+// is required to approve authorization.」）。但只有一个组的时候没得选：
+// 站点后头收不收是站点的事，让它答，比我们先拒了好。
+func TestTheOnlyGroupIsApprovedWhenNoneIsTheDefault(t *testing.T) {
 	f := newFakeSite(t)
 	f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":false}]}}`
 	c := f.client(t)
 	f.login(t, c)
+	if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if f.approved["group_id"] != "g1" {
+		t.Fatalf("group_id = %v, want the only group", f.approved["group_id"])
+	}
+}
+
+// TestSeveralGroupsWithoutADefaultAreAnError says several groups and
+// no default among them is an error.
+//
+// 有得选的时候不猜：猜错了就是把账号批进别的组里去了。站点答的那个
+// 形状得在错里：默认组是真的没有，还是我们没认出来，看一眼就知道
+// （设计文档「待实测」第 3 条）。
+func TestSeveralGroupsWithoutADefaultAreAnError(t *testing.T) {
+	f := newFakeSite(t)
+	f.groups = `{"code":0,"data":{"groups":[{"id":"g1"},{"id":"g2"}]}}`
+	c := f.client(t)
+	f.login(t, c)
 	err := c.Approve(context.Background(), "ABCD-1234")
 	if err == nil {
-		t.Fatal("no error without a default group")
+		t.Fatal("no error with several groups and no default")
 	}
-	if !strings.Contains(err.Error(), "group") {
-		t.Fatalf("err = %v", err)
+	if !errors.Is(err, ErrNoDefaultGroup) {
+		t.Fatalf("err = %v, want the no-default-group error", err)
+	}
+	if !strings.Contains(err.Error(), `"id":"g1"`) {
+		t.Fatalf("the site's answer is not in the error: %v", err)
 	}
 }
 

@@ -126,7 +126,9 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
 		if errors.Is(err, webauth.ErrNoDefaultGroup) {
-			// 站点没有默认组可批准，重试多少次都一样。
+			// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
+			// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
+			// 才知道是去站点上设默认组，还是我们没认出来。
 			return nil, &Error{Stage: StageApprove, Message: err.Error()}
 		}
 		return nil, c.webError(ctx, StageApprove, err)

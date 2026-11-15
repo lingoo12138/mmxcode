@@ -132,7 +132,16 @@ Cookie: _sid=…
 -> 200 {…设备信息…, groups:[{id:…, is_default:true}, …]}
 ```
 
-`group_id` 取 `is_default` 的那一组；一个都没有就报错（前端也是这么处理的：「A default group is required to approve authorization.」）。
+`group_id` 取 `is_default` 的那一组。
+
+- `is_default` 的真假有三种写法（真的布尔、`1`、`"true"`），三种都认。站
+  点到底回哪一种，原先没人验过（§11 待实测第 3 条）；认错一个组和认不出
+  一个组，后果一样：账号批不了设备码
+- 没有默认组、但**只有一个组**的时候，就用那一个：没得选的时候不猜。站点
+  后头收不收是站点的事，让它答，比我们先拒了好
+- 没有默认组、**有好几个组**的时候报错（前端也是这么处理的：「A default
+  group is required to approve authorization.」）。**错里带着站点答的原文**：
+  是真的没有默认组，还是我们没认出来，看一眼那个形状就知道
 
 ```
 POST https://account.minimax.io/oauth2/device/authorize
@@ -511,7 +520,8 @@ docker compose exec mmxcode mmxcode import --file /data/accounts.txt
 
 1. **拿真账号跑通整条链**（只有人能做）
 2. `statusInfo.code` 在「密码错」这件事上的**确切**码值（笔记里只列了常量名，没有实测对照表）
-3. `group_id` 的默认组规则：`is_default` 的那组在真实账号上是否唯一
+3. `group_id` 的默认组规则：`is_default` 的那组在真实账号上是否唯一 —— 现
+   在错里带着站点答的原文了，再跑一次导入就能看见（2026-11-16 改）
 4. 大陆出口下 `account.minimax.io` 是否也被 307 到 `.cn`（笔记里只记了 `agent.minimax.io`）
 5. Akamai 的 `_abck` / `bm_sz` 在批量登录时会不会真的拦（笔记里的实测是单账号直连通过）
 6. 批量到多少个号会触发风控

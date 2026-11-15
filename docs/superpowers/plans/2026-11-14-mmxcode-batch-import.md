@@ -2245,17 +2245,66 @@ func TestTheCodeIsApprovedWithTheSession(t *testing.T) {
 	}
 }
 
-func TestAGroupThatIsNotThereIsAnError(t *testing.T) {
+// TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool says a default
+// group that is written as a number or as a string is found too.
+//
+// is_default 到底回的是不是真的布尔，没人验过（设计文档「待实测」第
+// 3 条）。认错一个组和认不出一个组，后果一样：账号批不了设备码。
+func TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool(t *testing.T) {
+	for _, written := range []string{`1`, `"true"`, `true`} {
+		f := newFakeSite(t)
+		f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":` + written + `}]}}`
+		c := f.client(t)
+		f.login(t, c)
+		if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+			t.Fatalf("is_default = %s: %v", written, err)
+		}
+		if f.approved["group_id"] != "g1" {
+			t.Fatalf("is_default = %s: group_id = %v", written, f.approved["group_id"])
+		}
+	}
+}
+
+// TestTheOnlyGroupIsApprovedWhenNoneIsTheDefault says a group is used
+// even when none of them is marked the default, as long as there is
+// only one.
+//
+// 没有默认组的时候，站点的前端是拒绝的（它自己会写「A default group
+// is required to approve authorization.」）。但只有一个组的时候没得选：
+// 站点后头收不收是站点的事，让它答，比我们先拒了好。
+func TestTheOnlyGroupIsApprovedWhenNoneIsTheDefault(t *testing.T) {
 	f := newFakeSite(t)
 	f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":false}]}}`
 	c := f.client(t)
 	f.login(t, c)
+	if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if f.approved["group_id"] != "g1" {
+		t.Fatalf("group_id = %v, want the only group", f.approved["group_id"])
+	}
+}
+
+// TestSeveralGroupsWithoutADefaultAreAnError says several groups and
+// no default among them is an error.
+//
+// 有得选的时候不猜：猜错了就是把账号批进别的组里去了。站点答的那个
+// 形状得在错里：默认组是真的没有，还是我们没认出来，看一眼就知道
+// （设计文档「待实测」第 3 条）。
+func TestSeveralGroupsWithoutADefaultAreAnError(t *testing.T) {
+	f := newFakeSite(t)
+	f.groups = `{"code":0,"data":{"groups":[{"id":"g1"},{"id":"g2"}]}}`
+	c := f.client(t)
+	f.login(t, c)
 	err := c.Approve(context.Background(), "ABCD-1234")
 	if err == nil {
-		t.Fatal("no error without a default group")
+		t.Fatal("no error with several groups and no default")
 	}
-	if !strings.Contains(err.Error(), "group") {
-		t.Fatalf("err = %v", err)
+	if !errors.Is(err, ErrNoDefaultGroup) {
+		t.Fatalf("err = %v, want the no-default-group error", err)
+	}
+	if !strings.Contains(err.Error(), `"id":"g1"`) {
+		t.Fatalf("the site's answer is not in the error: %v", err)
 	}
 }
 
@@ -2759,13 +2808,55 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 	}
 	groups := findGroups(answer)
 	for _, g := range groups {
-		if def, ok := g["is_default"].(bool); ok && def {
-			if id, ok := g["id"].(string); ok && id != "" {
-				return id, nil
-			}
+		if !isDefaultGroup(g) {
+			continue
+		}
+		if id, ok := g["id"].(string); ok && id != "" {
+			return id, nil
 		}
 	}
-	return "", ErrNoDefaultGroup
+	// 没有默认组的时候，只有一个组的话就用它：没得选的时候不猜。站点
+	// 收不收是站点的事，让它答 —— 我们先拒了，就把人挡在门外了。
+	if len(groups) == 1 {
+		if id, ok := groups[0]["id"].(string); ok && id != "" {
+			return id, nil
+		}
+	}
+	return "", noDefaultGroupError{raw: rawAnswer(answer)}
+}
+
+// isDefaultGroup says whether a group is the site's default one.
+//
+// 真假有三种写法：真的布尔、1、"true"。站点到底回哪一种，没人验过
+// （设计文档「待实测」第 3 条）。认错一个组和认不出一个组，后果一样：
+// 账号批不了设备码。
+func isDefaultGroup(g map[string]any) bool {
+	switch v := g["is_default"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "true" || s == "1"
+	}
+	return false
+}
+
+// rawAnswer gives the site's answer as one compact line.
+//
+// 它进错里：默认组是真的没有，还是我们没认出来，看一眼那个形状就知道
+// （设计文档「待实测」第 3 条）。
+func rawAnswer(answer any) string {
+	b, err := json.Marshal(answer)
+	if err != nil {
+		return ""
+	}
+	s := string(b)
+	if len(s) > 800 {
+		s = s[:800] + "…"
+	}
+	return s
 }
 
 // ErrNoDefaultGroup is the answer when the site has no default group
@@ -2774,6 +2865,21 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 // It is not worth trying again: the group is not there, and it will
 // not be there in five seconds either.
 var ErrNoDefaultGroup = errors.New("device authorize: there is no default group to approve")
+
+// noDefaultGroupError is that answer, with the site's own words in it.
+//
+// 它带上站点答的那个形状：默认组是真的没有，还是我们没认出来，看一眼
+// 那个形状就知道（设计文档「待实测」第 3 条）。
+type noDefaultGroupError struct {
+	raw string
+}
+
+func (e noDefaultGroupError) Error() string {
+	return "这个账号没有默认组，设备码批不了（去站点把一个组设成默认的再来）。站点答的是：" + e.raw
+}
+
+// Is makes errors.Is(err, ErrNoDefaultGroup) true for it.
+func (e noDefaultGroupError) Is(target error) bool { return target == ErrNoDefaultGroup }
 
 // findGroups finds the groups in the site's answer.
 //
@@ -5230,7 +5336,9 @@ func (c *Chain) SignIn(ctx context.Context, email, password string) (*oauth.Toke
 	}
 	if err := c.Web.Approve(ctx, d.UserCode); err != nil {
 		if errors.Is(err, webauth.ErrNoDefaultGroup) {
-			// 站点没有默认组可批准，重试多少次都一样。
+			// 有好几个组、没有一个是默认的：重试多少次都一样，而且这
+			// 一条得把站点答的原文带着 —— 人得看见站点到底答了什么，
+			// 才知道是去站点上设默认组，还是我们没认出来。
 			return nil, &Error{Stage: StageApprove, Message: err.Error()}
 		}
 		return nil, c.webError(ctx, StageApprove, err)
@@ -8512,6 +8620,123 @@ func countLines(text string) int {
 
 ```bash
 gofmt -l . && go build ./... && go vet ./... && node --check internal/webui/static/app.js && go test ./... -count=1
+```
+
+---
+
+---
+
+### Task 14: 默认组那条 —— 认得宽一点，把站点答的原文带出来
+
+**Files:**
+- Modify: `internal/webauth/webauth.go`
+- Modify: `internal/webauth/webauth_test.go`
+- Modify: `internal/provision/chain.go`
+- Modify: `docs/superpowers/specs/2026-11-14-mmxcode-batch-import-design.md`
+
+真账号上跑出来的第一处真问题：那一个号的导入死在**批准设备码**那一步，报的是
+`device authorize: there is no default group to approve` —— 是我们自己抛的
+（`code: 0`，站点没拒绝）。
+
+死在批准那一步说明前面的都过了：探过了，**密码登录过了**（站点认了邮箱和密码，
+给了会话）。所以跟代理没关系 —— 三步（设备码、密码登录、批准）都走
+`e.egress(group)` 那个 transport。
+
+那么这个错属于哪一种：
+
+- **真的没有默认组** —— 站点的前端也是这么处理的，它自己会写「A default group is
+  required to approve authorization.」。那这个号得去站点上把一个组设成默认的
+- **我们没认出来** —— 规格 §2.4 里那个形状（`{…设备信息…, groups:[{id:…,
+  is_default:true}]}`）是照着站点的 JS 读出来的，**从没在真账号上验过**；设计
+  文档自己的「待实测」第 3 条就是这件事
+
+第二种是实打实可能的：我们只认 `is_default` 是**真的布尔**。站点回的是 `1` 或
+者 `"true"`，症状一模一样。
+
+- [x] **Step 1: 先写测试（红的）**
+
+```go
+// TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool says a default
+// group that is written as a number or as a string is found too.
+//
+// is_default 到底回的是不是真的布尔，没人验过（设计文档「待实测」第
+// 3 条）。认错一个组和认不出一个组，后果一样：账号批不了设备码。
+func TestTheDefaultGroupIsFoundEvenWhenItIsNotARealBool(t *testing.T) {
+	for _, written := range []string{`1`, `"true"`, `true`} {
+		f := newFakeSite(t)
+		f.groups = `{"code":0,"data":{"groups":[{"id":"g1","is_default":` + written + `}]}}`
+		c := f.client(t)
+		f.login(t, c)
+		if err := c.Approve(context.Background(), "ABCD-1234"); err != nil {
+			t.Fatalf("is_default = %s: %v", written, err)
+		}
+		if f.approved["group_id"] != "g1" {
+			t.Fatalf("is_default = %s: group_id = %v", written, f.approved["group_id"])
+		}
+	}
+}
+```
+
+- [x] **Step 2: 看它红**
+
+```bash
+go test ./internal/webauth/ -count=1
+```
+
+红的原因：`is_default = 1` 那个也找不到默认组 —— 我们只认真布尔。
+
+- [x] **Step 3: 三处改动**
+
+`internal/webauth/webauth.go`：
+
+```go
+// isDefaultGroup says whether a group is the site's default one.
+//
+// 真假有三种写法：真的布尔、1、"true"。站点到底回哪一种，没人验过
+// （设计文档「待实测」第 3 条）。认错一个组和认不出一个组，后果一样：
+// 账号批不了设备码。
+func isDefaultGroup(g map[string]any) bool {
+	switch v := g["is_default"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "true" || s == "1"
+	}
+	return false
+}
+```
+
+```go
+// noDefaultGroupError is that answer, with the site's own words in it.
+//
+// 它带上站点答的那个形状：默认组是真的没有，还是我们没认出来，看一眼
+// 那个形状就知道（设计文档「待实测」第 3 条）。
+type noDefaultGroupError struct {
+	raw string
+}
+
+func (e noDefaultGroupError) Error() string {
+	return "这个账号没有默认组，设备码批不了（去站点把一个组设成默认的再来）。站点答的是：" + e.raw
+}
+
+// Is makes errors.Is(err, ErrNoDefaultGroup) true for it.
+func (e noDefaultGroupError) Is(target error) bool { return target == ErrNoDefaultGroup }
+```
+
+还有一个兜底：没有默认组、但**只有一个组**的时候，就用那一个。没得选的时候
+不猜 —— 站点后头收不收是站点的事，让它答，比我们先拒了好。有好几个组的时候
+还是拒（猜错了就是把账号批进别的组里去了）。
+
+`internal/provision/chain.go`：那个分支的注释跟着改（它现在只管「好几个组、
+没有一个是默认的」这一种）。
+
+- [x] **Step 4: 验收**
+
+```bash
+gofmt -l . && go build ./... && go vet ./... && go test ./... -count=1
 ```
 
 ---

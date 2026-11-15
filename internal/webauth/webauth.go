@@ -324,13 +324,55 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 	}
 	groups := findGroups(answer)
 	for _, g := range groups {
-		if def, ok := g["is_default"].(bool); ok && def {
-			if id, ok := g["id"].(string); ok && id != "" {
-				return id, nil
-			}
+		if !isDefaultGroup(g) {
+			continue
+		}
+		if id, ok := g["id"].(string); ok && id != "" {
+			return id, nil
 		}
 	}
-	return "", ErrNoDefaultGroup
+	// 没有默认组的时候，只有一个组的话就用它：没得选的时候不猜。站点
+	// 收不收是站点的事，让它答 —— 我们先拒了，就把人挡在门外了。
+	if len(groups) == 1 {
+		if id, ok := groups[0]["id"].(string); ok && id != "" {
+			return id, nil
+		}
+	}
+	return "", noDefaultGroupError{raw: rawAnswer(answer)}
+}
+
+// isDefaultGroup says whether a group is the site's default one.
+//
+// 真假有三种写法：真的布尔、1、"true"。站点到底回哪一种，没人验过
+// （设计文档「待实测」第 3 条）。认错一个组和认不出一个组，后果一样：
+// 账号批不了设备码。
+func isDefaultGroup(g map[string]any) bool {
+	switch v := g["is_default"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "true" || s == "1"
+	}
+	return false
+}
+
+// rawAnswer gives the site's answer as one compact line.
+//
+// 它进错里：默认组是真的没有，还是我们没认出来，看一眼那个形状就知道
+// （设计文档「待实测」第 3 条）。
+func rawAnswer(answer any) string {
+	b, err := json.Marshal(answer)
+	if err != nil {
+		return ""
+	}
+	s := string(b)
+	if len(s) > 800 {
+		s = s[:800] + "…"
+	}
+	return s
 }
 
 // ErrNoDefaultGroup is the answer when the site has no default group
@@ -339,6 +381,21 @@ func (c *Client) defaultGroup(ctx context.Context, userCode string) (string, err
 // It is not worth trying again: the group is not there, and it will
 // not be there in five seconds either.
 var ErrNoDefaultGroup = errors.New("device authorize: there is no default group to approve")
+
+// noDefaultGroupError is that answer, with the site's own words in it.
+//
+// 它带上站点答的那个形状：默认组是真的没有，还是我们没认出来，看一眼
+// 那个形状就知道（设计文档「待实测」第 3 条）。
+type noDefaultGroupError struct {
+	raw string
+}
+
+func (e noDefaultGroupError) Error() string {
+	return "这个账号没有默认组，设备码批不了（去站点把一个组设成默认的再来）。站点答的是：" + e.raw
+}
+
+// Is makes errors.Is(err, ErrNoDefaultGroup) true for it.
+func (e noDefaultGroupError) Is(target error) bool { return target == ErrNoDefaultGroup }
 
 // findGroups finds the groups in the site's answer.
 //
