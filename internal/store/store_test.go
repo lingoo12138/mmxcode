@@ -14,6 +14,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"mmxcode/internal/apikey"
 )
 
 func openTest(t *testing.T) *Store {
@@ -2351,6 +2353,147 @@ func TestTheAccountIsFoundByItsUserID(t *testing.T) {
 	}
 	// 空的 user id 不是一把钥匙：没有它的账号，谁也不是。
 	if _, err := s.AccountByUserID(ctx, "  "); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+}
+
+// TestAKeyIsWrittenAndFound says a key that is written down can be
+// found again by its hash.
+//
+// 网关认一把 key，靠的就是它的哈希：库里存哈希，请求带来的 key 算一次
+// 哈希，两边对上了就是那一把。
+func TestAKeyIsWrittenAndFound(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := apikey.Hash(plain)
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "给我的笔记本", KeyHash: hash,
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.APIKeyByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("the key by its hash: %v", err)
+	}
+	if got.ID != "key_1" {
+		t.Fatalf("key = %+v, want the one that was written", got)
+	}
+	if got.Name != "给我的笔记本" {
+		t.Fatalf("name = %q", got.Name)
+	}
+	if got.RevokedAt != nil {
+		t.Fatalf("the key is already revoked: %v", got.RevokedAt)
+	}
+}
+
+// TestTheKeyItselfIsNotInTheDatabase says the database does not keep the
+// key.
+//
+// 数据库被人拿走的时候，里面不该有一把能开门的 key：它存的是哈希。
+func TestTheKeyItselfIsNotInTheDatabase(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "n", KeyHash: apikey.Hash(plain),
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v, want one", keys)
+	}
+	if strings.Contains(keys[0].KeyHash, plain) {
+		t.Fatal("the key itself is in the database")
+	}
+	if keys[0].KeyHash != apikey.Hash(plain) {
+		t.Fatalf("hash = %q, want the hash of the key", keys[0].KeyHash)
+	}
+}
+
+// TestARevokedKeyIsNotFound says a revoked key does not open the gate.
+//
+// 撤销是把门关上：撤了的那一把不该再能进门。它还在库里——人得看得见
+// 它曾经有过，也得说得清它什么时候没的。
+func TestARevokedKeyIsNotFound(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, _ := apikey.New()
+	hash := apikey.Hash(plain)
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "n", KeyHash: hash,
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeAPIKey(ctx, "key_1", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.APIKeyByHash(ctx, hash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v, want the revoked one still to be there", keys)
+	}
+	if keys[0].RevokedAt == nil {
+		t.Fatal("the key does not say when it was revoked")
+	}
+}
+
+// TestTheKeysAreListedNewestFirst says the newest key comes first.
+func TestTheKeysAreListedNewestFirst(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, id := range []string{"key_1", "key_2"} {
+		if err := s.CreateAPIKey(ctx, APIKey{
+			ID: id, Name: id, KeyHash: apikey.Hash(id),
+			Prefix: "sk-…", CreatedAt: now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want two", keys)
+	}
+	if keys[0].ID != "key_2" {
+		t.Fatalf("the first key is %q, want the newest one", keys[0].ID)
+	}
+}
+
+// TestAKeyThatIsNotThereIsNotFound says a key that was never written is
+// not found.
+func TestAKeyThatIsNotThereIsNotFound(t *testing.T) {
+	s := openTest(t)
+	if _, err := s.APIKeyByHash(context.Background(), "nothing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want not found", err)
 	}
 }

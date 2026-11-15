@@ -96,6 +96,14 @@ async function patch(url, body) {
   if (!answer.ok) throw new Error(messageOf(answer));
 }
 
+// del 删掉一个东西。
+async function del(url) {
+  const res = await fetch(url, { method: 'DELETE' });
+  const answer = await readAnswer(res);
+  if (answer.status === 401) askForKey();
+  if (!answer.ok) throw new Error(messageOf(answer));
+}
+
 // signIn 拿一张票。
 //
 // 回答可能是登录页（HTML），也可能是 JSON：网关现在给的是前者。两样
@@ -388,3 +396,105 @@ document.addEventListener('click', async (ev) => {
   const status = document.getElementById('usage-status');
   if (status) status.textContent = text;
 })();
+
+// 密钥：申请一把新的，撤销一把旧的。
+//
+// 申请出来的那一把 key 只在这一刻给得出：往后页面上只有它的开头。所以
+// 它得摆在人眼前，还得能复制走。
+document.addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#key-form');
+  if (!form) return;
+  ev.preventDefault();
+  const status = document.getElementById('key-status');
+  const name = document.getElementById('key-name');
+  if (status) status.textContent = '正在申请……';
+  try {
+    const out = await post('/api/keys', { name: name ? name.value : '' });
+    const plain = document.getElementById('key-plain');
+    if (plain) plain.textContent = out.key;
+    const box = document.getElementById('key-new');
+    if (box) box.hidden = false;
+    if (status) status.textContent = '申请好了。抄走收好：过了这一会儿就拿不出来了。';
+    if (name) name.value = '';
+    await renderKeys();
+  } catch (e) {
+    if (status) status.textContent = '失败：' + e.message;
+  }
+});
+
+document.addEventListener('click', async (ev) => {
+  const copy = ev.target.closest('#key-copy');
+  if (copy) {
+    const plain = document.getElementById('key-plain');
+    if (!plain) return;
+    try {
+      await navigator.clipboard.writeText(plain.textContent);
+      copy.textContent = '复制好了';
+    } catch (e) {
+      // 剪贴板不给用的时候，人自己选中那段字也一样。
+      copy.textContent = '选中最下面那段字自己复制';
+    }
+    return;
+  }
+  const revoke = ev.target.closest('[data-revoke]');
+  if (revoke) {
+    revoke.disabled = true;
+    try {
+      await del('/api/keys/' + encodeURIComponent(revoke.dataset.revoke));
+      await renderKeys();
+    } catch (e) {
+      revoke.disabled = false;
+      const status = document.getElementById('key-status');
+      if (status) status.textContent = '失败：' + e.message;
+    }
+  }
+});
+
+// renderKeys 把钥匙列表重新摆一遍。
+//
+// 页面是服务端渲染的，可这一页的列表是刚刚才变的：重新取一遍整页会把
+// 刚拿到手的那把 key 弄没，所以只把表格重摆一次。
+async function renderKeys() {
+  const body = document.getElementById('key-rows');
+  if (!body) return;
+  const res = await fetch('/api/keys');
+  const answer = await readAnswer(res);
+  if (!answer.ok) return;
+  const keys = Array.isArray(answer.json.keys) ? answer.json.keys : [];
+  body.textContent = '';
+  for (const k of keys) {
+    const tr = document.createElement('tr');
+    const revoked = !!k.revoked_at;
+    const cells = [
+      k.name || '（没名字）',
+      k.prefix || '',
+      (k.created_at || '').replace('T', ' ').slice(0, 16),
+    ];
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.appendChild(td);
+    }
+    const state = document.createElement('td');
+    const label = document.createElement('span');
+    if (revoked) {
+      label.textContent = '已撤销';
+      label.className = 'muted';
+    } else {
+      label.textContent = '能用';
+      label.className = 'good';
+    }
+    state.appendChild(label);
+    tr.appendChild(state);
+    const last = document.createElement('td');
+    if (!revoked) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '撤销';
+      button.dataset.revoke = k.id;
+      last.appendChild(button);
+    }
+    tr.appendChild(last);
+    body.appendChild(tr);
+  }
+}

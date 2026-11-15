@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -9,6 +10,8 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+
+	"mmxcode/internal/apikey"
 )
 
 // sessionCookie is the name of the cookie the browser carries.
@@ -50,14 +53,14 @@ func (s *Server) auth(r *http.Request) bool {
 	if len(keys) == 0 {
 		return true
 	}
-	given := r.Header.Get("x-api-key")
-	if given == "" {
-		auth := r.Header.Get("Authorization")
-		if strings.HasPrefix(auth, "Bearer ") {
-			given = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-		}
-	}
-	if _, ok := matchingKey(given, keys); ok {
+	return s.authWith(r, keys)
+}
+
+// authWith checks the request's key against the given keys.
+//
+// 头里的 key 和浏览器带的 cookie 都认。
+func (s *Server) authWith(r *http.Request, keys []string) bool {
+	if _, ok := matchingKey(givenKey(r), keys); ok {
 		return true
 	}
 	// 浏览器带来的 cookie：值是某一把配好的 key 算出来的
@@ -75,6 +78,56 @@ func (s *Server) auth(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// givenKey gives the key the request carries.
+//
+// 两个头都认：x-api-key，和 Authorization: Bearer。
+func givenKey(r *http.Request) string {
+	given := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if given != "" {
+		return given
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	return ""
+}
+
+// authChat checks the request's key for the chat API.
+//
+// 两把 key 都认：配置里那把（后台登录用的），和在后台申请的那把（给
+// 别的机器聊天用的）。
+//
+// 一把都没有的时候不鉴权：那时候网关只该听本机。申请过就不一样了：
+// 那是有人打算从别的机器用它。
+func (s *Server) authChat(r *http.Request) bool {
+	keys := s.Cfg.Server.APIKeys
+	if len(keys) == 0 && !s.hasMadeKeys(r.Context()) {
+		return true
+	}
+	// 配置里那把，和浏览器带的 cookie。
+	if s.authWith(r, keys) {
+		return true
+	}
+	given := givenKey(r)
+	if given == "" || s.Store == nil {
+		return false
+	}
+	// 库里存的是哈希：请求带来的 key 算一次哈希，对上了就是那一把。
+	// 撤销过的不算——它已经不能开门了。
+	_, err := s.Store.APIKeyByHash(r.Context(), apikey.Hash(given))
+	return err == nil
+}
+
+// hasMadeKeys says whether any key has been made in the console.
+func (s *Server) hasMadeKeys(ctx context.Context) bool {
+	if s.Store == nil {
+		return false
+	}
+	have, err := s.Store.HasAPIKeys(ctx)
+	return err == nil && have
 }
 
 // matchingKey gives the configured key the given one matches.
@@ -264,6 +317,13 @@ button { padding: .25rem .8rem; cursor: pointer; }
 </body>
 </html>
 `
+
+// isChatPath says the path is one of the chat API's.
+//
+// 聊天那扇门和管理页那扇门不一样：聊天认两把 key，管理页只认一把。
+func isChatPath(path string) bool {
+	return path == "/v1" || strings.HasPrefix(path, "/v1/")
+}
 
 // isAPIPath says the path is one the API clients use.
 //

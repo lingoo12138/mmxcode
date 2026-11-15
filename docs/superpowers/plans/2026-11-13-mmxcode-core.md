@@ -855,6 +855,35 @@ type Schedule struct {
 	EgressHealth Duration `yaml:"egress_health" json:"egress_health"`
 }
 
+// Batch is how a batch import runs.
+type Batch struct {
+	// Interval is the wait between two accounts.
+	Interval Duration `yaml:"interval" json:"interval"`
+	// Group is the egress group the logins go through. An empty one
+	// is the default proxy.
+	//
+	// 它是常驻的：网页上传和命令行没有另外指定的时候，导入都走这个组。
+	// 导入带了组的时候，账号自己那个出口地址要让位——出口是按「先看地
+	// 址、再看组」找的，地址留着就还是从那个地方出去。所以配了这个组
+	// 之后，清单里那些账号自己手填的地址会被清掉，导入结果里会写明
+	// 清掉的是哪个地址。
+	Group string `yaml:"group" json:"group"`
+	// Relogin is the automatic signing-in again.
+	Relogin Relogin `yaml:"relogin" json:"relogin"`
+}
+
+// Relogin is the automatic signing-in again.
+type Relogin struct {
+	// Enabled says whether it runs at all. It is off by default:
+	// signing in again is the site's business, and a person should
+	// say so.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Cooldown is how long the scheduler waits between two rounds.
+	Cooldown Duration `yaml:"cooldown" json:"cooldown"`
+	// MaxAccounts is how many accounts one round touches.
+	MaxAccounts int `yaml:"max_accounts" json:"max_accounts"`
+}
+
 // Config is the whole configuration.
 type Config struct {
 	Server   Server   `yaml:"server" json:"server"`
@@ -862,6 +891,7 @@ type Config struct {
 	Upstream Upstream `yaml:"upstream" json:"upstream"`
 	Rotation Rotation `yaml:"rotation" json:"rotation"`
 	Schedule Schedule `yaml:"schedule" json:"schedule"`
+	Batch    Batch    `yaml:"batch" json:"batch"`
 	DB       string   `yaml:"db" json:"db"`
 }
 
@@ -877,6 +907,13 @@ func Default() Config {
 			UsageRefresh: Duration(15 * time.Minute),
 			TokenRefresh: Duration(5 * time.Minute),
 			EgressHealth: Duration(2 * time.Minute),
+		},
+		Batch: Batch{
+			Interval: Duration(3 * time.Second),
+			Relogin: Relogin{
+				Cooldown:    Duration(time.Hour),
+				MaxAccounts: 20,
+			},
 		},
 		DB: "/data/mmxcode.db",
 	}
@@ -1965,6 +2002,21 @@ type KV struct {
 	V string
 }
 
+// Flavor is which client a signed request claims to be.
+//
+// The two clients sign the same way but send different things: the
+// CLI claims to be MiniMax Code and the web claims to be a browser.
+// The signature covers the query, so the query has to be the one that
+// client really sends.
+type Flavor int
+
+const (
+	// FlavorMCode is MiniMax Code, the CLI. It is the default.
+	FlavorMCode Flavor = iota
+	// FlavorWeb is the MiniMax account website.
+	FlavorWeb
+)
+
 // Options is what a request's signature is made of.
 type Options struct {
 	// Access is the account's access token, put in Authorization.
@@ -1985,9 +2037,9 @@ type Options struct {
 	Body []byte
 	// Query holds the caller's extra query parameters, in order.
 	//
-	// The reference builds its query as an object literal with the
-	// caller's query spread into the middle of it, and the two halves
-	// do not treat a repeated key the same way:
+	// The CLI builds its query as an object literal with the caller's
+	// query spread into the middle of it, and the two halves do not
+	// treat a repeated key the same way:
 	//
 	//   - the four leading defaults — device_platform, biz_id, app_id
 	//     and version_code — come before the spread, so a repeated key
@@ -1997,6 +2049,14 @@ type Options struct {
 	//     come after it, so a repeated key keeps the caller's place but
 	//     takes the reference's value. "lang" and "client" are the
 	//     reference's, "user_id" is the option's.
+	//
+	// The web client builds its query the other way round. It fills a
+	// URLSearchParams: the common parameters go in first and the
+	// caller's own parameter is appended after them. A key that is in
+	// both halves is therefore in the query twice, and the parsers the
+	// site uses — url.Values.Get, URLSearchParams.get, Java's
+	// getParameter — take the first one they see, so for the web
+	// flavour it is the common block's value that counts.
 	Query []KV
 	// Now is the request's time in Unix milliseconds.
 	//
@@ -2007,10 +2067,33 @@ type Options struct {
 	Now int64
 	// TZOffset is the client's timezone offset in seconds.
 	TZOffset int
-	// OSName is the client's platform name. An empty one is "linux".
+	// OSName is the client's platform name. An empty one is "linux"
+	// for the CLI and "Windows" for the web client.
 	OSName string
 	// Lang is the site's language. An empty one is the site's own.
 	Lang string
+	// Flavor says which client the request claims to be. The zero
+	// value is the CLI, so the existing callers do not change.
+	Flavor Flavor
+	// UUID is the web client's long-lived device id. The browser
+	// keeps one in localStorage and sends it with every request.
+	UUID string
+	// DeviceID is the number the device registration handed out.
+	DeviceID string
+	// ScreenWidth and ScreenHeight are the screen the web client
+	// claims to have.
+	ScreenWidth  int
+	ScreenHeight int
+	// DeviceMemory and CPUCores are the machine the web client claims.
+	DeviceMemory int
+	CPUCores     int
+	// BrowserLanguage and BrowserPlatform are what the web client
+	// claims about itself.
+	BrowserLanguage string
+	BrowserPlatform string
+	// OpTicket is the web session's ticket. Before signing in the
+	// browser sends the word "undefined", and so does this.
+	OpTicket string
 }
 
 // Signed is a signed request's URL and headers.
@@ -2047,31 +2130,112 @@ func Sign(origin, path string, o Options) Signed {
 	if lang == "" {
 		lang = site.Lang
 	}
-	osName := o.OSName
-	if osName == "" {
-		osName = "linux"
-	}
 
 	p := newParams()
-	p.set("device_platform", "mcode")
-	p.set("biz_id", "3")
-	p.set("app_id", "3001")
-	p.set("version_code", "22201")
-	for _, kv := range o.Query {
-		p.set(kv.K, kv.V)
+	switch o.Flavor {
+	case FlavorWeb:
+		// The web client fills a URLSearchParams: the common parameters
+		// go in first and the caller's own parameter is appended after
+		// them. A key that is in both halves is in the query twice, and
+		// the usual parsers — url.Values.Get, URLSearchParams.get,
+		// Java's getParameter — take the first one they see, so it is
+		// the common block's value that counts here.
+		//
+		// The rest are what the web client claims about itself. The CLI
+		// sends none of them.
+		osName := o.OSName
+		if osName == "" {
+			osName = "Windows"
+		}
+		userID := jsTrim(o.UserID)
+		if userID == "" {
+			userID = "0"
+		}
+		// The browser language is the one the client claims to have:
+		// the site says English and the browser behind it says English
+		// too.
+		browserLanguage := o.BrowserLanguage
+		if browserLanguage == "" {
+			browserLanguage = "en-US"
+		}
+		browserPlatform := o.BrowserPlatform
+		if browserPlatform == "" {
+			browserPlatform = "Win32"
+		}
+		deviceMemory := o.DeviceMemory
+		if deviceMemory == 0 {
+			deviceMemory = 16
+		}
+		cpuCores := o.CPUCores
+		if cpuCores == 0 {
+			cpuCores = 16
+		}
+		screenWidth := o.ScreenWidth
+		if screenWidth == 0 {
+			screenWidth = 1280
+		}
+		screenHeight := o.ScreenHeight
+		if screenHeight == 0 {
+			screenHeight = 800
+		}
+		opTicket := o.OpTicket
+		if opTicket == "" {
+			// The browser sends the word "undefined" before signing in:
+			// the ticket is not in the session yet.
+			opTicket = "undefined"
+		}
+		p.append("device_platform", "web")
+		p.append("biz_id", "3")
+		p.append("app_id", "3001")
+		p.append("version_code", "22201")
+		p.append("unix", strconv.FormatInt(o.Now, 10))
+		p.append("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.append("sys_language", lang)
+		p.append("lang", lang)
+		p.append("uuid", o.UUID)
+		p.append("device_id", o.DeviceID)
+		p.append("os_name", osName)
+		p.append("browser_name", "chrome")
+		p.append("device_memory", strconv.Itoa(deviceMemory))
+		p.append("cpu_core_num", strconv.Itoa(cpuCores))
+		p.append("browser_language", browserLanguage)
+		p.append("browser_platform", browserPlatform)
+		p.append("user_id", userID)
+		p.append("op_ticket", opTicket)
+		p.append("screen_width", strconv.Itoa(screenWidth))
+		p.append("screen_height", strconv.Itoa(screenHeight))
+		p.append("client", "web")
+		for _, kv := range o.Query {
+			p.append(kv.K, kv.V)
+		}
+	default:
+		// The CLI puts the caller's parameters in the middle and the
+		// defaults around them. That is what the reference does, and
+		// the order is part of the signature.
+		osName := o.OSName
+		if osName == "" {
+			osName = "linux"
+		}
+		p.set("device_platform", "mcode")
+		p.set("biz_id", "3")
+		p.set("app_id", "3001")
+		p.set("version_code", "22201")
+		for _, kv := range o.Query {
+			p.set(kv.K, kv.V)
+		}
+		p.set("unix", strconv.FormatInt(o.Now, 10))
+		p.set("timezone_offset", strconv.Itoa(o.TZOffset))
+		p.set("sys_language", lang)
+		p.set("lang", lang)
+		p.set("device_id", "0")
+		p.set("os_name", osName)
+		p.set("browser_name", "mcode")
+		p.set("user_id", jsTrim(o.UserID))
+		if p.get("user_id") == "" {
+			p.set("user_id", "0")
+		}
+		p.set("client", "mcode")
 	}
-	p.set("unix", strconv.FormatInt(o.Now, 10))
-	p.set("timezone_offset", strconv.Itoa(o.TZOffset))
-	p.set("sys_language", lang)
-	p.set("lang", lang)
-	p.set("device_id", "0")
-	p.set("os_name", osName)
-	p.set("browser_name", "mcode")
-	p.set("user_id", jsTrim(o.UserID))
-	if p.get("user_id") == "" {
-		p.set("user_id", "0")
-	}
-	p.set("client", "mcode")
 
 	query := p.encode()
 	target, at := resolveURL(origin, path, query)
@@ -2166,34 +2330,59 @@ func resolveURL(origin, path, query string) (target, at string) {
 }
 
 // params is an ordered query parameter set: setting a key that is
-// already there changes its value and keeps its place.
+// already there changes its value and keeps its place, and appending a
+// key puts it there a second time, further down.
 type params struct {
-	keys []string
-	vals map[string]string
+	entries []KV
+	// index is where a key's value is set, so that setting a key again
+	// changes its value and keeps its place.
+	index map[string]int
 }
 
 func newParams() *params {
-	return &params{vals: map[string]string{}}
+	return &params{index: map[string]int{}}
 }
 
 func (p *params) set(k, v string) {
-	if _, ok := p.vals[k]; !ok {
-		p.keys = append(p.keys, k)
+	if i, ok := p.index[k]; ok {
+		p.entries[i].V = v
+		return
 	}
-	p.vals[k] = v
+	p.index[k] = len(p.entries)
+	p.entries = append(p.entries, KV{K: k, V: v})
 }
 
-func (p *params) get(k string) string { return p.vals[k] }
+// append puts the key at the end, even when it is already there.
+//
+// The web client builds its query by filling a URLSearchParams: the
+// common parameters go in first and the caller's own parameter is
+// appended after them, so a key that is in both halves is in the query
+// twice.
+//
+// The key is registered in the index as well, so that get sees the most
+// recent value and set changes the appended entry in place instead of
+// appending a third copy of it.
+func (p *params) append(k, v string) {
+	p.entries = append(p.entries, KV{K: k, V: v})
+	p.index[k] = len(p.entries) - 1
+}
+
+func (p *params) get(k string) string {
+	if i, ok := p.index[k]; ok {
+		return p.entries[i].V
+	}
+	return ""
+}
 
 func (p *params) encode() string {
 	var b strings.Builder
-	for i, k := range p.keys {
+	for i, e := range p.entries {
 		if i > 0 {
 			b.WriteByte('&')
 		}
-		b.WriteString(formEncode(k))
+		b.WriteString(formEncode(e.K))
 		b.WriteByte('=')
-		b.WriteString(formEncode(p.vals[k]))
+		b.WriteString(formEncode(e.V))
 	}
 	return b.String()
 }
@@ -2288,7 +2477,6 @@ func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
-
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -2341,6 +2529,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"mmxcode/internal/apikey"
 )
 
 func openTest(t *testing.T) *Store {
@@ -2367,6 +2557,634 @@ func makeAccount(t *testing.T, s *Store, id string) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow says a lookup
+// and an insert inside one transaction are one thing to everybody.
+//
+// 两个并发的导入：都按邮箱找，都没有就建一行。真库的事务一开始就把
+// 写锁拿着，所以第二个进来的那个根本进不来——它等第一个提交完，才看得见
+// 第一个建好的那一行。不然同一个站点账号会有两行都是活的。
+//
+// 这一条守的是**先后**，不是等多久：第一个事务查完邮箱之后先把事务开
+// 着不放，第二个事务来敲门（它该在这期间被写锁挡在门外），然后第一个
+// 才建行、提交。第二个事务的事务体因此只能在第一个提交之后才跑，它看
+// 到的必须是第一个建好的那一行。写锁要是没生效，两个事务就会同时查到
+// 「没有」，建出两行来——那时候记下来的先后就不对了。
+//
+// 靠「等半秒钟没动静」是看不出写锁有没有生效的：两个线程谁先跑到哪一
+// 步是碰运气的事，慢的那一个可能压根没赶上。
+func TestTwoTransactionsThatLookUpTheSameEmailMakeOneRow(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// 第一个事务查完邮箱了。starting：第二个事务要敲门了。
+	holding := make(chan struct{})
+	starting := make(chan struct{})
+	// events 记着事情发生的先后。
+	var mu sync.Mutex
+	var events []string
+	note := func(e string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, e)
+	}
+	take := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), events...)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.Tx(ctx, func(tx Tx) error {
+			_, err := tx.AccountByEmail(ctx, "a@example.com")
+			if !errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("the account is already there: %v", err)
+			}
+			note("first looked")
+			close(holding)
+			// 等第二个事务来敲门，然后给它一点时间去撞那把锁：撞上的那
+			// 一下要在这之前发生，不然这一条就什么也没验到。
+			<-starting
+			time.Sleep(200 * time.Millisecond)
+			acc := Account{
+				ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+				Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			note("first made")
+			return tx.SaveToken(ctx, Token{
+				AccountID: acc.ID, Access: "tok", Refresh: "ref",
+				ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+			})
+		})
+		if err != nil {
+			t.Errorf("the first transaction: %v", err)
+		}
+	}()
+	<-holding
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// 敲门：这一下之后，这个事务就该去撞写锁了。
+		close(starting)
+		err := s.Tx(ctx, func(tx Tx) error {
+			acc, err := tx.AccountByEmail(ctx, "a@example.com")
+			if errors.Is(err, ErrNotFound) {
+				note("second made one of its own")
+				acc = Account{
+					ID: "acc_2", Name: "a@example.com", Email: "a@example.com",
+					Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+				}
+				if err := tx.CreateAccount(ctx, acc); err != nil {
+					return err
+				}
+				return tx.SaveToken(ctx, Token{
+					AccountID: acc.ID, Access: "tok", Refresh: "ref",
+					ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+				})
+			}
+			if err != nil {
+				return err
+			}
+			note("second found the row")
+			return nil
+		})
+		if err != nil {
+			t.Errorf("the second transaction: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	// The order is the point: the second one looked after the first one
+	// had made its row, and it found that row.
+	want := []string{"first looked", "first made", "second found the row"}
+	got := take()
+	if len(got) != len(want) {
+		t.Fatalf("what happened = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("what happened = %v, want %v", got, want)
+		}
+	}
+
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %d, want one row", len(rows))
+	}
+	if rows[0].ID != "acc_1" {
+		t.Fatalf("the row is %q, want the one the first transaction made", rows[0].ID)
+	}
+}
+
+// TestAnAccountIsFoundByItsSubject says the token's subject is a key.
+//
+// 令牌里带的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少次
+// 都是它。去重靠它，才不会在清单上的地址和站点那边报的地址不一样的时候
+// 建出第二行。
+func TestAnAccountIsFoundByItsSubject(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.AccountBySubject(ctx, "sub-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want acc_1", acc.ID)
+	}
+	if _, err := s.AccountBySubject(ctx, "sub-2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.AccountBySubject(ctx, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestTheAccountFoundByItsSubjectIsTheOldestOne says which row comes
+// when two rows carry the same subject.
+//
+// 同一个 subject 有两行，说明库里本来就有同一个站点账号的两行（老数
+// 据）。取哪一行是要说好的：取先建的那一行——后来那一行可能是哪一次
+// 出错的导入留下的，那一行的令牌未必对。
+func TestTheAccountFoundByItsSubjectIsTheOldestOne(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// 后建的那一行先拿到手，为的是看清「先建的」说的是创建时间，不
+	// 是碰巧。
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_2", Name: "b", Email: "b@example.com", Status: StatusActive,
+		CreatedAt: now.Add(time.Minute), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_2", Access: "tok2", Refresh: "ref2",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := s.AccountBySubject(ctx, "sub-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want the one that was made first", acc.ID)
+	}
+}
+
+// TestASignedOutAccountIsStillFoundByItsSubject says signing an
+// account out does not lose the key that says which site account it is.
+//
+// 签出是要收走令牌的：站点不认这个登录了，这份凭据没有用。可是令牌行
+// 里的 subject 得留着——那是站点那边账号自己的 id，是「这个站点账号在
+// 库里是哪一行」的键。签出的账号恰恰是最要紧的那一个：操作的人看见它
+// 掉线了，第一件事就是重新导入它。键要是被抹掉，那一次导入就会当成
+// 新账号，再插一行——两行都是活的，轮转会挑到两次。
+func TestASignedOutAccountIsStillFoundByItsSubject(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := s.SignOutIfTheTokenIsStillThere(ctx, "acc_1", "tok", "the site refused it", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !written {
+		t.Fatal("the sign-out was not written")
+	}
+	a, err := s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != StatusSignedOut {
+		t.Fatalf("status = %q, want %q", a.Status, StatusSignedOut)
+	}
+	tok, err := s.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "" || tok.Refresh != "" {
+		t.Fatalf("the token = %+v, want it taken away", tok)
+	}
+	if tok.Subject != "sub-1" {
+		t.Fatalf("subject = %q, want it kept", tok.Subject)
+	}
+	acc, err := s.AccountBySubject(ctx, "sub-1")
+	if err != nil {
+		t.Fatalf("the signed-out account is not found by its subject: %v", err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want acc_1", acc.ID)
+	}
+}
+
+// TestASignOutDoesNotUndoAFreshSignIn says a sign-out is only written
+// while the token in hand is still the one in the store.
+//
+// 手里这份令牌的续期被站点拒了，可是这期间另一个进程把这账号登回来
+// 了：库里换成了新令牌。这时候把签出写下去，就是把别人刚登好的账号
+// 作废掉，还把那份新令牌收走——页面说这个账号登出了，轮转池也不用它，
+// 而它手里握着一份能用的凭据。
+func TestASignOutDoesNotUndoAFreshSignIn(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 另一个进程登回来了。
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "fresh", Refresh: "freshref",
+		ExpiresAt: now.Add(2 * time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := s.SignOutIfTheTokenIsStillThere(ctx, "acc_1", "old", "the site refused it", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written {
+		t.Fatal("the sign-out was written even though the account was signed in again")
+	}
+	a, err := s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != StatusActive {
+		t.Fatalf("status = %q, want %q", a.Status, StatusActive)
+	}
+	tok, err := s.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "fresh" || tok.Refresh != "freshref" {
+		t.Fatalf("the token = %+v, want the one the other sign-in wrote", tok)
+	}
+}
+
+// TestTheErrorStateIsAlsoConditional says the error state is only
+// written while the token in hand is still the one in the store.
+//
+// 跟签出一样：这次失败说的是手里这份令牌，库里换成了别的，就是有人替
+// 它续好了。把别人刚续好的账号写成出错，页面会说一个好好在用的账号有
+// 毛病。
+func TestTheErrorStateIsAlsoConditional(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "acc_1", Access: "fresh", Refresh: "freshref",
+		ExpiresAt: now.Add(2 * time.Hour), Subject: "sub-1", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := s.MarkErrorIfTheTokenIsStillThere(ctx, "acc_1", "old", "the answer was lost", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written {
+		t.Fatal("the error was written even though the account was signed in again")
+	}
+	a, err := s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != StatusActive {
+		t.Fatalf("status = %q, want %q", a.Status, StatusActive)
+	}
+}
+
+// TestASignInLandsOnTheRowThatIsAlreadyThere says a sign-in does not
+// make a second row for one site account.
+//
+// 一个站点账号在库里只能有一行。这一行多半是批量导入进来的：登录又登
+// 了一遍，是把那一行改好，不是再插一行——同一个站点账号两行都是活的，
+// 轮转会挑到两次，页面把它列两遍，而且其中一个的令牌迟早被另一个的重
+// 登作废。
+func TestASignInLandsOnTheRowThatIsAlreadyThere(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	acc, err := s.SignIn(ctx, Account{
+		ID: "acc_1", Name: "the first one", UserID: "u1", Email: "a@example.com",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+		Subject: "sub-1", UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %+v, want the one that was made", acc)
+	}
+	if acc.Name != "the first one" {
+		t.Fatalf("name = %q, want the one that was given", acc.Name)
+	}
+
+	// 又登了一遍：同一行。
+	again, err := s.SignIn(ctx, Account{
+		ID: "acc_2", Name: "", UserID: "u1", Email: "a@example.com",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok2", Refresh: "ref2", ExpiresAt: now.Add(2 * time.Hour),
+		Subject: "sub-1", UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != "acc_1" {
+		t.Fatalf("account = %q, want the row that was already there", again.ID)
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", rows)
+	}
+	if rows[0].Name != "the first one" {
+		t.Fatalf("name = %q, want the label that was there", rows[0].Name)
+	}
+	tok, err := s.GetToken(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "tok2" {
+		t.Fatalf("the token = %+v, want the new one", tok)
+	}
+}
+
+// TestTheAddressIsWrittenWithoutTheSpacesAroundIt says the address is
+// stored trimmed.
+//
+// 地址是去重的键之一：同一个地址写成两种样子（一边带空格一边不带），
+// 库里就会看成两个账号。
+func TestTheAddressIsWrittenWithoutTheSpacesAroundIt(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "one", Email: "  a@example.com  ",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByEmail(ctx, "a@example.com")
+	if err != nil {
+		t.Fatalf("the account by its address: %v", err)
+	}
+	if got.Email != "a@example.com" {
+		t.Fatalf("email = %q, want it trimmed", got.Email)
+	}
+
+	// 登录那一路也一样：地址两头带着空格，落库的时候得去掉。
+	if _, err := s.SignIn(ctx, Account{
+		ID: "acc_2", Name: "two", Email: "  b@example.com  ",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+		Subject: "sub-2", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s.AccountByEmail(ctx, "b@example.com")
+	if err != nil {
+		t.Fatalf("the account by its address: %v", err)
+	}
+	if got2.Email != "b@example.com" {
+		t.Fatalf("email = %q, want it trimmed", got2.Email)
+	}
+}
+
+// TestASignInOfAnotherAccountMakesItsOwnRow says two site accounts are
+// two rows.
+func TestASignInOfAnotherAccountMakesItsOwnRow(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, sub := range []string{"sub-1", "sub-2"} {
+		if _, err := s.SignIn(ctx, Account{
+			ID: "acc_" + sub, Name: sub, UserID: "u" + sub, Email: sub + "@example.com",
+			Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+		}, Token{
+			Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+			Subject: sub, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = i
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("accounts = %v, want two rows", rows)
+	}
+}
+
+// TestAMarkedSignedOutAccountIsNotMarkedAgain says the reason for a
+// failed sign-in is only written while the account is still signed out.
+//
+// 另一个进程可能刚把这个账号登回去了，那一行现在是 active 了：这时候
+// 把它写回 signed_out，就是把别人刚换好的令牌作废掉，还让这个账号显示
+// 成登出的状态——手里却握着一份能用的凭据。
+func TestAMarkedSignedOutAccountIsNotMarkedAgain(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com", Status: StatusSignedOut,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	written, err := s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !written {
+		t.Fatal("the reason was not written down")
+	}
+	acc, err := s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != StatusSignedOut || !strings.Contains(acc.LastError, "refused") {
+		t.Fatalf("account = %+v", acc)
+	}
+
+	// 别人把它登回去了。
+	if err := s.UpdateAccountStatus(ctx, "acc_1", StatusActive, "", now); err != nil {
+		t.Fatal(err)
+	}
+	written, err = s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written {
+		t.Fatal("the account that is active was marked as signed out")
+	}
+	acc, err = s.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != StatusActive {
+		t.Fatalf("status = %q, want active", acc.Status)
+	}
+}
+
+// TestATransactionThatFailsLeavesNothingBehind says a transaction that
+// fails takes its writes back.
+//
+// 写失败的时候不能留半截子：读者会看见一行没有令牌的账号，那个账号
+// 以后就登不回来了。
+func TestATransactionThatFailsLeavesNothingBehind(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	err := s.Tx(ctx, func(tx Tx) error {
+		if err := tx.CreateAccount(ctx, Account{
+			ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+			Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return errors.New("the disk is full")
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("accounts = %d, want none", len(rows))
+	}
+}
+
+// TestATransactionThatIsCutShortHalfWayLeavesNothingBehind says a
+// transaction that is cut short half way takes its writes back.
+//
+// 导入被掐断的时候，行写下去了、令牌没写下去：这样的半截子留在库里，
+// 读者看见的是一个没有令牌的账号——那个账号以后就登不回来了。
+//
+// 回滚不用调用方的上下文：那时候它已经没了。
+func TestATransactionThatIsCutShortHalfWayLeavesNothingBehind(t *testing.T) {
+	s := openTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now()
+
+	err := s.Tx(ctx, func(tx Tx) error {
+		if err := tx.CreateAccount(ctx, Account{
+			ID: "acc_1", Name: "a@example.com", Email: "a@example.com",
+			Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		// 这一趟导入被掐断了：下一笔写不进去了。
+		cancel()
+		return tx.SaveToken(ctx, Token{
+			AccountID: "acc_1", Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	rows, err := s.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("accounts = %d, want none", len(rows))
 	}
 }
 
@@ -3747,6 +4565,453 @@ func TestTheFileAtVersionTwoGetsThePlanErrorColumn(t *testing.T) {
 		t.Fatalf("the plan error is %q", snaps[0].PlanError)
 	}
 }
+
+// TestThePasswordGoesInAndComesBack says the encrypted password can be
+// written and read back.
+func TestThePasswordGoesInAndComesBack(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(ctx, "acc_1", "Y2lwaGVy", now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Password(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Y2lwaGVy" {
+		t.Fatalf("password = %q", got)
+	}
+}
+
+// TestAnAccountWithoutAPassword says an account that was not brought
+// in by a batch import has no password, and that is not an error.
+func TestAnAccountWithoutAPassword(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateAccount(ctx, Account{ID: "acc_1", Name: "a", Status: StatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Password(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("password = %q, want none", got)
+	}
+}
+
+// TestTheImportRunIsKept says a batch import is written down with what
+// came of it.
+func TestTheImportRunIsKept(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "cli", StartedAt: now, Total: 2}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.FinishImportRun(ctx, "run_1", now, 1, 1, `[{"email":"a@example.com","ok":true}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.ListImportRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs", len(runs))
+	}
+	if runs[0].OK != 1 || runs[0].Failed != 1 || runs[0].Results == "" {
+		t.Fatalf("run = %+v", runs[0])
+	}
+}
+
+// TestAnImportRunCanBeAskedForByItsName says one batch import can be
+// taken out on its own.
+//
+// 页面上要看得见某一次导入走到哪儿了：光有"最近的几次"不够，
+// 得能按名字把这一次导入单独取出来。
+func TestAnImportRunCanBeAskedForByItsName(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second)
+	if err := s.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "web", StartedAt: now, Total: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishImportRun(ctx, "run_1", now, 1, 1, "[]"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetImportRun(ctx, "run_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "run_1" || got.Source != "web" || got.OK != 1 || got.Failed != 1 {
+		t.Fatalf("run = %+v", got)
+	}
+}
+
+// TestAnImportRunThatIsNotThere says a name that is not there is an
+// error, and not a quiet empty run.
+func TestAnImportRunThatIsNotThere(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.GetImportRun(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get import run: %v, want ErrNotFound", err)
+	}
+}
+
+// TestTheOldFileGetsThePasswordColumn says a file that was made before
+// the password column is brought forward: the column is there, the
+// rows are still in it, and the accounts that had no password have
+// none.
+//
+// 老库要有 password 那一列，行还要在，没有密码的账号还是 NULL。
+func TestTheOldFileGetsThePasswordColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	makeAccount(t, s, "acc_01")
+	if err := s.SaveToken(ctx, Token{AccountID: "acc_01", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE accounts DROP COLUMN password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "DROP TABLE import_runs"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再打开就该被补上。
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := s2.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("the file is at version %d, want %d", version, schemaVersion)
+	}
+	cols, err := columnsOf(ctx, s2.db, "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cols["password"]; !ok {
+		t.Fatal("accounts has no column password")
+	}
+	// 行还在
+	if _, err := s2.GetAccount(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	// 账本也还在
+	tok, err := s2.GetToken(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Access != "a" {
+		t.Fatalf("got %+v", tok)
+	}
+	// 没有密码的账号，那一格是空的，不是空字符串
+	var isNull bool
+	if err := s2.db.QueryRowContext(ctx,
+		"SELECT password IS NULL FROM accounts WHERE id = ?", "acc_01").Scan(&isNull); err != nil {
+		t.Fatal(err)
+	}
+	if !isNull {
+		t.Fatal("the password of an account that never had one is not NULL")
+	}
+	got, err := s2.Password(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Fatalf("password = %q, want none", got)
+	}
+	// 导入留痕的表也有了
+	if err := s2.CreateImportRun(ctx, ImportRun{ID: "run_1", Source: "cli",
+		StartedAt: time.Now(), Total: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAnAccountIsFoundByItsEmail says an account can be found by the
+// email it was brought in with.
+//
+// 同一个邮箱只该有一行：重跑一次导入的时候，靠这个把原来那一行找
+// 出来更新，而不是再来一行。
+func TestAnAccountIsFoundByItsEmail(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByEmail(ctx, "a@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %+v", got)
+	}
+	// 邮箱比大小写：清单上写的是哪个样子，库里存的是哪个样子，人看着
+	// 是同一个就是同一个。
+	got, err = s.AccountByEmail(ctx, "A@Example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %+v", got)
+	}
+	_, err = s.AccountByEmail(ctx, "b@example.com")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("error = %v, want not found", err)
+	}
+}
+
+// TestASignInLandsOnTheRowWithTheSameUserID says a sign-in lands on the
+// row that has the same site user id.
+//
+// 站点给的 realUserID 是账号唯一稳当的钥匙。有的账号没有邮箱，令牌里
+// 也没有 sub：这样的账号再登一遍，要是只按邮箱和 sub 找，就会多出一行
+// 活的——同一个站点账号两行都是活的，轮转会挑到两次，页面把它列两遍。
+func TestASignInLandsOnTheRowWithTheSameUserID(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	acc, err := s.SignIn(ctx, Account{
+		ID: "acc_1", Name: "the first one", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok", Refresh: "ref", ExpiresAt: now.Add(time.Hour),
+		UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "acc_1" {
+		t.Fatalf("account = %q, want the one that was made", acc.ID)
+	}
+
+	// 又登了一遍：没有邮箱，令牌里也没有 sub，只有那个 user id。
+	again, err := s.SignIn(ctx, Account{
+		ID: "acc_2", Name: "", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}, Token{
+		Access: "tok2", Refresh: "ref2", ExpiresAt: now.Add(2 * time.Hour),
+		UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != "acc_1" {
+		t.Fatalf("account = %q, want the row that was already there", again.ID)
+	}
+	rows, err := s.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v, want one row for one site account", rows)
+	}
+}
+
+// TestTheAccountIsFoundByItsUserID says the site user id finds the
+// account.
+//
+// 签到和积分明细要的是真的那个 user id，找账号也要按它找得到。
+func TestTheAccountIsFoundByItsUserID(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.CreateAccount(ctx, Account{
+		ID: "acc_1", Name: "one", UserID: "578078539524956167",
+		Status: StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AccountByUserID(ctx, "578078539524956167")
+	if err != nil {
+		t.Fatalf("the account by its user id: %v", err)
+	}
+	if got.ID != "acc_1" {
+		t.Fatalf("account = %q, want acc_1", got.ID)
+	}
+	// 空的 user id 不是一把钥匙：没有它的账号，谁也不是。
+	if _, err := s.AccountByUserID(ctx, "  "); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+}
+
+// TestAKeyIsWrittenAndFound says a key that is written down can be
+// found again by its hash.
+//
+// 网关认一把 key，靠的就是它的哈希：库里存哈希，请求带来的 key 算一次
+// 哈希，两边对上了就是那一把。
+func TestAKeyIsWrittenAndFound(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := apikey.Hash(plain)
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "给我的笔记本", KeyHash: hash,
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.APIKeyByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("the key by its hash: %v", err)
+	}
+	if got.ID != "key_1" {
+		t.Fatalf("key = %+v, want the one that was written", got)
+	}
+	if got.Name != "给我的笔记本" {
+		t.Fatalf("name = %q", got.Name)
+	}
+	if got.RevokedAt != nil {
+		t.Fatalf("the key is already revoked: %v", got.RevokedAt)
+	}
+}
+
+// TestTheKeyItselfIsNotInTheDatabase says the database does not keep the
+// key.
+//
+// 数据库被人拿走的时候，里面不该有一把能开门的 key：它存的是哈希。
+func TestTheKeyItselfIsNotInTheDatabase(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "n", KeyHash: apikey.Hash(plain),
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v, want one", keys)
+	}
+	if strings.Contains(keys[0].KeyHash, plain) {
+		t.Fatal("the key itself is in the database")
+	}
+	if keys[0].KeyHash != apikey.Hash(plain) {
+		t.Fatalf("hash = %q, want the hash of the key", keys[0].KeyHash)
+	}
+}
+
+// TestARevokedKeyIsNotFound says a revoked key does not open the gate.
+//
+// 撤销是把门关上：撤了的那一把不该再能进门。它还在库里——人得看得见
+// 它曾经有过，也得说得清它什么时候没的。
+func TestARevokedKeyIsNotFound(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	plain, _ := apikey.New()
+	hash := apikey.Hash(plain)
+	if err := s.CreateAPIKey(ctx, APIKey{
+		ID: "key_1", Name: "n", KeyHash: hash,
+		Prefix: apikey.Display(plain), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeAPIKey(ctx, "key_1", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.APIKeyByHash(ctx, hash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v, want the revoked one still to be there", keys)
+	}
+	if keys[0].RevokedAt == nil {
+		t.Fatal("the key does not say when it was revoked")
+	}
+}
+
+// TestTheKeysAreListedNewestFirst says the newest key comes first.
+func TestTheKeysAreListedNewestFirst(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, id := range []string{"key_1", "key_2"} {
+		if err := s.CreateAPIKey(ctx, APIKey{
+			ID: id, Name: id, KeyHash: apikey.Hash(id),
+			Prefix: "sk-…", CreatedAt: now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys, err := s.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want two", keys)
+	}
+	if keys[0].ID != "key_2" {
+		t.Fatalf("the first key is %q, want the newest one", keys[0].ID)
+	}
+}
+
+// TestAKeyThatIsNotThereIsNotFound says a key that was never written is
+// not found.
+func TestAKeyThatIsNotThereIsNotFound(t *testing.T) {
+	s := openTest(t)
+	if _, err := s.APIKeyByHash(context.Background(), "nothing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want not found", err)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3827,7 +5092,8 @@ var tables = []table{
   proxy_url    TEXT,
   last_error   TEXT,
   created_at   INTEGER NOT NULL,
-  updated_at   INTEGER NOT NULL
+  updated_at   INTEGER NOT NULL,
+  password    TEXT
 )`,
 		copy: []copyColumn{
 			notNull("id", "''"),
@@ -3840,6 +5106,30 @@ var tables = []table{
 			nullable("last_error"),
 			notNull("created_at", "0"),
 			notNull("updated_at", "0"),
+			nullable("password"),
+		},
+	},
+	{
+		name: "import_runs",
+		body: `(
+  id          TEXT PRIMARY KEY,
+  source      TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  finished_at INTEGER,
+  total       INTEGER NOT NULL DEFAULT 0,
+  ok          INTEGER NOT NULL DEFAULT 0,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  results     TEXT
+)`,
+		copy: []copyColumn{
+			notNull("id", "''"),
+			notNull("source", "''"),
+			notNull("started_at", "0"),
+			nullable("finished_at"),
+			notNull("total", "0"),
+			notNull("ok", "0"),
+			notNull("failed", "0"),
+			nullable("results"),
 		},
 	},
 	{
@@ -3964,6 +5254,31 @@ var tables = []table{
 			notNull("ok", "0"),
 			nullable("error"),
 			notNull("checked_at", "0"),
+		},
+	},
+	{
+		// The keys that open the chat API. They are not an account's:
+		// a key belongs to the gateway, not to a MiniMax account, so it
+		// has no account to be taken away with.
+		//
+		// The key itself is not in here: the hash of it is. The database
+		// is worth stealing; a key in it would open the gate.
+		name: "api_keys",
+		body: `(
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  key_hash   TEXT NOT NULL UNIQUE,
+  prefix     TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+)`,
+		copy: []copyColumn{
+			notNull("id", "''"),
+			notNull("name", "''"),
+			notNull("key_hash", "''"),
+			notNull("prefix", "''"),
+			notNull("created_at", "0"),
+			nullable("revoked_at"),
 		},
 	},
 }
@@ -4168,6 +5483,18 @@ type EgressHealth struct {
 	CheckedAt time.Time
 }
 
+// ImportRun is one batch import and what came of it.
+type ImportRun struct {
+	ID         string
+	Source     string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Total      int
+	OK         int
+	Failed     int
+	Results    string
+}
+
 // Open opens the database at path, creating it and its directory if
 // they are not there.
 //
@@ -4343,7 +5670,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 3
+const schemaVersion = 5
 
 // migrations are the steps, in order.
 //
@@ -4352,6 +5679,8 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateMake,
 	migrateConform,
 	migratePlanError,
+	migrateBatchImport,
+	migrateAPIKeys,
 }
 
 // migrateMake makes the tables that are not there.
@@ -4433,6 +5762,78 @@ func migratePlanError(ctx context.Context, conn *sql.Conn) error {
 		for _, t := range tables {
 			if t.name == "usage_snapshots" {
 				return rebuildTable(ctx, tx, t)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateBatchImport gives the accounts their password column and the
+// file its table of batch imports.
+//
+// Both were added after the file's shape was settled, so a file that
+// was made before them does not have them. The accounts table is
+// rebuilt when the column is not there, and the table of imports is
+// made when it is not there.
+//
+// The accounts that were already there keep their rows, and their
+// password is left empty: an account that was not brought in by a
+// batch import has no password, and saying so with an empty string
+// would make it look like there is a password that is not there.
+func migrateBatchImport(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 4, func(tx *sql.Tx) error {
+		cols, err := columnsOf(ctx, tx, "accounts")
+		if err != nil {
+			return err
+		}
+		if _, ok := cols["password"]; !ok {
+			for _, t := range tables {
+				if t.name == "accounts" {
+					if err := rebuildTable(ctx, tx, t); err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		for _, t := range tables {
+			if t.name != "import_runs" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got != "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateAPIKeys gives the file its table of api keys.
+//
+// 这一张表是后来才有的：一个文件在它之前做出来的时候没有它。表不在就
+// 造出来，在就不动它——已经有了的 key 不该为了一个迁移被抄一遍。
+func migrateAPIKeys(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 5, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			if t.name != "api_keys" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got != "" {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
 			}
 		}
 		return nil
@@ -4630,14 +6031,23 @@ func fromMS(v int64) time.Time {
 
 // CreateAccount inserts an account.
 func (s *Store) CreateAccount(ctx context.Context, a Account) error {
+	return s.createAccount(ctx, s.db, a)
+}
+
+// createAccount inserts an account, on the pool or inside a
+// transaction.
+//
+// 同一句语句在事务里和事务外都要用：能跑语句的就这三样，所以语句只
+// 写一遍。
+func (s *Store) createAccount(ctx context.Context, db execer, a Account) error {
 	if err := checkStatus(a.Status); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO accounts (id, name, user_id, email, status, proxy_group, proxy_url,
 			last_error, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.UserID, a.Email, a.Status, a.ProxyGroup, a.ProxyURL,
+		a.ID, a.Name, a.UserID, strings.TrimSpace(a.Email), a.Status, a.ProxyGroup, a.ProxyURL,
 		a.LastError, ms(s.stamp(a.CreatedAt)), ms(s.stamp(a.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("create account: %w", err)
@@ -4678,10 +6088,14 @@ func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
 // have to read the account first, and a change that touches the state
 // cannot lose a change that touched something else.
 func (s *Store) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return s.updateAccountStatus(ctx, s.db, id, status, lastError, updatedAt)
+}
+
+func (s *Store) updateAccountStatus(ctx context.Context, db execer, id, status, lastError string, updatedAt time.Time) error {
 	if err := checkStatus(status); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=?`,
 		status, lastError, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -4699,7 +6113,11 @@ func (s *Store) UpdateAccountStatus(ctx context.Context, id, status, lastError s
 // are the only things it writes, so a caller that changes the outlet
 // does not have to read the account first.
 func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	return s.setAccountProxy(ctx, s.db, id, group, url, updatedAt)
+}
+
+func (s *Store) setAccountProxy(ctx context.Context, db execer, id, group, url string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET proxy_group=?, proxy_url=?, updated_at=? WHERE id=?`,
 		group, url, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -4717,7 +6135,11 @@ func (s *Store) SetAccountProxy(ctx context.Context, id, group, url string, upda
 // writes, so a caller that renames an account does not have to read
 // the account first, and cannot lose a change another writer made.
 func (s *Store) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	return s.setAccountName(ctx, s.db, id, name, updatedAt)
+}
+
+func (s *Store) setAccountName(ctx context.Context, db execer, id, name string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
 		UPDATE accounts SET name=?, updated_at=? WHERE id=?`,
 		name, ms(s.stamp(updatedAt)), id)
 	if err != nil {
@@ -4725,6 +6147,256 @@ func (s *Store) SetAccountName(ctx context.Context, id, name string, updatedAt t
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("set the name of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// SetAccountIdentity writes an account's address and user id.
+//
+// 它是窄的：只写这两样。站点那边报出来的真邮箱和真用户 id 知道了就写
+// 上去——不去重的时候邮箱是键之一，键停在旧的地方，下一次导入就会把
+// 这个账号当成新账号，再插一行。
+//
+// 地址写进去之前是要去空格的：地址是去重的键之一，同一个地址写成两种
+// 样子，就看成两个账号。
+func (s *Store) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return s.setAccountIdentity(ctx, s.db, id, email, userID, updatedAt)
+}
+
+func (s *Store) setAccountIdentity(ctx context.Context, db execer, id, email, userID string, updatedAt time.Time) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE accounts SET email=?, user_id=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(email), userID, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the identity of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the identity of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// SignIn records a sign-in: the account and its token.
+//
+// 一个站点账号在库里只能有一行。库里已经有这一行的时候改那一行，不另
+// 起一行——同一个站点账号两行都是活的，轮转会挑到两次，页面把它列两遍，
+// 而且其中一个的令牌迟早被另一个的重登作废。
+//
+// 找的是令牌里带的那个 sub：那是站点账号自己的 id，一个站点账号一个，
+// 重登多少次都是它。清单上的邮箱可能是别名，站点那边报的邮箱又可能一
+// 时问不出来，只有它是一直在的。邮箱是第二条路：有的登录那条路上，令牌
+// 里的 sub 是空的。
+//
+// a 是这个账号该有的样子：它的 id 只在没有那一行的时候才用得上。a.Email
+// 是站点那边说的地址：它是空的，说明这一次没问出身份来——那就不动那一
+// 行上的地址和用户 id，把空的写上去等于把知道的东西换成不知道的。
+//
+// 名字是人自己写的标签：给了就写上去，没给就把原来那一行上的留着。
+func (s *Store) SignIn(ctx context.Context, a Account, tok Token) (Account, error) {
+	var out Account
+	err := s.Tx(ctx, func(tx Tx) error {
+		row, err := findForSignIn(ctx, tx, a, tok)
+		if err != nil {
+			return err
+		}
+		now := a.UpdatedAt
+		if row.ID == "" {
+			// 没有那一行：这就是一个新账号。名字没有给定的时候，用知道
+			// 的东西起：地址、用户 id、令牌里带的那个站点账号 id。
+			acc := a
+			acc.Name = firstNonEmpty(a.Name, a.Email, a.UserID, tok.Subject)
+			if err := tx.CreateAccount(ctx, acc); err != nil {
+				return err
+			}
+			row = acc
+		} else {
+			// 已经有这一行了：改它，不另起一行。
+			if a.Email != "" && (a.Email != row.Email || a.UserID != row.UserID) {
+				if err := tx.SetAccountIdentity(ctx, row.ID, a.Email, a.UserID, now); err != nil {
+					return err
+				}
+				row.Email = a.Email
+				row.UserID = a.UserID
+			}
+			if a.Name != "" && a.Name != row.Name {
+				if err := tx.SetAccountName(ctx, row.ID, a.Name, now); err != nil {
+					return err
+				}
+				row.Name = a.Name
+			}
+			if row.Status != StatusActive {
+				// 它刚登进来：状态回到 active。
+				if err := tx.UpdateAccountStatus(ctx, row.ID, StatusActive, "", now); err != nil {
+					return err
+				}
+				row.Status = StatusActive
+			}
+		}
+		if err := tx.SaveToken(ctx, Token{
+			AccountID: row.ID, Access: tok.Access, Refresh: tok.Refresh,
+			ExpiresAt: tok.ExpiresAt, Subject: tok.Subject, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		out = row
+		return nil
+	})
+	if err != nil {
+		return Account{}, err
+	}
+	return out, nil
+}
+
+// findForSignIn gives the row that belongs to this site account.
+//
+// It gives an empty account when there is none: that is a new account,
+// not an error.
+func findForSignIn(ctx context.Context, tx Tx, a Account, tok Token) (Account, error) {
+	if tok.Subject != "" {
+		row, err := tx.AccountBySubject(ctx, tok.Subject)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
+	if a.Email != "" {
+		row, err := tx.AccountByEmail(ctx, a.Email)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
+	// 站点给的那个真的 user id：有的账号没有邮箱，令牌里也没有 sub，
+	// 只有它认得出是哪一个站点账号。少了这一步，这样的账号每登一次就
+	// 多一行活的。
+	if a.UserID != "" {
+		row, err := tx.AccountByUserID(ctx, a.UserID)
+		if err == nil {
+			return row, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return Account{}, err
+		}
+	}
+	return Account{}, nil
+}
+
+// firstNonEmpty gives the first value that is not empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// MarkSignedOut writes the reason a sign-in failed, but only while the
+// account is still signed out.
+//
+// 它是有条件的：另一个进程可能刚把这个账号登回去了，那一行现在是
+// active 了，这时候把它写回 signed_out，就是把别人刚换好的令牌作废掉，
+// 还让这个账号显示成登出的状态——手里却握着一份能用的凭据。轮转池不
+// 会用它，下一轮又要登一次，白白多登一次。
+//
+// 它说有没有写下去：没有写，说明这一行的状态已经不是签出的了。
+func (s *Store) MarkSignedOut(ctx context.Context, id, lastError string, updatedAt time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=? AND status=?`,
+		StatusSignedOut, lastError, ms(s.stamp(updatedAt)), id, StatusSignedOut)
+	if err != nil {
+		return false, fmt.Errorf("mark the account %s as signed out: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// SignOutIfTheTokenIsStillThere signs the account out and takes its
+// token away, but only while the token row still holds that access
+// token.
+//
+// 签出是**有条件**地写的：另一个进程可能刚把这个账号登回去了。手里这
+// 份令牌就是这次失败说的那份；库里换成了别的，就是有人替它登好了，这
+// 时候把它写回签出，就是把别人刚换好的令牌作废掉，还让这个账号显示成
+// 登出的状态——手里却握着一份能用的凭据，轮转池不用它，下一轮又要登
+// 一次。
+//
+// 它说有没有写下去。没有写，说明库里那一份令牌已经不是手里这一份了：
+// 有人在这中间把账号救回来了，这次的失败说的已经不是它了。
+//
+// 写状态和收走令牌是一起写的。中间插进来一个写，账号就会停在「状态是
+// 签出、令牌还在」的样子：状态说它登出了，令牌却还在，每次请求都要
+// 去续一次，续不回来。
+//
+// 令牌行里的 subject 留着。那是站点那边账号自己的 id，不是凭据——它是
+// 「这个站点账号在库里是哪一行」的键。抹掉它，下次导入这个账号就会当
+// 成新账号再插一行，而那一行是活的。
+func (s *Store) SignOutIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	written := false
+	err := s.tx(ctx, func(tx *sqlTx) error {
+		n, err := tx.setStatusIfTokenUnchanged(ctx, id, access, StatusSignedOut, reason, updatedAt)
+		if err != nil || !n {
+			return err
+		}
+		written = true
+		return tx.blankToken(ctx, id, updatedAt)
+	})
+	if err != nil {
+		return false, err
+	}
+	return written, nil
+}
+
+// MarkErrorIfTheTokenIsStillThere writes the error state down, but only
+// while the token row still holds that access token.
+//
+// 它和 SignOutIfTheTokenIsStillThere 是同一个条件、同一件事：这个错误
+// 说的是手里这份令牌的事，库里换成了别的令牌，说的就不是这个账号了。
+// 把别人刚换好的状态改回出错，页面就会说一个好好在用的账号出错了。
+func (s *Store) MarkErrorIfTheTokenIsStillThere(ctx context.Context, id, access, reason string, updatedAt time.Time) (bool, error) {
+	return s.setStatusIfTokenUnchanged(ctx, s.db, id, access, StatusError, reason, updatedAt)
+}
+
+// setStatusIfTokenUnchanged writes the state and the reason, but only
+// while the token row still holds that access token.
+//
+// The access token is what says the chain in hand is still the chain in
+// the store: every renewal hands out a new access token, so a different
+// one means somebody else has moved the account on since.
+//
+// 手里没有令牌可比的时候不写：这次失败说的不是库里那一份令牌，写下去
+// 只能靠猜。
+func (s *Store) setStatusIfTokenUnchanged(ctx context.Context, db execer, id, access, status, reason string, updatedAt time.Time) (bool, error) {
+	if strings.TrimSpace(access) == "" {
+		return false, nil
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE accounts SET status=?, last_error=?, updated_at=?
+		WHERE id=? AND EXISTS (
+			SELECT 1 FROM tokens t WHERE t.account_id=accounts.id AND t.access=?
+		)`, status, reason, ms(s.stamp(updatedAt)), id, access)
+	if err != nil {
+		return false, fmt.Errorf("set the state of the account %s: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// blankToken takes an account's token away.
+//
+// The subject stays: it is the site account's own id, not a credential,
+// and it is what says which site account the row is. Wiping it would
+// make the next import of that account make a second row — a live one.
+func (s *Store) blankToken(ctx context.Context, db execer, id string, updatedAt time.Time) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE tokens SET access='', refresh='', expires_at=0, updated_at=? WHERE account_id=?`,
+		ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("take the token of the account %s away: %w", id, err)
 	}
 	return nil
 }
@@ -4748,6 +6420,148 @@ func (s *Store) SetAccountLastError(ctx context.Context, id, lastError string, u
 	return nil
 }
 
+// SetPassword writes an account's encrypted password.
+//
+// The cipher text is written on its own, so that the other setters --
+// which write one column each -- do not have to know about it.
+//
+// An account that is not there is ErrNotFound: the caller believes it
+// wrote a password, and writing nothing is not writing one.
+func (s *Store) SetPassword(ctx context.Context, id, cipher string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts SET password=?, updated_at=? WHERE id=?`,
+		cipher, ms(s.stamp(updatedAt)), id)
+	if err != nil {
+		return fmt.Errorf("set the password of the account %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("set the password of the account %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// Password gives an account's encrypted password.
+//
+// An account that was not brought in by a batch import has none, and
+// that is not an error: the text is empty.
+//
+// An account that is not there at all has no password either, and that
+// is not an error either: the caller asked about a password, and there
+// is none. A caller that cares whether the account is there asks for
+// the account.
+func (s *Store) Password(ctx context.Context, id string) (string, error) {
+	var cipher sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT password FROM accounts WHERE id=?`, id).Scan(&cipher)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get the password of the account %s: %w", id, err)
+	}
+	return cipher.String, nil
+}
+
+// CreateImportRun records the start of a batch import.
+//
+// The run is written down before the accounts are made, so that an
+// import that is still going can be seen.
+func (s *Store) CreateImportRun(ctx context.Context, r ImportRun) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO import_runs (id, source, started_at, total, ok, failed)
+		VALUES (?,?,?,?,?,?)`,
+		r.ID, r.Source, ms(s.stamp(r.StartedAt)), r.Total, r.OK, r.Failed)
+	if err != nil {
+		return fmt.Errorf("create import run %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// FinishImportRun records what a batch import came to.
+//
+// The results are kept as they were given: they are the reader's to
+// read, and the store does not have to know what is in them.
+func (s *Store) FinishImportRun(ctx context.Context, id string, finishedAt time.Time, ok, failed int, results string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE import_runs SET finished_at=?, ok=?, failed=?, results=? WHERE id=?`,
+		ms(s.stamp(finishedAt)), ok, failed, results, id)
+	if err != nil {
+		return fmt.Errorf("finish import run %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("finish import run %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// GetImportRun gives one batch import by its name.
+//
+// A name that is not there is ErrNotFound: the caller asked about one
+// particular import, and being handed a different one would be worse
+// than being told there is none.
+func (s *Store) GetImportRun(ctx context.Context, id string) (ImportRun, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs WHERE id=?`, id)
+	r, err := scanImportRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return ImportRun{}, fmt.Errorf("get import run %s: %w", id, err)
+	}
+	return r, nil
+}
+
+// ListImportRuns gives the most recent batch imports.
+//
+// A limit of zero or less means the usual twenty: a limit is a limit,
+// and a limit of zero is no limit at all, which is not what a reader
+// of the page wants.
+func (s *Store) ListImportRuns(ctx context.Context, limit int) ([]ImportRun, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source, started_at, finished_at, total, ok, failed,
+			COALESCE(results, '')
+		FROM import_runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list import runs: %w", err)
+	}
+	defer rows.Close()
+	var out []ImportRun
+	for rows.Next() {
+		r, err := scanImportRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list import runs: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list import runs: %w", err)
+	}
+	return out, nil
+}
+
+// scanImportRun reads one batch import.
+func scanImportRun(sc scanner) (ImportRun, error) {
+	var (
+		r        ImportRun
+		started  int64
+		finished sql.NullInt64
+		results  sql.NullString
+	)
+	if err := sc.Scan(&r.ID, &r.Source, &started, &finished, &r.Total, &r.OK,
+		&r.Failed, &results); err != nil {
+		return ImportRun{}, err
+	}
+	r.StartedAt = fromMS(started)
+	r.FinishedAt = fromMS(finished.Int64)
+	r.Results = results.String
+	return r, nil
+}
+
 // checkStatus says whether a status is one of ours.
 //
 // The rotator looks for the active accounts, so an account with a
@@ -4759,6 +6573,138 @@ func checkStatus(status string) error {
 	}
 	return fmt.Errorf("unknown account status %q: it is %q, %q or %q",
 		status, StatusActive, StatusSignedOut, StatusError)
+}
+
+// execer is what can run a statement.
+//
+// 事务里和事务外跑的是同一批语句：连接池和事务都做得到，所以语句只
+// 写一遍，事务里跑的也是同一句。
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// Tx is what one transaction can do.
+//
+// It is the same set of writes the store has, but inside one
+// transaction: they all land, or none of them does.
+type Tx interface {
+	// AccountByEmail gives the account with that email, when there is
+	// one. It says ErrNotFound when there is none.
+	AccountByEmail(ctx context.Context, email string) (Account, error)
+	// AccountBySubject gives the account whose token carries that
+	// subject, when there is one. It says ErrNotFound when there is
+	// none.
+	AccountBySubject(ctx context.Context, subject string) (Account, error)
+	// AccountByUserID gives the account with that site user id, when
+	// there is one. It says ErrNotFound when there is none.
+	AccountByUserID(ctx context.Context, userID string) (Account, error)
+	// CreateAccount inserts an account.
+	CreateAccount(ctx context.Context, a Account) error
+	// SaveToken writes an account's token.
+	SaveToken(ctx context.Context, t Token) error
+	// SetAccountIdentity writes an account's address and user id.
+	SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error
+	// SetAccountName writes the account's name.
+	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
+	// SetAccountProxy writes the account's outlet.
+	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
+	// UpdateAccountStatus writes the account's state and its last
+	// error.
+	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
+}
+
+// Tx runs fn inside one write transaction.
+//
+// The write lock is taken when the transaction starts (the data source
+// name says _txlock=immediate), so "look the email up, and make a row
+// when there is none" cannot be done by two imports at the same time.
+// Without that, two concurrent imports of one email leave two live rows
+// of one site account: both of them are in the rotation pool, the page
+// lists the account twice, and the token of one of them is bound to be
+// thrown away by the other one's re-login.
+//
+// An error from fn rolls the transaction back: a reader never sees a
+// row whose token was not written.
+//
+// The rollback does not need the caller's context: the caller may have
+// been cut short, and the half of the transaction that did land has to
+// go back all the same.
+func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
+	return s.tx(ctx, func(tx *sqlTx) error { return fn(tx) })
+}
+
+// tx runs fn inside one write transaction.
+//
+// It is what Tx hands out, and what the store's own two-step writes use
+// when the two steps have to land together.
+func (s *Store) tx(ctx context.Context, fn func(*sqlTx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin a transaction: %w", err)
+	}
+	if err := fn(&sqlTx{s: s, tx: tx}); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("commit the transaction: %w", err)
+	}
+	return nil
+}
+
+// sqlTx is one transaction of the store.
+//
+// 它拿着库，是为了那几样要盖时间戳的语句：时间戳是库自己的时钟盖的
+// （东八区），不是调用方的。
+type sqlTx struct {
+	s  *Store
+	tx *sql.Tx
+}
+
+func (t *sqlTx) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	return t.s.accountByEmail(ctx, t.tx, email)
+}
+
+func (t *sqlTx) AccountBySubject(ctx context.Context, subject string) (Account, error) {
+	return t.s.accountBySubject(ctx, t.tx, subject)
+}
+
+func (t *sqlTx) AccountByUserID(ctx context.Context, userID string) (Account, error) {
+	return t.s.accountByUserID(ctx, t.tx, userID)
+}
+
+func (t *sqlTx) CreateAccount(ctx context.Context, a Account) error {
+	return t.s.createAccount(ctx, t.tx, a)
+}
+
+func (t *sqlTx) SaveToken(ctx context.Context, tok Token) error {
+	return t.s.saveToken(ctx, t.tx, tok)
+}
+
+func (t *sqlTx) SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error {
+	return t.s.setAccountIdentity(ctx, t.tx, id, email, userID, updatedAt)
+}
+
+func (t *sqlTx) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
+	return t.s.setAccountName(ctx, t.tx, id, name, updatedAt)
+}
+
+func (t *sqlTx) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+	return t.s.setAccountProxy(ctx, t.tx, id, group, url, updatedAt)
+}
+
+func (t *sqlTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
+	return t.s.updateAccountStatus(ctx, t.tx, id, status, lastError, updatedAt)
+}
+
+func (t *sqlTx) setStatusIfTokenUnchanged(ctx context.Context, id, access, status, reason string, updatedAt time.Time) (bool, error) {
+	return t.s.setStatusIfTokenUnchanged(ctx, t.tx, id, access, status, reason, updatedAt)
+}
+
+func (t *sqlTx) blankToken(ctx context.Context, id string, updatedAt time.Time) error {
+	return t.s.blankToken(ctx, t.tx, id, updatedAt)
 }
 
 // DeleteAccount removes an account and everything under it.
@@ -4823,6 +6769,109 @@ func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 	return a, nil
 }
 
+// AccountByEmail gives the account with that email.
+//
+// 邮箱是站点那边认的东西：同一个邮箱只该有一行。重跑一次导入是常事
+// （上一批有一部分失败了，重来一遍是补救的办法），再来一行就是同一个
+// 站点账号有两个活着的行，两个都在轮转池里，页面把它列两遍。
+//
+// 表不大——几百行——一次全表扫就够了，不值得为它改表的结构或者加个
+// 索引。邮箱比的时候两边都折成小写：清单上写的是哪个样子，库里存的
+// 是哪个样子，人看着是同一个就是同一个。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountByEmail(ctx context.Context, email string) (Account, error) {
+	return s.accountByEmail(ctx, s.db, email)
+}
+
+func (s *Store) accountByEmail(ctx context.Context, db execer, email string) (Account, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
+			last_error, created_at, updated_at
+		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
+		ORDER BY created_at, id LIMIT 1`, email)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by email %s: %w", email, err)
+	}
+	return a, nil
+}
+
+// AccountByUserID gives the account with that site user id.
+//
+// 用户 id 是站点那边给的那个真的那个（realUserID）：签到和积分明细要的
+// 是它。它是账号最稳当的钥匙——有的账号没有邮箱，令牌里也没有 sub，只
+// 有它一直在。
+//
+// 空的 user id 不是一把钥匙：没有它的账号，谁也不是。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountByUserID(ctx context.Context, userID string) (Account, error) {
+	return s.accountByUserID(ctx, s.db, userID)
+}
+
+func (s *Store) accountByUserID(ctx context.Context, db execer, userID string) (Account, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return Account{}, fmt.Errorf("get the account by user id: %w", ErrNotFound)
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT id, name, user_id, email, status, proxy_group, proxy_url,
+			last_error, created_at, updated_at
+		FROM accounts WHERE user_id = ?
+		ORDER BY created_at, id LIMIT 1`, userID)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by user id %s: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by user id %s: %w", userID, err)
+	}
+	return a, nil
+}
+
+// AccountBySubject gives the account whose token carries that subject.
+//
+// 令牌里的那个 sub 是站点账号自己的 id：一个站点账号一个，重登多少次
+// 都是它。它比邮箱靠得住——清单上写的邮箱可能是别名，站点那边报的邮箱
+// 又可能一时问不出来，只有它是一直在的。
+//
+// 表不大——几百行——一次全表扫就够了，不值得为它改表的结构或者加个
+// 索引。
+//
+// 没有这一行是 ErrNotFound。
+func (s *Store) AccountBySubject(ctx context.Context, subject string) (Account, error) {
+	return s.accountBySubject(ctx, s.db, subject)
+}
+
+func (s *Store) accountBySubject(ctx context.Context, db execer, subject string) (Account, error) {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return Account{}, fmt.Errorf("get the account by subject: %w", ErrNotFound)
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group, a.proxy_url,
+			a.last_error, a.created_at, a.updated_at
+		FROM accounts a JOIN tokens t ON t.account_id = a.id
+		WHERE t.subject = ?
+		ORDER BY a.created_at, a.id LIMIT 1`, subject)
+	a, err := scanAccount(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, fmt.Errorf("get the account by subject %s: %w", subject, ErrNotFound)
+	}
+	if err != nil {
+		return Account{}, fmt.Errorf("get the account by subject %s: %w", subject, err)
+	}
+	return a, nil
+}
+
 type scanner interface{ Scan(dest ...any) error }
 
 func scanAccount(sc scanner) (Account, error) {
@@ -4846,9 +6895,145 @@ func scanAccount(sc scanner) (Account, error) {
 	return a, nil
 }
 
+// APIKey is one key that opens the chat API.
+//
+// It is the gateway's key, not a MiniMax account's: it has no account
+// under it, and it goes when it is revoked, not when an account is
+// deleted.
+type APIKey struct {
+	// ID is the key's own id.
+	ID string `json:"id"`
+	// Name is the label the person gave it.
+	Name string `json:"name"`
+	// KeyHash is the hash of the key.
+	//
+	// The key itself is not kept: the database is worth stealing, and a
+	// key in it would open the gate.
+	KeyHash string `json:"-"`
+	// Prefix is the part of the key that may be shown.
+	Prefix string `json:"prefix"`
+	// CreatedAt is when the key was made.
+	CreatedAt time.Time `json:"created_at"`
+	// RevokedAt is when the key was taken away.
+	//
+	// It is nil while the key works. A revoked key is still in here:
+	// a person has to see that it was there and when it stopped working.
+	RevokedAt *time.Time `json:"revoked_at"`
+}
+
+// Revoked says whether the key has been taken away.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
+// CreateAPIKey writes a key down.
+func (s *Store) CreateAPIKey(ctx context.Context, k APIKey) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO api_keys (id, name, key_hash, prefix, created_at, revoked_at)
+		VALUES (?,?,?,?,?,NULL)`,
+		k.ID, k.Name, k.KeyHash, k.Prefix, ms(k.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("create api key: %w", err)
+	}
+	return nil
+}
+
+// ListAPIKeys gives the keys, the newest first.
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, key_hash, prefix, created_at, revoked_at
+		FROM api_keys ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+	out := []APIKey{}
+	for rows.Next() {
+		var (
+			k         APIKey
+			createdAt int64
+			revokedAt sql.NullInt64
+		)
+		if err := rows.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &createdAt, &revokedAt); err != nil {
+			return nil, fmt.Errorf("list api keys: %w", err)
+		}
+		k.CreatedAt = fromMS(createdAt)
+		if revokedAt.Valid {
+			t := fromMS(revokedAt.Int64)
+			k.RevokedAt = &t
+		}
+		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeAPIKey takes a key away.
+//
+// 它是撤销，不是删除：那一行还在，人看得到它曾经有过，也看得到它什么
+// 时候没的。删掉的话，人会以为那把 key 从来没有存在过。
+func (s *Store) RevokeAPIKey(ctx context.Context, id string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
+		ms(at), id)
+	if err != nil {
+		return fmt.Errorf("revoke api key: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("revoke api key: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("revoke api key %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// APIKeyByHash gives the key that hash belongs to.
+//
+// 撤销过的那一把不算：它已经不能开门了，找它没有意义。
+func (s *Store) APIKeyByHash(ctx context.Context, hash string) (APIKey, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return APIKey{}, fmt.Errorf("get the api key by its hash: %w", ErrNotFound)
+	}
+	var (
+		k         APIKey
+		createdAt int64
+	)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, key_hash, prefix, created_at
+		FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`, hash)
+	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return APIKey{}, fmt.Errorf("get the api key by its hash: %w", ErrNotFound)
+		}
+		return APIKey{}, fmt.Errorf("get the api key by its hash: %w", err)
+	}
+	k.CreatedAt = fromMS(createdAt)
+	return k, nil
+}
+
+// HasAPIKeys says whether any key has been made.
+//
+// 一把都没有的时候网关不鉴权：那时候它只该听在本机。申请过就不一样
+// 了：那是有人打算从别的机器用它。
+func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL`).Scan(&n); err != nil {
+		return false, fmt.Errorf("count api keys: %w", err)
+	}
+	return n > 0, nil
+}
+
 // SaveToken writes an account's token.
 func (s *Store) SaveToken(ctx context.Context, t Token) error {
-	_, err := s.db.ExecContext(ctx, `
+	return s.saveToken(ctx, s.db, t)
+}
+
+func (s *Store) saveToken(ctx context.Context, db execer, t Token) error {
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO tokens (account_id, access, refresh, expires_at, subject, updated_at)
 		VALUES (?,?,?,?,?,?)
 		ON CONFLICT(account_id) DO UPDATE SET
@@ -15270,9 +17455,13 @@ func TestCheckinOnlyOneAccount(t *testing.T) {
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15287,6 +17476,7 @@ import (
 	"mmxcode/internal/oauth"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
+	"mmxcode/internal/webui"
 )
 
 // TestIsLoopback says which listen addresses stay on this machine.
@@ -15339,6 +17529,11 @@ func TestServeRefusesWithoutAnAPIKeyOnAWideAddress(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "no api key is configured") {
 			t.Errorf("the error for %s does not say the key is missing: %v", listen, err)
+		}
+		// 密钥有两个地方可以放：配置文件和环境变量。镜像里不放配置文件
+		// 里的密钥，所以那句话里要说得出来。
+		if !strings.Contains(err.Error(), APIKeysEnv) {
+			t.Errorf("the error for %s does not say where the key comes from: %v", listen, err)
 		}
 	}
 }
@@ -15449,6 +17644,78 @@ func serveEnv(t *testing.T, cfg config.Config) *env {
 		egr:   egr,
 		acc:   acc,
 		mgr:   manager.New(s, up, acc, egr, oauth.NewRenewer()),
+	}
+}
+
+// TestTheServePageSaysThePasswordsAreNotKept says the page the serve
+// command puts up says the passwords are not kept.
+//
+// 这句话是接线上的：serve 把那句提醒交给页面，页面把它显示出来。模板
+// 里有这句不算数——接线漏了这一句，页面上就没有了，人还是以为账号以
+// 后能自己登回去。
+func TestTheServePageSaysThePasswordsAreNotKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, "")
+	e := serveEnv(t, config.Default())
+	ui := webui.New(e.mgr, e.cfg, e.store)
+	e.wireImport(ui)
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	ui.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("the page does not say the passwords are not kept: %q", rec.Body.String())
+	}
+}
+
+// TestTheServePageSaysNothingWhenThePasswordsAreKept says the page says
+// nothing about the passwords when they are kept.
+//
+// 密码存着的时候，那句提醒是多余的：说过头了，人会以为密码没存。
+func TestTheServePageSaysNothingWhenThePasswordsAreKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	e := serveEnv(t, config.Default())
+	ui := webui.New(e.mgr, e.cfg, e.store)
+	e.wireImport(ui)
+
+	req := httptest.NewRequest(http.MethodGet, "/import", nil)
+	rec := httptest.NewRecorder()
+	ui.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "密码没有存进库里") {
+		t.Fatalf("the page says the passwords are not kept: %q", rec.Body.String())
+	}
+}
+
+func TestTheWebPathSaysThePasswordsAreNotKept(t *testing.T) {
+	// 没有密钥的时候，页面上得说密码没有存下来：不然人以为账号以后能
+	// 自己登回去。
+	t.Setenv(PasswordKeyEnv, "")
+	keeper, err := passwordKeeper(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := passwordNote(keeper, err)
+	if note == "" {
+		t.Fatal("no note about the passwords")
+	}
+	if !strings.Contains(note, PasswordKeyEnv) {
+		t.Fatalf("note = %q, want it to name the key", note)
+	}
+}
+
+func TestTheWebPathSaysNothingWhenThePasswordsAreKept(t *testing.T) {
+	t.Setenv(PasswordKeyEnv, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	keeper, err := passwordKeeper(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note := passwordNote(keeper, err); note != "" {
+		t.Fatalf("note = %q, want none", note)
 	}
 }
 ```

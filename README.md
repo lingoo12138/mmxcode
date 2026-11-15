@@ -191,6 +191,8 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `/api/import` | POST | 批量导入（上传清单；配了 key 就关着） |
 | `/api/import/{id}` | GET | 某一次批量导入走到哪儿了 |
 | `/api/relogin` | POST | 把签出的账号登回去 |
+| `/api/keys` | GET / POST | 列出聊天用的 key / 申请一把新的 |
+| `/api/keys/{id}` | DELETE | 撤销一把 key |
 
 WebUI 页面：
 
@@ -202,20 +204,46 @@ WebUI 页面：
 | `/usage` | 用量 |
 | `/import` | 批量导入（没配 key 时才开） |
 | `/relogin` | 重登 |
+| `/keys` | 密钥：申请聊天用的 api key |
 | `/signin` | 交 key 的登录页 |
 | `/static/app.js` | 页面上的脚本 |
 
 ### 鉴权
 
-- 配了 `server.api_keys` 时，每个请求都要带 `x-api-key` 或 `Authorization: Bearer <key>`；两个头都没有、或者 key 不对，一律 401。
-- 一个 key 都不配时，鉴权整体跳过。所以 `mmxcode serve` 只允许听本机地址：`server.listen` 不是回环地址（`:8080`、`0.0.0.0:8080` 都不算）就直接报错退出：
+有两把 key，分工不一样：
+
+| | 从哪来 | 开哪扇门 |
+|---|---|---|
+| 后台登录 key | 配置里的 `server.api_keys`，或环境变量 `MMXCODE_API_KEYS` | 管理界面（页面和 `/api/` 下的接口） |
+| 聊天 key | 在后台页面 `/keys` 上申请 | 聊天接口（`/v1/` 下的路由） |
+
+- 聊天接口两把都认：配好的那把能开，申请来的那把也能开。管理界面只认配好的那把 —— 申请来的 key 是给别的机器聊天用的，它开不了管理界面。
+- 两把都没有的时候，聊天接口不鉴权。所以 `mmxcode serve` 只允许听本机地址：`server.listen` 不是回环地址（`:8080`、`0.0.0.0:8080` 都不算）就直接报错退出：
 
   ```
   no api key is configured, so the gateway would listen on :8080 for everyone; put api_keys in the config or MMXCODE_API_KEYS, or listen on 127.0.0.1
   ```
 
+- 配了 `server.api_keys` 时，每个请求都要带 `x-api-key` 或 `Authorization: Bearer <key>`；两个头都没有、或者 key 不对，一律 401。
 - 鉴权对所有路径生效。带 key 的请求（`x-api-key` 头或 `Authorization: Bearer`）一律放行；不带 key 的请求分两种：`/api/` 下的接口回 401，浏览器要开的页面回登录页 `/signin`（200），登录页上填 key 换来的 cookie 之后就能进管理界面。
 - cookie 的值是拿 key 算出来的 HMAC，服务器自己不留东西；`HttpOnly`、`SameSite=Strict`，走 TLS 时才加 `Secure`。
+
+### 申请聊天用的 key
+
+聊天用的 key 在后台页面 `/keys` 上申请（也可以走 `POST /api/keys`）：
+
+```
+curl -X POST http://127.0.0.1:8080/api/keys \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: <后台登录 key>' \
+  -d '{"name":"我的笔记本"}'
+```
+
+回答里有那把 key 本身：`{"id":"key_...","name":"我的笔记本","key":"sk-...","prefix":"sk-XXXXXXXX…"}`。**它只出现这一次** —— 库里存的是它的哈希（SHA-256），不是它，所以往后任何地方都拿不回这把 key。抄走收好。
+
+- 客户端用它：`x-api-key: sk-...` 或者 `Authorization: Bearer sk-...`。
+- 撤销：`DELETE /api/keys/{id}`。撤销之后它就不开门了，但那一行还在列表里 —— 看得到它曾经有过、什么时候没的。删掉的话，人会以为这把 key 从来没有存在过。
+- 撤销过的 key 不再算「申请过」：一把都没有的时候聊天接口还是不鉴权。
 
 ### 轮转
 

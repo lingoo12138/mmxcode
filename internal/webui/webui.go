@@ -148,6 +148,13 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/relogin":
 		w.apiRelogin(rw, r)
 		return
+	case "/api/keys":
+		w.apiKeys(rw, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/keys/") {
+		w.apiKey(rw, r)
+		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/accounts/") {
 		w.apiAccount(rw, r)
@@ -177,6 +184,8 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/relogin":
 		// 重登页不受上传那个闸限制：它不接触明文密码。
 		w.page(rw, r, "relogin.html", w.reloginData)
+	case "/keys":
+		w.page(rw, r, "keys.html", w.keysData)
 	default:
 		http.NotFound(rw, r)
 	}

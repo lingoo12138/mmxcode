@@ -7328,6 +7328,7 @@ import (
 	"time"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/apikey"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
@@ -8712,6 +8713,96 @@ func TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
 		t.Fatalf("upstream id = %q, want the hash %q", seen[len(seen)-1], want)
 	}
 }
+
+// TestAKeyMadeInTheConsoleOpensTheChatAPI says a key made in the
+// console opens the chat API.
+//
+// 后台申请的那把 key 是给别的机器用的：它得能聊天。
+func TestAKeyMadeInTheConsoleOpensTheChatAPI(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 配置里有 key，所以门是关着的：这时候进来的那把才真是靠它开的门。
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the key made in the console was refused")
+	}
+}
+
+// TestARevokedKeyDoesNotOpenTheChatAPI says a revoked key opens
+// nothing.
+//
+// 撤销是把门关上：撤了的那一把不该再能进门。
+func TestARevokedKeyDoesNotOpenTheChatAPI(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+	if err := h.store.RevokeAPIKey(context.Background(), "key_1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 for a revoked key", w.Code)
+	}
+}
+
+// TestAKeyMadeInTheConsoleDoesNotOpenTheConsole says a chat key is not
+// a console key.
+//
+// 后台登录用的是另一把 key（配置里那把）：聊天用的 key 不该也能打开
+// 管理界面。
+func TestAKeyMadeInTheConsoleDoesNotOpenTheConsole(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401: a chat key opened the console", w.Code)
+	}
+
+	// 后台那把 key 还是能进后台。
+	req = httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	req.Header.Set("x-api-key", "sk-console")
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the console key was refused")
+	}
+}
+
+// makeAKey writes a key down and gives it back in the clear.
+func makeAKey(t *testing.T, s *store.Store) string {
+	t.Helper()
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAPIKey(context.Background(), store.APIKey{
+		ID: "key_1", Name: "给我的笔记本", KeyHash: apikey.Hash(plain),
+		Prefix: apikey.Display(plain), CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -8730,6 +8821,7 @@ Expected: FAIL —— `undefined: New`
 package gateway
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8738,6 +8830,8 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+
+	"mmxcode/internal/apikey"
 )
 
 // sessionCookie is the name of the cookie the browser carries.
@@ -8779,14 +8873,14 @@ func (s *Server) auth(r *http.Request) bool {
 	if len(keys) == 0 {
 		return true
 	}
-	given := r.Header.Get("x-api-key")
-	if given == "" {
-		auth := r.Header.Get("Authorization")
-		if strings.HasPrefix(auth, "Bearer ") {
-			given = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-		}
-	}
-	if _, ok := matchingKey(given, keys); ok {
+	return s.authWith(r, keys)
+}
+
+// authWith checks the request's key against the given keys.
+//
+// 头里的 key 和浏览器带的 cookie 都认。
+func (s *Server) authWith(r *http.Request, keys []string) bool {
+	if _, ok := matchingKey(givenKey(r), keys); ok {
 		return true
 	}
 	// 浏览器带来的 cookie：值是某一把配好的 key 算出来的
@@ -8804,6 +8898,56 @@ func (s *Server) auth(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// givenKey gives the key the request carries.
+//
+// 两个头都认：x-api-key，和 Authorization: Bearer。
+func givenKey(r *http.Request) string {
+	given := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if given != "" {
+		return given
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	return ""
+}
+
+// authChat checks the request's key for the chat API.
+//
+// 两把 key 都认：配置里那把（后台登录用的），和在后台申请的那把（给
+// 别的机器聊天用的）。
+//
+// 一把都没有的时候不鉴权：那时候网关只该听本机。申请过就不一样了：
+// 那是有人打算从别的机器用它。
+func (s *Server) authChat(r *http.Request) bool {
+	keys := s.Cfg.Server.APIKeys
+	if len(keys) == 0 && !s.hasMadeKeys(r.Context()) {
+		return true
+	}
+	// 配置里那把，和浏览器带的 cookie。
+	if s.authWith(r, keys) {
+		return true
+	}
+	given := givenKey(r)
+	if given == "" || s.Store == nil {
+		return false
+	}
+	// 库里存的是哈希：请求带来的 key 算一次哈希，对上了就是那一把。
+	// 撤销过的不算——它已经不能开门了。
+	_, err := s.Store.APIKeyByHash(r.Context(), apikey.Hash(given))
+	return err == nil
+}
+
+// hasMadeKeys says whether any key has been made in the console.
+func (s *Server) hasMadeKeys(ctx context.Context) bool {
+	if s.Store == nil {
+		return false
+	}
+	have, err := s.Store.HasAPIKeys(ctx)
+	return err == nil && have
 }
 
 // matchingKey gives the configured key the given one matches.
@@ -8993,6 +9137,13 @@ button { padding: .25rem .8rem; cursor: pointer; }
 </body>
 </html>
 `
+
+// isChatPath says the path is one of the chat API's.
+//
+// 聊天那扇门和管理页那扇门不一样：聊天认两把 key，管理页只认一把。
+func isChatPath(path string) bool {
+	return path == "/v1" || strings.HasPrefix(path, "/v1/")
+}
 
 // isAPIPath says the path is one the API clients use.
 //
@@ -9278,7 +9429,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.session(w, r)
 		return
 	}
-	if !s.auth(r) {
+	// 两扇门：聊天那扇认两把 key（配置里的和后台申请的），管理页那扇只
+	// 认配置里的那把。
+	gate := s.auth
+	if isChatPath(r.URL.Path) {
+		gate = s.authChat
+	}
+	if !gate(r) {
 		if isAPIPath(r.URL.Path) {
 			writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
 			return
@@ -12072,6 +12229,13 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/relogin":
 		w.apiRelogin(rw, r)
 		return
+	case "/api/keys":
+		w.apiKeys(rw, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/keys/") {
+		w.apiKey(rw, r)
+		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/accounts/") {
 		w.apiAccount(rw, r)
@@ -12101,6 +12265,8 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/relogin":
 		// 重登页不受上传那个闸限制：它不接触明文密码。
 		w.page(rw, r, "relogin.html", w.reloginData)
+	case "/keys":
+		w.page(rw, r, "keys.html", w.keysData)
 	default:
 		http.NotFound(rw, r)
 	}
@@ -12995,6 +13161,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -13006,6 +13173,7 @@ import (
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/oauth"
+	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
 )
@@ -13245,6 +13413,54 @@ func TestCheckEgressWritesAFailedHealth(t *testing.T) {
 		t.Error("the row does not say why the outlet is broken")
 	}
 }
+
+func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(ctx, "acc_01", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr.Key = key
+	mgr.ReloginFn = func(ctx context.Context, a store.Account, password string) error {
+		return s.SaveToken(ctx, store.Token{
+			AccountID: a.ID, Access: "a", Refresh: "r",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+
+	sc := New(mgr, config.Default())
+	sc.Relogin(ctx)
+
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.StatusActive {
+		t.Fatalf("status = %q", got.Status)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -13388,6 +13604,26 @@ func (s *Scheduler) RenewTokens(ctx context.Context) {
 	}
 }
 
+// Relogin signs in again the accounts that are signed out.
+//
+// It runs on its own clock: the cooldown is how long the scheduler
+// waits between two rounds, so a sign-in that failed is not retried
+// every minute.
+func (s *Scheduler) Relogin(ctx context.Context) {
+	res, err := s.Mgr.ReloginAll(ctx, s.Cfg.Batch.Relogin.MaxAccounts)
+	if err != nil {
+		// 这一趟根本没跑：说清楚，不然看着像「没什么要登的」。
+		fmt.Printf("relogin: %v\n", err)
+		return
+	}
+	if res.Fixed > 0 || res.Failed > 0 {
+		fmt.Printf("relogin: %d fixed, %d failed\n", res.Fixed, res.Failed)
+	}
+	for _, r := range res.Reasons {
+		fmt.Printf("relogin: %s\n", r)
+	}
+}
+
 // CheckEgress tests every outlet and records the result.
 //
 // The probe and the write have a context each. The probe's timeout is
@@ -13439,6 +13675,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 	go s.loop(ctx, usageEvery, s.RefreshUsage)
 	go s.loop(ctx, tokenEvery, s.RenewTokens)
 	go s.loop(ctx, egressEvery, s.CheckEgress)
+
+	// 重登是单独的活儿，不在续期器那条热路径上：续期器照旧把链断的
+	// 账号标成 signed_out，签回来的活儿交给这里。
+	if s.Cfg.Batch.Relogin.Enabled {
+		every := s.Cfg.Batch.Relogin.Cooldown.Duration()
+		if every <= 0 {
+			every = time.Hour
+		}
+		go s.loop(ctx, every, s.Relogin)
+	}
 
 	for {
 		next := NextCheckin(time.Now(), at, 30*time.Minute)
@@ -13533,6 +13779,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"mmxcode/internal/gateway"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/provision"
 	"mmxcode/internal/scheduler"
 	"mmxcode/internal/webui"
 )
@@ -13559,10 +13807,13 @@ func newServeCmd(e *env) *cobra.Command {
 			// 没配 key 时只听本机，不然就是把模型白送出去
 			listen := e.cfg.Server.Listen
 			if len(e.cfg.Server.APIKeys) == 0 && !isLoopback(listen) {
-				return fmt.Errorf("no api key is configured, so the gateway would listen on %s for everyone; put api_keys in the config or listen on 127.0.0.1", listen)
+				return fmt.Errorf("no api key is configured, so the gateway would listen on %s for everyone; "+
+					"put api_keys in the config or %s, or listen on 127.0.0.1",
+					listen, APIKeysEnv)
 			}
 
 			ui := webui.New(e.mgr, e.cfg, e.store)
+			e.wireImport(ui)
 			gw := gateway.New(e.mgr, e.cfg, e.store, ui)
 			sc := scheduler.New(e.mgr, e.cfg)
 
@@ -13597,6 +13848,47 @@ func newServeCmd(e *env) *cobra.Command {
 			return srv.Shutdown(shutCtx)
 		},
 	}
+}
+
+// wireImport puts the batch import and the re-login on the page.
+//
+// 页面上传和命令行导入走的是同一件事：批量入号和重登。
+//
+// 密钥有问题的时候导入要停下来：悄悄把密码丢掉，会留下一库谁也登不
+// 回去的账号。
+//
+// 没有密钥，密码就不入库。页面上得说清楚：账号掉线以后没有人能自己登
+// 回去，人得知道这件事。
+//
+// 这一段单独拿出来，是为了能测它：那句提醒是接线上的，不是模板里的。
+func (e *env) wireImport(ui *webui.WebUI) {
+	keeper, keeperErr := passwordKeeper(false)
+	ui.PasswordNote = passwordNote(keeper, keeperErr)
+	ui.Import = func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error) {
+		if keeperErr != nil {
+			return nil, keeperErr
+		}
+		runner, err := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
+		if err != nil {
+			return nil, err
+		}
+		return runner.Run(ctx, entries)
+	}
+	ui.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
+		return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
+	}
+}
+
+// passwordNote says what happens to the passwords, when they are not
+// kept.
+//
+// 没有密钥的时候密码就不入库，页面上得说清楚：账号掉线以后没有人能
+// 自己登回去。密钥有问题的时候导入自己就停了，页面不用多说。
+func passwordNote(keeper func(string) (string, error), keeperErr error) string {
+	if keeperErr != nil || keeper != nil {
+		return ""
+	}
+	return "密码没有存进库里（没有 " + PasswordKeyEnv + "）：账号掉线以后没有人能自己登回去。"
 }
 
 // isLoopback says a listen address is only on this machine.

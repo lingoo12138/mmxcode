@@ -227,6 +227,31 @@ var tables = []table{
 			notNull("checked_at", "0"),
 		},
 	},
+	{
+		// The keys that open the chat API. They are not an account's:
+		// a key belongs to the gateway, not to a MiniMax account, so it
+		// has no account to be taken away with.
+		//
+		// The key itself is not in here: the hash of it is. The database
+		// is worth stealing; a key in it would open the gate.
+		name: "api_keys",
+		body: `(
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  key_hash   TEXT NOT NULL UNIQUE,
+  prefix     TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+)`,
+		copy: []copyColumn{
+			notNull("id", "''"),
+			notNull("name", "''"),
+			notNull("key_hash", "''"),
+			notNull("prefix", "''"),
+			notNull("created_at", "0"),
+			nullable("revoked_at"),
+		},
+	},
 }
 
 // The indexes.

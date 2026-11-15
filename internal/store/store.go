@@ -355,7 +355,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 4
+const schemaVersion = 5
 
 // migrations are the steps, in order.
 //
@@ -365,6 +365,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateConform,
 	migratePlanError,
 	migrateBatchImport,
+	migrateAPIKeys,
 }
 
 // migrateMake makes the tables that are not there.
@@ -490,6 +491,31 @@ func migrateBatchImport(ctx context.Context, conn *sql.Conn) error {
 			}
 			if got != "" {
 				continue
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateAPIKeys gives the file its table of api keys.
+//
+// 这一张表是后来才有的：一个文件在它之前做出来的时候没有它。表不在就
+// 造出来，在就不动它——已经有了的 key 不该为了一个迁移被抄一遍。
+func migrateAPIKeys(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 5, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			if t.name != "api_keys" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got != "" {
+				return nil
 			}
 			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
 				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
@@ -1552,6 +1578,138 @@ func scanAccount(sc scanner) (Account, error) {
 	a.CreatedAt = fromMS(createdAt)
 	a.UpdatedAt = fromMS(updatedAt)
 	return a, nil
+}
+
+// APIKey is one key that opens the chat API.
+//
+// It is the gateway's key, not a MiniMax account's: it has no account
+// under it, and it goes when it is revoked, not when an account is
+// deleted.
+type APIKey struct {
+	// ID is the key's own id.
+	ID string `json:"id"`
+	// Name is the label the person gave it.
+	Name string `json:"name"`
+	// KeyHash is the hash of the key.
+	//
+	// The key itself is not kept: the database is worth stealing, and a
+	// key in it would open the gate.
+	KeyHash string `json:"-"`
+	// Prefix is the part of the key that may be shown.
+	Prefix string `json:"prefix"`
+	// CreatedAt is when the key was made.
+	CreatedAt time.Time `json:"created_at"`
+	// RevokedAt is when the key was taken away.
+	//
+	// It is nil while the key works. A revoked key is still in here:
+	// a person has to see that it was there and when it stopped working.
+	RevokedAt *time.Time `json:"revoked_at"`
+}
+
+// Revoked says whether the key has been taken away.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
+// CreateAPIKey writes a key down.
+func (s *Store) CreateAPIKey(ctx context.Context, k APIKey) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO api_keys (id, name, key_hash, prefix, created_at, revoked_at)
+		VALUES (?,?,?,?,?,NULL)`,
+		k.ID, k.Name, k.KeyHash, k.Prefix, ms(k.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("create api key: %w", err)
+	}
+	return nil
+}
+
+// ListAPIKeys gives the keys, the newest first.
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, key_hash, prefix, created_at, revoked_at
+		FROM api_keys ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+	out := []APIKey{}
+	for rows.Next() {
+		var (
+			k         APIKey
+			createdAt int64
+			revokedAt sql.NullInt64
+		)
+		if err := rows.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &createdAt, &revokedAt); err != nil {
+			return nil, fmt.Errorf("list api keys: %w", err)
+		}
+		k.CreatedAt = fromMS(createdAt)
+		if revokedAt.Valid {
+			t := fromMS(revokedAt.Int64)
+			k.RevokedAt = &t
+		}
+		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeAPIKey takes a key away.
+//
+// 它是撤销，不是删除：那一行还在，人看得到它曾经有过，也看得到它什么
+// 时候没的。删掉的话，人会以为那把 key 从来没有存在过。
+func (s *Store) RevokeAPIKey(ctx context.Context, id string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
+		ms(at), id)
+	if err != nil {
+		return fmt.Errorf("revoke api key: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("revoke api key: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("revoke api key %s: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// APIKeyByHash gives the key that hash belongs to.
+//
+// 撤销过的那一把不算：它已经不能开门了，找它没有意义。
+func (s *Store) APIKeyByHash(ctx context.Context, hash string) (APIKey, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return APIKey{}, fmt.Errorf("get the api key by its hash: %w", ErrNotFound)
+	}
+	var (
+		k         APIKey
+		createdAt int64
+	)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, key_hash, prefix, created_at
+		FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`, hash)
+	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return APIKey{}, fmt.Errorf("get the api key by its hash: %w", ErrNotFound)
+		}
+		return APIKey{}, fmt.Errorf("get the api key by its hash: %w", err)
+	}
+	k.CreatedAt = fromMS(createdAt)
+	return k, nil
+}
+
+// HasAPIKeys says whether any key has been made.
+//
+// 一把都没有的时候网关不鉴权：那时候它只该听在本机。申请过就不一样
+// 了：那是有人打算从别的机器用它。
+func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL`).Scan(&n); err != nil {
+		return false, fmt.Errorf("count api keys: %w", err)
+	}
+	return n > 0, nil
 }
 
 // SaveToken writes an account's token.

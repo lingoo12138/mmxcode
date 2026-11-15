@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"mmxcode/internal/account"
+	"mmxcode/internal/apikey"
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
@@ -1396,4 +1397,94 @@ func TestAPoolWithoutAnUpstreamIDFallsBackToTheDerivedOne(t *testing.T) {
 	if seen[len(seen)-1] != want {
 		t.Fatalf("upstream id = %q, want the hash %q", seen[len(seen)-1], want)
 	}
+}
+
+// TestAKeyMadeInTheConsoleOpensTheChatAPI says a key made in the
+// console opens the chat API.
+//
+// 后台申请的那把 key 是给别的机器用的：它得能聊天。
+func TestAKeyMadeInTheConsoleOpensTheChatAPI(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 配置里有 key，所以门是关着的：这时候进来的那把才真是靠它开的门。
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the key made in the console was refused")
+	}
+}
+
+// TestARevokedKeyDoesNotOpenTheChatAPI says a revoked key opens
+// nothing.
+//
+// 撤销是把门关上：撤了的那一把不该再能进门。
+func TestARevokedKeyDoesNotOpenTheChatAPI(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+	if err := h.store.RevokeAPIKey(context.Background(), "key_1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 for a revoked key", w.Code)
+	}
+}
+
+// TestAKeyMadeInTheConsoleDoesNotOpenTheConsole says a chat key is not
+// a console key.
+//
+// 后台登录用的是另一把 key（配置里那把）：聊天用的 key 不该也能打开
+// 管理界面。
+func TestAKeyMadeInTheConsoleDoesNotOpenTheConsole(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-console"}
+	plain := makeAKey(t, h.store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	req.Header.Set("x-api-key", plain)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401: a chat key opened the console", w.Code)
+	}
+
+	// 后台那把 key 还是能进后台。
+	req = httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	req.Header.Set("x-api-key", "sk-console")
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("the console key was refused")
+	}
+}
+
+// makeAKey writes a key down and gives it back in the clear.
+func makeAKey(t *testing.T, s *store.Store) string {
+	t.Helper()
+	plain, err := apikey.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAPIKey(context.Background(), store.APIKey{
+		ID: "key_1", Name: "给我的笔记本", KeyHash: apikey.Hash(plain),
+		Prefix: apikey.Display(plain), CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return plain
 }

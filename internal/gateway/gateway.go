@@ -210,7 +210,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.session(w, r)
 		return
 	}
-	if !s.auth(r) {
+	// 两扇门：聊天那扇认两把 key（配置里的和后台申请的），管理页那扇只
+	// 认配置里的那把。
+	gate := s.auth
+	if isChatPath(r.URL.Path) {
+		gate = s.authChat
+	}
+	if !gate(r) {
 		if isAPIPath(r.URL.Path) {
 			writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
 			return
