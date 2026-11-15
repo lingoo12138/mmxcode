@@ -784,6 +784,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v1/models":
 		s.handleModels(w, r)
 		return
+	case "/v1/usage":
+		// magpie 的卡片：这个网关还剩多少额度。
+		s.usageCard(w, r)
+		return
 	}
 	if s.WebUI != nil && strings.HasPrefix(r.URL.Path, "/api/") {
 		s.WebUI.ServeHTTP(w, r)
