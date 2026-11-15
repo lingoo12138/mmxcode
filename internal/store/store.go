@@ -2023,6 +2023,13 @@ func scanUsageSnapshot(sc scanner) (UsageSnapshot, error) {
 // their age: the newest reading is the account's reading, and it is
 // what the totals are made of.
 //
+// The newest is the one that was read last: the time says when the
+// reading was made, and the id only breaks a tie between two readings
+// of the same millisecond -- the same rule as LatestUsageSnapshots.
+// Ranking by the id alone would keep the reading that was written last,
+// which is not always the newest one: a reading stamps its time when it
+// starts and writes it down when it ends.
+//
 // A keepPerAccount of zero or less keeps nothing: every reading that
 // is older than olderThan goes.
 func (s *Store) PruneUsageSnapshots(ctx context.Context, olderThan time.Time, keepPerAccount int) error {
@@ -2033,7 +2040,7 @@ func (s *Store) PruneUsageSnapshots(ctx context.Context, olderThan time.Time, ke
 		DELETE FROM usage_snapshots WHERE id IN (
 			SELECT id FROM (
 				SELECT id, created_at,
-					ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS rn
+					ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC, id DESC) AS rn
 				FROM usage_snapshots
 			) WHERE rn > ? AND created_at < ?)`,
 		keepPerAccount, ms(olderThan))
@@ -2103,6 +2110,13 @@ func (s *Store) ListExhausted(ctx context.Context) ([]Exhausted, error) {
 //
 // A window that has run out is not a window that is spent, and it is
 // of no use to anybody.
+//
+// 它没有地方调用，而且是有意的：过了时刻的标记不是垃圾，它是「这个账
+// 号该去读一次」的信号（规格 §4.5 的恢复点 A）。删掉它，那个账号就再
+// 也等不到那一趟读 —— 它的数会一直停在用完的那一刻。
+//
+// 所以要收拾过期标记的地方，是读额度的名单（`internal/usage` 那一套）：
+// 它读完了，标记自然就不欠了。
 func (s *Store) PruneExpiredWindows(ctx context.Context, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, "DELETE FROM exhausted_windows WHERE until <= ?", ms(now))
 	if err != nil {

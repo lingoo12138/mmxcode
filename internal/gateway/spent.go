@@ -112,6 +112,9 @@ func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 // 读到的时刻比现在的标记晚，标记就挪到那儿；不然标记原样留着。读到的
 // 东西里没有这个组（或者读失败了），那就没有时刻：没有时刻就不动。
 //
+// 库里没有标记的时候它也不动：标记是被清掉的（签到给了积分），这一趟
+// 读是清掉它之前起的，它不许把标记放回来。
+//
 // 提前放一个用完的账号回轮转，正是这个标记要防的事。
 func (s *Server) correctMark(accountID, groupKey string) {
 	ctx, cancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
@@ -130,9 +133,13 @@ func (s *Server) correctMark(accountID, groupKey string) {
 	// 写的时限另起一份：读的那一份用完了，写也该写得下。
 	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
 	defer wcancel()
-	cur, ok := s.markedUntil(wctx, accountID, groupKey)
-	if !ok {
-		// 不知道现在的标记到什么时候：不知道就不动。
+	cur, found := s.markedUntil(wctx, accountID, groupKey)
+	if !found {
+		// 库里没有这个标记：它是被清掉的（签到给了积分，读到的数说有额
+		// 度，规格 §5.2）。后台这一趟读是清掉它之前起的，它不许把标记
+		// 放回来 —— 一个有积分的账号被关在外面，最多关七天。
+		//
+		// 读不到标记也是这一句：不知道就不动。
 		return
 	}
 	if cur.After(until) {
@@ -143,23 +150,28 @@ func (s *Server) correctMark(accountID, groupKey string) {
 }
 
 // markedUntil gives the moment the account's group is marked spent
-// until, and whether that mark could be read.
+// until, and whether there is such a mark at all.
 //
-// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就
-// 说一声：不知道就不动。
+// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就说
+// "没有"：不知道就不动。
+//
+// 「没有标记」和「标记到零时刻」是两件事：前者是被清掉的（签到给了积
+// 分），后台那一趟读不许把它放回来；后者是标记在那儿，只是没有时刻。
 func (s *Server) markedUntil(ctx context.Context, accountID, groupKey string) (time.Time, bool) {
 	rows, err := s.Store.ListExhausted(ctx)
 	if err != nil {
 		return time.Time{}, false
 	}
 	var until time.Time
+	found := false
 	for _, e := range rows {
 		if e.AccountID != accountID || e.WindowKey != groupKey {
 			continue
 		}
-		if e.Until.After(until) {
+		if !found || e.Until.After(until) {
 			until = e.Until
+			found = true
 		}
 	}
-	return until, true
+	return until, found
 }

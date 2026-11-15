@@ -114,7 +114,23 @@ type Server struct {
 	bgSem chan struct{}
 	// bgWG counts the background readings that are in the air.
 	bgWG sync.WaitGroup
+
+	// concMu guards the cached total concurrency.
+	concMu sync.Mutex
+	// concLimit is the total concurrency that was read last.
+	concLimit int
+	// concAt is when it was read.
+	concAt time.Time
+	// concTTL is how long the cached value is kept. A test sets it to
+	// zero to turn the cache off.
+	concTTL time.Duration
 }
+
+// concurrencyCacheTTL is how long the total concurrency is kept.
+//
+// 算总并发要读一遍账号和标记，而聊天那条路上每个请求都要问一次。一串
+// 请求就是一遍又一遍同样的读，而这一阵子的答案是一个样的：一秒够了。
+const concurrencyCacheTTL = time.Second
 
 // New makes a gateway.
 func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Handler) *Server {
@@ -140,6 +156,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		limit = 1
 	}
 	g.bgSem = make(chan struct{}, limit)
+	g.concTTL = concurrencyCacheTTL
 	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -154,6 +171,26 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 // 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
 func (s *Server) round() *usage.Round {
 	return usage.NewRound(s.Store, s.Reader, s.Mgr.HotAccounts, s.Cfg)
+}
+
+// concurrencyLimit says how many requests may be in the air at once.
+//
+// 它是总并发那道门的上限（可用账号的五分之一，小规模至少三个）。算它要
+// 读一遍账号和一遍标记，而聊天那条路上每个请求都要问一次：一串请求就
+// 是一遍又一遍同样的读。所以答案留一秒 —— 这一阵子的答案是一个样的。
+//
+// 缓存里的那个数还是照着同样的规矩算出来的：能用的是那些签入中、而且
+// 没有被记了「额度用完」的账号。
+func (s *Server) concurrencyLimit(ctx context.Context) int {
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
+	if !s.concAt.IsZero() && time.Since(s.concAt) < s.concTTL {
+		return s.concLimit
+	}
+	n := s.totalConcurrency(ctx)
+	s.concLimit = n
+	s.concAt = time.Now()
+	return n
 }
 
 // Close stops the background work and waits for it.
@@ -411,7 +448,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
 	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
 	// 着。
-	if !s.gate.waitFor(ctx, s.totalConcurrency(ctx), s.Cfg.Concurrency.Wait.Duration()) {
+	if !s.gate.waitFor(ctx, s.concurrencyLimit(ctx), s.Cfg.Concurrency.Wait.Duration()) {
 		w.Header().Set("Retry-After", "5")
 		writeError(w, proto, http.StatusTooManyRequests, "the gateway is busy: too many requests are in the air")
 		return

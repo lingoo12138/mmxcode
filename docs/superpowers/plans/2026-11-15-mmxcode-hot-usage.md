@@ -1465,6 +1465,8 @@ git commit -m "feat(usage): 一趟读额度有并发有时限有预算"
 
 标记只往后挪：读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西里没有这个组，标记原样留着。一个零写进去，冷却时间（五分钟）就会把标记缩短——那正是提前放行。
 
+还有一条：库里没有这个标记的时候，后台那一趟读什么也不做。标记是被清掉的（签到给了积分，读到的数说有额度，Task 6），后台这一趟读是清掉它之前起的：它把标记放回去，一个有积分的账号就白扔了——最多扔七天。
+
 **Files:**
 - Create: `internal/gateway/spent.go`
 - Create: `internal/gateway/spent_test.go`
@@ -1856,6 +1858,9 @@ func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 // 读到的时刻比现在的标记晚，标记就挪到那儿；不然标记原样留着。读到的
 // 东西里没有这个组（或者读失败了），那就没有时刻：没有时刻就不动。
 //
+// 库里没有标记的时候它也不动：标记是被清掉的（签到给了积分），这一趟
+// 读是清掉它之前起的，它不许把标记放回来。
+//
 // 提前放一个用完的账号回轮转，正是这个标记要防的事。
 func (s *Server) correctMark(accountID, groupKey string) {
 	ctx, cancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
@@ -1874,9 +1879,13 @@ func (s *Server) correctMark(accountID, groupKey string) {
 	// 写的时限另起一份：读的那一份用完了，写也该写得下。
 	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
 	defer wcancel()
-	cur, ok := s.markedUntil(wctx, accountID, groupKey)
-	if !ok {
-		// 不知道现在的标记到什么时候：不知道就不动。
+	cur, found := s.markedUntil(wctx, accountID, groupKey)
+	if !found {
+		// 库里没有这个标记：它是被清掉的（签到给了积分，读到的数说有额
+		// 度，规格 §5.2）。后台这一趟读是清掉它之前起的，它不许把标记
+		// 放回来 —— 一个有积分的账号被关在外面，最多关七天。
+		//
+		// 读不到标记也是这一句：不知道就不动。
 		return
 	}
 	if cur.After(until) {
@@ -1887,25 +1896,30 @@ func (s *Server) correctMark(accountID, groupKey string) {
 }
 
 // markedUntil gives the moment the account's group is marked spent
-// until, and whether that mark could be read.
+// until, and whether there is such a mark at all.
 //
-// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就
-// 说一声：不知道就不动。
+// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就说
+// "没有"：不知道就不动。
+//
+// 「没有标记」和「标记到零时刻」是两件事：前者是被清掉的（签到给了积
+// 分），后台那一趟读不许把它放回来；后者是标记在那儿，只是没有时刻。
 func (s *Server) markedUntil(ctx context.Context, accountID, groupKey string) (time.Time, bool) {
 	rows, err := s.Store.ListExhausted(ctx)
 	if err != nil {
 		return time.Time{}, false
 	}
 	var until time.Time
+	found := false
 	for _, e := range rows {
 		if e.AccountID != accountID || e.WindowKey != groupKey {
 			continue
 		}
-		if e.Until.After(until) {
+		if !found || e.Until.After(until) {
 			until = e.Until
+			found = true
 		}
 	}
-	return until, true
+	return until, found
 }
 ```
 
@@ -2050,6 +2064,8 @@ git commit -m "feat(gateway): 用完的标记照着读到的数改"
 ---
 
 ### Task 6: 签到之后读一次
+
+签到给的积分能救活一个用完的账号（规格 §5.2）。清掉的标记不会被后台那一趟读放回去（Task 5）：后台读问的是「库里现在有没有这个标记」，没有就不写。
 
 **Files:**
 - Modify: `internal/usage/round.go`
@@ -2934,7 +2950,7 @@ func (p poolAdapter) Busy(ctx context.Context, accountID string) bool {
 	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
 	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
 	// 着。
-	if !s.gate.waitFor(ctx, s.totalConcurrency(ctx), s.Cfg.Concurrency.Wait.Duration()) {
+	if !s.gate.waitFor(ctx, s.concurrencyLimit(ctx), s.Cfg.Concurrency.Wait.Duration()) {
 		w.Header().Set("Retry-After", "5")
 		writeError(w, proto, http.StatusTooManyRequests, "the gateway is busy: too many requests are in the air")
 		return
@@ -3534,8 +3550,15 @@ func (s *Server) usageCard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolOf(r.URL.Path), http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 标记也摆进去：被记了「额度用完」的账号，卡上要写着用完，它的积分也
+	// 不算在余额里 —— 网关不会再把它给客户端，卡上不能还许着积分。
+	spent, err := s.Store.ListExhausted(ctx)
+	if err != nil {
+		writeError(w, protocolOf(r.URL.Path), http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(card.Of(snaps, accounts))
+	json.NewEncoder(w).Encode(card.Of(snaps, accounts, spent))
 }
 ```
 
@@ -3679,11 +3702,6 @@ go test ./internal/scheduler/
 `internal/scheduler/scheduler.go` 的 `RefreshUsage` 改成：
 
 ```go
-// RefreshUsage reads the credits of the accounts that should be read.
-//
-// 它不再是"把所有账号读一遍"：账号多起来以后，冷账号的额度没有必要
-// 读 —— 读了也是旧的。要读的是那些该读的：签到待补的、标记到期的、
-// 从没读过的、还有热的。
 func (s *Scheduler) RefreshUsage(ctx context.Context) {
 	res, err := s.round().RefreshDue(ctx)
 	if err != nil {
@@ -3693,6 +3711,7 @@ func (s *Scheduler) RefreshUsage(ctx context.Context) {
 	for _, reason := range res.Reasons {
 		fmt.Printf("usage: %s\n", reason)
 	}
+	s.pruneReadings(ctx)
 }
 ```
 
@@ -3704,6 +3723,36 @@ func (s *Scheduler) RefreshUsage(ctx context.Context) {
 // 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
 func (s *Scheduler) round() *usage.Round {
 	return usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
+}
+```
+
+读到的每一次都存一行：调度器每 30 秒扫一趟，一趟读几个账号就写几行。
+不收拾的话，一天下来就是几千行 —— 而除了每个账号最新的一条（卡上摆的
+就是它），剩下的谁也不看。所以这一趟读完顺手收拾一下：
+
+```go
+// The values of the pruning of the readings.
+//
+// 调度器每 usage.refresh.scan_every 扫一趟，每读一个账号就写一行读数。
+// 不收拾的话，一天下来就是几千行 —— 而除了每个账号最新的一条（卡上摆的
+// 就是它），剩下的谁也不看。
+const (
+	// pruneKeep is how many readings of every account are kept whatever
+	// their age. One is the reading the card and the summary use: it is
+	// the account's reading.
+	pruneKeep = 1
+	// pruneOlderThan is how long a reading that is not the newest one
+	// is kept. A quarter of an hour is enough to see what just
+	// happened; further back there is nothing to see.
+	pruneOlderThan = 15 * time.Minute
+)
+```
+
+```go
+func (s *Scheduler) pruneReadings(ctx context.Context) {
+	if err := s.Mgr.Store.PruneUsageSnapshots(ctx, time.Now().Add(-pruneOlderThan), pruneKeep); err != nil {
+		fmt.Printf("usage: the old readings could not be thrown away: %v\n", err)
+	}
 }
 ```
 
@@ -4810,6 +4859,1177 @@ go test ./...
 ```
 git add internal/rotator internal/gateway internal/manager internal/usage
 git commit -m "fix(gateway): 忙的账号等一等，不算一次失败"
+```
+
+---
+
+### Task 14: 卡上写着用完
+
+这一节记的是最后一轮复查改掉的东西：卡上没有写着用完的账号、被清掉的标记会被后台那一趟读放回来、旧的读数没有人收拾、关掉的时候调度器没有人等、聊天那条路上每个请求都去读一遍总并发。
+
+**Files:**
+- Modify: `internal/card/card.go`
+- Modify: `internal/card/card_test.go`
+- Modify: `internal/gateway/usage.go`
+- Modify: `internal/gateway/spent.go`
+- Modify: `internal/gateway/spent_test.go`
+- Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/gateway_test.go`
+- Modify: `internal/store/store.go`
+- Modify: `internal/store/store_test.go`
+- Modify: `internal/usage/usage.go`
+- Modify: `internal/scheduler/scheduler.go`
+- Modify: `internal/scheduler/scheduler_test.go`
+- Modify: `cmd/mmxcode/serve.go`
+- Modify: `cmd/mmxcode/login.go`
+- Modify: `internal/webui/webui.go`
+- Modify: `README.md`
+
+**一、卡上写着用完。**
+
+规格 §7 的那张表里，「X 用完」那一行写的是：卡上**显示用完**，在轮转里**不在**。可是卡上从来不问「这个账号被记了用完没有」：上游拒了它（额度用完），网关把它挪出轮转，卡上还摆着它上一次读到的 437.5 积分 —— 人就以为那积分还在。卡上说的话，网关得兑现。
+
+标记的粒度是「账号 × 窗口组」（规格 §4.1）：别的组没有用完，那些窗口照旧摆着数。过了时刻的标记不是标记了：那个组已经回来，账号回到轮转里（规格 §4.5 的恢复点 A）。
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/card/card_test.go` 里加：
+
+```go
+// TestTheCardSaysTheAccountIsUsedUp says an account that is marked
+// spent says so on the card, and its credits are not counted.
+//
+// 上游拒了它：网关不会再把它给任何客户端。卡上还摆着它上一次读到的
+// 437.5 积分，人就以为那积分还在 —— 卡上说的话，网关得兑现。
+func TestTheCardSaysTheAccountIsUsedUp(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 100},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(time.Hour), Reason: "quota",
+		}},
+	)
+	if c.Balance != "0 credits" {
+		t.Errorf("balance = %q, want %q: the account is out, it has no credits to spend",
+			c.Balance, "0 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display != "用完" {
+			t.Errorf("the window %q says %q, want %q", w.Name, w.Display, "用完")
+		}
+	}
+}
+```
+
+```go
+// TestTheCardWithoutASpentMarkIsUnchanged says an account that is not
+// marked spent is said as it was read.
+//
+// 没有标记的账号跟从前一样：它的数就是它上一次读到的数。
+func TestTheCardWithoutASpentMarkIsUnchanged(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 12.5},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	if c.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q", c.Balance, "437.5 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display == "用完" {
+			t.Errorf("the window %q says it is used up: there is no mark", w.Name)
+		}
+	}
+}
+```
+
+```go
+// TestTheExpiredSpentMarkIsNotUsedUp says a mark whose time has passed
+// does not say the account is used up.
+//
+// 时刻过了的标记不是标记了：那个组已经回来，账号回到轮转里（规格 §4.5
+// 的恢复点 A）。卡上不能还写着用完。
+func TestTheExpiredSpentMarkIsNotUsedUp(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(-time.Hour), Reason: "quota",
+		}},
+	)
+	if c.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q: the mark is over", c.Balance, "437.5 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display == "用完" {
+			t.Errorf("the window %q says it is used up: the mark is over", w.Name)
+		}
+	}
+}
+```
+
+```go
+// TestTheGroupThatIsNotSpentKeepsItsNumbers says a mark for one group
+// does not mark the other groups.
+//
+// 标记的粒度是「账号 × 窗口组」：别的组没有用完，那些窗口照旧摆着数。
+func TestTheGroupThatIsNotSpentKeepsItsNumbers(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 100},
+		{Name: "5 hours video", ModelName: "video", Used: 10},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(time.Hour), Reason: "quota",
+		}},
+	)
+	general, video := "", ""
+	for _, w := range c.Windows {
+		switch w.Name {
+		case "5 hours":
+			general = w.Display
+		case "5 hours video":
+			video = w.Display
+		}
+	}
+	if general != "用完" {
+		t.Errorf("the general window says %q, want %q", general, "用完")
+	}
+	if video == "用完" {
+		t.Errorf("the video window says it is used up: only the general group is")
+	}
+}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```
+go test ./internal/card/
+```
+
+失败：卡上还摆着「437.5 credits」，窗口上没有「用完」。
+
+- [ ] **Step 3: 卡上写着用完**
+
+`internal/card/card.go` 的 `Of` 多收一份标记 —— 它现在知道哪些账号被记了用完：
+
+```go
+// Of builds the card from the accounts' latest readings.
+//
+// The readings are the ones that were saved: the card says what was read
+// and when, not what would be read now. A reading that failed is left
+// out of the totals -- it is not a zero.
+//
+// spent are the marks of the accounts that have run out: each one is an
+// account and the plan group that is spent for it.
+//
+// An account that is marked spent is out: the gateway will not hand it
+// to a client, so the card must not claim its credits -- a card that
+// promises credits the gateway refuses is worse than a short balance.
+// The windows of the spent group say so, and the account's credits are
+// left out of the balance.
+func Of(snaps []store.UsageSnapshot, accounts []store.Account, spent []store.Exhausted) Card {
+	byAccount := map[string]store.Account{}
+	for _, a := range accounts {
+		byAccount[a.ID] = a
+	}
+	marks := spentOf(spent, time.Now())
+	c := Card{Windows: []Window{}}
+	read := map[string]bool{}
+	for _, s := range snaps {
+		read[s.AccountID] = true
+		name := accountName(byAccount[s.AccountID], s.AccountID)
+		// 一个账号的窗口上带它的名字：网关是轮转的，不说清是谁的，
+		// 卡片上就分不出哪个窗口是谁的。
+		prefix := ""
+		if len(snaps) > 1 {
+			prefix = name + " · "
+		}
+		mark := marks[s.AccountID]
+		c.Windows = append(c.Windows, creditWindow(s, prefix, mark)...)
+		c.Windows = append(c.Windows, planWindows(s, prefix, mark)...)
+		if s.HasAmounts {
+			if !mark.out {
+				// 用完的账号没有积分可以花：网关不会把它给客户端，卡上
+				// 不能还摆着它的数。
+				c.remaining += s.Remaining
+			}
+			c.readable = true
+		}
+		if p, ok := planOf(s); ok {
+			if c.Plan == "" || planRank(p) > planRank(c.Plan) {
+				c.Plan = p
+			}
+			// 计划什么时候没：这一批里最早的那个。一个账号的计划先
+			// 没了，那张卡片就不该再拿它说事。
+			if !s.PlanUntil.IsZero() && (c.Until == nil || s.PlanUntil.Before(*c.Until)) {
+				t := s.PlanUntil
+				c.Until = &t
+			}
+		}
+	}
+	unread := 0
+	for _, a := range accounts {
+		if !read[a.ID] {
+			unread++
+		}
+	}
+	c.Extra = &Extra{
+		Accounts:   len(accounts),
+		Readings:   len(snaps),
+		Unread:     unread,
+		Unreadable: unreadable(snaps),
+		ReadAt:     readAt(snaps),
+	}
+	if c.readable {
+		c.Balance = creditsText(c.remaining)
+	}
+	return c
+}
+```
+
+它问的是每个账号哪些组用完了：
+
+```go
+// spentInfo says what is spent of one account.
+//
+// 标记的粒度是「账号 × 窗口组」：别的组不是用完的，那些窗口照旧摆着数。
+type spentInfo struct {
+	// out says the account is out: the gateway will not hand it to a
+	// client.
+	out bool
+	// whole says the mark has no group: it counts for every group.
+	whole bool
+	// groups are the plan groups that are spent.
+	groups map[string]bool
+}
+```
+
+```go
+// spentGroup says whether the plan group is spent for this account.
+//
+// 组的名字比的时候不看大小写：站上写的是 "General"，这边说的是
+// "general"，说的是同一个组（跟网关那边一个规矩）。
+func (i spentInfo) spentGroup(group string) bool {
+	if i.whole {
+		return true
+	}
+	return i.groups[strings.ToLower(strings.TrimSpace(group))]
+}
+```
+
+```go
+// spentOf gives the accounts' live spent marks.
+//
+// 时刻过了的标记不是标记了：那个组已经回来，账号回到轮转里（规格 §4.5
+// 的恢复点 A）。所以只有将来的那些算数。
+func spentOf(spent []store.Exhausted, now time.Time) map[string]spentInfo {
+	out := map[string]spentInfo{}
+	for _, e := range spent {
+		if !e.Until.After(now) {
+			continue
+		}
+		i := out[e.AccountID]
+		if i.groups == nil {
+			i.groups = map[string]bool{}
+		}
+		i.out = true
+		key := strings.ToLower(strings.TrimSpace(e.WindowKey))
+		if key == "" {
+			// 账号级的标记：它对每一个组都算。
+			i.whole = true
+		} else {
+			i.groups[key] = true
+		}
+		out[e.AccountID] = i
+	}
+	return out
+}
+```
+
+积分那个窗口和计划那些窗口照着改：
+
+```go
+// creditWindow gives the credits as a window.
+//
+// magpie 的卡片上，积分是一个窗口：共给了多少、用了多少、什么时候用完。
+func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+	if !s.HasAmounts || s.Granted <= 0 {
+		return nil
+	}
+	// 账本给的是十进制的小数，加起来会带出一串小数点后头的零头。
+	// 四舍五入到两位：卡片上的数是给人看的。
+	used := round2(math.Max(0, s.Consumed))
+	limit := round2(s.Granted)
+	left := round2(s.Remaining)
+	w := Window{
+		Name:    prefix + "Credits",
+		Used:    round2(100 * used / limit),
+		Display: strconv.FormatFloat(used, 'f', -1, 64) + " / " + strconv.FormatFloat(limit, 'f', -1, 64),
+		Amount:  &used,
+		Limit:   &limit,
+		Unit:    "credits",
+	}
+	if spent.out {
+		// 用完的账号没有积分可以花：网关不会把它给客户端。卡上摆着
+		// 「437.5 / 500」就是骗人 —— 它说了就要兑现。
+		w.Display = "用完"
+		return []Window{w}
+	}
+	if !s.ExpiresAt.IsZero() {
+		t := s.ExpiresAt
+		w.RunsOutAt = &t
+		w.RunsOut = &left
+	}
+	return []Window{w}
+}
+```
+
+```go
+// planWindows gives the plan's windows.
+func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
+	if strings.TrimSpace(s.WindowsJSON) == "" {
+		return nil
+	}
+	var ws []account.Window
+	if err := json.Unmarshal([]byte(s.WindowsJSON), &ws); err != nil {
+		// 读不出来的窗口就是没有窗口：这里不能因为一个存坏的读数
+		// 就把整张卡片弄坏。
+		return nil
+	}
+	out := make([]Window, 0, len(ws))
+	for _, w := range ws {
+		cw := Window{Name: prefix + w.Name, Used: w.Used}
+		if w.Unlimited {
+			cw.Display = "Unlimited"
+			cw.Aside = true
+			out = append(out, cw)
+			continue
+		}
+		if !w.ResetsAt.IsZero() {
+			t := w.ResetsAt
+			cw.ResetsAt = &t
+		}
+		if w.Amount != 0 {
+			v := w.Amount
+			cw.Amount = &v
+		}
+		if w.Limit != 0 {
+			v := w.Limit
+			cw.Limit = &v
+		}
+		cw.Unit = w.Unit
+		if spent.spentGroup(w.ModelName) {
+			// 这个组用完了：窗口上就写着「用完」，别让人以为还有。
+			cw.Display = "用完"
+		}
+		out = append(out, cw)
+	}
+	return out
+}
+```
+
+`internal/gateway/usage.go` 的 `usageCard` 把库里的标记递进去（Task 9 那一段也改了）。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```
+go test ./internal/card/ ./internal/gateway/
+```
+
+**二、后台那一趟读不把清掉的标记放回去。**
+
+`internal/gateway/spent.go` 的 `markedUntil` 以前答的是「这个标记知道不知道」：库里没有这个账号这个组的标记，它也答「知道」。于是后台那一趟读会把标记写回去 —— 它是签到清掉标记之前起的那一趟，而签到给的积分已经让这个账号回到轮转里去了。一个有积分的账号被关在外面，最多关七天（规格 §4.5 的恢复点 B）。
+
+现在它答的是「有没有这个标记」：没有就不写。读不到标记也是不写：不知道就不动。
+
+Task 5 那一段的 `markedUntil` 和 `correctMark` 改了，改的就是这两句。
+
+- [ ] **Step 5: 写失败的测试**
+
+`internal/gateway/spent_test.go` 里加：
+
+```go
+// TestTheMarkAndNoMarkAreNotTheSame says a mark that is there and no
+// mark at all are told apart.
+//
+// 「没有标记」和「标记到零时刻」是两件事：前者是被清掉的（签到给了积
+// 分），后者是标记在那儿、只是没有时刻。后台那一趟读不许把清掉的标记
+// 又写回去。
+func TestTheMarkAndNoMarkAreNotTheSame(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if _, found := h.gw.markedUntil(ctx, "acc_01", "general"); found {
+		t.Error("there is a mark, want none")
+	}
+	// 一个到零时刻的标记：它在，只是没有时刻。
+	if err := h.store.SetExhausted(ctx, "acc_01", "general", time.Time{}, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	until, found := h.gw.markedUntil(ctx, "acc_01", "general")
+	if !found {
+		t.Error("the mark is not found, want it")
+	}
+	if !until.IsZero() {
+		t.Errorf("the mark = %s, want the zero time", until)
+	}
+}
+```
+
+```go
+// TestTheBackgroundReadingDoesNotPutBackAClearedMark says a background
+// reading does not put a mark back that is not in the database.
+//
+// 上游拒了它 → 标记 → 后台去读。读的那一趟还没回来，签到给了积分，读到
+// 的数说有额度 → 标记被清掉 → 账号回到轮转里。后台那一趟这时候才回来，
+// 它把标记又写回去：这个有积分的账号就白扔了 —— 最多扔七天。
+func TestTheBackgroundReadingDoesNotPutBackAClearedMark(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	// 后台那一次读：读到的是七天以后回来的时刻。
+	h.reader.set(readingOf(t, []account.Window{
+		{ModelName: "general", ResetsAt: time.Now().Add(7 * 24 * time.Hour)},
+	}), nil)
+	// 库里没有标记了：签到给了积分，标记已经被清掉。
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if !got.IsZero() {
+		t.Errorf("the mark = %s, want none: it was cleared on purpose", got)
+	}
+}
+```
+
+- [ ] **Step 6: 运行测试确认失败**
+
+```
+go test ./internal/gateway/ -run 'TestTheMarkAndNoMarkAreNotTheSame|TestTheBackgroundReadingDoesNotPutBackAClearedMark'
+```
+
+失败：没有标记也被当成了「知道」，后台那一趟读把标记写了回去。
+
+**三、旧的读数有人收拾，而且留的是最新的那一行。**
+
+`usage_snapshots` 原来一行都不扔：调度器每 30 秒扫一趟，每读一个账号写一行，一天下来就是几千行。
+
+`internal/store/store.go` 的 `PruneUsageSnapshots` 按 id 排（最后写进去的那一行）：读额度的时候时刻是在读的开头盖的、插入是在读完之后，两次读撞在一起的时候，先读到的那一次反而是后写进去的 —— 按 id 排就留错了那一条。改成跟 `LatestUsageSnapshots` 一个规矩：时刻说哪一次读是最新的，id 只在时刻一样时分出先后。
+
+```go
+// PruneUsageSnapshots throws away the readings that are not needed.
+//
+// The readings that are older than olderThan are thrown away, but the
+// newest keepPerAccount readings of every account are kept whatever
+// their age: the newest reading is the account's reading, and it is
+// what the totals are made of.
+//
+// The newest is the one that was read last: the time says when the
+// reading was made, and the id only breaks a tie between two readings
+// of the same millisecond -- the same rule as LatestUsageSnapshots.
+// Ranking by the id alone would keep the reading that was written last,
+// which is not always the newest one: a reading stamps its time when it
+// starts and writes it down when it ends.
+//
+// A keepPerAccount of zero or less keeps nothing: every reading that
+// is older than olderThan goes.
+func (s *Store) PruneUsageSnapshots(ctx context.Context, olderThan time.Time, keepPerAccount int) error {
+	if keepPerAccount < 0 {
+		keepPerAccount = 0
+	}
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM usage_snapshots WHERE id IN (
+			SELECT id FROM (
+				SELECT id, created_at,
+					ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC, id DESC) AS rn
+				FROM usage_snapshots
+			) WHERE rn > ? AND created_at < ?)`,
+		keepPerAccount, ms(olderThan))
+	if err != nil {
+		return fmt.Errorf("prune the usage snapshots: %w", err)
+	}
+	return nil
+}
+```
+
+- [ ] **Step 7: 写失败的测试**
+
+`internal/store/store_test.go` 里加：
+
+```go
+// TestThePruningKeepsTheNewestReading says the reading that is kept is
+// the one that was read last.
+//
+// 读额度的时候时刻是在读的开头盖的，插入是在读完之后：两次读撞在一起
+// 的时候，先读到的那一次反而是后写进去的（id 更大）。按 id 排就留错了那
+// 一条 —— 卡上摆着旧的数。
+//
+// 时刻说哪一次读是最新的，id 只在时刻一样时分出先后 —— 跟
+// LatestUsageSnapshots 一个规矩。
+func TestThePruningKeepsTheNewestReading(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	readFirst := time.Now().Add(-2 * time.Hour)
+	readLater := time.Now().Add(-time.Hour)
+	// 先写进去的那一次读，是更晚读到的那一次。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Remaining: 100, CreatedAt: readLater,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 后写进去的那一次读，是更早读到的那一次：id 更大，读到的更早。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Remaining: 300, CreatedAt: readFirst,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PruneUsageSnapshots(ctx, time.Now(), 1); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("got %d readings, want the newest one", n)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", got[0])
+	}
+}
+```
+
+`internal/scheduler/scheduler_test.go` 里加（它要数的是全部的行，所以自己开一条连接去数）：
+
+```go
+// countReadings says how many usage readings the database holds.
+//
+// 调度器的那个包外面数不到行数：库的读法只有「每个账号最新的一条」。这
+// 个测试要数的是全部的行，所以自己开一条连接去数。
+func countReadings(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+```
+
+```go
+// TestTheUsageRoundThrowsAwayTheOldReadings says the usage round throws
+// away the readings that are not needed.
+//
+// 调度器每 scan_every 扫一趟，每读一个账号就写一行读数：不收拾的话一天
+// 下来就是几千行，而除了每个账号最新的一条，剩下的谁也不看。
+func TestTheUsageRoundThrowsAwayTheOldReadings(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	path := t.TempDir() + "/t.db"
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 三次很早以前的读。
+	for i := 0; i < 3; i++ {
+		if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 10, Remaining: 10,
+			CreatedAt: now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	// 它刚被用过：它是热的，这一趟要读它。
+	mgr.MarkUsed("acc_01")
+
+	sc := New(mgr, config.Default())
+	sc.RefreshUsage(ctx)
+
+	// 刚才读的那一次留下，三次很早以前的都扔掉。
+	if n := countReadings(t, path); n != 1 {
+		t.Fatalf("the readings = %d, want only the newest one", n)
+	}
+}
+```
+
+- [ ] **Step 8: 运行测试确认失败**
+
+```
+go test ./internal/store/ ./internal/scheduler/
+```
+
+失败：库里留的是错的那一行；调度器那一趟读完，四行读数还在。
+
+- [ ] **Step 9: 调度器读完顺手收拾**
+
+`internal/scheduler/scheduler.go` 的 `RefreshUsage` 读完顺手收拾一下（Task 10 那一段也改了）：
+
+```go
+// The values of the pruning of the readings.
+//
+// 调度器每 usage.refresh.scan_every 扫一趟，每读一个账号就写一行读数。
+// 不收拾的话，一天下来就是几千行 —— 而除了每个账号最新的一条（卡上摆的
+// 就是它），剩下的谁也不看。
+const (
+	// pruneKeep is how many readings of every account are kept whatever
+	// their age. One is the reading the card and the summary use: it is
+	// the account's reading.
+	pruneKeep = 1
+	// pruneOlderThan is how long a reading that is not the newest one
+	// is kept. A quarter of an hour is enough to see what just
+	// happened; further back there is nothing to see.
+	pruneOlderThan = 15 * time.Minute
+)
+```
+
+**四、关掉的时候要等调度器。**
+
+`cmd/mmxcode/serve.go` 以前是 `cancel()`、`gw.Close()`、`srv.Shutdown(10s)`，然后库在 `cmd/mmxcode/root.go` 里关。调度器那几趟活儿没有人等：进程在拆的时候还在飞的那一趟读额度，继续往库里写，写下去的是「database is closed」—— 读到的数丢了，错误打在屏幕上。
+
+`internal/scheduler/scheduler.go` 的调度器现在有一份自己的账：
+
+```go
+// run runs a piece of work every so often, on the scheduler's account.
+//
+// 它算在调度器的账上：进程要关的时候要等它停下来（Wait）。
+func (s *Scheduler) run(ctx context.Context, every time.Duration, work func(context.Context)) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.loop(ctx, every, work)
+	}()
+}
+```
+
+```go
+// Wait waits for the scheduler's work to stop.
+//
+// 调度器的活儿挂在它自己的上下文上：那个上下文一结束，活儿就不该再开
+// 新的一趟，而在飞的那一趟要等它自己停下（或者放弃）。
+//
+// 它等的是那些周期活儿。Run 自己是在调用它的那条线上的：等 Run 回来
+// 之后调 Wait，才是「全都停了」。
+func (s *Scheduler) Wait() {
+	s.wg.Wait()
+}
+```
+
+`cmd/mmxcode/serve.go` 里，`cancel()` 以后等它停下来，再关 HTTP：
+
+```go
+			cancel()
+			// 网关关了以后，后台的读额度也得停，而且要等它停下来：库
+			// 是接着关的，它不该往一个正在关着的库上写。
+			gw.Close()
+			// 调度器的活儿也是：它停，而且要等它停。库是接着关的，那
+			// 一趟读额度要是还在飞，它写下去的就是「database is closed」。
+			<-scDone
+			sc.Wait()
+```
+
+- [ ] **Step 10: 写失败的测试**
+
+`internal/scheduler/scheduler_test.go` 里加：
+
+```go
+// TestTheSchedulerCanBeWaitedFor says the scheduler's work can be waited
+// for.
+//
+// 进程要关的时候，调度器的活儿也得停，而且要等它停下来：库是接着关的，
+// 它不该往一个正在关着的库上写（那是「database is closed」）。
+func TestTheSchedulerCanBeWaitedFor(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	sc := New(mgr, config.Default())
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sc.Run(runCtx)
+	}()
+	// 停它。
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scheduler did not stop")
+	}
+	// 等它的活儿停下来。
+	waited := make(chan struct{})
+	go func() {
+		defer close(waited)
+		sc.Wait()
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scheduler's work was not waited for")
+	}
+}
+```
+
+- [ ] **Step 11: 运行测试确认失败**
+
+```
+go test ./internal/scheduler/ -run TestTheSchedulerCanBeWaitedFor
+```
+
+失败：`sc.Wait undefined`。
+
+**五、总并发缓存一秒。**
+
+聊天那条路上每个请求都要问一次总并发：算它要读一遍账号和一遍标记。一串请求就是一遍又一遍同样的读，而这个答案很少变。缓存一秒：这一秒里的答案是一个样的。
+
+缓存里的那个数还是照着同样的规矩算出来的（可用账号、还是那些没有被记了「额度用完」的账号）。
+
+`internal/gateway/gateway.go` 里加：
+
+```go
+// concurrencyCacheTTL is how long the total concurrency is kept.
+//
+// 算总并发要读一遍账号和标记，而聊天那条路上每个请求都要问一次。一串
+// 请求就是一遍又一遍同样的读，而这一阵子的答案是一个样的：一秒够了。
+const concurrencyCacheTTL = time.Second
+
+// New makes a gateway.
+func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Handler) *Server {
+	// 多久算热是配置说了算：管理器记着谁刚被用过，这个窗口是它的。
+	mgr.HotWindow = cfg.Usage.Refresh.HotWindow.Duration()
+	g := &Server{
+		Mgr:          mgr,
+		Cfg:          cfg,
+		Store:        s,
+		Reader:       mgr,
+		UpstreamBase: site.LLMHost,
+		WebUI:        webui,
+	}
+	// 原生路径先开着：上游说它没有 /responses 的时候再关。
+	g.NativeResponses.Store(true)
+	g.NativeChatCompletions.Store(true)
+	g.busy = newBusyAccounts(cfg.Concurrency.PerAccount)
+	g.gate = &gate{}
+	g.lifeCtx, g.lifeCancel = context.WithCancel(context.Background())
+	// 后台的读有上限：到顶了就跳过那一次，不排队。
+	limit := cfg.Usage.Refresh.Concurrency
+	if limit <= 0 {
+		limit = 1
+	}
+	g.bgSem = make(chan struct{}, limit)
+	g.concTTL = concurrencyCacheTTL
+	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy}, rotator.Options{
+		MaxAttempts: cfg.Rotation.MaxAttempts,
+		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
+		WindowGroup: manager.WindowGroup,
+		Strategy:    cfg.Rotation.Strategy,
+	})
+	return g
+}
+
+// round makes the reader of the credits.
+//
+// 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
+func (s *Server) round() *usage.Round {
+	return usage.NewRound(s.Store, s.Reader, s.Mgr.HotAccounts, s.Cfg)
+}
+
+// concurrencyLimit says how many requests may be in the air at once.
+//
+// 它是总并发那道门的上限（可用账号的五分之一，小规模至少三个）。算它要
+// 读一遍账号和一遍标记，而聊天那条路上每个请求都要问一次：一串请求就
+// 是一遍又一遍同样的读。所以答案留一秒 —— 这一阵子的答案是一个样的。
+//
+// 缓存里的那个数还是照着同样的规矩算出来的：能用的是那些签入中、而且
+// 没有被记了「额度用完」的账号。
+func (s *Server) concurrencyLimit(ctx context.Context) int {
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
+	if !s.concAt.IsZero() && time.Since(s.concAt) < s.concTTL {
+		return s.concLimit
+	}
+	n := s.totalConcurrency(ctx)
+	s.concLimit = n
+	s.concAt = time.Now()
+	return n
+}
+
+// Close stops the background work and waits for it.
+//
+// 后台的活儿挂在网关的命上：网关关了它也停，而且要等在飞的那些停下
+// 来 —— 不然它会往一个正在关着的库上写。
+func (s *Server) Close() {
+	s.bgMu.Lock()
+	s.bgClosed = true
+	s.bgMu.Unlock()
+	s.lifeCancel()
+	s.bgWG.Wait()
+}
+
+// startBackground runs fn in the background, if there is room for it.
+//
+// 同时在跑的读有上限：到顶了就跳过这一次。标记就照着写下去的那份留
+// 着（冷却时间），下一趟再说。
+//
+// 它说活儿有没有开始。
+func (s *Server) startBackground(fn func()) bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgClosed {
+		return false
+	}
+	select {
+	case s.bgSem <- struct{}{}:
+	default:
+		return false
+	}
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		defer func() { <-s.bgSem }()
+		fn()
+	}()
+	return true
+}
+
+// poolStore is what the pool adapter reads from the store.
+//
+// It is an interface and not the store itself, so that a test can count
+// the questions the adapter asks without the store knowing about
+// counting.
+type poolStore interface {
+	ListAccounts(ctx context.Context) ([]store.Account, error)
+	ListExhausted(ctx context.Context) ([]store.Exhausted, error)
+	BindSession(ctx context.Context, sessionKey, accountID string) error
+	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	UpstreamID(ctx context.Context, sessionKey string) (string, error)
+	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
+	LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error)
+}
+
+// poolAdapter makes the store into a rotator pool.
+type poolAdapter struct {
+	s poolStore
+	// busy counts the requests in the air per account.
+	busy *busyAccounts
+}
+
+func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
+	return p.s.ListAccounts(ctx)
+}
+
+func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
+	return p.s.ListExhausted(ctx)
+}
+
+func (p poolAdapter) BindSession(ctx context.Context, key, accountID string) error {
+	return p.s.BindSession(ctx, key, accountID)
+}
+
+func (p poolAdapter) SessionAccount(ctx context.Context, key string) (string, bool, error) {
+	return p.s.SessionAccount(ctx, key)
+}
+
+// UpstreamID gives the upstream id of a session.
+//
+// The id is the one the database keeps: an opaque id, made once and
+// kept, so the upstream sees one conversation and the mapping survives
+// a restart. The client's own session id does not go upstream.
+func (p poolAdapter) UpstreamID(ctx context.Context, key string) (string, error) {
+	return p.s.UpstreamID(ctx, key)
+}
+
+func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
+	return p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
+}
+
+// RemainingAll gives the credits left of a whole list of accounts.
+//
+// The rotator asks for every account it may pick in one question, so
+// the answer comes out of one read of the readings and not one read
+// per account.
+//
+// The map holds only the accounts whose credits are known: an account
+// that is not in it has not been read yet, and the rotator takes it
+// after the ones whose balance it knows.
+func (p poolAdapter) RemainingAll(ctx context.Context, accountIDs []string) map[string]rotator.Remaining {
+	out := map[string]rotator.Remaining{}
+	if len(accountIDs) == 0 {
+		return out
+	}
+	wanted := make(map[string]bool, len(accountIDs))
+	for _, id := range accountIDs {
+		wanted[id] = true
+	}
+	snaps, err := p.s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		return out
+	}
+	for _, s := range snaps {
+		if !wanted[s.AccountID] {
+			continue
+		}
+		if !s.HasAmounts {
+			// 没读到余额的账号不算有余额：留空，让 rotator 把它排在后面。
+			continue
+		}
+		out[s.AccountID] = rotator.Remaining{Left: s.Remaining, Known: true}
+	}
+	return out
+}
+
+// Remaining gives one account's credits left.
+//
+// It goes through the same read as RemainingAll, so that the two
+// cannot disagree about one account.
+func (p poolAdapter) Remaining(ctx context.Context, accountID string) (float64, bool) {
+	rem, ok := p.RemainingAll(ctx, []string{accountID})[accountID]
+	if !ok {
+		return 0, false
+	}
+	return rem.Left, true
+}
+
+// Busy says whether a request is in the air on an account.
+//
+// 网关把在飞的计数报给 rotator，rotator 挑账号的时候避开在飞的那些
+// （规格 §6.3）。这个账是网关自己的：它不用问数据库。
+func (p poolAdapter) Busy(ctx context.Context, accountID string) bool {
+	if p.busy == nil {
+		return false
+	}
+	return p.busy.isBusy(accountID)
+}
+
+// ServeHTTP routes a request.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/signin":
+		// 登录页不用会话：没有会话的人正要来这里登录。
+		s.signInPage(w, r, http.StatusOK, "")
+		return
+	case "/api/session":
+		// 发 cookie 和销 cookie 都不用会话。
+		s.session(w, r)
+		return
+	}
+	// 两扇门：聊天那扇认两把 key（配置里的和后台申请的），管理页那扇只
+	// 认配置里的那把。
+	gate := s.auth
+	if isChatPath(r.URL.Path) {
+		gate = s.authChat
+	}
+	if !gate(r) {
+		if isAPIPath(r.URL.Path) {
+			writeError(w, protocolOf(r.URL.Path), http.StatusUnauthorized, "the key was refused")
+			return
+		}
+		// 浏览器来的是页面：给它登录页，不是一段 JSON。
+		s.signInPage(w, r, http.StatusOK, "")
+		return
+	}
+	switch r.URL.Path {
+	case "/v1/messages":
+		s.handleChat(w, r, protocolAnthropic)
+		return
+	case "/v1/chat/completions":
+		s.handleChat(w, r, protocolOpenAI)
+		return
+	case "/v1/responses":
+		s.handleChat(w, r, protocolCodex)
+		return
+	case "/v1/models":
+		s.handleModels(w, r)
+		return
+	case "/v1/usage":
+		// magpie 的卡片：这个网关还剩多少额度。
+		s.usageCard(w, r)
+		return
+	}
+	if s.WebUI != nil && strings.HasPrefix(r.URL.Path, "/api/") {
+		s.WebUI.ServeHTTP(w, r)
+		return
+	}
+	if s.WebUI != nil {
+		s.WebUI.ServeHTTP(w, r)
+		return
+	}
+	writeError(w, protocolOf(r.URL.Path), http.StatusNotFound, "no such endpoint")
+}
+
+// protocol is the protocol the client speaks.
+type protocol int
+
+const (
+	protocolAnthropic protocol = iota
+	protocolOpenAI
+	protocolCodex
+)
+```
+
+```go
+// concurrencyLimit says how many requests may be in the air at once.
+//
+// 它是总并发那道门的上限（可用账号的五分之一，小规模至少三个）。算它要
+// 读一遍账号和一遍标记，而聊天那条路上每个请求都要问一次：一串请求就
+// 是一遍又一遍同样的读。所以答案留一秒 —— 这一阵子的答案是一个样的。
+//
+// 缓存里的那个数还是照着同样的规矩算出来的：能用的是那些签入中、而且
+// 没有被记了「额度用完」的账号。
+func (s *Server) concurrencyLimit(ctx context.Context) int {
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
+	if !s.concAt.IsZero() && time.Since(s.concAt) < s.concTTL {
+		return s.concLimit
+	}
+	n := s.totalConcurrency(ctx)
+	s.concLimit = n
+	s.concAt = time.Now()
+	return n
+}
+```
+
+- [ ] **Step 12: 写失败的测试**
+
+`internal/gateway/gateway_test.go` 里加：
+
+```go
+// TestTheTotalConcurrencyIsCached says the total concurrency is not read
+// out of the database for every request.
+//
+// 聊天那条路上每个请求都要问一次总并发：算它要读一遍账号和标记。一串
+// 请求就是一遍又一遍同样的读，而这一阵子的答案是一个样的。
+func TestTheTotalConcurrencyIsCached(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	// 缓存住一阵子。
+	h.gw.concTTL = time.Minute
+	first := h.gw.concurrencyLimit(ctx)
+	// 多一个能用的账号：可用账号多了，总并发该变大。
+	if err := h.store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, UserID: "0987654321",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.gw.concurrencyLimit(ctx); got != first {
+		t.Errorf("the total concurrency = %d, want %d: it is cached", got, first)
+	}
+	// 缓存过期以后，它跟着库走。
+	h.gw.concTTL = 0
+	if got := h.gw.concurrencyLimit(ctx); got == first {
+		t.Errorf("the total concurrency = %d, want the new one", got)
+	}
+}
+```
+
+- [ ] **Step 13: 运行测试确认失败**
+
+```
+go test ./internal/gateway/ -run TestTheTotalConcurrencyIsCached
+```
+
+失败：`h.gw.concurrencyLimit undefined`。
+
+**六、零碎。**
+
+- `internal/gateway/usage.go`、`cmd/mmxcode/login.go`、`internal/webui/webui.go` 和那两个测试里的注释还在说「调度器每 15 分钟读一遍」：调度器现在每 `usage.refresh.scan_every`（默认 30 秒）扫一遍，老的 `schedule.usage_refresh` 只是没配它的时候的兜底。注释照着改。
+- `internal/usage/usage.go` 的 `newestPerAccount` 和 `newer` 没人用了：每一个调用方给的都是每个账号一条读数（`LatestUsageSnapshots` 就是那么给的）。去重的那两句挪进 `Aggregate` 里，行为不变。
+- `internal/store/store.go` 的 `PruneExpiredWindows` 不接：过了时刻的标记不是垃圾，它是「这个账号该去读一次」的信号（规格 §4.5 的恢复点 A）。删掉它，那个账号就再也等不到那一趟读。它的注释里写清楚了这一点。
+
+- [ ] **Step 14: 运行测试确认通过**
+
+```
+gofmt -l .
+go build ./...
+go vet ./...
+go test ./...
+```
+
+- [ ] **Step 15: 提交**
+
+```
+git add internal/card internal/gateway internal/store internal/usage internal/scheduler cmd/mmxcode internal/webui README.md docs/superpowers/plans
+git commit -m "fix(card): 卡上写着额度用完了"
 ```
 
 ---

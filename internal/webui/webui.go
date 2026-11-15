@@ -463,8 +463,9 @@ func (w *WebUI) waitLogin(id string, d *oauth.Device) {
 		w.failLogin(id, "the account could not be written down: "+err.Error())
 		return
 	}
-	// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人
-	// 才看得到它有多少积分。读不到不算登录失败——账号是进来了的。
+	// 刚登进来的账号马上读一次账本：不等调度器那一趟
+	// （usage.refresh.scan_every，默认 30 秒），人才看得到它有多少
+	// 积分。读不到不算登录失败——账号是进来了的。
 	w.refreshUsage(ctx, acc.ID)
 	w.mu.Lock()
 	delete(w.pending, id)

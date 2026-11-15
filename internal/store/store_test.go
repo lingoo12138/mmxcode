@@ -2548,3 +2548,55 @@ func TestAKeyThatIsNotThereIsNotFound(t *testing.T) {
 		t.Fatalf("err = %v, want not found", err)
 	}
 }
+
+// TestThePruningKeepsTheNewestReading says the reading that is kept is
+// the one that was read last.
+//
+// 读额度的时候时刻是在读的开头盖的，插入是在读完之后：两次读撞在一起
+// 的时候，先读到的那一次反而是后写进去的（id 更大）。按 id 排就留错了那
+// 一条 —— 卡上摆着旧的数。
+//
+// 时刻说哪一次读是最新的，id 只在时刻一样时分出先后 —— 跟
+// LatestUsageSnapshots 一个规矩。
+func TestThePruningKeepsTheNewestReading(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "acc_01")
+
+	readFirst := time.Now().Add(-2 * time.Hour)
+	readLater := time.Now().Add(-time.Hour)
+	// 先写进去的那一次读，是更晚读到的那一次。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 100, Remaining: 100, CreatedAt: readLater,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 后写进去的那一次读，是更早读到的那一次：id 更大，读到的更早。
+	if err := s.SaveUsageSnapshot(ctx, UsageSnapshot{
+		AccountID: "acc_01", HasAmounts: true,
+		Granted: 300, Remaining: 300, CreatedAt: readFirst,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PruneUsageSnapshots(ctx, time.Now(), 1); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("got %d readings, want the newest one", n)
+	}
+	got, err := s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want one per account", len(got))
+	}
+	if got[0].Remaining != 100 {
+		t.Fatalf("got %+v, want the reading that was made last", got[0])
+	}
+}

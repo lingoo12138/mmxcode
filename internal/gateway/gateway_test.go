@@ -1659,3 +1659,31 @@ func TestAKeyMadeInTheConsoleOpensTheUsageCard(t *testing.T) {
 		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestTheTotalConcurrencyIsCached says the total concurrency is not read
+// out of the database for every request.
+//
+// 聊天那条路上每个请求都要问一次总并发：算它要读一遍账号和标记。一串
+// 请求就是一遍又一遍同样的读，而这一阵子的答案是一个样的。
+func TestTheTotalConcurrencyIsCached(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	// 缓存住一阵子。
+	h.gw.concTTL = time.Minute
+	first := h.gw.concurrencyLimit(ctx)
+	// 多一个能用的账号：可用账号多了，总并发该变大。
+	if err := h.store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, UserID: "0987654321",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.gw.concurrencyLimit(ctx); got != first {
+		t.Errorf("the total concurrency = %d, want %d: it is cached", got, first)
+	}
+	// 缓存过期以后，它跟着库走。
+	h.gw.concTTL = 0
+	if got := h.gw.concurrencyLimit(ctx); got == first {
+		t.Errorf("the total concurrency = %d, want the new one", got)
+	}
+}

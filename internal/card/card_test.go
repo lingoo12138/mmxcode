@@ -21,6 +21,7 @@ func TestTheCardSaysHowManyCreditsAreLeft(t *testing.T) {
 			CreatedAt: time.Now(),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Balance != "437.5 credits" {
 		t.Errorf("balance = %q, want %q", c.Balance, "437.5 credits")
@@ -35,6 +36,7 @@ func TestAWholeNumberOfCreditsIsSaidWithoutADecimal(t *testing.T) {
 			Granted: 500, Consumed: 0, Remaining: 500,
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Balance != "500 credits" {
 		t.Errorf("balance = %q, want %q", c.Balance, "500 credits")
@@ -55,6 +57,7 @@ func TestTheCreditsOfEveryAccountAreAddedUp(t *testing.T) {
 			{ID: "acc_01", Name: "主号"},
 			{ID: "acc_02", Name: "副号"},
 		},
+		nil,
 	)
 	if c.Balance != "650 credits" {
 		t.Errorf("balance = %q, want %q", c.Balance, "650 credits")
@@ -74,6 +77,7 @@ func TestAnAccountThatWasNeverReadIsNotCounted(t *testing.T) {
 			{ID: "acc_01", Name: "主号"},
 			{ID: "acc_02", Name: "副号"},
 		},
+		nil,
 	)
 	if c.Balance != "400 credits" {
 		t.Errorf("balance = %q, want %q", c.Balance, "400 credits")
@@ -93,6 +97,7 @@ func TestTheCardHasNoBalanceWhenNothingWasRead(t *testing.T) {
 			{AccountID: "acc_01", MembershipError: "the site did not answer"},
 		},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Balance != "" {
 		t.Errorf("balance = %q, want none", c.Balance)
@@ -107,6 +112,7 @@ func TestTheCardNamesThePlan(t *testing.T) {
 			Plan: "Token Plan M3", PlanUntil: time.Now().Add(24 * time.Hour),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Plan != "Token Plan M3" {
 		t.Errorf("plan = %q, want %q", c.Plan, "Token Plan M3")
@@ -123,6 +129,7 @@ func TestAnAccountWithoutAPlanIsFree(t *testing.T) {
 			AccountID: "acc_01", HasAmounts: true, Granted: 500, Remaining: 500,
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Plan != "Free" {
 		t.Errorf("plan = %q, want %q", c.Plan, "Free")
@@ -141,6 +148,7 @@ func TestThePlanIsLeftOutWhenItIsNotKnown(t *testing.T) {
 			MembershipError: "the site did not answer",
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if c.Plan != "" {
 		t.Errorf("plan = %q, want none", c.Plan)
@@ -159,6 +167,7 @@ func TestTheCreditsAreAWindowOfTheirOwn(t *testing.T) {
 			ExpiresAt: time.Now().Add(time.Hour),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if len(c.Windows) != 1 {
 		t.Fatalf("windows = %d, want 1", len(c.Windows))
@@ -192,6 +201,7 @@ func TestThePlanWindowsAreOnTheCard(t *testing.T) {
 			Plan: "M Plan", WindowsJSON: string(ws),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	found := false
 	for _, w := range c.Windows {
@@ -221,6 +231,7 @@ func TestAnUnlimitedWindowIsSaidSo(t *testing.T) {
 			WindowsJSON: string(ws),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if len(c.Windows) != 2 {
 		t.Fatalf("windows = %d, want 2", len(c.Windows))
@@ -253,6 +264,7 @@ func TestTheAccountsAreNamedOnTheWindows(t *testing.T) {
 			{ID: "acc_01", Name: "主号"},
 			{ID: "acc_02", Name: "副号"},
 		},
+		nil,
 	)
 	if len(c.Windows) != 2 {
 		t.Fatalf("windows = %d, want 2", len(c.Windows))
@@ -274,6 +286,7 @@ func TestTheCardIsMagpiesShape(t *testing.T) {
 			Plan: "Token Plan M3", PlanUntil: time.Now(),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	b, err := json.Marshal(c)
 	if err != nil {
@@ -306,6 +319,7 @@ func TestTheNumbersAreNotFullOfNoise(t *testing.T) {
 			ExpiresAt: time.Now().Add(time.Hour),
 		}},
 		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
 	)
 	if len(c.Windows) != 1 {
 		t.Fatalf("windows = %d, want 1", len(c.Windows))
@@ -319,5 +333,130 @@ func TestTheNumbersAreNotFullOfNoise(t *testing.T) {
 	}
 	if w.Used != 0.01 {
 		t.Errorf("used = %v, want 0.01", w.Used)
+	}
+}
+
+// TestTheCardSaysTheAccountIsUsedUp says an account that is marked
+// spent says so on the card, and its credits are not counted.
+//
+// 上游拒了它：网关不会再把它给任何客户端。卡上还摆着它上一次读到的
+// 437.5 积分，人就以为那积分还在 —— 卡上说的话，网关得兑现。
+func TestTheCardSaysTheAccountIsUsedUp(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 100},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(time.Hour), Reason: "quota",
+		}},
+	)
+	if c.Balance != "0 credits" {
+		t.Errorf("balance = %q, want %q: the account is out, it has no credits to spend",
+			c.Balance, "0 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display != "用完" {
+			t.Errorf("the window %q says %q, want %q", w.Name, w.Display, "用完")
+		}
+	}
+}
+
+// TestTheCardWithoutASpentMarkIsUnchanged says an account that is not
+// marked spent is said as it was read.
+//
+// 没有标记的账号跟从前一样：它的数就是它上一次读到的数。
+func TestTheCardWithoutASpentMarkIsUnchanged(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 12.5},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		nil,
+	)
+	if c.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q", c.Balance, "437.5 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display == "用完" {
+			t.Errorf("the window %q says it is used up: there is no mark", w.Name)
+		}
+	}
+}
+
+// TestTheExpiredSpentMarkIsNotUsedUp says a mark whose time has passed
+// does not say the account is used up.
+//
+// 时刻过了的标记不是标记了：那个组已经回来，账号回到轮转里（规格 §4.5
+// 的恢复点 A）。卡上不能还写着用完。
+func TestTheExpiredSpentMarkIsNotUsedUp(t *testing.T) {
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(-time.Hour), Reason: "quota",
+		}},
+	)
+	if c.Balance != "437.5 credits" {
+		t.Errorf("balance = %q, want %q: the mark is over", c.Balance, "437.5 credits")
+	}
+	for _, w := range c.Windows {
+		if w.Display == "用完" {
+			t.Errorf("the window %q says it is used up: the mark is over", w.Name)
+		}
+	}
+}
+
+// TestTheGroupThatIsNotSpentKeepsItsNumbers says a mark for one group
+// does not mark the other groups.
+//
+// 标记的粒度是「账号 × 窗口组」：别的组没有用完，那些窗口照旧摆着数。
+func TestTheGroupThatIsNotSpentKeepsItsNumbers(t *testing.T) {
+	ws, _ := json.Marshal([]account.Window{
+		{Name: "5 hours", ModelName: "general", Used: 100},
+		{Name: "5 hours video", ModelName: "video", Used: 10},
+	})
+	c := Of(
+		[]store.UsageSnapshot{{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 500, Consumed: 62.5, Remaining: 437.5,
+			WindowsJSON: string(ws), CreatedAt: time.Now(),
+		}},
+		[]store.Account{{ID: "acc_01", Name: "主号"}},
+		[]store.Exhausted{{
+			AccountID: "acc_01", WindowKey: "general",
+			Until: time.Now().Add(time.Hour), Reason: "quota",
+		}},
+	)
+	general, video := "", ""
+	for _, w := range c.Windows {
+		switch w.Name {
+		case "5 hours":
+			general = w.Display
+		case "5 hours video":
+			video = w.Display
+		}
+	}
+	if general != "用完" {
+		t.Errorf("the general window says %q, want %q", general, "用完")
+	}
+	if video == "用完" {
+		t.Errorf("the video window says it is used up: only the general group is")
 	}
 }

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +17,8 @@ import (
 	"mmxcode/internal/secret"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestCheckinDelayIsJittered(t *testing.T) {
@@ -377,5 +380,134 @@ func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
 	}
 	if got.Status != store.StatusActive {
 		t.Fatalf("status = %q", got.Status)
+	}
+}
+
+// countReadings says how many usage readings the database holds.
+//
+// 调度器的那个包外面数不到行数：库的读法只有「每个账号最新的一条」。这
+// 个测试要数的是全部的行，所以自己开一条连接去数。
+func countReadings(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM usage_snapshots").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestTheUsageRoundThrowsAwayTheOldReadings says the usage round throws
+// away the readings that are not needed.
+//
+// 调度器每 scan_every 扫一趟，每读一个账号就写一行读数：不收拾的话一天
+// 下来就是几千行，而除了每个账号最新的一条，剩下的谁也不看。
+func TestTheUsageRoundThrowsAwayTheOldReadings(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	path := t.TempDir() + "/t.db"
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 三次很早以前的读。
+	for i := 0; i < 3; i++ {
+		if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+			AccountID: "acc_01", HasAmounts: true,
+			Granted: 10, Remaining: 10,
+			CreatedAt: now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	// 它刚被用过：它是热的，这一趟要读它。
+	mgr.MarkUsed("acc_01")
+
+	sc := New(mgr, config.Default())
+	sc.RefreshUsage(ctx)
+
+	// 刚才读的那一次留下，三次很早以前的都扔掉。
+	if n := countReadings(t, path); n != 1 {
+		t.Fatalf("the readings = %d, want only the newest one", n)
+	}
+}
+
+// TestTheSchedulerCanBeWaitedFor says the scheduler's work can be waited
+// for.
+//
+// 进程要关的时候，调度器的活儿也得停，而且要等它停下来：库是接着关的，
+// 它不该往一个正在关着的库上写（那是「database is closed」）。
+func TestTheSchedulerCanBeWaitedFor(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	sc := New(mgr, config.Default())
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sc.Run(runCtx)
+	}()
+	// 停它。
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scheduler did not stop")
+	}
+	// 等它的活儿停下来。
+	waited := make(chan struct{})
+	go func() {
+		defer close(waited)
+		sc.Wait()
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scheduler's work was not waited for")
 	}
 }

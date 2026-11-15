@@ -53,8 +53,8 @@ func (f *aFakeSignIn) RoundTrip(r *http.Request) (*http.Response, error) {
 // TestTheLoginReadsTheCreditsOfTheNewAccount says an account signed in
 // at the command line has its credits read.
 //
-// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看得到
-// 它有多少积分。
+// 刚登进来的账号马上读一次账本：不等调度器那一趟
+// （usage.refresh.scan_every，默认 30 秒），人才看得到它有多少积分。
 func TestTheLoginReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	var reads int
 	var mu sync.Mutex

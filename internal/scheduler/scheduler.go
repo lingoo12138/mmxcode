@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"mmxcode/internal/checkin"
@@ -36,6 +37,12 @@ type Scheduler struct {
 	// points it at a stand-in, so that the check never leaves the
 	// machine.
 	target string
+	// wg counts the goroutines the scheduler runs.
+	//
+	// 它是这一份进程的账：进程要关的时候，调度器的活儿也得停，而且要
+	// 等在飞的那些停下来 —— 库是接着关的，它不该往一个正在关着的库上
+	// 写。
+	wg sync.WaitGroup
 }
 
 // New makes a scheduler.
@@ -136,6 +143,22 @@ func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 	}
 }
 
+// The values of the pruning of the readings.
+//
+// 调度器每 usage.refresh.scan_every 扫一趟，每读一个账号就写一行读数。
+// 不收拾的话，一天下来就是几千行 —— 而除了每个账号最新的一条（卡上摆的
+// 就是它），剩下的谁也不看。
+const (
+	// pruneKeep is how many readings of every account are kept whatever
+	// their age. One is the reading the card and the summary use: it is
+	// the account's reading.
+	pruneKeep = 1
+	// pruneOlderThan is how long a reading that is not the newest one
+	// is kept. A quarter of an hour is enough to see what just
+	// happened; further back there is nothing to see.
+	pruneOlderThan = 15 * time.Minute
+)
+
 // RefreshUsage reads the credits of the accounts that should be read.
 //
 // 它不再是"把所有账号读一遍"：账号多起来以后，冷账号的额度没有必要
@@ -149,6 +172,17 @@ func (s *Scheduler) RefreshUsage(ctx context.Context) {
 	}
 	for _, reason := range res.Reasons {
 		fmt.Printf("usage: %s\n", reason)
+	}
+	s.pruneReadings(ctx)
+}
+
+// pruneReadings throws away the readings that are not needed.
+//
+// 每个账号留最新的一条（不管它多老：卡上摆的就是它），其余的只留一刻
+// 钟 —— 那个窗口是给「刚才发生了什么」看的，再往前的没有用。
+func (s *Scheduler) pruneReadings(ctx context.Context) {
+	if err := s.Mgr.Store.PruneUsageSnapshots(ctx, time.Now().Add(-pruneOlderThan), pruneKeep); err != nil {
+		fmt.Printf("usage: the old readings could not be thrown away: %v\n", err)
 	}
 }
 
@@ -241,9 +275,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 		egressEvery = 2 * time.Minute
 	}
 
-	go s.loop(ctx, usageEvery, s.RefreshUsage)
-	go s.loop(ctx, tokenEvery, s.RenewTokens)
-	go s.loop(ctx, egressEvery, s.CheckEgress)
+	s.run(ctx, usageEvery, s.RefreshUsage)
+	s.run(ctx, tokenEvery, s.RenewTokens)
+	s.run(ctx, egressEvery, s.CheckEgress)
 
 	// 重登是单独的活儿，不在续期器那条热路径上：续期器照旧把链断的
 	// 账号标成 signed_out，签回来的活儿交给这里。
@@ -252,9 +286,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 		if every <= 0 {
 			every = time.Hour
 		}
-		go s.loop(ctx, every, s.Relogin)
+		s.run(ctx, every, s.Relogin)
 	}
-
 	for {
 		next := NextCheckin(time.Now(), at, 30*time.Minute)
 		timer := time.NewTimer(time.Until(next))
@@ -272,6 +305,28 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// run runs a piece of work every so often, on the scheduler's account.
+//
+// 它算在调度器的账上：进程要关的时候要等它停下来（Wait）。
+func (s *Scheduler) run(ctx context.Context, every time.Duration, work func(context.Context)) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.loop(ctx, every, work)
+	}()
+}
+
+// Wait waits for the scheduler's work to stop.
+//
+// 调度器的活儿挂在它自己的上下文上：那个上下文一结束，活儿就不该再开
+// 新的一趟，而在飞的那一趟要等它自己停下（或者放弃）。
+//
+// 它等的是那些周期活儿。Run 自己是在调用它的那条线上的：等 Run 回来
+// 之后调 Wait，才是「全都停了」。
+func (s *Scheduler) Wait() {
+	s.wg.Wait()
 }
 
 // loop runs a piece of work every so often.

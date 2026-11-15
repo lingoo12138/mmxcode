@@ -225,8 +225,8 @@ func TestTheWebUIAcquiresTheRealUserIDAndEmail(t *testing.T) {
 // TestTheWebLoginReadsTheCreditsOfTheNewAccount says an account signed
 // in through the page has its credits read.
 //
-// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看
-// 得到它有多少积分。
+// 刚登进来的账号马上读一次账本：不等调度器那一趟
+// （usage.refresh.scan_every，默认 30 秒），人才看得到它有多少积分。
 func TestTheWebLoginReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	f := &fakeSite{
 		device: deviceAnswer,

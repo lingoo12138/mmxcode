@@ -44,8 +44,8 @@ func aFakeEnv(t *testing.T) *env {
 // TestTheImportReadsTheCreditsOfTheNewAccount says an account that
 // just came in has its credits read.
 //
-// 导入完了要等上一个周期（15 分钟）才看得到积分，是不让人话的：刚进
-// 来的账号马上就读一次账本。
+// 导入完了要等上一趟扫描（usage.refresh.scan_every，默认 30 秒）才看
+// 得到积分，是不让人话的：刚进来的账号马上就读一次账本。
 func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	var reads atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

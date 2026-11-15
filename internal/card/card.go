@@ -100,11 +100,21 @@ type Window struct {
 // The readings are the ones that were saved: the card says what was read
 // and when, not what would be read now. A reading that failed is left
 // out of the totals -- it is not a zero.
-func Of(snaps []store.UsageSnapshot, accounts []store.Account) Card {
+//
+// spent are the marks of the accounts that have run out: each one is an
+// account and the plan group that is spent for it.
+//
+// An account that is marked spent is out: the gateway will not hand it
+// to a client, so the card must not claim its credits -- a card that
+// promises credits the gateway refuses is worse than a short balance.
+// The windows of the spent group say so, and the account's credits are
+// left out of the balance.
+func Of(snaps []store.UsageSnapshot, accounts []store.Account, spent []store.Exhausted) Card {
 	byAccount := map[string]store.Account{}
 	for _, a := range accounts {
 		byAccount[a.ID] = a
 	}
+	marks := spentOf(spent, time.Now())
 	c := Card{Windows: []Window{}}
 	read := map[string]bool{}
 	for _, s := range snaps {
@@ -116,10 +126,15 @@ func Of(snaps []store.UsageSnapshot, accounts []store.Account) Card {
 		if len(snaps) > 1 {
 			prefix = name + " · "
 		}
-		c.Windows = append(c.Windows, creditWindow(s, prefix)...)
-		c.Windows = append(c.Windows, planWindows(s, prefix)...)
+		mark := marks[s.AccountID]
+		c.Windows = append(c.Windows, creditWindow(s, prefix, mark)...)
+		c.Windows = append(c.Windows, planWindows(s, prefix, mark)...)
 		if s.HasAmounts {
-			c.remaining += s.Remaining
+			if !mark.out {
+				// 用完的账号没有积分可以花：网关不会把它给客户端，卡上
+				// 不能还摆着它的数。
+				c.remaining += s.Remaining
+			}
 			c.readable = true
 		}
 		if p, ok := planOf(s); ok {
@@ -192,7 +207,7 @@ func planRank(plan string) int {
 // creditWindow gives the credits as a window.
 //
 // magpie 的卡片上，积分是一个窗口：共给了多少、用了多少、什么时候用完。
-func creditWindow(s store.UsageSnapshot, prefix string) []Window {
+func creditWindow(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
 	if !s.HasAmounts || s.Granted <= 0 {
 		return nil
 	}
@@ -209,6 +224,12 @@ func creditWindow(s store.UsageSnapshot, prefix string) []Window {
 		Limit:   &limit,
 		Unit:    "credits",
 	}
+	if spent.out {
+		// 用完的账号没有积分可以花：网关不会把它给客户端。卡上摆着
+		// 「437.5 / 500」就是骗人 —— 它说了就要兑现。
+		w.Display = "用完"
+		return []Window{w}
+	}
 	if !s.ExpiresAt.IsZero() {
 		t := s.ExpiresAt
 		w.RunsOutAt = &t
@@ -218,7 +239,7 @@ func creditWindow(s store.UsageSnapshot, prefix string) []Window {
 }
 
 // planWindows gives the plan's windows.
-func planWindows(s store.UsageSnapshot, prefix string) []Window {
+func planWindows(s store.UsageSnapshot, prefix string, spent spentInfo) []Window {
 	if strings.TrimSpace(s.WindowsJSON) == "" {
 		return nil
 	}
@@ -250,7 +271,62 @@ func planWindows(s store.UsageSnapshot, prefix string) []Window {
 			cw.Limit = &v
 		}
 		cw.Unit = w.Unit
+		if spent.spentGroup(w.ModelName) {
+			// 这个组用完了：窗口上就写着「用完」，别让人以为还有。
+			cw.Display = "用完"
+		}
 		out = append(out, cw)
+	}
+	return out
+}
+
+// spentInfo says what is spent of one account.
+//
+// 标记的粒度是「账号 × 窗口组」：别的组不是用完的，那些窗口照旧摆着数。
+type spentInfo struct {
+	// out says the account is out: the gateway will not hand it to a
+	// client.
+	out bool
+	// whole says the mark has no group: it counts for every group.
+	whole bool
+	// groups are the plan groups that are spent.
+	groups map[string]bool
+}
+
+// spentGroup says whether the plan group is spent for this account.
+//
+// 组的名字比的时候不看大小写：站上写的是 "General"，这边说的是
+// "general"，说的是同一个组（跟网关那边一个规矩）。
+func (i spentInfo) spentGroup(group string) bool {
+	if i.whole {
+		return true
+	}
+	return i.groups[strings.ToLower(strings.TrimSpace(group))]
+}
+
+// spentOf gives the accounts' live spent marks.
+//
+// 时刻过了的标记不是标记了：那个组已经回来，账号回到轮转里（规格 §4.5
+// 的恢复点 A）。所以只有将来的那些算数。
+func spentOf(spent []store.Exhausted, now time.Time) map[string]spentInfo {
+	out := map[string]spentInfo{}
+	for _, e := range spent {
+		if !e.Until.After(now) {
+			continue
+		}
+		i := out[e.AccountID]
+		if i.groups == nil {
+			i.groups = map[string]bool{}
+		}
+		i.out = true
+		key := strings.ToLower(strings.TrimSpace(e.WindowKey))
+		if key == "" {
+			// 账号级的标记：它对每一个组都算。
+			i.whole = true
+		} else {
+			i.groups[key] = true
+		}
+		out[e.AccountID] = i
 	}
 	return out
 }

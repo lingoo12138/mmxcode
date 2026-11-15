@@ -113,9 +113,15 @@ type Summary struct {
 // reading does not change its state from one call to the next.
 func Aggregate(snaps []store.UsageSnapshot, accounts []store.Account, now time.Time) Summary {
 	s := Summary{UpdatedAt: now}
+	// 一个账号一条读数：两个读数撞在一起的时候，后来读到的那一条是它
+	// 的读数。时刻说哪一次读是最新的，id 只在时刻一样时分出先后。
 	reading := map[string]store.UsageSnapshot{}
-	for _, sn := range newestPerAccount(snaps) {
-		reading[sn.AccountID] = sn
+	for _, sn := range snaps {
+		cur, ok := reading[sn.AccountID]
+		if !ok || sn.CreatedAt.After(cur.CreatedAt) ||
+			(sn.CreatedAt.Equal(cur.CreatedAt) && sn.ID >= cur.ID) {
+			reading[sn.AccountID] = sn
+		}
 	}
 	emails := map[string]string{}
 	ids := make(map[string]bool, len(accounts)+len(reading))
@@ -179,43 +185,4 @@ func Aggregate(snaps []store.UsageSnapshot, accounts []store.Account, now time.T
 	}
 	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].ID < s.Accounts[j].ID })
 	return s
-}
-
-// newestPerAccount gives each account's newest snapshot.
-//
-// The newest is the one that was read last: the later reading wins,
-// and a reading that shares its millisecond with another is told from
-// it by the id, which grows with every row written.
-func newestPerAccount(snaps []store.UsageSnapshot) []store.UsageSnapshot {
-	byAccount := make(map[string]store.UsageSnapshot, len(snaps))
-	at := make(map[string]int, len(snaps))
-	order := make([]string, 0, len(snaps))
-	for i, sn := range snaps {
-		cur, ok := byAccount[sn.AccountID]
-		if !ok {
-			byAccount[sn.AccountID] = sn
-			at[sn.AccountID] = i
-			order = append(order, sn.AccountID)
-			continue
-		}
-		// Two readings that cannot be told apart are the later one's:
-		// they are the same reading, so either will do.
-		if newer(sn, cur) || (sn.ID == cur.ID && i > at[sn.AccountID]) {
-			byAccount[sn.AccountID] = sn
-			at[sn.AccountID] = i
-		}
-	}
-	out := make([]store.UsageSnapshot, 0, len(order))
-	for _, id := range order {
-		out = append(out, byAccount[id])
-	}
-	return out
-}
-
-// newer says a reading is newer than another.
-func newer(a, b store.UsageSnapshot) bool {
-	if !a.CreatedAt.Equal(b.CreatedAt) {
-		return a.CreatedAt.After(b.CreatedAt)
-	}
-	return a.ID > b.ID
 }

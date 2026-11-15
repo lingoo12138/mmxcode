@@ -58,7 +58,11 @@ func newServeCmd(e *env) *cobra.Command {
 				// 聊天会流很久，不给写超时
 			}
 
-			go sc.Run(ctx)
+			scDone := make(chan struct{})
+			go func() {
+				defer close(scDone)
+				sc.Run(ctx)
+			}()
 
 			errc := make(chan error, 1)
 			go func() {
@@ -80,6 +84,10 @@ func newServeCmd(e *env) *cobra.Command {
 			// 网关关了以后，后台的读额度也得停，而且要等它停下来：库
 			// 是接着关的，它不该往一个正在关着的库上写。
 			gw.Close()
+			// 调度器的活儿也是：它停，而且要等它停。库是接着关的，那
+			// 一趟读额度要是还在飞，它写下去的就是「database is closed」。
+			<-scDone
+			sc.Wait()
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer shutCancel()
 			return srv.Shutdown(shutCtx)

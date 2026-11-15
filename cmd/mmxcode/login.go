@@ -69,7 +69,8 @@ func newLoginCmd(e *env) *cobra.Command {
 
 // readCredits reads one account's credits now.
 //
-// 刚登进来的账号马上读一次账本：不等调度器那一趟（15 分钟），人才看得到
+// 刚登进来的账号马上读一次账本：不等调度器那一趟（usage.refresh.scan_every，
+// 默认 30 秒；没配它的时候才用老的 schedule.usage_refresh），人才看得到
 // 它有多少积分。读不到不算登录失败——账号是进来了的，账本读不到是另一件
 // 事，但要说出来。
 func readCredits(ctx context.Context, e *env, out io.Writer, accountID string) {

@@ -248,3 +248,48 @@ func TestTheBackgroundReadingGoesThroughTheReader(t *testing.T) {
 		t.Errorf("the mark = %s, want %s", got, later)
 	}
 }
+
+// TestTheMarkAndNoMarkAreNotTheSame says a mark that is there and no
+// mark at all are told apart.
+//
+// 「没有标记」和「标记到零时刻」是两件事：前者是被清掉的（签到给了积
+// 分），后者是标记在那儿、只是没有时刻。后台那一趟读不许把清掉的标记
+// 又写回去。
+func TestTheMarkAndNoMarkAreNotTheSame(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if _, found := h.gw.markedUntil(ctx, "acc_01", "general"); found {
+		t.Error("there is a mark, want none")
+	}
+	// 一个到零时刻的标记：它在，只是没有时刻。
+	if err := h.store.SetExhausted(ctx, "acc_01", "general", time.Time{}, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	until, found := h.gw.markedUntil(ctx, "acc_01", "general")
+	if !found {
+		t.Error("the mark is not found, want it")
+	}
+	if !until.IsZero() {
+		t.Errorf("the mark = %s, want the zero time", until)
+	}
+}
+
+// TestTheBackgroundReadingDoesNotPutBackAClearedMark says a background
+// reading does not put a mark back that is not in the database.
+//
+// 上游拒了它 → 标记 → 后台去读。读的那一趟还没回来，签到给了积分，读到
+// 的数说有额度 → 标记被清掉 → 账号回到轮转里。后台那一趟这时候才回来，
+// 它把标记又写回去：这个有积分的账号就白扔了 —— 最多扔七天。
+func TestTheBackgroundReadingDoesNotPutBackAClearedMark(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	// 后台那一次读：读到的是七天以后回来的时刻。
+	h.reader.set(readingOf(t, []account.Window{
+		{ModelName: "general", ResetsAt: time.Now().Add(7 * 24 * time.Hour)},
+	}), nil)
+	// 库里没有标记了：签到给了积分，标记已经被清掉。
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if !got.IsZero() {
+		t.Errorf("the mark = %s, want none: it was cleared on purpose", got)
+	}
+}
