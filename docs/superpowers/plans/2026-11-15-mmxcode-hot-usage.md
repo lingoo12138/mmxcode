@@ -48,7 +48,7 @@
 // 一趟的预算、一趟最多读几个、卡片现读读几个。这些数是配的，配不
 // 着的时候也有一个说得过去的数。
 func TestTheUsageDefaults(t *testing.T) {
-	c := config.Default()
+	c := Default()
 	if c.Usage.Refresh.HotWindow.Duration() != 5*time.Minute {
 		t.Errorf("hot_window = %s, want 5m", c.Usage.Refresh.HotWindow)
 	}
@@ -79,7 +79,7 @@ func TestTheUsageDefaults(t *testing.T) {
 //
 // 每个账号同时一个请求；总并发是账号数的五分之一，小规模至少三个。
 func TestTheConcurrencyDefaults(t *testing.T) {
-	c := config.Default()
+	c := Default()
 	if c.Concurrency.PerAccount != 1 {
 		t.Errorf("per_account = %d, want 1", c.Concurrency.PerAccount)
 	}
@@ -119,6 +119,9 @@ type Usage struct {
 // 一趟读额度有四道控：并发（读得快，不是读得多）、每个账号的时限
 // （一个卡住的账号不能拖住整趟）、一趟的预算（预算用完就停）、一趟
 // 最多读几个（剩下的下一趟接着读）。
+//
+// 配 0 的时候按 1 算：0 并发、0 个一批都是一趟也读不了，那不是关掉，
+// 是坏了。
 type Refresh struct {
 	// HotWindow is how long an account counts as hot after it was used.
 	HotWindow Duration `yaml:"hot_window" json:"hot_window"`
@@ -139,10 +142,12 @@ type Refresh struct {
 }
 
 // Concurrency holds how many requests may be in the air at once.
+//
+// 配 0 的时候按 1 算：0 并发是一个请求也进不来，那不是关掉，是坏了。
 type Concurrency struct {
 	// PerAccount is how many requests one account takes at once.
 	PerAccount int `yaml:"per_account" json:"per_account"`
-	// TotalRatio is how much of the accounts may be in use at once.
+	// TotalRatio is how many accounts share one place (5 = one in five).
 	//
 	// 五分之一：100 个账号同时只用 20 个，这 20 个把额度用完了，还有
 	// 80 个是满的可以接。一个接一个地烧，而不是所有账号一起烧到没。
@@ -266,7 +271,7 @@ func TestTheHotCountIsNotBig(t *testing.T) {
 	for i := 0; i < maxHotAccounts+50; i++ {
 		c.mark(string(rune('a'+i%26))+time.Duration(i).String(), time.Minute, now)
 	}
-	if got := len(c.at); got > maxHotAccounts {
+	if got := len(c.list(time.Minute, now)); got > maxHotAccounts {
 		t.Fatalf("the counter holds %d accounts, want at most %d", got, maxHotAccounts)
 	}
 }
@@ -301,7 +306,11 @@ const maxHotAccounts = 200
 
 // hotUse is one account's use in the window.
 type hotUse struct {
-	// count is how many times it was used in the window.
+	// count is how many times it was used without a gap of a whole
+	// window.
+	//
+	// 它是"用得多不多"的粗略数：中间隔了一个整窗口就从头数。热账号
+	// 名单要的是"刚用过"，先后的粗略先后就够，不必是精确的滑动窗口。
 	count int
 	// last is when it was used last.
 	last time.Time
@@ -344,6 +353,8 @@ func (c *hotCounter) mark(accountID string, window time.Duration, now time.Time)
 }
 
 // prune throws away the accounts whose use is out of the window.
+//
+// 调用的人拿着锁。
 func (c *hotCounter) prune(window time.Duration, now time.Time) {
 	for id, e := range c.at {
 		if !e.last.Add(window).After(now) {
@@ -353,13 +364,15 @@ func (c *hotCounter) prune(window time.Duration, now time.Time) {
 }
 
 // trim keeps the counter from growing without end.
+//
+// 调用的人拿着锁。
 func (c *hotCounter) trim() {
 	for len(c.at) > maxHotAccounts {
 		oldest := ""
-		var at time.Time
+		var oldestAt time.Time
 		for id, e := range c.at {
-			if oldest == "" || e.last.Before(at) {
-				oldest, at = id, e.last
+			if oldest == "" || e.last.Before(oldestAt) {
+				oldest, oldestAt = id, e.last
 			}
 		}
 		if oldest == "" {
@@ -384,13 +397,26 @@ func (c *hotCounter) list(window time.Duration, now time.Time) []string {
 		if a.count != b.count {
 			return a.count > b.count
 		}
-		return a.last.After(b.last)
+		if !a.last.Equal(b.last) {
+			return a.last.After(b.last)
+		}
+		// 同样的次数、同样的时候：按 id 分出来，结果才每次一样。
+		return out[i] < out[j]
 	})
 	return out
 }
 ```
 
 - [ ] **Step 4: 管理器记着谁刚被用过**
+
+`internal/manager/manager.go` 里加一个常量（放在 `accountTimeout` 后面）：
+
+```go
+// defaultHotWindow is how long an account counts as hot when nobody says.
+//
+// 五个分钟：刚用过一次的账号，它的额度最可能刚变。
+const defaultHotWindow = 5 * time.Minute
+```
 
 `internal/manager/manager.go` 的 `Manager` 里加两个字段：
 
@@ -401,6 +427,9 @@ func (c *hotCounter) list(window time.Duration, now time.Time) []string {
 	//
 	// 它是配置说了算，所以它是公开的：网关起的时候会把它设成配置里的
 	// 那个。没有人设它的时候是五分钟。
+	//
+	// 它是起来的时候写一次、之后只读的东西，所以没有锁：写它要在服务
+	// 起来之前。
 	HotWindow time.Duration
 ```
 
@@ -408,7 +437,7 @@ func (c *hotCounter) list(window time.Duration, now time.Time) []string {
 
 ```go
 		hot:       newHotCounter(),
-		HotWindow: 5 * time.Minute,
+		HotWindow: defaultHotWindow,
 ```
 
 再加两个方法：
@@ -418,13 +447,25 @@ func (c *hotCounter) list(window time.Duration, now time.Time) []string {
 //
 // 聊天成功一次就算一次"用过"：热账号是"刚刚"的账，而这一笔就是刚刚。
 func (m *Manager) MarkUsed(accountID string) {
-	m.hot.mark(accountID, m.HotWindow, time.Now())
+	m.hot.mark(accountID, m.hotWindow(), time.Now())
 }
 
 // HotAccounts gives the accounts that were used lately, the most used
 // first.
+//
+// 它给的是"刚刚"的那批账号：读额度的时候它们在热的那一组里。
 func (m *Manager) HotAccounts() []string {
-	return m.hot.list(m.HotWindow, time.Now())
+	return m.hot.list(m.hotWindow(), time.Now())
+}
+
+// hotWindow says how long an account counts as hot.
+//
+// 配 0 的时候按默认算：0 分钟的窗口等于没有热账号，那不是关掉，是坏了。
+func (m *Manager) hotWindow() time.Duration {
+	if m.HotWindow <= 0 {
+		return defaultHotWindow
+	}
+	return m.HotWindow
 }
 ```
 
@@ -448,14 +489,24 @@ git commit -m "feat(manager): 记着谁刚被用过"
 **Files:**
 - Create: `internal/usage/round.go`
 - Create: `internal/usage/round_test.go`
+- Create: `internal/store/checkins_test.go`
 - Modify: `internal/store/store.go`
-- Modify: `internal/store/store_test.go`
 
 - [ ] **Step 1: 写失败的测试**
 
-`internal/store/store_test.go` 里加：
+`internal/store/store_test.go` 是 `package store`（它用包内的 `s.db`），在这个包里再 import `mmxcode/internal/store` 是循环引用，编译不过。所以这条测试另开一个文件 `internal/store/checkins_test.go`，用 `package store_test`：
 
 ```go
+package store_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"mmxcode/internal/store"
+)
+
 // TestTheLatestCheckinsOfEveryAccount says each account's newest
 // check-in is the one that is given.
 //
@@ -493,6 +544,33 @@ func TestTheLatestCheckinsOfEveryAccount(t *testing.T) {
 			t.Errorf("acc_1's check-in = %v, want the newest one", c.Credit)
 		}
 	}
+}
+
+// newStore gives a store with the schema in it.
+//
+// The two accounts the check-in test uses are in it as well: a check-in
+// belongs to an account, and the store refuses a check-in whose
+// account is not there.
+func newStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.Open(t.TempDir() + "/mmxcode.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for _, id := range []string{"acc_1", "acc_2"} {
+		now := time.Now()
+		if err := s.CreateAccount(context.Background(), store.Account{
+			ID: id, Name: id, Status: store.StatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+	}
+	return s
 }
 ```
 
@@ -637,7 +715,7 @@ go test ./internal/store/ ./internal/usage/
 // there is one row per account, always.
 func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, account_id, day, outcome, credit, streak, message, created_at
+		SELECT c.id, c.account_id, c.day, c.outcome, c.credit, c.streak, c.message, c.created_at
 		FROM checkins c
 		JOIN (SELECT account_id, MAX(id) AS mid FROM checkins GROUP BY account_id)
 			m ON m.account_id = c.account_id AND m.mid = c.id
@@ -1806,13 +1884,6 @@ func (b *busyAccounts) give(accountID string) {
 	b.at[accountID]--
 }
 
-// busy says whether an account is taken.
-func (b *busyAccounts) busy(accountID string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.at[accountID] > 0
-}
-
 // gate counts the requests in the air and lets the ones that do not
 // fit wait.
 type gate struct {
@@ -2109,6 +2180,8 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 
 				// 200 且是流：直接转出去
 				if resp.StatusCode == http.StatusOK && raw == nil {
+					// 答上了：这个账号刚刚被用过，它变热了。
+					s.Mgr.MarkUsed(plan.AccountID)
 					s.writeStream(w, resp, proto, convertBack, model)
 					return true
 				}
@@ -2116,6 +2189,8 @@ func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool
 				// 200 但身体里有业务错误
 				if resp.StatusCode == http.StatusOK {
 					if err := upstream.CheckEnvelope("chat", raw); err == nil {
+						// 答上了：这个账号刚刚被用过，它变热了。
+						s.Mgr.MarkUsed(plan.AccountID)
 						s.writeJSON(w, resp, raw, proto, convertBack, model)
 						return true
 					}
@@ -2567,6 +2642,8 @@ git commit -m "feat(scheduler): 一趟读额度读的是该读的账号"
 
 **Files:**
 - Modify: `README.md`
+- Modify: `config.example.yaml`
+- Modify: `config.docker.yaml`
 
 - [ ] **Step 1: README 写清楚这几件事**
 
@@ -2578,10 +2655,47 @@ README 里加一节「读额度」：
 - 额度用完的账号：立刻标记，后台读一次把标记改准；签到给了积分就读一次，读到的数说有额度就清掉标记。
 - 并发：每个账号同时一个请求（`concurrency.per_account`），总并发是可用账号的五分之一（`concurrency.total_ratio` / `concurrency.total_min`）。
 
-- [ ] **Step 2: 提交**
+- [ ] **Step 2: 两份配置样例补上这两节**
+
+`config.example.yaml` 和 `config.docker.yaml` 现在把每一节都写着（`server`、`proxy`、`upstream`、`rotation`、`schedule`、`batch`），新加的两节也要写上，不然看样例的人不知道有这些旋钮：
+
+```yaml
+usage:
+  refresh:
+    # 一个账号用过之后多久还算热（热账号的额度才值得现读）
+    hot_window: 5m
+    # 多久扫一遍该读额度的账号
+    scan_every: 30s
+    # 一趟同时读几个账号的额度
+    concurrency: 4
+    # 一个账号的额度最多读多久（卡住的账号不拖住整趟）
+    timeout: 15s
+    # 一趟读额度最多花多久（用完就停，剩下的下一趟接着读）
+    budget: 30s
+    # 一趟最多读几个账号
+    batch: 6
+    # 卡片现读读几个账号（卡片等不了）
+    card: 2
+    # 卡片现读最多花多久
+    card_budget: 5s
+
+concurrency:
+  # 每个账号同时几个请求
+  per_account: 1
+  # 总并发是可用账号数的几分之一（5 = 五分之一）
+  total_ratio: 5
+  # 账号少的时候总并发至少几个
+  total_min: 3
+  # 请求等一个空位最多等多久（等不到就 429）
+  wait: 10s
+```
+
+两份文件里都加在 `batch:` 那节后面、`db:` 那行前面。
+
+- [ ] **Step 3: 提交**
 
 ```
-git add README.md
+git add README.md config.example.yaml config.docker.yaml
 git commit -m "docs(readme): 读额度只碰该碰的账号"
 ```
 
