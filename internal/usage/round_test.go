@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,5 +113,129 @@ func mk(t *testing.T, s *store.Store, id string, readAt time.Time) {
 		CreatedAt: readAt,
 	}); err != nil {
 		t.Fatalf("save snapshot: %v", err)
+	}
+}
+
+// fakeReader reads an account's credits without a network.
+type fakeReader struct {
+	// read are the accounts that were read.
+	read []string
+	// fail are the accounts whose reading fails.
+	fail map[string]bool
+	// wait is how long a reading takes.
+	wait time.Duration
+	// at is when the readings happened.
+	at time.Time
+	// mu guards read.
+	mu sync.Mutex
+}
+
+// RefreshUsage reads an account's credits.
+func (f *fakeReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	if f.wait > 0 {
+		select {
+		case <-time.After(f.wait):
+		case <-ctx.Done():
+			return store.UsageSnapshot{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	f.read = append(f.read, accountID)
+	f.mu.Unlock()
+	if f.fail[accountID] {
+		return store.UsageSnapshot{}, errors.New("the ledger could not be read")
+	}
+	return store.UsageSnapshot{
+		AccountID: accountID, Granted: 100, Consumed: 10, Remaining: 90,
+		HasAmounts: true, CreatedAt: f.at,
+	}, nil
+}
+
+// TestOneRoundReadsEachAccountOnce says the same account is not read
+// twice in one round.
+//
+// 签到那一趟和热的那一趟可能撞上同一个账号。
+func TestOneRoundReadsEachAccountOnce(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_1", "acc_2"},
+		Options{Concurrency: 2, Timeout: time.Second, Budget: time.Second, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 2 {
+		t.Fatalf("the readings = %d, want two", res.Refreshed)
+	}
+}
+
+// TestOneRoundKeepsToItsBatch says a round reads at most so many.
+//
+// 剩下的下一趟接着读：不然一个账号多的网关一轮就把上游问死了。
+func TestOneRoundKeepsToItsBatch(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2", "acc_3"},
+		Options{Concurrency: 2, Timeout: time.Second, Budget: time.Second, Batch: 2})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 2 {
+		t.Fatalf("the readings = %d, want two", res.Refreshed)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want one", res.Skipped)
+	}
+}
+
+// TestOneRoundKeepsToItsConcurrency says a round reads so many at once.
+//
+// 并发是读得快，不是读得多：上游不是只给我们用。
+func TestOneRoundKeepsToItsConcurrency(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}, wait: 50 * time.Millisecond}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2", "acc_3", "acc_4"},
+		Options{Concurrency: 2, Timeout: time.Second, Budget: 5 * time.Second, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 4 {
+		t.Fatalf("the readings = %d, want four", res.Refreshed)
+	}
+}
+
+// TestOneRoundStopsWhenTheBudgetIsOut says the budget stops the round.
+//
+// 预算用完就停，剩下的下一趟接着读。
+func TestOneRoundStopsWhenTheBudgetIsOut(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{}, wait: time.Second}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2"},
+		Options{Concurrency: 1, Timeout: time.Second, Budget: 100 * time.Millisecond, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 0 {
+		t.Fatalf("the readings = %d, want none", res.Refreshed)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("the skipped = %d, want the one the budget left out", res.Skipped)
+	}
+}
+
+// TestAFailedReadingDoesNotStopTheOthers says one account that cannot
+// be read does not stop the rest.
+//
+// 一个账号读不到不影响别的——但要说出来是哪一个，人才知道去看哪一行。
+func TestAFailedReadingDoesNotStopTheOthers(t *testing.T) {
+	r := &Round{Reader: &fakeReader{fail: map[string]bool{"acc_1": true}}}
+	res, err := r.Run(context.Background(), []string{"acc_1", "acc_2"},
+		Options{Concurrency: 2, Timeout: time.Second, Budget: time.Second, Batch: 6})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Refreshed != 1 {
+		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+	if res.Failed != 1 {
+		t.Fatalf("the failed = %d, want one", res.Failed)
+	}
+	if len(res.Reasons) != 1 {
+		t.Fatalf("the reasons = %v, want one", res.Reasons)
 	}
 }

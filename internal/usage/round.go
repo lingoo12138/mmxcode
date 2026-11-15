@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"sort"
+	"sync"
 	"time"
 
 	"mmxcode/internal/config"
@@ -171,4 +172,167 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 		out = append(out, t.id)
 	}
 	return out, nil
+}
+
+// Options holds the controls of one round of readings.
+type Options struct {
+	// Concurrency is how many accounts are read at once.
+	Concurrency int
+	// Timeout is how long one account's reading may take.
+	Timeout time.Duration
+	// Budget is how long the whole round may take.
+	Budget time.Duration
+	// Batch is how many accounts the round reads at most.
+	Batch int
+}
+
+// Result says what one round of readings came to.
+type Result struct {
+	// Read are the readings that came back.
+	Read []store.UsageSnapshot
+	// Refreshed counts the accounts whose credits were read.
+	Refreshed int
+	// Failed counts the accounts whose credits could not be read.
+	Failed int
+	// Skipped counts the accounts the round did not get to.
+	Skipped int
+	// Reasons says why, one line per account.
+	Reasons []string
+}
+
+// Run reads the given accounts' credits, within a budget.
+//
+// 同一个账号同一时刻只读一次：一个账号在名单里出现两遍，读它一遍就
+// 够了。读失败不挡别的账号。
+func (r *Round) Run(ctx context.Context, ids []string, opts Options) (Result, error) {
+	var out Result
+	ids = dedupe(ids)
+	if len(ids) == 0 {
+		return out, nil
+	}
+	if opts.Batch > 0 && len(ids) > opts.Batch {
+		out.Skipped = len(ids) - opts.Batch
+		ids = ids[:opts.Batch]
+	}
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = 1
+	}
+	if opts.Budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Budget)
+		defer cancel()
+	}
+	sem := make(chan struct{}, opts.Concurrency)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			skipped := func() {
+				mu.Lock()
+				out.Skipped++
+				out.Reasons = append(out.Reasons, id+": the budget is used up")
+				mu.Unlock()
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				skipped()
+				return
+			}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				// 抢到了位置，可是预算刚好在这时候用完了：这个账号没读
+				// 成，算没轮上，不算读失败。
+				//
+				// 不查这一下就说不准：select 的两个都成了的时候，Go 随
+				// 便挑一个，于是同一个账号有时算跳过，有时算失败。
+				skipped()
+				return
+			}
+			one := ctx
+			if opts.Timeout > 0 {
+				var cancel context.CancelFunc
+				one, cancel = context.WithTimeout(ctx, opts.Timeout)
+				defer cancel()
+			}
+			snap, err := r.Reader.RefreshUsage(one, id)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				out.Failed++
+				out.Reasons = append(out.Reasons, id+": "+err.Error())
+				return
+			}
+			out.Refreshed++
+			out.Read = append(out.Read, snap)
+		}(id)
+	}
+	wg.Wait()
+	return out, nil
+}
+
+// RefreshDue reads the credits of the accounts that should be read.
+func (r *Round) RefreshDue(ctx context.Context) (Result, error) {
+	ids, err := r.Targets(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	return r.Run(ctx, ids, r.Options())
+}
+
+// RefreshHot reads the credits of the accounts that were used lately.
+//
+// 卡片那条路：只现读最热的几个，其余用上一次读到的数。卡片因此永远
+// 几秒内回来。
+func (r *Round) RefreshHot(ctx context.Context) (Result, error) {
+	var ids []string
+	if r.Hot != nil {
+		ids = r.Hot()
+	}
+	return r.Run(ctx, ids, r.CardOptions())
+}
+
+// Options gives the controls of the periodic round.
+func (r *Round) Options() Options {
+	f := r.Cfg.Usage.Refresh
+	return Options{
+		Concurrency: f.Concurrency,
+		Timeout:     f.Timeout.Duration(),
+		Budget:      f.Budget.Duration(),
+		Batch:       f.Batch,
+	}
+}
+
+// CardOptions gives the controls of the card's own round.
+//
+// 卡片有自己的一份预算：它不能等。它读的那些账号的时限也是这份预算
+// 说了算，不然一个卡住的账号会把卡片拖到超时。
+func (r *Round) CardOptions() Options {
+	f := r.Cfg.Usage.Refresh
+	timeout := f.Timeout.Duration()
+	if b := f.CardBudget.Duration(); b > 0 && (timeout <= 0 || b < timeout) {
+		timeout = b
+	}
+	return Options{
+		Concurrency: f.Concurrency,
+		Timeout:     timeout,
+		Budget:      f.CardBudget.Duration(),
+		Batch:       f.Card,
+	}
+}
+
+// dedupe takes the repeated ids out of a list, keeping the order.
+func dedupe(ids []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
