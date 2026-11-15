@@ -189,9 +189,11 @@ const MODELS = [
 //
 // 签入的时候问的地址存进了签到的 metadata；没有就问环境变量；再没有
 // 就是本机的那个默认地址。末尾的斜杠去掉：底座后面还要接路径。
+// 空着的地址算是没有：提示里写着默认值，答个空就用它。
 const baseOf = (a) => {
   const b = a?.base ?? a?.metadata?.base ?? process.env[BASE_ENV] ?? DEFAULT_BASE
-  return String(b ?? "").replace(/\/+$/, "")
+  const s = String(b ?? "").trim()
+  return (s || DEFAULT_BASE).replace(/\/+$/, "")
 }
 
 // keyOf gives the chat key.
@@ -213,6 +215,20 @@ const headersFor = (key) => {
   return h
 }
 
+// variantsOf are a model's reasoning levels, as @ai-sdk/anthropic options.
+//
+// "none" 是把思考关掉（模型自己说关得掉的时候）；其余的是思考的档位。
+function variantsOf(thinking, efforts) {
+  const out = {}
+  if (thinking === "switchable") out.none = { thinking: { type: "disabled" } }
+  if (efforts.length) {
+    for (const e of efforts) out[e] = { thinking: { type: "adaptive" }, effort: e }
+  } else if (thinking === "switchable") {
+    out.high = { thinking: { type: "adaptive" } }
+  }
+  return out
+}
+
 // rowOf gives one model as magpie's provider wants it.
 //
 // 网关的名单带元数据：context/output、能不能读图、思考档位。magpie 要
@@ -222,13 +238,7 @@ function rowOf(m, base) {
   const efforts = Array.isArray(m.efforts) ? m.efforts : []
   const thinking = typeof m.thinking === "string" ? m.thinking : "off"
   const limit = m.limit ?? {}
-  const variants = {}
-  if (thinking === "switchable") variants.none = { thinking: { type: "disabled" } }
-  if (efforts.length) {
-    for (const e of efforts) variants[e] = { thinking: { type: "adaptive" }, effort: e }
-  } else if (thinking === "switchable") {
-    variants.high = { thinking: { type: "adaptive" } }
-  }
+  const variants = variantsOf(thinking, efforts)
   return {
     id: m.id,
     providerID: PROVIDER,
@@ -259,23 +269,35 @@ function rowOf(m, base) {
   }
 }
 
-// rowsOf gives the built-in models as rows.
-function rowsOf(models, base) {
-  const out = {}
-  for (const m of models) {
-    out[m.id] = rowOf(
-      {
-        id: m.id,
-        name: m.name,
-        limit: { context: m.context, output: m.output },
-        modalities: { input: m.inputs },
-        reasoning: m.thinking !== "off",
-        thinking: m.thinking,
-        efforts: m.efforts,
-      },
-      base,
-    )
+// configRowOf gives one model as magpie's config wants it.
+//
+// The config hook's models are a smaller shape than the rows the models
+// hook gives: the host reads the names it knows (reasoning, tool_call,
+// attachment, modalities, limit, cost, variants) and fills the rest in
+// itself. A full row loses them.
+//
+// 配的是配置形状：宿主照着这些名字读（reasoning、tool_call、
+// attachment、modalities、limit、cost、variants），剩下的它自己补。塞
+// 一整行进去，这些名字就没人读了 —— 图读不了、思考也没有。
+function configRowOf(m) {
+  const inputs = Array.isArray(m.inputs) && m.inputs.length ? m.inputs : ["text"]
+  const efforts = Array.isArray(m.efforts) ? m.efforts : []
+  return {
+    name: m.name,
+    reasoning: m.thinking !== "off",
+    tool_call: true,
+    attachment: inputs.length > 1,
+    modalities: { input: inputs, output: ["text"] },
+    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    variants: variantsOf(m.thinking, efforts),
   }
+}
+
+// configRowsOf gives the built-in models as config entries.
+function configRowsOf(models) {
+  const out = {}
+  for (const m of models) out[m.id] = configRowOf(m)
   return out
 }
 
@@ -297,8 +319,8 @@ async function modelsOf(base, key) {
 // says why.
 //
 // 有 key 而网关不认，是 key 的问题。没有 key 而网关说 401，不是问
-// 题：那是说"我要一把 key"，而那把 key 是 magpie 自己问用户要的那一
-// 把。
+// 题：那是说"我要一把 key"，而那把 key 是可以没有的（网关一把 key
+// 都没有的时候它自己认）。
 async function authorize(base, key) {
   try {
     const res = await globalThis.fetch(base + "/v1/models", { headers: headersFor(key) })
@@ -329,7 +351,7 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
       // 网关讲 Anthropic 的 /v1/messages
       p.npm ??= NPM
       p.api ??= DEFAULT_BASE + "/v1"
-      p.models = { ...rowsOf(MODELS, DEFAULT_BASE), ...(p.models ?? {}) }
+      p.models = { ...configRowsOf(MODELS), ...(p.models ?? {}) }
     },
 
     // the conversation's id, which the gateway binds to an account
@@ -358,19 +380,32 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
       provider: PROVIDER,
       methods: [
         {
-          // magpie 自己问那把 key：它是网关后台申请的那一把。
+          // We ask for the address and the key ourselves.
           //
-          // 我们也写 authorize：签入的时候要打一次网关，说清它在不在、
-          // 它收不收。authorize 拿得到的是提示的答案（地址），拿不到
-          // magpie 问出来的那把 key —— 所以 401 在没有 key 可试的时候
-          // 不算失败。
+          // magpie 自己不问 key（keyless），我们问：网关的地址和聊天用的
+          // 那把 key 都是提示的答案，authorize 拿得到，才谈得上"打一次
+          // 网关，说清它在不在、它收不收"。没有提示，authorize 拿到的
+          // 永远是空对象，地址只能从环境变量里来。
           type: "api",
           label: "MMXCode 网关",
-          placeholder: "sk-…（网关一把 key 都没有时可以留空）",
+          keyless: true,
+          placeholder: "sk-…（网关一把 key 都没有的时候可以留空）",
+          prompts: [
+            { type: "text", key: "base", message: "网关地址（默认 http://127.0.0.1:8080）" },
+            { type: "password", key: "key", required: false, message: "聊天用的 key（后台 /keys 申请的；网关一把 key 都没有的时候可以留空）" },
+            { type: "text", key: "label", required: false, message: "这个名字（magpie 里认这个账号用）" },
+          ],
           async authorize(inputs = {}) {
             const base = baseOf(inputs)
             const key = keyOf(inputs)
-            return await authorize(base, key)
+            const label = typeof inputs?.label === "string" ? inputs.label.trim() : ""
+            const res = await authorize(base, key)
+            if (res.type !== "success") return res
+            // magpie names an account by accountId, else by metadata.email:
+            // the label the user gave is the name it will know it by.
+            // magpie 给账号起名字用的是 accountId，没有就 metadata.email
+            // —— 用户给的那个名字得落在 email 上，账号才认得出来。
+            return { ...res, metadata: { ...res.metadata, ...(label ? { email: label } : {}) } }
           },
         },
       ],
@@ -410,6 +445,17 @@ export const MMXCodePlugin = async ({ client, magpie } = {}) => {
 
 export default MMXCodePlugin
 ```
+
+两处跟 magpie 宿主有关的地方，是对着宿主读出来的，不是猜的：
+
+- 签入要问两样东西（`prompts`），magpie 把答案交给 `authorize`：没有它们，
+  地址就只能走环境变量。`keyless: true` 是说这把 key 可以不填 —— 网关一把
+  key 都没有的时候，聊天接口不鉴权。
+- `config` 钩子摆的那份名单是 magpie 宿主认的形状（`reasoning`、
+  `tool_call`、`attachment`、`modalities`、`limit`、`cost`、`variants`），
+  跟参考插件的 `configModels()` 一个样；`provider.models` 钩子摆的才是
+  整行（`id`、`api`、`capabilities`）。两个形状不一样，摆错了 magpie 就
+  认不出「能不能读图」「能不能思考」。
 
 - [ ] **Step 2: 提交**
 
@@ -459,7 +505,7 @@ async function thePlugin() {
 // said in words.
 //
 // 签入不成功要说清楚，不留一个半签入的账号。
-test("the sign-in says the gateway is not there", async (t) => {
+test("the sign-in says the gateway is not there", async () => {
   const plugin = await thePlugin()
   const res = await plugin.auth.methods[0].authorize({ base: "http://127.0.0.1:1" })
   assert.equal(res.type, "failed")
@@ -545,6 +591,8 @@ test("the card is handed over as it is", async (t) => {
   assert.equal(got.balance, card.balance)
   assert.equal(got.windows.length, 1)
   assert.equal(got.windows[0].name, card.windows[0].name)
+  // 卡片是网关那张：插件一个字也不加。
+  assert.deepEqual(got, card)
 })
 
 // TestTheModelsAreTheGateways says the models are the gateway's own,
@@ -599,7 +647,7 @@ test("the models fall back when the gateway is silent", async (t) => {
 
 // TestTheConfigPutsTheProvider says the config hook puts the provider
 // there, with the built-in list.
-test("the config puts the provider there", async (t) => {
+test("the config puts the provider there", async () => {
   const plugin = await thePlugin()
   const config = {}
   await plugin.config(config)
@@ -610,12 +658,98 @@ test("the config puts the provider there", async (t) => {
   assert.ok(p.models["MiniMax-M3.1-Flash"], "the built-in list is not there")
 })
 
+// TestTheConfigModelsAreConfigShaped says the config hook's models are
+// the shape the host reads, not the whole provider row.
+//
+// 宿主照着配置形状里的名字读：reasoning、tool_call、attachment、
+// modalities、limit、cost、variants。塞一整行进去，这些名字就没人读
+// 了 —— 图读不了、思考也没有。参考插件的 configModels() 也是这样
+// （minimax/index.mjs:203-220），它那 whole row 是 modelOf()
+// （:222-246），走的是另一个钩子。
+test("the config's models are in the shape the host reads", async () => {
+  const plugin = await thePlugin()
+  const config = {}
+  await plugin.config(config)
+  const m = config.provider.mmxcode.models["MiniMax-M3.1-Flash"]
+  assert.ok(m, "the model is not in the config")
+  assert.equal(m.name, "M3.1-Flash")
+  assert.equal(m.reasoning, true)
+  assert.equal(m.tool_call, true)
+  assert.equal(m.attachment, true)
+  assert.deepEqual(m.modalities, { input: ["text", "image", "video"], output: ["text"] })
+  assert.deepEqual(m.limit, { context: 1048576, output: 524288 })
+  assert.deepEqual(m.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 })
+  assert.ok(m.variants.low, "the reasoning levels are not said")
+  assert.deepEqual(m.variants.low, { thinking: { type: "adaptive" }, effort: "low" })
+  // 不是 provider 的整行：整行里那些名字宿主不读。
+  assert.equal(m.id, undefined)
+  assert.equal(m.api, undefined)
+  assert.equal(m.capabilities, undefined)
+})
+
+// TestTheConfigModelsSayTheThinkingThatCanBeTurnedOff says a model
+// whose thinking can be turned off has that said.
+//
+// 思考能关的模型有 none 这一档，能关才关得掉。
+test("the config's models say the thinking that can be turned off", async () => {
+  const plugin = await thePlugin()
+  const config = {}
+  await plugin.config(config)
+  const m = config.provider.mmxcode.models["MiniMax-M3"]
+  assert.ok(m, "the model is not in the config")
+  assert.deepEqual(m.variants.none, { thinking: { type: "disabled" } })
+  assert.ok(m.variants.high, "the reasoning levels are not said")
+  // 强制开着的模型没有 none：那档它做不到。
+  const flash = config.provider.mmxcode.models["MiniMax-M3.1-Flash"]
+  assert.equal(flash.variants.none, undefined)
+})
+
+// TestTheSignInAsksForTheAddressAndTheKey says the sign-in method asks
+// for the gateway's address and the chat key itself.
+//
+// magpie 调 authorize(inputs) 时给的是提示的答案：没有提示，地址就
+// 只能从环境变量里来，用户连网关在哪儿都答不了。所以这方法是
+// keyless 的，提示里必须有地址。
+test("the sign-in asks for the address and the key", async () => {
+  const plugin = await thePlugin()
+  const method = plugin.auth.methods[0]
+  assert.equal(method.keyless, true)
+  assert.ok(Array.isArray(method.prompts), "the sign-in asks for nothing")
+  const base = method.prompts.find((p) => p.key === "base")
+  assert.ok(base, "the gateway's address is not asked for")
+  assert.match(base.message, /网关地址/)
+  const key = method.prompts.find((p) => p.key === "key")
+  assert.ok(key, "the chat key is not asked for")
+  // 网关一把 key 都没有的时候它自己认：这把 key 可以不填。
+  assert.equal(key.required, false)
+})
+
+// TestTheSignInTakesTheAnswers says the sign-in takes the answers to
+// its prompts.
+//
+// 提示的答案就是 authorize 的入参：地址在 base 上，key 在 key 上。
+// 少了这一条，签到就不知道该往哪儿打。
+test("the sign-in takes the answers to its prompts", async (t) => {
+  const base = await aGateway(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ object: "list", data: [] }))
+  })
+  const plugin = await thePlugin()
+  const method = plugin.auth.methods[0]
+  const answers = {}
+  for (const p of method.prompts) answers[p.key] = p.key === "base" ? base : ""
+  answers.key = "sk-x"
+  const res = await method.authorize(answers)
+  assert.equal(res.type, "success")
+  assert.equal(res.metadata.base, base)
+})
+
 // TestTheSessionIdIsGivenToTheGateway says the conversation's id goes
 // to the gateway.
 //
 // 有了它，一段对话黏在一个账号上；没有它，两个用户的第一句话一样就
 // 会撞成一个会话。
-test("the session id is given to the gateway", async (t) => {
+test("the session id is given to the gateway", async () => {
   const plugin = await thePlugin()
   const out = { headers: {} }
   await plugin["chat.headers"]({ model: { providerID: "mmxcode" }, sessionID: "sess-1" }, out)
@@ -624,7 +758,7 @@ test("the session id is given to the gateway", async (t) => {
 
 // TestTheSessionIdIsOnlyForOurProvider says another provider's request
 // is left alone.
-test("the session id is only for our provider", async (t) => {
+test("the session id is only for our provider", async () => {
   const plugin = await thePlugin()
   const out = { headers: {} }
   await plugin["chat.headers"]({ model: { providerID: "somebody-else" }, sessionID: "sess-1" }, out)
@@ -633,7 +767,7 @@ test("the session id is only for our provider", async (t) => {
 
 // TestTheLoaderGivesTheGateway says the loader points at the gateway
 // with the key.
-test("the loader gives the gateway", async (t) => {
+test("the loader gives the gateway", async () => {
   const plugin = await thePlugin()
   const got = await plugin.auth.loader(async () => ({
     type: "api",
