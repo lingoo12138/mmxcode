@@ -239,3 +239,76 @@ func TestAFailedReadingDoesNotStopTheOthers(t *testing.T) {
 		t.Fatalf("the reasons = %v, want one", res.Reasons)
 	}
 }
+
+// TestTheReadingSaysWhetherTheAccountHasRoom says a reading says
+// whether the account has something to spend.
+//
+// 账本还有余额，或者计划窗口还有余量，都算还有。
+func TestTheReadingSaysWhetherTheAccountHasRoom(t *testing.T) {
+	if HasRoom(store.UsageSnapshot{HasAmounts: true, Remaining: 10}) != true {
+		t.Error("an account with credits left has no room")
+	}
+	if HasRoom(store.UsageSnapshot{HasAmounts: true, Remaining: 0}) {
+		t.Error("an account without credits has room")
+	}
+	if HasRoom(store.UsageSnapshot{HasAmounts: false}) {
+		t.Error("an account that could not be read has room")
+	}
+	ws := `[{"name":"5 hours","modelName":"general","amount":10,"limit":100}]`
+	if HasRoom(store.UsageSnapshot{WindowsJSON: ws}) != true {
+		t.Error("a window with room left has no room")
+	}
+	full := `[{"name":"5 hours","modelName":"general","amount":100,"limit":100}]`
+	if HasRoom(store.UsageSnapshot{WindowsJSON: full}) {
+		t.Error("a window that is used up has room")
+	}
+}
+
+// TestTheReadingClearsTheSpentMark says a reading that says there is
+// something to spend takes the "used up" mark off.
+//
+// 签到给的积分能救活一个用完的账号。不处理的话它会一直待在外面的
+// 轮转之外，直到窗口回来（最长七天）—— 白扔一个账号。
+func TestTheReadingClearsTheSpentMark(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_1", now)
+	if err := s.SetExhausted(context.Background(), "acc_1", "general", now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, &fakeReader{fail: map[string]bool{}}, nil, config.Default())
+	if _, err := r.Settle(context.Background(), "acc_1"); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	left, err := s.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatalf("list exhausted: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("the spent marks = %v, want none", left)
+	}
+}
+
+// TestAFailedReadingKeepsTheSpentMark says a reading that failed does
+// not take the "used up" mark off.
+//
+// 宁可少用一个账号，也不要把一个用完的账号放回去让客户端撞它。
+func TestAFailedReadingKeepsTheSpentMark(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_1", now)
+	if err := s.SetExhausted(context.Background(), "acc_1", "general", now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, &fakeReader{fail: map[string]bool{"acc_1": true}}, nil, config.Default())
+	if _, err := r.Settle(context.Background(), "acc_1"); err == nil {
+		t.Fatal("settle said nothing about the failed reading")
+	}
+	left, err := s.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatalf("list exhausted: %v", err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("the spent marks = %v, want the one", left)
+	}
+}

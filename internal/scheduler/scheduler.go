@@ -11,6 +11,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/config"
 	"mmxcode/internal/manager"
+	"mmxcode/internal/usage"
 )
 
 // egressTarget is the address the outlets are checked against.
@@ -86,6 +87,7 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 		return nil
 	}
 	out := make([]CheckinResult, 0, len(accounts))
+	checked := []string{}
 	for _, a := range accounts {
 		r := CheckinResult{AccountID: a.ID}
 		res, err := s.Mgr.Checkin(ctx, a.ID)
@@ -95,10 +97,43 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 			r.Outcome = res.Outcome
 			r.Credit = res.Credit
 			r.Streak = res.Streak
+			checked = append(checked, a.ID)
 		}
 		out = append(out, r)
 	}
+	// 签到给的积分是账本池里的：不读额度，卡上的余额还是签到前的旧
+	// 数。签到的账号凑成一批，一次有预算地读；读到的数说有额度就清
+	// 掉"用完"的标记。
+	s.readCheckedIn(ctx, checked)
 	return out
+}
+
+// readCheckedIn reads the credits of the accounts that were checked in.
+//
+// 一趟读完不完都没关系：没读到的那些在"签到待补"名单里，下一趟接着
+// 读（待补排在最前面，所以几分钟内就清完了）。
+func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	round := usage.NewRound(s.Mgr.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
+	res, err := round.Run(ctx, ids, round.Options())
+	if err != nil {
+		fmt.Printf("checkin: the credits could not be read: %v\n", err)
+		return
+	}
+	for _, reason := range res.Reasons {
+		fmt.Printf("checkin: %s\n", reason)
+	}
+	// 读到的数说话：说有额度就清掉"用完"的标记。
+	for _, snap := range res.Read {
+		if !usage.HasRoom(snap) {
+			continue
+		}
+		if err := round.ClearSpent(ctx, snap.AccountID); err != nil {
+			fmt.Printf("checkin %s: the spent mark could not be taken off: %v\n", snap.AccountID, err)
+		}
+	}
 }
 
 // RefreshUsage reads every account's credits.

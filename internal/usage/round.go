@@ -2,10 +2,12 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"sync"
 	"time"
 
+	"mmxcode/internal/account"
 	"mmxcode/internal/config"
 	"mmxcode/internal/store"
 )
@@ -313,6 +315,76 @@ func (r *Round) CardOptions() Options {
 		Budget:      f.CardBudget.Duration(),
 		Batch:       f.Card,
 	}
+}
+
+// HasRoom says whether a reading says the account has something to spend.
+//
+// 账本还有余额，或者计划窗口还有余量，都算还有。读不到（没有账本，
+// 窗口也没有余量）就是没有：宁可少用一个账号，也不要把一个用完的
+// 账号放回去让客户端撞它。
+func HasRoom(snap store.UsageSnapshot) bool {
+	if snap.HasAmounts && snap.Remaining > 0 {
+		return true
+	}
+	for _, w := range windowsOf(snap) {
+		if w.Unlimited {
+			return true
+		}
+		if w.Limit > 0 && w.Amount < w.Limit {
+			return true
+		}
+	}
+	return false
+}
+
+// windowsOf reads the plan's windows out of a reading.
+func windowsOf(snap store.UsageSnapshot) []account.Window {
+	if snap.WindowsJSON == "" {
+		return nil
+	}
+	var ws []account.Window
+	if err := json.Unmarshal([]byte(snap.WindowsJSON), &ws); err != nil {
+		return nil
+	}
+	return ws
+}
+
+// ClearSpent takes the "used up" marks off an account.
+//
+// 它是给签到用的：签到给的积分能救活一个用完的账号，而清不清由读到
+// 的数决定。
+func (r *Round) ClearSpent(ctx context.Context, accountID string) error {
+	rows, err := r.Store.ListExhausted(ctx)
+	if err != nil {
+		return err
+	}
+	for _, e := range rows {
+		if e.AccountID != accountID {
+			continue
+		}
+		if err := r.Store.ClearExhausted(ctx, e.AccountID, e.WindowKey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Settle reads an account after a check-in and says whether it is spent.
+//
+// 它是签到那条路的一整套：读完，读到的数说有额度就清掉"用完"的标
+// 记，读不到就留着（账号进"待补"名单，下一趟再读）。
+func (r *Round) Settle(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	snap, err := r.Reader.RefreshUsage(ctx, accountID)
+	if err != nil {
+		return snap, err
+	}
+	if !HasRoom(snap) {
+		return snap, nil
+	}
+	if err := r.ClearSpent(ctx, accountID); err != nil {
+		return snap, err
+	}
+	return snap, nil
 }
 
 // dedupe takes the repeated ids out of a list, keeping the order.

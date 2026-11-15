@@ -727,6 +727,12 @@ func (w *WebUI) apiCheckin(rw http.ResponseWriter, r *http.Request, id string) {
 		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// 签到给的积分是账本池里的：读完这一账号的额度，卡上的余额才是
+	// 签到之后的数。人在等，所以只读这一个。
+	round := usage.NewRound(w.Store, w.Mgr, w.Mgr.HotAccounts, w.Cfg)
+	if _, err := round.Settle(r.Context(), id); err != nil {
+		fmt.Printf("checkin %s: the credits could not be read: %v\n", id, err)
+	}
 	writeJSON(rw, map[string]any{
 		"outcome": out.Outcome, "credit": out.Credit,
 		"streak": out.Streak, "message": out.Message,
