@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"strings"
 	"time"
 
@@ -89,6 +90,15 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // markSpent marks an account's group as spent, and reads it once more
 // in the background.
 //
+// ctx 是客户端那个请求的 context：它多半已经被取消了（客户端走了，或
+// 者上游的超时到了）。标记的写不用它 —— 标记是网关自己的活：写在客
+// 户端那个 context 上，它就跟着客户端一起没了，而库里没有这一行，账
+// 号就继续留在轮转里，下一个客户端照样撞上"用完"（规格 §4.1）。
+//
+// 读（问库里存着的窗口时刻）先用客户端那个 context。它死了就用网关自
+// 己的命再问一次：那一刻定下来的"什么时候回来"不该因为客户端走了就
+// 短成冷却时间。
+//
 // 标记的那一刻就把"什么时候回来"定下来：读到的窗口时刻在将来就用
 // 它，取不到就用冷却时间。后台那一次读是来改标记的，而且只往后改：
 // 读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西
@@ -99,7 +109,21 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // 着真的时刻改"。
 func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 	until := s.windowReset(ctx, accountID, groupKey)
-	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
+	if until.IsZero() && ctx.Err() != nil {
+		// 客户端走了：这一次读没有读到。网关自己的命还在，用它再问
+		// 一次 —— 读到的时刻不该因为客户端走了就短成冷却时间。
+		rctx, rcancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
+		until = s.windowReset(rctx, accountID, groupKey)
+		rcancel()
+	}
+	// 写用网关自己的命：客户端断开、上游超时，都不该让这一行丢掉。
+	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
+	defer wcancel()
+	if err := s.Rot.MarkWindowExhausted(wctx, accountID, groupKey, until, "quota"); err != nil {
+		// 写不进去要说得出来：不然这一行没了，谁也不知道，下一个客
+		// 户端照样撞上"用完"。
+		log.Printf("the spent mark of %s (%s) could not be written: %v", accountID, groupKey, err)
+	}
 	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
 	// 着（冷却时间），下一次再说。
 	s.startBackground(func() { s.correctMark(accountID, groupKey) })

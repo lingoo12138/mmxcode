@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"mmxcode/internal/config"
+	"mmxcode/internal/manager"
+	"mmxcode/internal/rotator"
 	"mmxcode/internal/store"
 )
 
@@ -179,6 +181,93 @@ func TestTheSecondRequestWaitsForTheBusyAccount(t *testing.T) {
 	h.gw.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// stealingStore takes an account while the rotator is still choosing.
+//
+// 它站在挑和抢中间那道缝里：rotator 挑的时候那个账号还闲，等网关去抢
+// 的时候它已经被别的请求抢走了。这道缝平时很小，测试把它撑开。
+type stealingStore struct {
+	poolStore
+	// busy counts the requests in the air per account.
+	busy *busyAccounts
+	// stolen is the account that was taken.
+	stolen string
+}
+
+// BindSession binds the session, and takes the account it was bound to.
+func (s *stealingStore) BindSession(ctx context.Context, sessionKey, accountID string) error {
+	if err := s.poolStore.BindSession(ctx, sessionKey, accountID); err != nil {
+		return err
+	}
+	if s.stolen != "" {
+		return nil
+	}
+	if s.busy.take(accountID) {
+		s.stolen = accountID
+	}
+	return nil
+}
+
+// TestTheRequestWaitsForAnAccountThatIsNotBusy says a request waits for
+// an account that can answer, and not for the whole gateway to be idle.
+//
+// 一个账号在飞、另一个空着的时候，等的是那个空着的账号。等不到就回
+// 429 说"every account is busy right now"，那句话是假的：网关里明明有
+// 一个账号能答（规格 §6.4）。
+//
+// 账本只记着在飞的那几个账号，它不知道池子里有多少账号：所以"还有没
+// 有空的账号"只能问 rotator。
+func TestTheRequestWaitsForAnAccountThatIsNotBusy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[]}`))
+	})
+	// 等不了多久：这个测试等的是那个「等不到」。
+	h.gw.Cfg.Concurrency.Wait = config.Duration(100 * time.Millisecond)
+	ctx := context.Background()
+	now := time.Now()
+	// 第二个账号：它空着。
+	if err := h.store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SaveToken(ctx, store.Token{
+		AccountID: "acc_02", Access: "tokacc_02", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 挑的时候那个账号还闲，等网关去抢的时候它已经被抢走了。
+	steal := &stealingStore{poolStore: h.store, busy: h.gw.busy}
+	h.gw.Rot = rotator.New(poolAdapter{s: steal, busy: h.gw.busy}, rotator.Options{
+		MaxAttempts: h.gw.Cfg.Rotation.MaxAttempts,
+		Cooldown:    h.gw.Cfg.Rotation.ExhaustedCooldown.Duration(),
+		WindowGroup: manager.WindowGroup,
+		Strategy:    h.gw.Cfg.Rotation.Strategy,
+	})
+	defer func() { h.gw.busy.give(steal.stolen) }()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if steal.stolen == "" {
+		t.Fatal("the account was not taken: the test did not do what it says")
+	}
+	// 答的是那个空着的账号，不是被抢走的那个。
+	h.mu.Lock()
+	tokens := append([]string(nil), h.tokens...)
+	h.mu.Unlock()
+	if len(tokens) != 1 {
+		t.Fatalf("the upstream was asked %d times, want once", len(tokens))
+	}
+	if strings.Contains(tokens[0], steal.stolen) {
+		t.Fatalf("the upstream was asked with %q, want the account that is free", tokens[0])
 	}
 }
 

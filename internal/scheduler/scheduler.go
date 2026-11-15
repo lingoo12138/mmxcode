@@ -253,19 +253,29 @@ func (s *Scheduler) CheckEgress(ctx context.Context) {
 	}
 }
 
+// usageEvery says how often the round of readings runs.
+//
+// 新键（usage.refresh.scan_every）是 0 的时候，间隔交回老的那个
+// （schedule.usage_refresh）；再没有就是十五分钟。两个都写的时候新键
+// 赢 —— 老的那个只是回退。
+func (s *Scheduler) usageEvery() time.Duration {
+	every := s.Cfg.Usage.Refresh.ScanEvery.Duration()
+	if every <= 0 {
+		every = s.Cfg.Schedule.UsageRefresh.Duration()
+	}
+	if every <= 0 {
+		every = 15 * time.Minute
+	}
+	return every
+}
+
 // Run runs the recurring work until the context ends.
 func (s *Scheduler) Run(ctx context.Context) {
 	at, err := time.Parse("15:04", s.Cfg.Schedule.CheckinAt)
 	if err != nil {
 		at = time.Date(0, 1, 1, 9, 0, 0, 0, time.Local)
 	}
-	usageEvery := s.Cfg.Usage.Refresh.ScanEvery.Duration()
-	if usageEvery <= 0 {
-		usageEvery = s.Cfg.Schedule.UsageRefresh.Duration()
-	}
-	if usageEvery <= 0 {
-		usageEvery = 15 * time.Minute
-	}
+	usageEvery := s.usageEvery()
 	tokenEvery := s.Cfg.Schedule.TokenRefresh.Duration()
 	if tokenEvery <= 0 {
 		tokenEvery = 5 * time.Minute

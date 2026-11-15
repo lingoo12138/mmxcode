@@ -249,6 +249,83 @@ func TestTheBusyAccountIsNotPicked(t *testing.T) {
 	}
 }
 
+// TestTheRotatorSaysWhetherSomeAccountCanAnswer says the rotator says
+// whether an account could answer right now.
+//
+// 谁在飞、谁能用、谁被标记用完了，只有 rotator 知道：账本自己不知道池
+// 子里有多少账号。"等一个账号空出来"问的就是这一句（规格 §6.4）。
+//
+// 它只看，不挑：挑不动任何东西。
+func TestTheRotatorSaysWhetherSomeAccountCanAnswer(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+	ctx := context.Background()
+
+	ok, err := r.AnyUsable(ctx, "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("no account can answer, want one")
+	}
+	// 一个在飞，另一个空着：还有能答的。
+	p.busy["acc_01"] = true
+	ok, err = r.AnyUsable(ctx, "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("no account can answer, want the one that is not busy")
+	}
+	// 两个都在飞：没有了。
+	p.busy["acc_02"] = true
+	ok, err = r.AnyUsable(ctx, "MiniMax-M3", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("an account can answer, want none")
+	}
+	// 一个已经试过的账号不算：这个请求不再用它。
+	p.busy = map[string]bool{}
+	ok, err = r.AnyUsable(ctx, "MiniMax-M3", map[string]bool{"acc_02": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("no account can answer, want acc_01")
+	}
+	ok, err = r.AnyUsable(ctx, "MiniMax-M3", map[string]bool{"acc_01": true, "acc_02": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("an account can answer, want none")
+	}
+}
+
+// TestTheRotatorDoesNotPickWhenItIsAsked says the question does not
+// pick an account and does not bind a session.
+//
+// 它是"还有没有能答的账号"这一句：问它的人自己会去挑。
+func TestTheRotatorDoesNotPickWhenItIsAsked(t *testing.T) {
+	p := &busyPool{
+		fakePool: newFakePool(acc("acc_01"), acc("acc_02")),
+		busy:     map[string]bool{},
+	}
+	r := New(p, Options{MaxAttempts: 3})
+
+	if _, err := r.AnyUsable(context.Background(), "MiniMax-M3", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.bound) != 0 {
+		t.Fatalf("bound %v", p.bound)
+	}
+}
+
 // TestEveryAccountBusyIsSaidSo says the rotator says the accounts are
 // busy, and not that they are spent.
 //

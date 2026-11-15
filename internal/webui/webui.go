@@ -567,7 +567,8 @@ func (w *WebUI) apiPoll(rw http.ResponseWriter, r *http.Request) {
 // apiUsageRefresh reads every account's credits now.
 //
 // 页面上那些数是上一次读数时的数。这一趟是现读的：不等调度器，也不
-// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。
+// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。正在被别的
+// 那一趟读着的账号被跳过了 —— 跳过的也要说得出来。
 func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
 	res, err := w.Mgr.RefreshAllUsage(r.Context())
 	if err != nil {
@@ -577,9 +578,13 @@ func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
 	for _, reason := range res.Reasons {
 		log.Printf("usage: %s", reason)
 	}
+	if res.Skipped > 0 {
+		log.Printf("usage: %d account(s) are being read by another round and were skipped", res.Skipped)
+	}
 	writeJSON(rw, map[string]any{
 		"refreshed": res.Refreshed,
 		"failed":    res.Failed,
+		"skipped":   res.Skipped,
 		"reasons":   res.Reasons,
 	})
 }

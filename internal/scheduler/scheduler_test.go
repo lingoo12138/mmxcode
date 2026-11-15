@@ -110,6 +110,84 @@ func TestUsageRefresh(t *testing.T) {
 	}
 }
 
+// TestTheScanEveryCanBeZero says the new key may be zero, and the
+// interval goes back to the old key then.
+//
+// 新键写成 0 的意思是"间隔交回 schedule.usage_refresh"：那一趟按老的
+// 间隔跑。写 0 以前配置文件都读不了，这一趟就根本没有"写 0"这回事 ——
+// 文档许了，代码不许。
+func TestTheScanEveryCanBeZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"10","consumed_amount":"0","remaining_amount":"10","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	// 新键是 0：间隔交回 schedule.usage_refresh。
+	cfg := config.Default()
+	cfg.Usage.Refresh.ScanEvery = config.OptionalDuration(0)
+	cfg.Schedule.UsageRefresh = config.Duration(20 * time.Millisecond)
+	sc := New(mgr, cfg)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go sc.Run(runCtx)
+
+	// 那一趟按老的间隔跑过了：快照出来了。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snaps, err := s.LatestUsageSnapshots(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snaps) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the round did not run: the interval did not go back to schedule.usage_refresh")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTheScanEveryKeepsItsOwnInterval says the new key wins when both
+// are written.
+//
+// 两个都写的时候新键赢：schedule.usage_refresh 只是新键写 0 时的回退。
+func TestTheScanEveryKeepsItsOwnInterval(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.ScanEvery = config.OptionalDuration(30 * time.Second)
+	cfg.Schedule.UsageRefresh = config.Duration(20 * time.Millisecond)
+	sc := New(nil, cfg)
+	if got := sc.usageEvery(); got != 30*time.Second {
+		t.Fatalf("the interval = %s, want 30s: the new key wins", got)
+	}
+}
+
 // TestTheUsageRoundReadsTheAccountsThatNeedIt says the round reads the
 // accounts that need a reading first, and stops at the batch.
 //

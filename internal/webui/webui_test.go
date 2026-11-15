@@ -244,6 +244,39 @@ func TestTheUsageCanBeRefreshedNow(t *testing.T) {
 	}
 }
 
+// TestTheUsageRefreshSaysHowManyWereSkipped says the answer says how
+// many accounts were skipped because another round was reading them.
+//
+// 跳过的不是读失败：那个账号没有坏，它正在被读。但人要看得见这一趟
+// 少读了几个。
+func TestTheUsageRefreshSaysHowManyWereSkipped(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	// 别的这一趟正在读这个账号。
+	if !w.Mgr.BeginReading("acc_01") {
+		t.Fatal("the account could not be claimed")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/usage/refresh", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Refreshed int `json:"refreshed"`
+		Failed    int `json:"failed"`
+		Skipped   int `json:"skipped"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Skipped != 1 {
+		t.Errorf("skipped = %d, body = %s", out.Skipped, rec.Body.String())
+	}
+	if out.Failed != 0 {
+		t.Errorf("failed = %d, want 0: it is being read, not broken", out.Failed)
+	}
+}
+
 // TestTheUsagePageHasARefreshButton says the page offers the refresh.
 func TestTheUsagePageHasARefreshButton(t *testing.T) {
 	w, _ := newTestWebUI(t)

@@ -80,7 +80,7 @@ mmxcode models                   # 模型列表
 账本是站点那边的数，网关只能去问它要。
 
 - 调度器每 `usage.refresh.scan_every`（默认 30 秒）扫一遍**该读的账号**，一趟最多读 `usage.refresh.batch`（默认 6 个），剩下的下一趟接着读。读到的每一次都存一行；每个账号只留最新的一行，其余的只留一刻钟 —— 不收拾的话一天下来就是几千行。
-- 把 `usage.refresh.scan_every` 写成 0，间隔才交回老的 `schedule.usage_refresh`（再没有就 15 分钟）；不写就是默认的 30 秒。
+- 把 `usage.refresh.scan_every` 写成 0，间隔才交回老的 `schedule.usage_refresh`（再没有就 15 分钟）；不写就是默认的 30 秒。两个都写的时候新键赢 —— `schedule.usage_refresh` 只是新键写 0 时的回退。
 - 刚登录进来的账号、刚导入进来的账号，马上问一次 —— 不用等那一趟。
 - 想现在就知道：`mmxcode usage --refresh`（所有账号读一遍），或者在「用量」那一页上点「刷新」。
 - 一次也没读过的账号，在页面上和命令行里都写着「还没读」：它跟「读到了但是读不出来」不是一回事。
@@ -321,7 +321,7 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `proxy.default` | 空 | 全局默认出口 |
 | `proxy.groups` | 空 | 出口组：组名 → 地址。账号可以指向其中一组，一组共用一个出口 |
 | `schedule.checkin_at` | `"09:00"` | 每天签到的时间，本地时区，`HH:MM` |
-| `schedule.usage_refresh` | `15m` | 积分刷新间隔。只在 `usage.refresh.scan_every` 写成 0 时才用它 |
+| `schedule.usage_refresh` | `15m` | 积分刷新间隔。只在 `usage.refresh.scan_every` 写成 0 时才用它；两个都写的时候新键赢 |
 | `schedule.token_refresh` | `5m` | token 续期检查间隔 |
 | `schedule.egress_health` | `2m` | 出口健康检查间隔 |
 
@@ -353,7 +353,7 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `usage.refresh.budget` | `30s` | 一趟读额度最多花多久。用完就停，剩下的下一趟接着读 |
 | `usage.refresh.batch` | `6` | 一趟最多读几个账号 |
 | `usage.refresh.hot_window` | `5m` | 一个账号用过之后多久还算热。热账号的额度才值得现读 |
-| `usage.refresh.scan_every` | `30s` | 多久扫一遍该读额度的账号 |
+| `usage.refresh.scan_every` | `30s` | 多久扫一遍该读额度的账号。写成 0 就交回 `schedule.usage_refresh` |
 
 magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refresh.card`，默认 2 个；`usage.refresh.card_budget`，默认 5s），所以卡片不会卡。
 

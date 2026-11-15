@@ -769,6 +769,11 @@ type UsageRefreshResult struct {
 	Refreshed int
 	// Failed counts the accounts whose credits could not be read.
 	Failed int
+	// Skipped counts the accounts another round was reading right now.
+	//
+	// 跳过的不是读失败：那个账号没有坏，它正在被别的这一趟读着（规格
+	// §3.3）。但要说得出来：人得知道这一趟少读了几个。
+	Skipped int
 	// Reasons says why each of those failed, one line per account.
 	Reasons []string
 }
@@ -779,6 +784,9 @@ type UsageRefreshResult struct {
 // 遍，不等调度器下一趟。一个账号读不到不影响别的——但要说出来是哪一
 // 个，人才知道去看哪一行。
 //
+// 同一个账号同一时刻只读一次（规格 §3.3）：别的这一趟正在读它，这一
+// 趟就跳过它——它没有坏，它正在被读。跳过的要说得出来，不算读失败。
+//
 // 账号都没列出来的时候，这一趟就根本没跑：把它说成「读了 0 个」，人
 // 会以为账本是空的。
 func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, error) {
@@ -788,7 +796,14 @@ func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, erro
 		return out, fmt.Errorf("the accounts could not be listed: %w", err)
 	}
 	for _, acc := range accounts {
-		if _, err := m.RefreshUsage(ctx, acc.ID); err != nil {
+		if !m.BeginReading(acc.ID) {
+			// 别的这一趟正在读这个账号：这一趟不读它。读的是同一
+			// 次，读两遍是白读（规格 §3.3）。
+			out.Skipped++
+			continue
+		}
+		_, err := m.readOne(ctx, acc.ID)
+		if err != nil {
 			out.Failed++
 			out.Reasons = append(out.Reasons, accountReason(acc, err))
 			continue
@@ -796,6 +811,14 @@ func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, erro
 		out.Refreshed++
 	}
 	return out, nil
+}
+
+// readOne reads one account's credits and gives it back.
+//
+// 读失败了也要还回来：不然那个账号再也读不到了。
+func (m *Manager) readOne(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	defer m.EndReading(accountID)
+	return m.RefreshUsage(ctx, accountID)
 }
 
 // spentRefresh remembers the refresh token that really went to the

@@ -62,35 +62,25 @@ func (b *busyAccounts) isBusy(accountID string) bool {
 	return b.at[accountID] >= b.per
 }
 
-// anyFree says whether some account is free right now.
+// waitForFree waits until an account can answer, or the deadline is over.
 //
-// 一个账号都没在飞的时候，当然有空的：账本上是空的。
-func (b *busyAccounts) anyFree() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.at) == 0 {
-		return true
-	}
-	for _, n := range b.at {
-		if n < b.per {
-			return true
-		}
-	}
-	return false
-}
-
-// waitForFree waits until an account is free, or the deadline is over.
+// 等的是一个能答的账号，不是整个网关空下来：别的账号在飞的时候，这个
+// 请求照样能走到那个空着的账号上（规格 §6.4）。
 //
-// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
-// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
-func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+// 账本只记着在飞的那几个账号，它不知道池子里有多少账号：所以"还有没
+// 有能答的账号"只能问 rotator —— 谁在飞、谁能用、谁被标记用完了，只有
+// 它知道。
+//
+// 等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model string, used map[string]bool) bool {
 	for {
 		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
 		// 抢走了，一醒就轮着看会转不停。
 		if !sleepCtx(ctx, 25*time.Millisecond) {
 			return false
 		}
-		if b.anyFree() {
+		ok, err := s.Rot.AnyUsable(ctx, model, used)
+		if err == nil && ok {
 			return true
 		}
 		if !time.Now().Before(deadline) {

@@ -140,6 +140,31 @@ func TestTheGroupComesBackWithItsLatestWindow(t *testing.T) {
 	}
 }
 
+// TestTheMarkIsWrittenWhenTheClientIsGone says the mark is written
+// even when the client goes away.
+//
+// 上游说"额度用完"的那一刻就把标记写下去（规格 §4.1）。那一刻客户端
+// 可能刚好断开：标记写在客户端那个请求的 context 上，它就跟着那个
+// context 一起没了 —— 库里没有这一行，账号继续留在轮转里，下一个客
+// 户端照样撞上它。
+func TestTheMarkIsWrittenWhenTheClientIsGone(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	// 客户端走了：请求的 context 被取消了。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.gw.markSpent(ctx, "acc_01", "general")
+	ex, err := h.store.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ex) != 1 || ex[0].AccountID != "acc_01" {
+		t.Fatalf("exhausted = %+v, want the mark", ex)
+	}
+	if ex[0].WindowKey != "general" {
+		t.Fatalf("window key = %q, want the group", ex[0].WindowKey)
+	}
+}
+
 // TestTheBackgroundReadingDoesNotShortenTheMark says a reading that
 // does not mention the group leaves the mark as it is.
 //

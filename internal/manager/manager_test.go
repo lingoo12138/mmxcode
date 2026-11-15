@@ -379,6 +379,102 @@ func TestRefreshAllUsageSaysWhichAccountFailed(t *testing.T) {
 	}
 }
 
+// TestTheRefreshSkipsAnAccountThatIsBeingRead says the round skips an
+// account that another round is reading right now.
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：别的这一趟正在读它，这一趟
+// 就跳过它 —— 它没有坏，它正在被读，所以不算读失败，但要说得出来。
+func TestTheRefreshSkipsAnAccountThatIsBeingRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1234567890",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		m.Store.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "acc", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	// 别的这一趟正在读 acc_01。
+	if !m.BeginReading("acc_01") {
+		t.Fatal("the account could not be claimed")
+	}
+
+	res, err := m.RefreshAllUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Refreshed != 1 {
+		t.Errorf("refreshed = %d, want 1", res.Refreshed)
+	}
+	if res.Failed != 0 {
+		t.Errorf("failed = %d, want 0: it is being read, not broken", res.Failed)
+	}
+	if res.Skipped != 1 {
+		t.Errorf("skipped = %d, want 1", res.Skipped)
+	}
+}
+
+// TestTheRefreshGivesTheAccountBack says the round gives the account
+// back when the reading is done.
+//
+// 读失败了也要还回来：不然那个账号再也读不到了。
+func TestTheRefreshGivesTheAccountBack(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/credit/details":
+			w.Write([]byte(`{"total_count":1,"details":[{"credit_type":1,"granted_amount":"600","consumed_amount":"100","remaining_amount":"500","granted_at_ms":1763000000000,"expire_at_ms":1900000000000}]}`))
+		case "/backend/account/token_plan/remains_percent":
+			w.Write([]byte(`{"base_resp":{"status_code":0},"model_remains":[]}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m := newTestManager(t, srv)
+	now := time.Now()
+	// 这个账号读得到。
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1234567890",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "acc", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+	// 这个账号读不到：没有令牌。
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, UserID: "0987654321",
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	if _, err := m.RefreshAllUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"acc_01", "acc_02"} {
+		if !m.BeginReading(id) {
+			t.Errorf("the account %s is still locked", id)
+		}
+	}
+}
+
 func TestCheckinDelegates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

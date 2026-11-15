@@ -321,24 +321,10 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	if err != nil {
 		return Plan{}, err
 	}
-	group := r.GroupKey(model)
-
-	// The accounts that can answer: they are signed in, their group
-	// is not spent, and they have not been tried yet.
-	usable := make([]store.Account, 0, len(accounts))
-	for _, a := range accounts {
-		if a.Status != store.StatusActive {
-			continue
-		}
-		if used[a.ID] || r.isExhausted(exhausted, a.ID, group) {
-			continue
-		}
-		usable = append(usable, a)
-	}
+	usable, group := r.usableAccounts(accounts, exhausted, model, used)
 	if len(usable) == 0 {
 		return Plan{}, fmt.Errorf("no account can answer: every account is spent for the %s group or has already been tried", group)
 	}
-
 	// The accounts that are not busy: a request is in the air on the
 	// other ones, and they are not picked.
 	free, err := r.freeAccounts(ctx, usable)
@@ -420,6 +406,58 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	}
 	r.markUsed(a.ID)
 	return r.plan(a, group, false, false), nil
+}
+
+// usableAccounts gives the accounts that can answer, and the group the
+// request spends.
+//
+// 能答的账号是签入中的、它们的组没有被标记用完的、而且这个请求里还没
+// 有试过的。挑的时候和问"还有没有能答的"的时候用的是同一套口径。
+func (r *Rotator) usableAccounts(accounts []store.Account, exhausted []store.Exhausted, model string, used map[string]bool) ([]store.Account, string) {
+	group := r.GroupKey(model)
+	usable := make([]store.Account, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Status != store.StatusActive {
+			continue
+		}
+		if used[a.ID] || r.isExhausted(exhausted, a.ID, group) {
+			continue
+		}
+		usable = append(usable, a)
+	}
+	return usable, group
+}
+
+// AnyUsable says whether some account could answer right now.
+//
+// 它是"等一个账号空出来"问的那一句（规格 §6.4）：能答的账号是签入中
+// 的、没有被标记用完的、这个请求里还没有试过的，再减去正在飞的那些。
+//
+// 谁在飞、谁能用、谁被标记用完了，只有 rotator 知道：账本自己不知道池
+// 子里有多少账号，所以"有没有空的账号"这件事只能问它。
+//
+// 它只看，不挑：不记"用过了"，不绑会话，什么都不改。挑是 Pick 的事。
+func (r *Rotator) AnyUsable(ctx context.Context, model string, used map[string]bool) (bool, error) {
+	accounts, err := r.pool.Accounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	exhausted, err := r.pool.Exhausted(ctx)
+	if err != nil {
+		return false, err
+	}
+	usable, _ := r.usableAccounts(accounts, exhausted, model, used)
+	if len(usable) == 0 {
+		return false, nil
+	}
+	free, err := r.freeAccounts(ctx, usable)
+	if err != nil {
+		if errors.Is(err, ErrAllBusy) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(free) > 0, nil
 }
 
 // freeAccounts gives the accounts that are not busy right now.

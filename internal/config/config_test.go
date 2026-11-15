@@ -182,6 +182,92 @@ func TestDurationRejectsGarbage(t *testing.T) {
 	}
 }
 
+// TestTheScanEveryCanBeZero says the new key may be zero.
+//
+// 新键写成 0 有一个确切的意思：间隔交回 schedule.usage_refresh。所以它
+// 得能写进去 —— 以前写 0 会让整个配置文件读不了，网关连数据库都连不
+// 上就退出了，而文档许了这么写。
+func TestTheScanEveryCanBeZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "usage:\n  refresh:\n    scan_every: 0\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("the config could not be read: %v", err)
+	}
+	if got := c.Usage.Refresh.ScanEvery.Duration(); got != 0 {
+		t.Fatalf("scan_every = %s, want 0", got)
+	}
+}
+
+// TestTheScanEveryRefusesANegative says the new key still refuses a
+// negative interval.
+//
+// 负的间隔没有意思：它顺着"小于等于 0 就按默认来"那条路，变成一个没
+// 人要的间隔。零是许的，负的不是。
+func TestTheScanEveryRefusesANegative(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "usage:\n  refresh:\n    scan_every: -5s\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("the negative interval was taken")
+	}
+}
+
+// TestTheScanEveryRefusesGarbage says the new key still refuses
+// something that is not a duration at all.
+func TestTheScanEveryRefusesGarbage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "usage:\n  refresh:\n    scan_every: 5x\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("the garbage interval was taken")
+	}
+}
+
+// TestTheOtherDurationsStillRefuseZero says only the one key lets zero
+// through.
+//
+// 别的键写 0 仍然是错：零在那边是"没有时限"或者"悄悄按默认来"，两个
+// 都比拒绝更坏。
+func TestTheOtherDurationsStillRefuseZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "schedule:\n  usage_refresh: 0\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("the zero interval was taken")
+	}
+}
+
+// TestTheOptionalDurationJSON says the new key is written and read as
+// a string, like every other duration.
+//
+// WebUI 读配置用 JSON：一个纳秒数对它什么也不是。
+func TestTheOptionalDurationJSON(t *testing.T) {
+	b, err := json.Marshal(OptionalDuration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `"0s"` {
+		t.Fatalf("marshalled = %s", b)
+	}
+	var d OptionalDuration
+	if err := json.Unmarshal(b, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Duration() != 0 {
+		t.Fatalf("d = %v", d.Duration())
+	}
+}
+
 func TestLoadEmptyPath(t *testing.T) {
 	c, err := Load("")
 	if err != nil {

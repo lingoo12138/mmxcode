@@ -72,8 +72,10 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 // or "fall back to the default" — a schedule that quietly runs at a
 // time nobody asked for. Both are worse than refusing to start.
 //
-// There is no legitimate zero to protect: the defaults are all
-// positive, so a zero in a file can only be a mistake.
+// 有一个地方的零是合法的：usage.refresh.scan_every。那一个键用的是
+// 自己的类型（OptionalDuration），零在那里是"间隔交回
+// schedule.usage_refresh" —— 是人写的意思。别的键没有这个意思，所以
+// 它们还是拒绝零。
 func parseDuration(s string) (time.Duration, error) {
 	v, err := time.ParseDuration(s)
 	if err != nil {
@@ -84,6 +86,79 @@ func parseDuration(s string) (time.Duration, error) {
 	}
 	return v, nil
 }
+
+// parseOptionalDuration reads a duration that may be zero.
+//
+// 零在这里是许的：只有一个键有合法的 0（usage.refresh.scan_every），
+// 它说的是"间隔交回 schedule.usage_refresh"。负数仍然不是：负的间隔
+// 没有意思，而且它会顺着"小于等于 0 就按默认来"那条路，变成一个没人
+// 要的间隔。
+func parseOptionalDuration(s string) (time.Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	}
+	return v, nil
+}
+
+// OptionalDuration is a time.Duration that may be zero.
+//
+// 它只给一个键用：usage.refresh.scan_every。那个键的零有确切的意思
+// ——"间隔交回 schedule.usage_refresh"（规格 §9）—— 所以它得写得进去。
+//
+// 别的时长仍然拒绝零：零在那边是"没有时限"或者"悄悄按默认来"，两个
+// 都比拒绝更坏。那些地方用的是 Duration。
+type OptionalDuration time.Duration
+
+// UnmarshalYAML reads a duration from a string.
+//
+// 零是许的，负数不是。
+func (d *OptionalDuration) UnmarshalYAML(node *yaml.Node) error {
+	var s string
+	if err := node.Decode(&s); err != nil {
+		return err
+	}
+	v, err := parseOptionalDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = OptionalDuration(v)
+	return nil
+}
+
+// MarshalYAML writes the duration back as a string.
+func (d OptionalDuration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+
+// MarshalJSON writes the duration as a string.
+//
+// Not as a number of nanoseconds: the WebUI reads the configuration as
+// JSON, and 120000000000 means nothing to it.
+func (d OptionalDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// UnmarshalJSON reads a duration from a string.
+func (d *OptionalDuration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := parseOptionalDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = OptionalDuration(v)
+	return nil
+}
+
+// String is the duration's own text.
+func (d OptionalDuration) String() string { return time.Duration(d).String() }
+
+// Duration gives the value as a time.Duration.
+func (d OptionalDuration) Duration() time.Duration { return time.Duration(d) }
 
 // String is the duration's own text.
 func (d Duration) String() string { return time.Duration(d).String() }
@@ -174,7 +249,10 @@ type Refresh struct {
 	// HotWindow is how long an account counts as hot after it was used.
 	HotWindow Duration `yaml:"hot_window" json:"hot_window"`
 	// ScanEvery is how often the accounts that should be read are read.
-	ScanEvery Duration `yaml:"scan_every" json:"scan_every"`
+	//
+	// 它是唯一可以写 0 的时长：零说的是"间隔交回
+	// schedule.usage_refresh"。
+	ScanEvery OptionalDuration `yaml:"scan_every" json:"scan_every"`
 	// Concurrency is how many accounts one round reads at once.
 	Concurrency int `yaml:"concurrency" json:"concurrency"`
 	// Timeout is how long one account's reading may take.
@@ -246,7 +324,7 @@ func Default() Config {
 		},
 		Usage: Usage{Refresh: Refresh{
 			HotWindow:   Duration(5 * time.Minute),
-			ScanEvery:   Duration(30 * time.Second),
+			ScanEvery:   OptionalDuration(30 * time.Second),
 			Concurrency: 4,
 			Timeout:     Duration(15 * time.Second),
 			Budget:      Duration(30 * time.Second),

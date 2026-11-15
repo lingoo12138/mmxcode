@@ -126,7 +126,10 @@ type Refresh struct {
 	// HotWindow is how long an account counts as hot after it was used.
 	HotWindow Duration `yaml:"hot_window" json:"hot_window"`
 	// ScanEvery is how often the accounts that should be read are read.
-	ScanEvery Duration `yaml:"scan_every" json:"scan_every"`
+	//
+	// 它是唯一可以写 0 的时长：零说的是"间隔交回
+	// schedule.usage_refresh"。
+	ScanEvery OptionalDuration `yaml:"scan_every" json:"scan_every"`
 	// Concurrency is how many accounts one round reads at once.
 	Concurrency int `yaml:"concurrency" json:"concurrency"`
 	// Timeout is how long one account's reading may take.
@@ -1749,6 +1752,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"strings"
 	"time"
 
@@ -1835,6 +1839,15 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // markSpent marks an account's group as spent, and reads it once more
 // in the background.
 //
+// ctx 是客户端那个请求的 context：它多半已经被取消了（客户端走了，或
+// 者上游的超时到了）。标记的写不用它 —— 标记是网关自己的活：写在客
+// 户端那个 context 上，它就跟着客户端一起没了，而库里没有这一行，账
+// 号就继续留在轮转里，下一个客户端照样撞上"用完"（规格 §4.1）。
+//
+// 读（问库里存着的窗口时刻）先用客户端那个 context。它死了就用网关自
+// 己的命再问一次：那一刻定下来的"什么时候回来"不该因为客户端走了就
+// 短成冷却时间。
+//
 // 标记的那一刻就把"什么时候回来"定下来：读到的窗口时刻在将来就用
 // 它，取不到就用冷却时间。后台那一次读是来改标记的，而且只往后改：
 // 读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西
@@ -1845,7 +1858,21 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // 着真的时刻改"。
 func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 	until := s.windowReset(ctx, accountID, groupKey)
-	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
+	if until.IsZero() && ctx.Err() != nil {
+		// 客户端走了：这一次读没有读到。网关自己的命还在，用它再问
+		// 一次 —— 读到的时刻不该因为客户端走了就短成冷却时间。
+		rctx, rcancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
+		until = s.windowReset(rctx, accountID, groupKey)
+		rcancel()
+	}
+	// 写用网关自己的命：客户端断开、上游超时，都不该让这一行丢掉。
+	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
+	defer wcancel()
+	if err := s.Rot.MarkWindowExhausted(wctx, accountID, groupKey, until, "quota"); err != nil {
+		// 写不进去要说得出来：不然这一行没了，谁也不知道，下一个客
+		// 户端照样撞上"用完"。
+		log.Printf("the spent mark of %s (%s) could not be written: %v", accountID, groupKey, err)
+	}
 	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
 	// 着（冷却时间），下一次再说。
 	s.startBackground(func() { s.correctMark(accountID, groupKey) })
@@ -2651,35 +2678,25 @@ func (b *busyAccounts) isBusy(accountID string) bool {
 	return b.at[accountID] >= b.per
 }
 
-// anyFree says whether some account is free right now.
+// waitForFree waits until an account can answer, or the deadline is over.
 //
-// 一个账号都没在飞的时候，当然有空的：账本上是空的。
-func (b *busyAccounts) anyFree() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.at) == 0 {
-		return true
-	}
-	for _, n := range b.at {
-		if n < b.per {
-			return true
-		}
-	}
-	return false
-}
-
-// waitForFree waits until an account is free, or the deadline is over.
+// 等的是一个能答的账号，不是整个网关空下来：别的账号在飞的时候，这个
+// 请求照样能走到那个空着的账号上（规格 §6.4）。
 //
-// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
-// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
-func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+// 账本只记着在飞的那几个账号，它不知道池子里有多少账号：所以"还有没
+// 有能答的账号"只能问 rotator —— 谁在飞、谁能用、谁被标记用完了，只有
+// 它知道。
+//
+// 等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model string, used map[string]bool) bool {
 	for {
 		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
 		// 抢走了，一醒就轮着看会转不停。
 		if !sleepCtx(ctx, 25*time.Millisecond) {
 			return false
 		}
-		if b.anyFree() {
+		ok, err := s.Rot.AnyUsable(ctx, model, used)
+		if err == nil && ok {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -3940,13 +3957,21 @@ func (s *Scheduler) pruneReadings(ctx context.Context) {
 `Run` 里那一趟的钟改成新的那个：
 
 ```go
-	usageEvery := s.Cfg.Usage.Refresh.ScanEvery.Duration()
-	if usageEvery <= 0 {
-		usageEvery = s.Cfg.Schedule.UsageRefresh.Duration()
+// usageEvery says how often the round of readings runs.
+//
+// 新键（usage.refresh.scan_every）是 0 的时候，间隔交回老的那个
+// （schedule.usage_refresh）；再没有就是十五分钟。两个都写的时候新键
+// 赢 —— 老的那个只是回退。
+func (s *Scheduler) usageEvery() time.Duration {
+	every := s.Cfg.Usage.Refresh.ScanEvery.Duration()
+	if every <= 0 {
+		every = s.Cfg.Schedule.UsageRefresh.Duration()
 	}
-	if usageEvery <= 0 {
-		usageEvery = 15 * time.Minute
+	if every <= 0 {
+		every = 15 * time.Minute
 	}
+	return every
+}
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -4898,35 +4923,25 @@ func (b *busyAccounts) isBusy(accountID string) bool {
 	return b.at[accountID] >= b.per
 }
 
-// anyFree says whether some account is free right now.
+// waitForFree waits until an account can answer, or the deadline is over.
 //
-// 一个账号都没在飞的时候，当然有空的：账本上是空的。
-func (b *busyAccounts) anyFree() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.at) == 0 {
-		return true
-	}
-	for _, n := range b.at {
-		if n < b.per {
-			return true
-		}
-	}
-	return false
-}
-
-// waitForFree waits until an account is free, or the deadline is over.
+// 等的是一个能答的账号，不是整个网关空下来：别的账号在飞的时候，这个
+// 请求照样能走到那个空着的账号上（规格 §6.4）。
 //
-// 等一个账号空出来：忙不是它不能答了的理由，答案是等它做完（规格
-// §6.4）。等不到就是等不到：客户端自己超时了，网关不该把它吊着。
-func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool {
+// 账本只记着在飞的那几个账号，它不知道池子里有多少账号：所以"还有没
+// 有能答的账号"只能问 rotator —— 谁在飞、谁能用、谁被标记用完了，只有
+// 它知道。
+//
+// 等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model string, used map[string]bool) bool {
 	for {
 		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
 		// 抢走了，一醒就轮着看会转不停。
 		if !sleepCtx(ctx, 25*time.Millisecond) {
 			return false
 		}
-		if b.anyFree() {
+		ok, err := s.Rot.AnyUsable(ctx, model, used)
+		if err == nil && ok {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -4936,7 +4951,7 @@ func (b *busyAccounts) waitForFree(ctx context.Context, deadline time.Time) bool
 }
 ```
 
-`internal/gateway/busy.go` 里加的是那把账上的两个读法：现在忙不忙（rotator 问的），有没有空出来的（网关等的）。
+`internal/gateway/busy.go` 里那把账上留着的是「现在忙不忙」（rotator 问的那一句）。「有没有能答的账号」不是这把账能答的：账本里只有正在飞的那几个账号，它不知道池子里有多少账号 —— 那是 rotator 知道的事（Task 16 第一节之二）。
 
 - [ ] **Step 4: 网关等一等**
 
@@ -6967,6 +6982,388 @@ git commit -m "fix(gateway): 照参考插件对齐卡片、名单和签入的形
 
 ---
 
+### Task 16: 复查补上的四处
+
+这一节记的是最后一轮复查查出来的四个毛病：规格（和 README）说了，代码没做到。四个都是同一类毛病，所以一条提交。
+
+**一、`usage.refresh.scan_every` 写成 0，以前是不合法的配置。**
+
+README 承诺的是「把 `usage.refresh.scan_every` 写成 0，间隔才交回老的 `schedule.usage_refresh`」，调度器里那个回退也是真的（`usageEvery <= 0` → `schedule.usage_refresh` → 15 分钟）。可是那个回退从 YAML 侧一行都走不到：两个键都是 `Duration`，而 `Duration` 拒绝 0 —— 写 0 会让**整个配置文件加载失败**，`serve` 连数据库都连不上就退出了。文档和实现那时候都是假的。
+
+改法：给这一个键一个自己的类型 `OptionalDuration`。零在那里有确切的意思（"间隔交回老的那个"），所以它不是错；别的时长仍然拒绝零 —— 零在那边是"没有时限"或者"悄悄按默认来"，比拒绝更坏。两个都写的时候新键赢：`schedule.usage_refresh` 只是回退。
+
+```go
+// OptionalDuration is a time.Duration that may be zero.
+//
+// 它只给一个键用：usage.refresh.scan_every。那个键的零有确切的意思
+// ——"间隔交回 schedule.usage_refresh"（规格 §9）—— 所以它得写得进去。
+//
+// 别的时长仍然拒绝零：零在那边是"没有时限"或者"悄悄按默认来"，两个
+// 都比拒绝更坏。那些地方用的是 Duration。
+type OptionalDuration time.Duration
+```
+
+```go
+// parseOptionalDuration reads a duration that may be zero.
+//
+// 零在这里是许的：只有一个键有合法的 0（usage.refresh.scan_every），
+// 它说的是"间隔交回 schedule.usage_refresh"。负数仍然不是：负的间隔
+// 没有意思，而且它会顺着"小于等于 0 就按默认来"那条路，变成一个没人
+// 要的间隔。
+func parseOptionalDuration(s string) (time.Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("invalid duration %q: must not be negative", s)
+	}
+	return v, nil
+}
+```
+
+```go
+// parseDuration reads a duration, refusing the impossible ones.
+//
+// Zero and negative are refused here, at the last gate before the
+// configuration is used. Everywhere a timeout is read, "not positive"
+// means either "no timeout at all" — a request that never comes back —
+// or "fall back to the default" — a schedule that quietly runs at a
+// time nobody asked for. Both are worse than refusing to start.
+//
+// 有一个地方的零是合法的：usage.refresh.scan_every。那一个键用的是
+// 自己的类型（OptionalDuration），零在那里是"间隔交回
+// schedule.usage_refresh" —— 是人写的意思。别的键没有这个意思，所以
+// 它们还是拒绝零。
+func parseDuration(s string) (time.Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("invalid duration %q: must be positive", s)
+	}
+	return v, nil
+}
+```
+
+`internal/config/config.go` 里那个 `Refresh` 的新键：
+
+```go
+// Refresh holds the controls of one round of reading the credits.
+//
+// 一趟读额度有四道控：并发（读得快，不是读得多）、每个账号的时限
+// （一个卡住的账号不能拖住整趟）、一趟的预算（预算用完就停）、一趟
+// 最多读几个（剩下的下一趟接着读）。
+//
+// 配 0 的时候按 1 算：0 并发、0 个一批都是一趟也读不了，那不是关掉，
+// 是坏了。
+type Refresh struct {
+	// HotWindow is how long an account counts as hot after it was used.
+	HotWindow Duration `yaml:"hot_window" json:"hot_window"`
+	// ScanEvery is how often the accounts that should be read are read.
+	//
+	// 它是唯一可以写 0 的时长：零说的是"间隔交回
+	// schedule.usage_refresh"。
+	ScanEvery OptionalDuration `yaml:"scan_every" json:"scan_every"`
+	// Concurrency is how many accounts one round reads at once.
+	Concurrency int `yaml:"concurrency" json:"concurrency"`
+	// Timeout is how long one account's reading may take.
+	Timeout Duration `yaml:"timeout" json:"timeout"`
+	// Budget is how long one round may take.
+	Budget Duration `yaml:"budget" json:"budget"`
+	// Batch is how many accounts one round reads at most.
+	Batch int `yaml:"batch" json:"batch"`
+	// Card is how many accounts the card's own refresh reads.
+	Card int `yaml:"card" json:"card"`
+	// CardBudget is how long the card's own refresh may take.
+	CardBudget Duration `yaml:"card_budget" json:"card_budget"`
+}
+```
+
+`internal/scheduler/scheduler.go` 里那个间隔：
+
+```go
+// usageEvery says how often the round of readings runs.
+//
+// 新键（usage.refresh.scan_every）是 0 的时候，间隔交回老的那个
+// （schedule.usage_refresh）；再没有就是十五分钟。两个都写的时候新键
+// 赢 —— 老的那个只是回退。
+func (s *Scheduler) usageEvery() time.Duration {
+	every := s.Cfg.Usage.Refresh.ScanEvery.Duration()
+	if every <= 0 {
+		every = s.Cfg.Schedule.UsageRefresh.Duration()
+	}
+	if every <= 0 {
+		every = 15 * time.Minute
+	}
+	return every
+}
+```
+
+**二、"等一个账号空出来"从前等成了"等整个网关空下来"。**
+
+`busyAccounts` 的账本 `at` 里只有正在飞的账号（请求一结束就 `delete`）。所以 `anyFree` 实际问的是"网关里一个请求都没有"：三个账号（默认 `per_account: 1`），X 上正跑着一个 60 秒的长流式请求，Y、Z 空着。第四个请求进来 —— rotator 挑中了 X（挑的时候它还闲），`busy.take(X)` 失败（被前一个抢走了）→ 走 `waitForFree` → `anyFree` 看到 Y、Z 根本不在账本里 → **一直等到 10 秒上限，返回 429「every account is busy right now」**，而 Y、Z 这 10 秒一直闲着。那句话是假的。
+
+改法：谁在飞、谁能用、谁被标记用完了，只有 rotator 知道 —— 账本自己不知道池子里有多少账号。所以 rotator 多一个只读的查询：**它只看，不挑**（不记"用过了"，不绑会话，不改任何状态），网关等账号的地方改成问它。等的语义还是：「等一个能答的账号空出来；等不到就是等不到，回 429 加 `Retry-After`」（规格 §6.2/§6.4）。`busy.go` 里那个骗人的 `anyFree`/`waitForFree` 删掉。
+
+```go
+// usableAccounts gives the accounts that can answer, and the group the
+// request spends.
+//
+// 能答的账号是签入中的、它们的组没有被标记用完的、而且这个请求里还没
+// 有试过的。挑的时候和问"还有没有能答的"的时候用的是同一套口径。
+func (r *Rotator) usableAccounts(accounts []store.Account, exhausted []store.Exhausted, model string, used map[string]bool) ([]store.Account, string) {
+	group := r.GroupKey(model)
+	usable := make([]store.Account, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Status != store.StatusActive {
+			continue
+		}
+		if used[a.ID] || r.isExhausted(exhausted, a.ID, group) {
+			continue
+		}
+		usable = append(usable, a)
+	}
+	return usable, group
+}
+```
+
+```go
+// AnyUsable says whether some account could answer right now.
+//
+// 它是"等一个账号空出来"问的那一句（规格 §6.4）：能答的账号是签入中
+// 的、没有被标记用完的、这个请求里还没有试过的，再减去正在飞的那些。
+//
+// 谁在飞、谁能用、谁被标记用完了，只有 rotator 知道：账本自己不知道池
+// 子里有多少账号，所以"有没有空的账号"这件事只能问它。
+//
+// 它只看，不挑：不记"用过了"，不绑会话，什么都不改。挑是 Pick 的事。
+func (r *Rotator) AnyUsable(ctx context.Context, model string, used map[string]bool) (bool, error) {
+	accounts, err := r.pool.Accounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	exhausted, err := r.pool.Exhausted(ctx)
+	if err != nil {
+		return false, err
+	}
+	usable, _ := r.usableAccounts(accounts, exhausted, model, used)
+	if len(usable) == 0 {
+		return false, nil
+	}
+	free, err := r.freeAccounts(ctx, usable)
+	if err != nil {
+		if errors.Is(err, ErrAllBusy) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(free) > 0, nil
+}
+```
+
+```go
+// waitForFree waits until an account can answer, or the deadline is over.
+//
+// 等的是一个能答的账号，不是整个网关空下来：别的账号在飞的时候，这个
+// 请求照样能走到那个空着的账号上（规格 §6.4）。
+//
+// 账本只记着在飞的那几个账号，它不知道池子里有多少账号：所以"还有没
+// 有能答的账号"只能问 rotator —— 谁在飞、谁能用、谁被标记用完了，只有
+// 它知道。
+//
+// 等不到就是等不到：客户端自己超时了，网关不该把它吊着。
+func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model string, used map[string]bool) bool {
+	for {
+		// 每一次都先睡一下再看：刚空出来的那个账号可能又被别的请求
+		// 抢走了，一醒就轮着看会转不停。
+		if !sleepCtx(ctx, 25*time.Millisecond) {
+			return false
+		}
+		ok, err := s.Rot.AnyUsable(ctx, model, used)
+		if err == nil && ok {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+}
+```
+
+**三、"额度用完"的标记写在客户端请求的 context 上，客户端一断开标记就丢了。**
+
+上游答"额度用完"，就在这一刻客户端断开了（或者上游超时把 request ctx 取消了）→ `s.windowReset(ctx, ...)`（读库）和 `MarkWindowExhausted(ctx, ...)`（写库）**两个都在已取消的 context 上跑，全失败** → 库里没有这一行 → 后台那次读也救不回来（`correctMark` 读到"没有标记"就直接不动，它不会替一个不存在的标记补写）→ **这个账号继续留在轮转里，下一个客户端照样撞上"用完"**，再标记一次、再失败一次。而且写失败**日志里什么都没有**。
+
+规格 §4.1：上游答"用完了"的那一刻（rotator 的 `ActionFailover`）就标记，不等下一轮读额度。§4.3 的"标记完在后台读一次"是**标记已经写下去之后**的补救，不是补救标记本身。
+
+改法：标记的写用**网关自己的命**（`s.lifeCtx`，跟 `correctMark` 用的是同一个 —— 客户端断开不影响它），配上自己的时限（`spentWriteTimeout` 那个 5 秒就在旁边，照它的样子）；**写失败要记日志**，不许再 `_ =` 吞掉。
+
+读（问库里存着的窗口时刻）先用客户端那个 context；它死了就用网关自己的命再问一次 —— 那一刻定下来的"什么时候回来"不该因为客户端走了就短成冷却时间。网关正在关的时候这一趟不算数：`lifeCtx` 已经取消，读和写都做不成，写失败会记在日志里；网关起来以后客户端再撞一次，就重新标记。
+
+```go
+// markSpent marks an account's group as spent, and reads it once more
+// in the background.
+//
+// ctx 是客户端那个请求的 context：它多半已经被取消了（客户端走了，或
+// 者上游的超时到了）。标记的写不用它 —— 标记是网关自己的活：写在客
+// 户端那个 context 上，它就跟着客户端一起没了，而库里没有这一行，账
+// 号就继续留在轮转里，下一个客户端照样撞上"用完"（规格 §4.1）。
+//
+// 读（问库里存着的窗口时刻）先用客户端那个 context。它死了就用网关自
+// 己的命再问一次：那一刻定下来的"什么时候回来"不该因为客户端走了就
+// 短成冷却时间。
+//
+// 标记的那一刻就把"什么时候回来"定下来：读到的窗口时刻在将来就用
+// 它，取不到就用冷却时间。后台那一次读是来改标记的，而且只往后改：
+// 读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西
+// 里没有这个组，标记就原样留着。
+//
+// 提前放一个用完的账号回轮转，正是这个标记要防的事。而一个滚动的窗
+// 口，它的时刻本来也只是越来越晚：所以"只往后改"平常的时候就是"照
+// 着真的时刻改"。
+func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
+	until := s.windowReset(ctx, accountID, groupKey)
+	if until.IsZero() && ctx.Err() != nil {
+		// 客户端走了：这一次读没有读到。网关自己的命还在，用它再问
+		// 一次 —— 读到的时刻不该因为客户端走了就短成冷却时间。
+		rctx, rcancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
+		until = s.windowReset(rctx, accountID, groupKey)
+		rcancel()
+	}
+	// 写用网关自己的命：客户端断开、上游超时，都不该让这一行丢掉。
+	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
+	defer wcancel()
+	if err := s.Rot.MarkWindowExhausted(wctx, accountID, groupKey, until, "quota"); err != nil {
+		// 写不进去要说得出来：不然这一行没了，谁也不知道，下一个客
+		// 户端照样撞上"用完"。
+		log.Printf("the spent mark of %s (%s) could not be written: %v", accountID, groupKey, err)
+	}
+	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
+	// 着（冷却时间），下一次再说。
+	s.startBackground(func() { s.correctMark(accountID, groupKey) })
+}
+```
+
+**四、后台那个「刷新」按钮读所有账号时没有去重。**
+
+那个按钮直接调 `manager.RefreshAllUsage`，**不走 `usage.Round`** —— 所以它既没有 §3.3 的单账号去重（同一个账号同一时刻只读一次），也没有那一趟的并发/时限/预算。它可以和调度器那一趟**同时读同一个账号**（Round 那条路拿的是管理器里的 `reading` 锁，这条路没拿）→ 同一个账号被并发读两遍，两次读写的账本快照互相盖。
+
+改法：`RefreshAllUsage` 读每个账号之前**拿管理器里那把 `reading` 锁**（`BeginReading`）；拿不到说明这个账号正在被别的趟读（调度器那一趟、卡片那一趟、或者另一条路）→ **跳过它，不算失败**（它没有坏，它正在被读），但结果里要说得出来（跳过几个）。读完了要 `EndReading` —— 成功和失败都要还。
+
+`Round` 那条路是自己在 `Round.Run` 里拿锁、再调 `RefreshUsage` 的，所以 `manager.RefreshUsage` 里不能再拿一次锁（那会自己等自己）。改的是 `RefreshAllUsage` 这一条路。
+
+```go
+// UsageRefreshResult says what one round of usage readings came to.
+type UsageRefreshResult struct {
+	// Refreshed counts the accounts whose credits were read.
+	Refreshed int
+	// Failed counts the accounts whose credits could not be read.
+	Failed int
+	// Skipped counts the accounts another round was reading right now.
+	//
+	// 跳过的不是读失败：那个账号没有坏，它正在被别的这一趟读着（规格
+	// §3.3）。但要说得出来：人得知道这一趟少读了几个。
+	Skipped int
+	// Reasons says why each of those failed, one line per account.
+	Reasons []string
+}
+```
+
+```go
+// RefreshAllUsage reads every account's credits now.
+//
+// 这是页面上那个「刷新」按钮按下去以后做的事：所有账号的账本现读一
+// 遍，不等调度器下一趟。一个账号读不到不影响别的——但要说出来是哪一
+// 个，人才知道去看哪一行。
+//
+// 同一个账号同一时刻只读一次（规格 §3.3）：别的这一趟正在读它，这一
+// 趟就跳过它——它没有坏，它正在被读。跳过的要说得出来，不算读失败。
+//
+// 账号都没列出来的时候，这一趟就根本没跑：把它说成「读了 0 个」，人
+// 会以为账本是空的。
+func (m *Manager) RefreshAllUsage(ctx context.Context) (UsageRefreshResult, error) {
+	var out UsageRefreshResult
+	accounts, err := m.Store.ListAccounts(ctx)
+	if err != nil {
+		return out, fmt.Errorf("the accounts could not be listed: %w", err)
+	}
+	for _, acc := range accounts {
+		if !m.BeginReading(acc.ID) {
+			// 别的这一趟正在读这个账号：这一趟不读它。读的是同一
+			// 次，读两遍是白读（规格 §3.3）。
+			out.Skipped++
+			continue
+		}
+		_, err := m.readOne(ctx, acc.ID)
+		if err != nil {
+			out.Failed++
+			out.Reasons = append(out.Reasons, accountReason(acc, err))
+			continue
+		}
+		out.Refreshed++
+	}
+	return out, nil
+}
+```
+
+```go
+// readOne reads one account's credits and gives it back.
+//
+// 读失败了也要还回来：不然那个账号再也读不到了。
+func (m *Manager) readOne(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	defer m.EndReading(accountID)
+	return m.RefreshUsage(ctx, accountID)
+}
+```
+
+```go
+// apiUsageRefresh reads every account's credits now.
+//
+// 页面上那些数是上一次读数时的数。这一趟是现读的：不等调度器，也不
+// 等下一次。读不到的账号要说得出来，人才知道去看哪一个。正在被别的
+// 那一趟读着的账号被跳过了 —— 跳过的也要说得出来。
+func (w *WebUI) apiUsageRefresh(rw http.ResponseWriter, r *http.Request) {
+	res, err := w.Mgr.RefreshAllUsage(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, reason := range res.Reasons {
+		log.Printf("usage: %s", reason)
+	}
+	if res.Skipped > 0 {
+		log.Printf("usage: %d account(s) are being read by another round and were skipped", res.Skipped)
+	}
+	writeJSON(rw, map[string]any{
+		"refreshed": res.Refreshed,
+		"failed":    res.Failed,
+		"skipped":   res.Skipped,
+		"reasons":   res.Reasons,
+	})
+}
+```
+
+**Files:**
+- Modify: `internal/config/config.go`
+- Modify: `internal/config/config_test.go`
+- Modify: `internal/scheduler/scheduler.go`
+- Modify: `internal/scheduler/scheduler_test.go`
+- Modify: `internal/rotator/rotator.go`
+- Modify: `internal/rotator/rotator_test.go`
+- Modify: `internal/gateway/busy.go`
+- Modify: `internal/gateway/busy_test.go`
+- Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/spent.go`
+- Modify: `internal/gateway/spent_test.go`
+- Modify: `internal/manager/manager.go`
+- Modify: `internal/manager/manager_test.go`
+- Modify: `internal/webui/webui.go`
+- Modify: `internal/webui/webui_test.go`
+- Modify: `README.md`
+
+---
 
 ## 验证
 

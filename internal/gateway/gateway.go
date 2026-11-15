@@ -489,12 +489,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// busyDeadline is when this request stops waiting for a free account.
 	// 它是整个请求的一份：等一个账号空出来，等不到就 429（规格 §6.2）。
 	var busyDeadline time.Time
-	// waitForFree waits for an account to come free.
+	// waitForFree waits for an account that can answer.
 	waitForFree := func() bool {
 		if busyDeadline.IsZero() {
 			busyDeadline = time.Now().Add(s.Cfg.Concurrency.Wait.Duration())
 		}
-		return s.busy.waitForFree(ctx, busyDeadline)
+		return s.waitForFree(ctx, busyDeadline, model, used)
 	}
 	for {
 		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
