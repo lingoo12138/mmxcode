@@ -42,6 +42,7 @@ import (
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
 	"mmxcode/internal/upstream"
+	"mmxcode/internal/usage"
 )
 
 // nowOffset gives the timezone offset in seconds east of UTC.
@@ -63,6 +64,10 @@ type Server struct {
 	Store *store.Store
 	// Rot picks the account.
 	Rot *rotator.Rotator
+	// Reader reads the credits of an account. It is a field so that a
+	// test can stand in for the network: the gateway's only way to the
+	// network for the credits goes through it.
+	Reader usage.Reader
 	// UpstreamBase is the host the chats go to. It is a field so a
 	// test can point it at a stand-in.
 	UpstreamBase string
@@ -96,6 +101,19 @@ type Server struct {
 	busy *busyAccounts
 	// gate counts the requests in the air in the whole gateway.
 	gate *gate
+	// lifeCtx is the life of the gateway: the background work hangs on
+	// it, so it stops when the gateway stops.
+	lifeCtx context.Context
+	// lifeCancel ends the life of the gateway.
+	lifeCancel context.CancelFunc
+	// bgMu guards the background work's bookkeeping.
+	bgMu sync.Mutex
+	// bgClosed says the gateway is closing: no new background work.
+	bgClosed bool
+	// bgSem bounds how many background readings run at once.
+	bgSem chan struct{}
+	// bgWG counts the background readings that are in the air.
+	bgWG sync.WaitGroup
 }
 
 // New makes a gateway.
@@ -104,6 +122,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		Mgr:          mgr,
 		Cfg:          cfg,
 		Store:        s,
+		Reader:       mgr,
 		UpstreamBase: site.LLMHost,
 		WebUI:        webui,
 	}
@@ -112,6 +131,13 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	g.NativeChatCompletions.Store(true)
 	g.busy = newBusyAccounts(cfg.Concurrency.PerAccount)
 	g.gate = &gate{}
+	g.lifeCtx, g.lifeCancel = context.WithCancel(context.Background())
+	// 后台的读有上限：到顶了就跳过那一次，不排队。
+	limit := cfg.Usage.Refresh.Concurrency
+	if limit <= 0 {
+		limit = 1
+	}
+	g.bgSem = make(chan struct{}, limit)
 	g.Rot = rotator.New(poolAdapter{s}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
@@ -119,6 +145,44 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		Strategy:    cfg.Rotation.Strategy,
 	})
 	return g
+}
+
+// Close stops the background work and waits for it.
+//
+// 后台的活儿挂在网关的命上：网关关了它也停，而且要等在飞的那些停下
+// 来 —— 不然它会往一个正在关着的库上写。
+func (s *Server) Close() {
+	s.bgMu.Lock()
+	s.bgClosed = true
+	s.bgMu.Unlock()
+	s.lifeCancel()
+	s.bgWG.Wait()
+}
+
+// startBackground runs fn in the background, if there is room for it.
+//
+// 同时在跑的读有上限：到顶了就跳过这一次。标记就照着写下去的那份留
+// 着（冷却时间），下一趟再说。
+//
+// 它说活儿有没有开始。
+func (s *Server) startBackground(fn func()) bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgClosed {
+		return false
+	}
+	select {
+	case s.bgSem <- struct{}{}:
+	default:
+		return false
+	}
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		defer func() { <-s.bgSem }()
+		fn()
+	}()
+	return true
 }
 
 // poolStore is what the pool adapter reads from the store.

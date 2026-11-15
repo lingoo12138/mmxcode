@@ -77,6 +77,9 @@ func newServeCmd(e *env) *cobra.Command {
 				fmt.Println("正在关掉……")
 			}
 			cancel()
+			// 网关关了以后，后台的读额度也得停，而且要等它停下来：库
+			// 是接着关的，它不该往一个正在关着的库上写。
+			gw.Close()
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer shutCancel()
 			return srv.Shutdown(shutCtx)

@@ -29,6 +29,9 @@ type harness struct {
 	srv   *httptest.Server
 	gw    *Server
 	store *store.Store
+	// reader is the credits reader the gateway uses: a fake one, so a
+	// test never goes to the network to read the credits.
+	reader *fakeReader
 	// mu guards the counters below: a test may send many requests at
 	// once, and the fake upstream counts them from the server's own
 	// goroutines.
@@ -90,6 +93,12 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	h.gw = New(mgr, cfg, s, nil)
 	// 上游地址指到假服务器
 	h.gw.UpstreamBase = h.srv.URL
+	// 读额度走假读者：网关读额度只有一个口子，把它换成假的，测试就
+	// 永远不碰 MiniMax 自己。
+	h.reader = &fakeReader{}
+	h.gw.Reader = h.reader
+	// 网关关了以后，后台的活儿也得停：它在往库里写。
+	t.Cleanup(func() { h.gw.Close() })
 	return h
 }
 

@@ -1286,10 +1286,16 @@ git commit -m "feat(usage): 一趟读额度有并发有时限有预算"
 
 ### Task 5: 额度用完的标记
 
+标记是「这个账号的这个组用完了，客户端别再撞它」。它得说清楚什么时候回来：说准了，客户端等得到；说不准，一个还欠着额度的账号就被提前放回轮转里。
+
+标记只往后挪：读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西里没有这个组，标记原样留着。一个零写进去，冷却时间（五分钟）就会把标记缩短——那正是提前放行。
+
 **Files:**
 - Create: `internal/gateway/spent.go`
 - Create: `internal/gateway/spent_test.go`
 - Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/gateway_test.go`
+- Modify: `cmd/mmxcode/serve.go`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1299,9 +1305,84 @@ git commit -m "feat(usage): 一趟读额度有并发有时限有预算"
 package gateway
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
+
+	"mmxcode/internal/account"
+	"mmxcode/internal/store"
 )
+
+// fakeReader reads the credits without the network.
+//
+// 网关读额度只有一个口子：Reader 那个字段。测试把它换成这个，测试就
+// 永远不碰 MiniMax 自己。
+type fakeReader struct {
+	mu sync.Mutex
+	// snap is what a reading gives back.
+	snap store.UsageSnapshot
+	// err is what a reading fails with.
+	err error
+	// reads counts the readings that were asked for.
+	reads int
+}
+
+// set gives the reader what it should say.
+func (f *fakeReader) set(snap store.UsageSnapshot, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snap = snap
+	f.err = err
+}
+
+// RefreshUsage reads the credits from the test's own answers.
+func (f *fakeReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if f.err != nil {
+		return store.UsageSnapshot{}, f.err
+	}
+	return f.snap, nil
+}
+
+// count says how many readings were asked for.
+func (f *fakeReader) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+// readingOf makes a reading that says the windows it has.
+func readingOf(t *testing.T, ws []account.Window) store.UsageSnapshot {
+	t.Helper()
+	raw, err := json.Marshal(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store.UsageSnapshot{WindowsJSON: string(raw)}
+}
+
+// markUntil gives the moment the account's group is marked spent until.
+//
+// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。
+func markUntil(t *testing.T, s *store.Store, accountID, groupKey string) time.Time {
+	t.Helper()
+	rows, err := s.ListExhausted(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range rows {
+		if e.AccountID == accountID && e.WindowKey == groupKey {
+			return e.Until
+		}
+	}
+	return time.Time{}
+}
 
 // TestAResetInThePastIsNoReset says a window that came back already is
 // not a time to come back to.
@@ -1317,15 +1398,157 @@ func TestAResetInThePastIsNoReset(t *testing.T) {
 		t.Errorf("the reset = %s, want a time in the future", got)
 	}
 }
+
+// TestTheGroupComesBackWithItsLatestWindow says a group comes back as a
+// whole: its moment is the latest of the windows it still has to come
+// back from.
+//
+// 一个组是好几个窗口（"5 hours"、"7 days"），组是整个回来的：它最后
+// 那个窗口回来了，组才回来。已经过去的那个窗口不算：它不能盖住一个
+// 还在将来的窗口。
+func TestTheGroupComesBackWithItsLatestWindow(t *testing.T) {
+	now := time.Now()
+	// 一个过去的，一个将来的：将来的是那个时刻。
+	ws := []account.Window{
+		{ModelName: "general", ResetsAt: now.Add(-time.Hour)},
+		{ModelName: "general", ResetsAt: now.Add(time.Hour)},
+	}
+	if got := resetOf(ws, "general"); !got.Equal(now.Add(time.Hour)) {
+		t.Errorf("the group's reset = %s, want %s", got, now.Add(time.Hour))
+	}
+	// 两个将来的：晚的那个是那个时刻。
+	ws = []account.Window{
+		{ModelName: "general", ResetsAt: now.Add(time.Hour)},
+		{ModelName: "general", ResetsAt: now.Add(3 * time.Hour)},
+	}
+	if got := resetOf(ws, "general"); !got.Equal(now.Add(3 * time.Hour)) {
+		t.Errorf("the group's reset = %s, want %s", got, now.Add(3*time.Hour))
+	}
+	// 组的键比的时候不看大小写：站上写的是 "General"，这边说的是
+	// "general"，说的是同一个组。
+	ws = []account.Window{{ModelName: "General", ResetsAt: now.Add(2 * time.Hour)}}
+	if got := resetOf(ws, "general"); !got.Equal(now.Add(2 * time.Hour)) {
+		t.Errorf("the group's reset = %s, want %s", got, now.Add(2*time.Hour))
+	}
+}
+
+// TestTheBackgroundReadingDoesNotShortenTheMark says a reading that
+// does not mention the group leaves the mark as it is.
+//
+// 标记是三小时以后：读到的数里没有这个组，那就没有。没有就是没有，写
+// 一个零进去，冷却时间（五分钟）就会把标记缩短，一个还欠着额度的账号
+// 就提前回到轮转里 —— 提前放行正是这个标记要防的事。
+func TestTheBackgroundReadingDoesNotShortenTheMark(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	until := time.Now().Add(3 * time.Hour)
+	if err := h.gw.Rot.MarkWindowExhausted(ctx, "acc_01", "general", until, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	// 这一次读到的东西里没有这个组。
+	h.reader.set(readingOf(t, []account.Window{{ModelName: "video", ResetsAt: time.Now().Add(time.Hour)}}), nil)
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if got.UnixMilli() != until.UnixMilli() {
+		t.Errorf("the mark = %s, want %s", got, until)
+	}
+}
+
+// TestTheBackgroundReadingDoesNotShortenTheMarkWithAnEarlierMoment says
+// a reading that says an earlier moment leaves the mark as it is.
+//
+// 标记是三小时以后，读到的时刻是一小时以后：标记不动。只往后挪。
+func TestTheBackgroundReadingDoesNotShortenTheMarkWithAnEarlierMoment(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	until := time.Now().Add(3 * time.Hour)
+	if err := h.gw.Rot.MarkWindowExhausted(ctx, "acc_01", "general", until, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	h.reader.set(readingOf(t, []account.Window{{ModelName: "general", ResetsAt: time.Now().Add(time.Hour)}}), nil)
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if got.UnixMilli() != until.UnixMilli() {
+		t.Errorf("the mark = %s, want %s", got, until)
+	}
+}
+
+// TestTheBackgroundReadingMovesTheMarkLater says a reading that says a
+// later moment moves the mark there.
+//
+// 标记是三小时以后，读到的时刻是五小时以后：标记挪到五小时以后。一个
+// 滚动的窗口它的时刻本来就是越来越晚的，所以平常的时候这就是"照着真
+// 的时刻改"。
+func TestTheBackgroundReadingMovesTheMarkLater(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if err := h.gw.Rot.MarkWindowExhausted(ctx, "acc_01", "general", time.Now().Add(3*time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(5 * time.Hour)
+	h.reader.set(readingOf(t, []account.Window{{ModelName: "general", ResetsAt: later}}), nil)
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if got.UnixMilli() != later.UnixMilli() {
+		t.Errorf("the mark = %s, want %s", got, later)
+	}
+}
+
+// TestTheBackgroundReadingThatFailsLeavesTheMarkAlone says a reading
+// that fails leaves the mark as it is.
+//
+// 读不到就不知道什么时候回来：不知道就不动。动一下就有可能提前放行。
+func TestTheBackgroundReadingThatFailsLeavesTheMarkAlone(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	until := time.Now().Add(3 * time.Hour)
+	if err := h.gw.Rot.MarkWindowExhausted(ctx, "acc_01", "general", until, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	h.reader.set(store.UsageSnapshot{}, errors.New("the site is not there"))
+	h.gw.correctMark("acc_01", "general")
+	got := markUntil(t, h.store, "acc_01", "general")
+	if got.UnixMilli() != until.UnixMilli() {
+		t.Errorf("the mark = %s, want %s", got, until)
+	}
+}
+
+// TestTheBackgroundReadingGoesThroughTheReader says the background
+// reading goes through the injected reader and not to the network.
+//
+// 网关读额度只有一个口子：Reader 那个字段。这个账号没有令牌，所以管
+// 理器那条路读不到它 —— 读额度就只可能走那个口子。
+func TestTheBackgroundReadingGoesThroughTheReader(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	now := time.Now()
+	h.store.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, UserID: "0987654321",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	if err := h.gw.Rot.MarkWindowExhausted(ctx, "acc_02", "general", time.Now().Add(3*time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(5 * time.Hour)
+	h.reader.set(readingOf(t, []account.Window{{ModelName: "general", ResetsAt: later}}), nil)
+	h.gw.correctMark("acc_02", "general")
+	if n := h.reader.count(); n != 1 {
+		t.Errorf("the reader was asked %d times, want 1", n)
+	}
+	got := markUntil(t, h.store, "acc_02", "general")
+	if got.UnixMilli() != later.UnixMilli() {
+		t.Errorf("the mark = %s, want %s", got, later)
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 ```
-go test ./internal/gateway/ -run Reset
+go test ./internal/gateway/ -run 'TestTheGroupComesBackWithItsLatestWindow|TestTheBackgroundReading'
 ```
 
-失败：`undefined: resetAfter`。
+失败：`undefined: resetOf`、`undefined: correctMark`。
 
 - [ ] **Step 3: 写「什么时候回来」**
 
@@ -1336,10 +1559,22 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"time"
 
 	"mmxcode/internal/account"
 	"mmxcode/internal/store"
+)
+
+// The timeouts of the background work.
+//
+// 读和写各有一份：读的那一份用完了，不该把写也一起拖掉。
+const (
+	// spentReadTimeout is how long the background reading may take.
+	spentReadTimeout = 30 * time.Second
+	// spentWriteTimeout is how long the background writing may take.
+	spentWriteTimeout = 5 * time.Second
 )
 
 // resetAfter gives the moment a window comes back, when it is in the
@@ -1372,13 +1607,26 @@ func (s *Server) windowReset(ctx context.Context, accountID, groupKey string) ti
 }
 
 // resetOf gives the group's reset out of a list of windows.
+//
+// 一个组是好几个窗口（"5 hours"、"7 days"），组是整个回来的：它最后
+// 那个窗口回来了，组才回来。所以组的时刻取它那些窗口里最晚的一个，
+// 而且只算将来的 —— 已经过去的那个不算：它不能盖住一个还在将来的窗
+// 口。
+//
+// 组的键比的时候不看大小写：站上写的是 "General"，这边说的是
+// "general"，说的是同一个组。
 func resetOf(ws []account.Window, groupKey string) time.Time {
+	var latest time.Time
 	for _, w := range ws {
-		if w.ModelName == groupKey && !w.ResetsAt.IsZero() {
-			return resetAfter(w.ResetsAt)
+		if !strings.EqualFold(w.ModelName, groupKey) {
+			continue
+		}
+		at := resetAfter(w.ResetsAt)
+		if at.After(latest) {
+			latest = at
 		}
 	}
-	return time.Time{}
+	return latest
 }
 
 // resetOfSnapshot gives the group's reset out of a reading.
@@ -1399,65 +1647,216 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // in the background.
 //
 // 标记的那一刻就把"什么时候回来"定下来：读到的窗口时刻在将来就用
-// 它，取不到就用冷却时间。后台那一次读是来改标记的：读到了，标记就
-// 照着真的时刻改；读不到，标记留着（冷却）。
+// 它，取不到就用冷却时间。后台那一次读是来改标记的，而且只往后改：
+// 读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西
+// 里没有这个组，标记就原样留着。
+//
+// 提前放一个用完的账号回轮转，正是这个标记要防的事。而一个滚动的窗
+// 口，它的时刻本来也只是越来越晚：所以"只往后改"平常的时候就是"照
+// 着真的时刻改"。
 func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 	until := s.windowReset(ctx, accountID, groupKey)
 	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
-	go s.refixSpent(accountID, groupKey)
+	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
+	// 着（冷却时间），下一次再说。
+	s.startBackground(func() { s.correctMark(accountID, groupKey) })
 }
 
-// refixSpent reads the account and puts the mark's time right.
+// correctMark reads the account and puts the mark's time right.
 //
 // 它不挡客户端：后台的活。
-func (s *Server) refixSpent(accountID, groupKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//
+// 读到的时刻比现在的标记晚，标记就挪到那儿；不然标记原样留着。读到的
+// 东西里没有这个组（或者读失败了），那就没有时刻：没有时刻就不动。
+//
+// 提前放一个用完的账号回轮转，正是这个标记要防的事。
+func (s *Server) correctMark(accountID, groupKey string) {
+	ctx, cancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
 	defer cancel()
-	snap, err := s.Mgr.RefreshUsage(ctx, accountID)
+	snap, err := s.Reader.RefreshUsage(ctx, accountID)
 	if err != nil {
-		// 读不到：标记留着（冷却）。
+		// 读不到：标记原样留着。
 		return
 	}
 	until := resetOfSnapshot(snap, groupKey)
-	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
+	if until.IsZero() {
+		// 这一次读到的东西里没有这个组：没有就是没有。写一个零进去，
+		// 冷却时间就会把标记缩短。
+		return
+	}
+	// 写的时限另起一份：读的那一份用完了，写也该写得下。
+	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
+	defer wcancel()
+	cur, ok := s.markedUntil(wctx, accountID, groupKey)
+	if !ok {
+		// 不知道现在的标记到什么时候：不知道就不动。
+		return
+	}
+	if cur.After(until) {
+		// 现在的标记比读到的时刻还晚：标记不动。标记只往后挪。
+		return
+	}
+	_ = s.Rot.MarkWindowExhausted(wctx, accountID, groupKey, until, "quota")
+}
+
+// markedUntil gives the moment the account's group is marked spent
+// until, and whether that mark could be read.
+//
+// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就
+// 说一声：不知道就不动。
+func (s *Server) markedUntil(ctx context.Context, accountID, groupKey string) (time.Time, bool) {
+	rows, err := s.Store.ListExhausted(ctx)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var until time.Time
+	for _, e := range rows {
+		if e.AccountID != accountID || e.WindowKey != groupKey {
+			continue
+		}
+		if e.Until.After(until) {
+			until = e.Until
+		}
+	}
+	return until, true
 }
 ```
 
-`internal/gateway/spent.go` 的 import 补上 `"encoding/json"`。
+- [ ] **Step 4: 网关把读额度放在一个字段上，后台的活儿挂在网关的命上**
 
-- [ ] **Step 4: 聊天那条路用它**
-
-`internal/gateway/gateway.go` 里：
-
-把 `windowReset` 整个换掉（它搬到了 `spent.go`）：
+`internal/gateway/gateway.go` 的 import 补上：
 
 ```go
+	"mmxcode/internal/usage"
 ```
 
-（删掉 `internal/gateway/gateway.go` 里原来的 `windowReset` 那个函数。）
-
-`handleChat` 里 `rotator.ActionFailover` 那一段改成：
+`Server` 里加读额度的那个字段（网关读额度只有这一个口子，测试把它换成假的，测试就永远不碰 MiniMax 自己）：
 
 ```go
-			case rotator.ActionFailover:
-				// 额度用完了：这个账号的窗口记成用完，换一个账号。
-				s.markSpent(ctx, plan.AccountID, plan.GroupKey)
-				lastErr = fmt.Errorf("the account's credits or plan are used up")
-				quota = true
-				quotaMsg = failure.Message
-				continue accountLoop
+	// Reader reads the credits of an account. It is a field so that a
+	// test can stand in for the network: the gateway's only way to the
+	// network for the credits goes through it.
+	Reader usage.Reader
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+`Server` 里加后台那点活儿的账：
+
+```go
+	// lifeCtx is the life of the gateway: the background work hangs on
+	// it, so it stops when the gateway stops.
+	lifeCtx context.Context
+	// lifeCancel ends the life of the gateway.
+	lifeCancel context.CancelFunc
+	// bgMu guards the background work's bookkeeping.
+	bgMu sync.Mutex
+	// bgClosed says the gateway is closing: no new background work.
+	bgClosed bool
+	// bgSem bounds how many background readings run at once.
+	bgSem chan struct{}
+	// bgWG counts the background readings that are in the air.
+	bgWG sync.WaitGroup
+```
+
+`New` 里加：
+
+```go
+		Reader:       mgr,
+```
+
+```go
+	g.lifeCtx, g.lifeCancel = context.WithCancel(context.Background())
+	// 后台的读有上限：到顶了就跳过那一次，不排队。
+	limit := cfg.Usage.Refresh.Concurrency
+	if limit <= 0 {
+		limit = 1
+	}
+	g.bgSem = make(chan struct{}, limit)
+```
+
+网关还得能关掉后台那点活儿（关的时候要等在飞的那些停下来，不然它会往一个正在关着的库上写）：
+
+```go
+// Close stops the background work and waits for it.
+//
+// 后台的活儿挂在网关的命上：网关关了它也停，而且要等在飞的那些停下
+// 来 —— 不然它会往一个正在关着的库上写。
+func (s *Server) Close() {
+	s.bgMu.Lock()
+	s.bgClosed = true
+	s.bgMu.Unlock()
+	s.lifeCancel()
+	s.bgWG.Wait()
+}
+
+// startBackground runs fn in the background, if there is room for it.
+//
+// 同时在跑的读有上限：到顶了就跳过这一次。标记就照着写下去的那份留
+// 着（冷却时间），下一趟再说。
+//
+// 它说活儿有没有开始。
+func (s *Server) startBackground(fn func()) bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgClosed {
+		return false
+	}
+	select {
+	case s.bgSem <- struct{}{}:
+	default:
+		return false
+	}
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		defer func() { <-s.bgSem }()
+		fn()
+	}()
+	return true
+}
+```
+
+- [ ] **Step 5: 测试里换上假读者**
+
+`internal/gateway/gateway_test.go` 里，`harness` 加一个字段：
+
+```go
+	// reader is the credits reader the gateway uses: a fake one, so a
+	// test never goes to the network to read the credits.
+	reader *fakeReader
+```
+
+`newHarness` 里：
+
+```go
+	// 读额度走假读者：网关读额度只有一个口子，把它换成假的，测试就
+	// 永远不碰 MiniMax 自己。
+	h.reader = &fakeReader{}
+	h.gw.Reader = h.reader
+	// 网关关了以后，后台的活儿也得停：它在往库里写。
+	t.Cleanup(func() { h.gw.Close() })
+```
+
+- [ ] **Step 6: 网关关了以后后台的活儿也得停**
+
+`cmd/mmxcode/serve.go` 里：
+
+```go
+			cancel()
+			// 网关关了以后，后台的读额度也得停，而且要等它停下来：库
+			// 是接着关的，它不该往一个正在关着的库上写。
+			gw.Close()
+```
+
+- [ ] **Step 7: 运行测试确认通过**
 
 ```
 go test ./internal/gateway/
 ```
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 8: 提交**
 
 ```
-git add internal/gateway
+git add internal/gateway cmd/mmxcode/serve.go
 git commit -m "feat(gateway): 用完的标记照着读到的数改"
 ```
 
@@ -2533,7 +2932,7 @@ func (s *Server) usageCard(w http.ResponseWriter, r *http.Request) {
 //
 // 它是网关和调度器共用的那一套：该读哪些账号、一趟读几个、并发几个。
 func (s *Server) round() *usage.Round {
-	return usage.NewRound(s.Store, s.Mgr, s.Mgr.HotAccounts, s.Cfg)
+	return usage.NewRound(s.Store, s.Reader, s.Mgr.HotAccounts, s.Cfg)
 }
 ```
 
@@ -2544,7 +2943,7 @@ func (s *Server) round() *usage.Round {
 	mgr.HotWindow = cfg.Usage.Refresh.HotWindow.Duration()
 ```
 
-`internal/gateway/gateway.go` 的 import 补上 `"mmxcode/internal/usage"`。
+`internal/gateway/gateway.go` 的 import 已经有 `"mmxcode/internal/usage"` 了（Task 5 加的）。
 
 - [ ] **Step 5: 运行测试确认通过**
 

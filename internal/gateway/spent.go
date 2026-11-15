@@ -3,10 +3,21 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"mmxcode/internal/account"
 	"mmxcode/internal/store"
+)
+
+// The timeouts of the background work.
+//
+// 读和写各有一份：读的那一份用完了，不该把写也一起拖掉。
+const (
+	// spentReadTimeout is how long the background reading may take.
+	spentReadTimeout = 30 * time.Second
+	// spentWriteTimeout is how long the background writing may take.
+	spentWriteTimeout = 5 * time.Second
 )
 
 // resetAfter gives the moment a window comes back, when it is in the
@@ -39,13 +50,26 @@ func (s *Server) windowReset(ctx context.Context, accountID, groupKey string) ti
 }
 
 // resetOf gives the group's reset out of a list of windows.
+//
+// 一个组是好几个窗口（"5 hours"、"7 days"），组是整个回来的：它最后
+// 那个窗口回来了，组才回来。所以组的时刻取它那些窗口里最晚的一个，
+// 而且只算将来的 —— 已经过去的那个不算：它不能盖住一个还在将来的窗
+// 口。
+//
+// 组的键比的时候不看大小写：站上写的是 "General"，这边说的是
+// "general"，说的是同一个组。
 func resetOf(ws []account.Window, groupKey string) time.Time {
+	var latest time.Time
 	for _, w := range ws {
-		if w.ModelName == groupKey && !w.ResetsAt.IsZero() {
-			return resetAfter(w.ResetsAt)
+		if !strings.EqualFold(w.ModelName, groupKey) {
+			continue
+		}
+		at := resetAfter(w.ResetsAt)
+		if at.After(latest) {
+			latest = at
 		}
 	}
-	return time.Time{}
+	return latest
 }
 
 // resetOfSnapshot gives the group's reset out of a reading.
@@ -66,25 +90,76 @@ func resetOfSnapshot(snap store.UsageSnapshot, groupKey string) time.Time {
 // in the background.
 //
 // 标记的那一刻就把"什么时候回来"定下来：读到的窗口时刻在将来就用
-// 它，取不到就用冷却时间。后台那一次读是来改标记的：读到了，标记就
-// 照着真的时刻改；读不到，标记留着（冷却）。
+// 它，取不到就用冷却时间。后台那一次读是来改标记的，而且只往后改：
+// 读到的时刻比现在的标记晚，标记就挪到那儿；读不到，或者读到的东西
+// 里没有这个组，标记就原样留着。
+//
+// 提前放一个用完的账号回轮转，正是这个标记要防的事。而一个滚动的窗
+// 口，它的时刻本来也只是越来越晚：所以"只往后改"平常的时候就是"照
+// 着真的时刻改"。
 func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 	until := s.windowReset(ctx, accountID, groupKey)
 	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
-	go s.refixSpent(accountID, groupKey)
+	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
+	// 着（冷却时间），下一次再说。
+	s.startBackground(func() { s.correctMark(accountID, groupKey) })
 }
 
-// refixSpent reads the account and puts the mark's time right.
+// correctMark reads the account and puts the mark's time right.
 //
 // 它不挡客户端：后台的活。
-func (s *Server) refixSpent(accountID, groupKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//
+// 读到的时刻比现在的标记晚，标记就挪到那儿；不然标记原样留着。读到的
+// 东西里没有这个组（或者读失败了），那就没有时刻：没有时刻就不动。
+//
+// 提前放一个用完的账号回轮转，正是这个标记要防的事。
+func (s *Server) correctMark(accountID, groupKey string) {
+	ctx, cancel := context.WithTimeout(s.lifeCtx, spentReadTimeout)
 	defer cancel()
-	snap, err := s.Mgr.RefreshUsage(ctx, accountID)
+	snap, err := s.Reader.RefreshUsage(ctx, accountID)
 	if err != nil {
-		// 读不到：标记留着（冷却）。
+		// 读不到：标记原样留着。
 		return
 	}
 	until := resetOfSnapshot(snap, groupKey)
-	_ = s.Rot.MarkWindowExhausted(ctx, accountID, groupKey, until, "quota")
+	if until.IsZero() {
+		// 这一次读到的东西里没有这个组：没有就是没有。写一个零进去，
+		// 冷却时间就会把标记缩短。
+		return
+	}
+	// 写的时限另起一份：读的那一份用完了，写也该写得下。
+	wctx, wcancel := context.WithTimeout(s.lifeCtx, spentWriteTimeout)
+	defer wcancel()
+	cur, ok := s.markedUntil(wctx, accountID, groupKey)
+	if !ok {
+		// 不知道现在的标记到什么时候：不知道就不动。
+		return
+	}
+	if cur.After(until) {
+		// 现在的标记比读到的时刻还晚：标记不动。标记只往后挪。
+		return
+	}
+	_ = s.Rot.MarkWindowExhausted(wctx, accountID, groupKey, until, "quota")
+}
+
+// markedUntil gives the moment the account's group is marked spent
+// until, and whether that mark could be read.
+//
+// 库里那一行说了算：标记现在到什么时候，是写下去的那一份。读不到就
+// 说一声：不知道就不动。
+func (s *Server) markedUntil(ctx context.Context, accountID, groupKey string) (time.Time, bool) {
+	rows, err := s.Store.ListExhausted(ctx)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var until time.Time
+	for _, e := range rows {
+		if e.AccountID != accountID || e.WindowKey != groupKey {
+			continue
+		}
+		if e.Until.After(until) {
+			until = e.Until
+		}
+	}
+	return until, true
 }
