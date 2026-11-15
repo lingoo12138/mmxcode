@@ -467,8 +467,7 @@ accountLoop:
 			switch s.action(failure) {
 			case rotator.ActionFailover:
 				// 额度用完了：这个账号的窗口记成用完，换一个账号。
-				until := s.windowReset(ctx, plan.AccountID, plan.GroupKey)
-				_ = s.Rot.MarkWindowExhausted(ctx, plan.AccountID, plan.GroupKey, until, "quota")
+				s.markSpent(ctx, plan.AccountID, plan.GroupKey)
 				lastErr = fmt.Errorf("the account's credits or plan are used up")
 				quota = true
 				quotaMsg = failure.Message
@@ -986,23 +985,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   data,
 	})
-}
-
-// windowReset gives the moment a spent window comes back.
-//
-// The key is the plan group, not one window: the windows "5 hours" and
-// "7 days" belong to a group, and the group comes back as a whole.
-func (s *Server) windowReset(ctx context.Context, accountID, groupKey string) time.Time {
-	ws, err := s.Mgr.LatestWindows(ctx, accountID)
-	if err != nil {
-		return time.Time{}
-	}
-	for _, w := range ws {
-		if w.ModelName == groupKey && !w.ResetsAt.IsZero() {
-			return w.ResetsAt
-		}
-	}
-	return time.Time{}
 }
 
 // backoff is how long to wait before asking again.
