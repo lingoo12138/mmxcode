@@ -79,9 +79,10 @@ mmxcode models                   # 模型列表
 
 账本是站点那边的数，网关只能去问它要。
 
-- 调度器每 `schedule.usage_refresh`（默认 15 分钟）问一遍所有账号；读到的每一次都存一行。
+- 调度器每 `usage.refresh.scan_every`（默认 30 秒）扫一遍**该读的账号**，一趟最多读 `usage.refresh.batch`（默认 6 个），剩下的下一趟接着读。读到的每一次都存一行。
+- 没配 `usage.refresh.scan_every` 的，老的 `schedule.usage_refresh` 才说了算（再没有就 15 分钟）。
 - 刚登录进来的账号、刚导入进来的账号，马上问一次 —— 不用等那一趟。
-- 想现在就知道：`mmxcode usage --refresh`，或者在「用量」那一页上点「刷新」。
+- 想现在就知道：`mmxcode usage --refresh`（所有账号读一遍），或者在「用量」那一页上点「刷新」。
 - 一次也没读过的账号，在页面上和命令行里都写着「还没读」：它跟「读到了但是读不出来」不是一回事。
 
 ### 批量导入
@@ -284,7 +285,7 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `until` | 有计划的那些账号里最早到期的一个 |
 | `windows` | 每个账号的积分是一个窗口（`Credits`），它的计划的窗口也在里面。账号不止一个的时候，窗口名字前面带账号名（`主号 · Credits`），不然分不出是谁的 |
 
-数字是**上一次读到的**：调度器每 15 分钟读一遍账本，后台页面上也有一个「刷新」按钮。要现读一遍就在地址上加 `refresh=1`（`GET /v1/usage?refresh=1`）。
+数字是**上一次读到的**：调度器每 `usage.refresh.scan_every`（默认 30 秒）读一遍该读的账号，后台页面上也有一个「刷新」按钮。要现读一遍就在地址上加 `refresh=1`（`GET /v1/usage?refresh=1`）—— 那一遍只现读最热的几个账号，卡片等不了所有账号的账。
 
 这个接口在聊天那扇门后面：手里有聊天那把 key（或者后台登录那把）才能问。
 
@@ -318,7 +319,7 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `proxy.default` | 空 | 全局默认出口 |
 | `proxy.groups` | 空 | 出口组：组名 → 地址。账号可以指向其中一组，一组共用一个出口 |
 | `schedule.checkin_at` | `"09:00"` | 每天签到的时间，本地时区，`HH:MM` |
-| `schedule.usage_refresh` | `15m` | 积分刷新间隔 |
+| `schedule.usage_refresh` | `15m` | 积分刷新间隔。只在没配 `usage.refresh.scan_every` 时才用它 |
 | `schedule.token_refresh` | `5m` | token 续期检查间隔 |
 | `schedule.egress_health` | `2m` | 出口健康检查间隔 |
 
@@ -327,6 +328,34 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 密钥放哪里都行：配置文件里的 `server.api_keys`，或者环境变量 `MMXCODE_API_KEYS`。容器里推荐后者 —— 密钥是申请来的，写进镜像就等于把它摊在别人眼前。两者都没有的时候，网关只肯听本机地址（`server.listen` 不是回环地址就报错退出）。后台登录用的就是这把 key：它是管理界面和网关共用的那一把。
 
 两个值写错了 `mmxcode serve` 会拒绝启动，而不是悄悄按别的来：`schedule.checkin_at` 不是 `HH:MM` 会报 `schedule.checkin_at = "..."; want HH:MM`，`upstream.site` 不是 `global` 会报 `upstream.site = "..."; only "global" is supported`。
+
+### 读额度
+
+额度不是所有账号一起读的 —— 冷账号排在最后，读到的数也是旧的。调度器每 `usage.refresh.scan_every` 扫一遍，只读**该读的账号**：
+
+- **签到待补的**：签到过了，账本还没读到（没读到，或者读到的那次失败了）。
+- **标记到期的**：额度用完被标记的账号，冷却时间到了，回到轮转里。
+- **从没读过的**：卡上没有它，一次也没读过。
+- **热的**：刚被用过的账号。
+
+排在前面的先读：签到待补 → 标记到期 → 从没读过 → 热 → 冷。冷账号里最久没读的先 —— 它被读到的时候，读到的数也是旧的。
+
+一趟有四道控，都在 `usage.refresh` 下面：
+
+| 键 | 默认值 | 作用 |
+|---|---|---|
+| `usage.refresh.concurrency` | `4` | 一趟同时读几个账号的额度 |
+| `usage.refresh.timeout` | `15s` | 一个账号的额度最多读多久。卡住的账号不拖住整趟 |
+| `usage.refresh.budget` | `30s` | 一趟读额度最多花多久。用完就停，剩下的下一趟接着读 |
+| `usage.refresh.batch` | `6` | 一趟最多读几个账号 |
+| `usage.refresh.hot_window` | `5m` | 一个账号用过之后多久还算热。热账号的额度才值得现读 |
+| `usage.refresh.scan_every` | `30s` | 多久扫一遍该读额度的账号 |
+
+magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refresh.card`，默认 2 个；`usage.refresh.card_budget`，默认 5s），所以卡片不会卡。
+
+**额度用完的账号。** 上游说配额耗尽，网关立刻把这个账号的这个 plan 组标记成用完 —— 它暂时不进轮转。后台再读一次，把标记的时刻改准：读到几点的窗口回来，就到几点（标记只往后挪）；读不到就留着冷却时间（`rotation.exhausted_cooldown`，默认 5 分钟）。签到给了积分就读一次，读到的数说有额度就清掉标记。
+
+**并发。** 每个账号同时一个请求（`concurrency.per_account`，默认 1）；总并发是可用账号的五分之一（`concurrency.total_ratio`，默认 5），账号少的时候按 `concurrency.total_min`（默认 3）兜底。等一个空位最多等 `concurrency.wait`（默认 10s），等不到就 429。
 
 ### 代理模型
 

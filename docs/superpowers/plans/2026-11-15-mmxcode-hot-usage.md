@@ -3217,6 +3217,8 @@ README 里加一节「读额度」：
 - 额度用完的账号：立刻标记，后台读一次把标记改准；签到给了积分就读一次，读到的数说有额度就清掉标记。
 - 并发：每个账号同时一个请求（`concurrency.per_account`），总并发是可用账号的五分之一（`concurrency.total_ratio` / `concurrency.total_min`）。
 
+README 里「积分什么时候读」那一节要改：它写的还是「每 `schedule.usage_refresh` 问一遍**所有账号**」，现在不是了 —— 调度器每 `usage.refresh.scan_every` 扫一遍，只读该读的账号，一趟最多读 `usage.refresh.batch` 个。
+
 - [ ] **Step 2: 两份配置样例补上这两节**
 
 `config.example.yaml` 和 `config.docker.yaml` 现在把每一节都写着（`server`、`proxy`、`upstream`、`rotation`、`schedule`、`batch`），新加的两节也要写上，不然看样例的人不知道有这些旋钮：
