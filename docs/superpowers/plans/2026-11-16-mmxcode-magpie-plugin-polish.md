@@ -2251,6 +2251,48 @@ Expected: 过。卡片上是十几行，不是 98 行。
 
 ---
 
+### Task 5: 自建 provider —— 能改地址、密钥、协议的那一页
+
+**Files:**
+- Modify: `packages/mmxcode/README.md`（把命令和两个供应商的分工写进去）
+- Modify: `docs/superpowers/specs/2026-11-16-mmxcode-magpie-plugin-polish-design.md`（§2.4、§3.4）
+
+插件的 provider 页面上不会有「接口地址 / 接口密钥」：宿主把插件 provider 的地址换成 `plugin://`，编辑器那一支就没有地址和密钥（规格 §2.4）。要 Image #1 那一页，网关得当**自建 provider**。
+
+- [ ] **Step 1: 加**
+
+```sh
+magpie provider add mmxcode-direct id=mmxcode-direct "name=MMXCode 网关（直连）" \
+  anthropic=http://127.0.0.1:8080 \
+  chat=http://127.0.0.1:8080/v1 \
+  responses=http://127.0.0.1:8080/v1 \
+  key=sk-admin \
+  models.url=http://127.0.0.1:8080/v1/models \
+  balance="http://127.0.0.1:8080/v1/usage?refresh=1" balance.path=balance
+```
+
+- 三个协议地址都填：填了 ≥2 个，编辑器的 Base URL 才有分协议的标签页，每把 key 旁边也才有协议下拉。
+- `id=` 显式给：不给的话宿主从名字推，`MMXCode 网关` 已经被插件 provider 占了，会推成 `mmxcode-2`。
+- 插件 provider 不撤：卡片和会话黏性在它那儿。
+
+- [ ] **Step 2: 验**
+
+```sh
+magpie provider test mmxcode-direct
+magpie quota mmxcode-direct
+```
+
+Expected: 三个协议都答（chat / responses / anthropic）；余额读得到。
+
+- [ ] **Step 3: 提交**
+
+```sh
+git add packages/mmxcode/README.md docs/superpowers/specs/2026-11-16-mmxcode-magpie-plugin-polish-design.md
+git commit -F .git/commit_msg.txt
+```
+
+---
+
 ## 实测（本机，2026-11-16）
 
 `magpie quota mmxcode` 答的卡片（98 个号的池子）：
@@ -2271,7 +2313,28 @@ mmxcode · Free · http://127.0.0.1:8080  subscription  Credits 2% (746.72 / 396
 - 账号名：签入时**账号 id 留空**，magpie 的账号列表里显示的是那个地址。
 - `magpie provider test mmxcode` 过：`✓ anthropic 847 ms · MiniMax-M3.1-Flash`。
 
+自建 provider（Task 5）：
+
+```
+magpie providers
+  MMXCode 网关（直连） custom  mmxcode-direct  127.0.0.1:8080  ● ••••••••  2 of 2 models
+  MMXCode 网关            mmxcode              mmxcode            ● signed in as http://127.0.0.1:8080  2 of 2 models
+
+magpie provider test mmxcode-direct
+  ✓ chat       998 ms · MiniMax-M3.1-Flash
+  ✓ responses  980 ms · MiniMax-M3.1-Flash
+  ✓ anthropic 1246 ms · MiniMax-M3.1-Flash
+
+magpie quota mmxcode-direct
+  mmxcode-direct  balance  78037.1 credits left
+```
+
+- 编辑器（点那一行右边的 `>`）真的有 Image #1 那一页：**Base URL**（分协议标签页：OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 / Gemini 兼容 / System One）、**账号**（密钥那一行 + 协议下拉「任意协议」+ 并发不限 + 「添加另一个密钥」）、**模型**（从网关 `/v1/models` 拉来的 M3.1-Flash / M3）、**高级**（请求头、额外请求体、透传响应头、代理）。
+- 三个协议地址都填了，所以协议下拉才有得选。
+- 直连这条路**不带会话 id**（前面架记路径的代理，只看见 Authorization / X-Api-Key，没有 `X-Session-Id`）—— 所以卡片和会话黏性还是靠插件那个 provider。
+
 还剩的：
 
 1. 最多十个账号合不合手：现在是十个（98 个号里七个有过话，其余的没摆）。要改就改 `internal/card` 里的 `shownAccounts`。
 2. 想要账号名叫「生产网关」这样的，就签入的时候填账号 id —— 那样它就是一个名字，不是地址。
+3. 两个 provider 都在模型列表里（各一份网关的模型），agent 挑哪个由它自己定。

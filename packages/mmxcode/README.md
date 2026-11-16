@@ -56,6 +56,40 @@ magpie plugin add ./packages/mmxcode
 
 没读到的账号不写成「0」—— 是「没读到」。
 
+## 在 magpie 里改地址、密钥、协议
+
+插件的 provider（**MMXCode 网关**）在 magpie 的供应商页面上**没有**「接口地址 / 接口密钥」那两个框 —— 那是宿主给**自建 provider** 的。插件的 provider 是 magpie 内部的一个 provider（宿主把它的地址换成 `plugin://`，所以编辑器的「端点」那一栏也不出现）：它的地址和密钥在签入的时候问，换地址就再签入一次。
+
+要一个能改地址、密钥、每把 key 选协议的页面，把网关加成**自建 provider**：
+
+```sh
+magpie provider add mmxcode-direct id=mmxcode-direct "name=MMXCode 网关（直连）" \
+  anthropic=http://127.0.0.1:8080 \
+  chat=http://127.0.0.1:8080/v1 \
+  responses=http://127.0.0.1:8080/v1 \
+  key=sk-… \
+  models.url=http://127.0.0.1:8080/v1/models \
+  balance="http://127.0.0.1:8080/v1/usage?refresh=1" balance.path=balance
+```
+
+那一页上就有了：
+
+- **接口地址**：分协议的几张标签页（Anthropic 兼容 / OpenAI 兼容 / OpenAI Responses / Gemini 兼容）—— 网关三种都收；
+- **接口密钥**：密钥那一行，可以改地址、换 key、再加一把；
+- **协议**：每把 key 旁边一个下拉（任意协议 / Anthropic / Chat Completions / Responses）—— 填了三个协议地址它就有得选；
+- **余额**：从网关的 `/v1/usage` 读。
+
+两个供应商的分工：
+
+| | MMXCode 网关（插件） | MMXCode 网关（直连，自建） |
+|---|---|---|
+| 模型 | 有 | 有 |
+| 一段对话黏在一个账号上 | 有（插件送 `X-Session-Id`） | 没有（宿主不转发会话 id） |
+| 用量卡片 | 有（积分、账号、协议行） | 只有余额 |
+| 地址 / 密钥 / 协议能改 | 不能（在签入表单里） | 能 |
+
+两个都在模型列表里，agent 各挑一个用。
+
 ## 它跟 magpie 自带的 minimax-code-global 差在哪
 
 | | minimax-code-global | mmxcode（这个） |
@@ -80,5 +114,16 @@ magpie plugin add ./packages/mmxcode
 Signing in asks for three things: the gateway's address, the chat key, and the **account id** — the name magpie shows for that account (leave it empty and the address becomes the name).
 
 The gateway speaks Anthropic, Chat Completions and Responses. magpie talks Anthropic to the plugin's provider (a plugin provider has one protocol) and translates for clients that speak something else; clients that point at the gateway directly can use any of the three.
+
+The plugin's provider page has no address or key field of its own — that is a host feature for providers you added yourself (a custom provider). Add the gateway as a custom provider to get one:
+
+```sh
+magpie provider add mmxcode-direct id=mmxcode-direct "name=MMXCode 网关（直连）" \
+  anthropic=http://127.0.0.1:8080 chat=http://127.0.0.1:8080/v1 responses=http://127.0.0.1:8080/v1 \
+  key=sk-… models.url=http://127.0.0.1:8080/v1/models \
+  balance="http://127.0.0.1:8080/v1/usage?refresh=1" balance.path=balance
+```
+
+That page has the endpoint (one tab per protocol), the key, a protocol per key, and the balance read from the gateway.
 
 It has no check-in button (checking in is the gateway's job) and no tools. It runs beside magpie's own `minimax-code-global`, under the provider id `mmxcode`.

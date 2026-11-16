@@ -44,6 +44,17 @@
 - 一个 provider 可以有**多个账号**：再签入一次就多一个账号（`magpie plugin login mmxcode`），旧的能删。
 - 账号的名字由我们给（`metadata.email`）。不给的话，magpie 显示的是「API key」。
 
+### 2.4 为什么插件的供应商页面上没有「接口地址 / 接口密钥」
+
+用户在页面上看到的就是这个：插件的 provider（MMXCode 网关）那一行只有账号、额度、模型，没有 Image #1 里那两个框。查清楚了，是宿主的规矩，不是我们漏了：
+
+- **插件的 provider 是 magpie 内部的一个 provider。** 宿主给它的地址换成了 `plugin://`（`app.js` 里那句注释：「a plugin's provider is reached inside magpie: its plugin:// URLs go nowhere to show or test」）。编辑器只在地址不是 `plugin://` 的时候才画「端点」那一栏 —— 所以插件的 provider 那一栏永远不出现。
+- **编辑器是分叉的。** 有账号的 provider 走「账号 + 模型 + 高级」那一支（没有地址、没有密钥）；没有账号的 provider（自建的、预设的）走「名称 / id / Base URL / 密钥 / 模型」那一支 —— Image #1 就是那一支。
+- **插件 provider 只能是「有账号」的那一支**：没签入的插件 provider 根本不进供应商列表（实测：`qoder-cn` 没签入，`magpie provider qoder-cn` 答「no provider」）。
+- **每把 key 旁边的协议下拉**（任意协议 / Anthropic / Chat Completions / Responses）也是自建 provider 的功能：它列出的是 provider 自己有哪些协议地址，插件 provider 只有一个地址，所以没有得选。
+
+**所以**：地址、密钥、协议要能改，就得让这个网关当**自建 provider**；插件那边留着卡片和会话黏性。两件事各管各的，见 §3.4。
+
 ## 3. 做什么
 
 ### 3.1 地址和 id（插件侧）
@@ -92,6 +103,34 @@
 - 每个窗口上的 `runsOut` / `runsOutAt` —— 积分什么时候过期、还剩多少，是客户端要显示的东西。
 - 计划窗口的 `resetsAt`（重置时间）。
 
+### 3.4 自建 provider：能改地址、密钥、协议的那个页面
+
+§2.4 查清楚了：插件的 provider 页面上不会有「接口地址 / 接口密钥」。要那一页，网关得当**自建 provider**（`providers.json`）。所以网关在 magpie 里有**两个**供应商，各管各的：
+
+| | MMXCode 网关（插件） | MMXCode 网关（直连，自建） |
+| --- | --- | --- |
+| id | `mmxcode` | `mmxcode-direct` |
+| 模型 | 有 | 有（`models.url` 指网关的 `/v1/models`） |
+| 一段对话黏在一个账号上 | 有（插件送 `X-Session-Id`） | 没有（宿主不转发会话 id） |
+| 用量卡片 | 有（积分、账号、协议行） | 只有余额（`balance` 指网关的 `/v1/usage`） |
+| 地址 / 密钥 / 每把 key 的协议 | 不能改（在签入表单里） | **能改**（Image #1 那一页） |
+
+自建 provider 的字段：
+
+```sh
+magpie provider add mmxcode-direct id=mmxcode-direct "name=MMXCode 网关（直连）" \
+  anthropic=http://127.0.0.1:8080 \
+  chat=http://127.0.0.1:8080/v1 \
+  responses=http://127.0.0.1:8080/v1 \
+  key=sk-… \
+  models.url=http://127.0.0.1:8080/v1/models \
+  balance="http://127.0.0.1:8080/v1/usage?refresh=1" balance.path=balance
+```
+
+- **三个协议地址都填**：填了 ≥2 个，编辑器的 Base URL 才有分协议的标签页，每把 key 旁边也才有协议下拉（任意协议 / Anthropic / Chat Completions / Responses）。网关三种都收（§3.2），所以三种都填。
+- **id 是显式给的**（`id=mmxcode-direct`）：不给的话宿主从名字推，`MMXCode 网关` 那个名字已经被插件 provider 占了，会推成 `mmxcode-2`。
+- **不撤插件 provider**：卡片和会话黏性在它那儿。
+
 ## 4. 三条不变量（跟原来一样）
 
 1. **形状是 magpie 的**：`plan`、`until`、`balance`、`windows`。我们自己多知道的收在 `mmxcode` 那一个名字下面。
@@ -103,9 +142,13 @@
 - 单元测试（`internal/card`）：98 个账号的读数 → 卡片上是 2 个汇总窗口 + 有话说的那几行；`used` 为空的账号不写成 0；`balance` 不变；计划窗口还在。
 - 单元测试（插件，`packages/mmxcode`）：签入时留空 label → 账号名是网关地址；填了 label → 账号名是 label；`baseOf` 的兜底顺序（签入的值 → 环境变量 → 默认）。
 - 本机实测：重启网关 → `magpie provider test mmxcode` 通过 → 卡片在 magpie 里只有几行。
+- 本机实测（自建 provider）：`magpie provider test mmxcode-direct` → chat / responses / anthropic 三个协议都答；`magpie quota mmxcode-direct` → 余额读得到；编辑器的 Base URL 分协议标签页、密钥那一行、每把 key 的协议下拉都在（实测截图逐段看过）。
 
 ## 6. 待实测
 
-1. magpie 卡片上「aside 的窗口」（没有 `used` 的）画出来是什么样 —— 参考实现里 Unlimited 的窗口就是这个样子，但我们的「账号」那一行是中文的、数量是活的。
-2. 最多 10 个账号这个数合不合手：98 个号的时候，卡片上是 12 行上下（2 汇总 + 最多 10 个账号）。用户要是觉得还是多，改 `card` 里的那个数就行。
-3. provider 名改成「MMXCode 网关」之后，magpie 的 provider 列表和插件页显示的样子。
+1. ~~magpie 卡片上「aside 的窗口」（没有 `used` 的）画出来是什么样~~ —— 测了：「账号」那一行和「协议」那一行都画出来了（`magpie quota mmxcode` 看得到）。
+2. 最多 10 个账号这个数合不合手：实测 100 个号的时候卡片上是 12 行（1 全池 + 1 账号 + 10 个账号 + 协议），「账号」那一行还说了「17 没上卡」。要改就改 `card` 里的那个数。
+3. ~~provider 名改成「MMXCode 网关」之后的样子~~ —— 测了：`magpie providers` 里是 `MMXCode 网关`，`signed in as http://127.0.0.1:8080`。
+4. 自建 provider 和插件 provider 都在模型列表里（每个网关五个模型，两份）：agent 该挑哪个。插件那份带会话黏性和卡片，直连那份能改地址和密钥。
+5. 直连那条路**不送会话 id**：网关前面架一个记头的代理，只看见 `Authorization` / `X-Api-Key`，没有 `X-Session-Id`。所以「一段对话黏在一个账号上」这件事，只有插件那份 provider 有。
+
