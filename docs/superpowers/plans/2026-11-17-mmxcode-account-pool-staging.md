@@ -1648,6 +1648,11 @@ git commit -F .git/commit_msg.txt
 - **写 0 按 1 算**（跟 `usage.batch()` 一个规矩）：0 不是「不读」，0 是「读一个」。keeper 那边的 0 说的是「不限」，所以接线的那一层必须先夹住 —— 一个写 `usage.refresh.batch: 0` 的人不该把补号那一趟的预算打开。
 - **一趟自己的时限**（`usage.refresh.budget`，默认 30s）：没有它，一趟的时长是「预算 × 每个号的时限」（6 × 15 秒 = 90 秒），而补号那一趟每 30 秒就该来一次 —— 中间那几趟都被「上一趟还在跑」挡掉了，补号的速度就悄悄降下来了。
 
+这一趟出的错都要说出去，调用方（`TopUpPool`）才知道日志里写什么：
+
+- **候选问不到**、**标记写不进去**、**这一趟被它自己的时限掐断** —— 三件都往外说。掐断了还说「没有错」，池短着的时候日志里就什么都看不见：只看得见池短了，看不见为什么。
+- **写标记用的是不跟这一趟的时限走的 ctx**（`context.WithoutCancel`）：这一趟的时限到了，不该让这个标记丢掉。丢了这个号还在库里占着一个位置，下一趟补号还会挑它，再读一遍（一次读是 2~11 个上游请求），一趟接一趟，直到它自己好起来。标记是这个号的事实，不是一趟的活。
+
 - [x] **Step 1: 写失败的测试**
 
 新建 `internal/pool/keeper_test.go`：
@@ -1657,6 +1662,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1735,11 +1741,22 @@ type fakeMarker struct {
 	mu sync.Mutex
 	// marks are the marks that were written.
 	marks []store.Exhausted
+	// err is what it answers with, when it is set.
+	err error
+	// ctxErr is what the context said when the mark was written.
+	ctxErr error
+	// called counts the times it was called.
+	called int
 }
 
-func (f *fakeMarker) SetExhausted(_ context.Context, accountID, windowKey string, until time.Time, reason string) error {
+func (f *fakeMarker) SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.called++
+	f.ctxErr = ctx.Err()
+	if f.err != nil {
+		return f.err
+	}
 	f.marks = append(f.marks, store.Exhausted{
 		AccountID: accountID, WindowKey: windowKey, Until: until, Reason: reason,
 	})
@@ -1761,6 +1778,87 @@ func (b *blockingReader) RefreshUsage(ctx context.Context, accountID string) (st
 	b.mu.Unlock()
 	<-ctx.Done()
 	return store.UsageSnapshot{}, ctx.Err()
+}
+
+// spentOnTimeout reads the credits only when the pass is over.
+//
+// 它是那种"读回来了，但这一趟的时间已经用完了"的读：读到的数说这个号
+// 没有额度，而写标记的时候这一趟的时限已经到了。
+type spentOnTimeout struct{}
+
+func (s *spentOnTimeout) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	<-ctx.Done()
+	return store.UsageSnapshot{
+		AccountID:  accountID,
+		Granted:    400,
+		Remaining:  0,
+		HasAmounts: true,
+	}, nil
+}
+
+// TestTheMarkThatCouldNotBeWrittenIsReported says a mark that could not
+// be written is said out loud.
+//
+// 标记写不进去，那个号在库里还占着一个位置：下一趟补号还会挑它，再读一
+// 遍（一次读是 2~11 个上游请求），每一趟都是这样，直到它自己好起来。
+// 写不进去又没有人知道，就没有人管它。
+func TestTheMarkThatCouldNotBeWrittenIsReported(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+	}}
+	reader := &fakeReader{left: map[string]float64{"a": 0, "b": 400}}
+	marker := &fakeMarker{err: errors.New("the database did not answer")}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10,
+	})
+
+	n, err := k.Replenish(context.Background(), 2)
+	if err == nil {
+		t.Fatal("the mark that could not be written was not reported")
+	}
+	if !strings.Contains(err.Error(), "the database did not answer") {
+		t.Fatalf("err = %v, want the failure of the mark", err)
+	}
+	// 一个号的标记写不进去，不该把整趟填池都放弃：后面的号照旧进池。
+	if n != 1 {
+		t.Fatalf("replenished = %d, want 1", n)
+	}
+	if _, ok := p.Get("b"); !ok {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+}
+
+// TestTheMarkIsWrittenEvenWhenThePassIsOver says the mark is written
+// even when the pass ran out of time.
+//
+// 标记是关于这个号的事实：它不能因为这一趟跑超时了就丢掉。丢了这个号还
+// 在库里占着位置，下一趟补号还会挑它，一趟读一次（2~11 个上游请求），
+// 一趟接一趟，永远。
+func TestTheMarkIsWrittenEvenWhenThePassIsOver(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
+	reader := &spentOnTimeout{}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10, PassTimeout: 100 * time.Millisecond,
+	})
+
+	_, err := k.Replenish(context.Background(), 1)
+	// 这一趟是被时限掐断的：它报出来的错只能是时限的错。
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the deadline of the pass", err)
+	}
+	if marker.called != 1 {
+		t.Fatalf("the mark was written %d times, want 1", marker.called)
+	}
+	if marker.ctxErr != nil {
+		t.Fatalf("the mark was written with a dead context: %v", marker.ctxErr)
+	}
+	if len(marker.marks) != 1 || marker.marks[0].AccountID != "a" {
+		t.Fatalf("marks = %v, want just a", marker.marks)
+	}
 }
 
 // TestTheReplenishStopsWhenThePassIsOver says one filling pass does not
@@ -1790,8 +1888,12 @@ func TestTheReplenishStopsWhenThePassIsOver(t *testing.T) {
 	start := time.Now()
 	n, err := k.Replenish(ctx, 5)
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
+	// 这一趟是被时限掐断的：它报出来的错就是那个时限的错。
+	//
+	// 以前这里报的是"没有错"：池短着，日志里却什么都没有 —— 看得见的
+	// 只有"这一趟没填上"，看不见"这一趟没跑完"。两件事要分开说。
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the deadline of the pass", err)
 	}
 	if n != 0 {
 		t.Fatalf("replenished = %d, want 0", n)
@@ -2090,6 +2192,8 @@ package pool
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -2148,6 +2252,12 @@ type KeeperOptions struct {
 	// 0 = 不限。生产上不该这么配。
 	PassTimeout time.Duration
 }
+
+// markWriteTimeout is how long the writing of a mark may take.
+//
+// 写一行标记是本地库里的一个写，几毫秒的事：5 秒钟是给卡住的库留的余
+// 量，不是给它等的。
+const markWriteTimeout = 5 * time.Second
 
 // Keeper keeps the pool full.
 //
@@ -2231,6 +2341,10 @@ func (k *Keeper) Seed(ctx context.Context, want int) (int, error) {
 //
 // 一次只跑一趟：已经在跑的那一趟没有跑完，这一次就不跑 —— 池里的号不
 // 会因为跑两趟就多出来，而上游的请求会翻倍。
+//
+// 出错的时候说的是这一趟出的错：候选问不到、标记写不进去、这一趟被它
+// 自己的时限掐断。三件都说出去 —— 池短着的时候，日志里要看得见是"没
+// 填上"还是"没跑完"。
 func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	if want <= 0 {
 		return 0, nil
@@ -2259,6 +2373,11 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 
 	added := 0
 	var lastErr error
+	// markErr is the mark that could not be written.
+	//
+	// 它跟 lastErr 分开记：两个错都要给调用方 —— 少一个，日志里就少一件
+	// 事：一个是这一趟没填上，一个是那个号还在库里占着位置。
+	var markErr error
 	// 这一趟读了几次：预算是这一趟的，不是整天的。
 	reads := 0
 	// 读失败的号这一趟不再读：它刚才读不到，再读一次也是读不到，而
@@ -2267,15 +2386,22 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 这一趟挑过了几个：候选里被刷掉的那些。下一趟问候选的时候要多问
 	// 这么多个 —— 不然问回来的还是那几个刷掉的。
 	passed := 0
+	// cutShort says the pass was cut short by its own deadline.
+	//
+	// 它跟"这一趟没填上"是两件事：填池没填满是结果，被时限掐断是原因。
+	// 掐断了还报"没有错"，池短着的时候日志里就什么都看不见 —— 只看得见
+	// 池短了，看不见为什么。
+	cutShort := false
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
+		if k.pool.Len() >= want {
+			break
+		}
 		if ctx.Err() != nil {
 			// 这一趟的时间用完了：整趟就此打住，不是只放下一个号。下
 			// 一趟重新开始。
-			break
-		}
-		if k.pool.Len() >= want {
+			cutShort = true
 			break
 		}
 		inPool := k.pool.IDs()
@@ -2296,6 +2422,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			}
 			if ctx.Err() != nil {
 				// 这一趟的时间用完了：不再读下一个号，也不再问候选。
+				cutShort = true
 				break
 			}
 			if inPool[c.Account.ID] {
@@ -2338,7 +2465,17 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				// 读到了：它没有额度。标记掉，别让它占着位置。这一趟
 				// 也不再读它 —— 读到了就是没有，再读一遍还是没有，而
 				// 预算是有限的。
-				k.markSpent(ctx, c.Account.ID, snap)
+				if err := k.markSpent(ctx, c.Account.ID, snap); err != nil {
+					// 写不进去：那个号在库里还占着一个位置，下一趟
+					// 补号还会挑它，再读一遍（2~11 个上游请求），一趟
+					// 接一趟。记下来，别让它悄悄地没有。
+					//
+					// 这一趟不因为它放弃：一个号的标记写不进去，不该
+					// 把整趟填池都扔掉。
+					if markErr == nil {
+						markErr = fmt.Errorf("the mark of %s could not be written: %w", c.Account.ID, err)
+					}
+				}
 				failed[c.Account.ID] = true
 				passed++
 				fresh++
@@ -2362,6 +2499,27 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 	}
+	// 这一趟出的错都要说出去：候选问不到是一件事，标记写不进去是另一件
+	// —— 少一件，日志里就少一件。只有一件的时候就是那一个：调用方拿
+	// 到的就是那个错本身。
+	switch {
+	case lastErr != nil && markErr != nil:
+		lastErr = errors.Join(lastErr, markErr)
+	case lastErr == nil:
+		lastErr = markErr
+	}
+	if cutShort {
+		// 这一趟是被时限掐断的：也说出去 —— 池短着的时候，日志里要看得
+		// 见是"这一趟没跑完"，不是"这一趟跑完了，池还是短"。
+		//
+		// 别的事也有错的时候，两件都留着：那个错是这一趟的错，这个错是
+		// 这一趟为什么没跑完。
+		if lastErr == nil {
+			lastErr = ctx.Err()
+		} else {
+			lastErr = errors.Join(lastErr, ctx.Err())
+		}
+	}
 	return added, lastErr
 }
 
@@ -2383,7 +2541,12 @@ func (k *Keeper) readOne(ctx context.Context, accountID string) (store.UsageSnap
 // 说的不是「这个模型组用完了」，是「这个号没有额度了」。
 //
 // 什么时候回来：读到的时间在将来就用它，取不到就用冷却时间。
-func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.UsageSnapshot) {
+//
+// 写这一行用的是不跟这一趟的时限走的 ctx：这一趟的时限到了，不该让这
+// 个标记丢掉。丢了这个号还在库里占着一个位置，下一趟补号还会挑它，再
+// 读一遍（一次读是 2~11 个上游请求），一趟接一趟，直到它自己好起来。
+// 标记是这个号的事实，不是一趟的活。
+func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.UsageSnapshot) error {
 	until := time.Time{}
 	if snap.ExpiresAt.After(time.Now()) {
 		until = snap.ExpiresAt
@@ -2392,9 +2555,11 @@ func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.Usa
 		until = time.Now().Add(k.opts.Cooldown)
 	}
 	if k.marker == nil {
-		return
+		return nil
 	}
-	_ = k.marker.SetExhausted(ctx, accountID, "", until, "quota")
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markWriteTimeout)
+	defer cancel()
+	return k.marker.SetExhausted(wctx, accountID, "", until, "quota")
 }
 ```
 
@@ -2508,6 +2673,58 @@ func TestTheReadBudgetIsNeverUnlimited(t *testing.T) {
 		if got := poolReadBudget(cfg.Usage); got != c.want {
 			t.Errorf("the read budget for batch %d = %d, want %d", c.batch, got, c.want)
 		}
+	}
+}
+
+// TestTheKeeperOptionsNeverHaveAnUnlimitedReadBudget says the keeper the
+// gateway builds never reads without a budget.
+//
+// keeper 那边的 0 说的是"不限"：补号读的是上游的钱，一次读是 2~11 个上游
+// 请求（规格 §6.4），一趟读几百个号就是几千个请求 —— 那不是填池，是打上
+// 游。而 usage.refresh.batch 配 0 说的是"一个一批"（usage.batch 的那
+// 条规矩），不是"全都读"。所以这一层必须把它夹住。
+//
+// 夹的是 keeper 拿到的那份预算：算预算的函数对了，接线的那一行漏了夹子
+// 也没用 —— 那个 keeper 拿到的就是"不限"。所以这里看的是 New() 用的那
+// 份选项，不是那个函数。
+func TestTheKeeperOptionsNeverHaveAnUnlimitedReadBudget(t *testing.T) {
+	for _, c := range []struct {
+		batch int
+		want  int
+	}{
+		{0, 1}, {-1, 1}, {1, 1}, {6, 6},
+	} {
+		cfg := config.Default()
+		cfg.Usage.Refresh.Batch = c.batch
+		opts := keeperOptions(cfg)
+		if opts.ReadBudget != c.want {
+			t.Errorf("the read budget for batch %d = %d, want %d", c.batch, opts.ReadBudget, c.want)
+		}
+	}
+}
+
+// TestTheKeeperOptionsCarryTheConfiguration says the keeper the gateway
+// builds gets the configuration it should.
+//
+// 别的几项也是配置说了算：读不读额度（pool.read_on_admit）、冷却多久
+// （rotation.exhausted_cooldown）、一个号读多久（usage.refresh.timeout）、
+// 一趟跑多久（usage.refresh.budget）。
+func TestTheKeeperOptionsCarryTheConfiguration(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.Batch = 0
+	opts := keeperOptions(cfg)
+
+	if opts.Read != cfg.Pool.ReadOnAdmit {
+		t.Errorf("read = %v, want %v", opts.Read, cfg.Pool.ReadOnAdmit)
+	}
+	if opts.Cooldown != cfg.Rotation.ExhaustedCooldown.Duration() {
+		t.Errorf("cooldown = %v, want %v", opts.Cooldown, cfg.Rotation.ExhaustedCooldown.Duration())
+	}
+	if opts.ReadTimeout != cfg.Usage.Refresh.Timeout.Duration() {
+		t.Errorf("read timeout = %v, want %v", opts.ReadTimeout, cfg.Usage.Refresh.Timeout.Duration())
+	}
+	if opts.PassTimeout != cfg.Usage.Refresh.Budget.Duration() {
+		t.Errorf("pass timeout = %v, want %v", opts.PassTimeout, cfg.Usage.Refresh.Budget.Duration())
 	}
 }
 
@@ -2915,6 +3132,120 @@ func TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow(t *testing.T) {
 	}
 }
 
+// ctxStore answers only while the context is alive.
+//
+// 它站在读库的那一头：客户端走了的时候，读就该跟着断 —— 库没坏，是那
+// 一头不要答案了。
+type ctxStore struct {
+	*store.Store
+	mu sync.Mutex
+	// reads counts the reads it was asked for.
+	reads int
+}
+
+func (c *ctxStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.Store.ListAccounts(ctx)
+}
+
+// slowStore holds the first read until the context is done.
+//
+// 它是那种"读库里那一头慢"的库：第一个人的 ctx 断了，读就断在那儿。
+type slowStore struct {
+	*store.Store
+	mu sync.Mutex
+	// reads counts the reads it was asked for.
+	reads int
+	// started says the first read began.
+	started chan struct{}
+}
+
+func (s *slowStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	s.mu.Lock()
+	s.reads++
+	first := s.reads == 1
+	s.mu.Unlock()
+	if first {
+		close(s.started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.ListAccounts(ctx)
+}
+
+// TestTheCancelledCallerDoesNotPoisonTheNextOne says a read that was
+// cut short by the caller is not remembered as the database's answer.
+//
+// 客户端走了的时候，读到一半就断了 —— 那是它的事，不是库的事。这个错
+// 不能被记住：记住了一秒，这一秒里来的每一个请求都拿到"context
+// canceled"，一个客户端的断开就变成一片 503。下一个请求要自己读一遍。
+func TestTheCancelledCallerDoesNotPoisonTheNextOne(t *testing.T) {
+	s, _ := oneAccount(t)
+	c := &ctxStore{Store: s}
+	f := newDBFallback(c, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the cancelled read was not reported")
+	}
+
+	snap, err := f.get(context.Background())
+	if err != nil {
+		t.Fatalf("the next caller got the cancellation: %v", err)
+	}
+	if len(snap.accounts) != 1 || snap.accounts[0].ID != "acc_01" {
+		t.Fatalf("accounts = %v, want just acc_01", snap.accounts)
+	}
+	if c.reads != 2 {
+		t.Fatalf("the store was read %d times, want 2", c.reads)
+	}
+}
+
+// TestTheWaiterReadsAgainWhenTheReaderWasCutShort says a waiter does
+// not inherit the reader's cancellation.
+//
+// 一次只读一遍：等的人等的是那个信号。读的那一头被掐断了，等的人醒来
+// 的时候手上什么都没有 —— 它得自己读一遍，而不是接着那个取消。
+func TestTheWaiterReadsAgainWhenTheReaderWasCutShort(t *testing.T) {
+	s, _ := oneAccount(t)
+	c := &slowStore{Store: s, started: make(chan struct{})}
+	f := newDBFallback(c, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := f.get(ctx)
+		first <- err
+	}()
+	<-c.started
+	// 读的那一头还在库里等：来第二个请求，它得等。
+	second := make(chan error, 1)
+	go func() {
+		_, err := f.get(context.Background())
+		second <- err
+	}()
+	cancel()
+
+	if err := <-first; err == nil {
+		t.Fatal("the cancelled read was not reported")
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("the waiter inherited the cancellation: %v", err)
+	}
+	if c.reads != 2 {
+		t.Fatalf("the store was read %d times, want 2", c.reads)
+	}
+}
+
 // panickingStore breaks on the first read and answers after that.
 //
 // 它站在读库的那一头：库崩了的时候，网关不能跟着崩，也不能从此吊死。
@@ -3212,16 +3543,7 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	// 池空的时候的那份兜底：库里的答案留一秒（规格 §6.9）。
 	g.fallback = newDBFallback(s, concurrencyCacheTTL)
 	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()}, mgr, s,
-		pool.KeeperOptions{
-			Read:        cfg.Pool.ReadOnAdmit,
-			Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
-			ReadBudget:  poolReadBudget(cfg.Usage),
-			ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
-			// 一趟补号自己的时限：跟读额度那一趟用同一把尺子
-			// （usage.refresh.budget）。没有它，一趟能跑 90 秒，而补号
-			// 那一趟每 30 秒就该来一次。
-			PassTimeout: cfg.Usage.Refresh.Budget.Duration(),
-		})
+		keeperOptions(cfg))
 ```
 
 `internal/gateway/gateway.go`，`rotator.New(...)` 那行改成：
@@ -3342,6 +3664,12 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 
 - [x] **Step 4: 池空的时候，库里的答案留一秒 —— `internal/gateway/fallback.go`**
 
+兜底的缓存有三条规矩：
+
+- **一秒一份**：那一波并发只读一次。
+- **读库在锁外面**：一次只读一遍（单飞），等的人等的是那个信号，不是那把锁 —— 锁里读库就是把所有人吊在库上。手上有旧的一份就拿旧的先走；读失败了旧的那份照给（挑出来的号顶多撞一次空，撞空是一个请求 —— 那比一片 503 强）。
+- **被调用方掐断的那一次读不算数**：那是那一个请求的事，不是库的事。记下来就成了这一秒里每一个请求的答案，一个客户端的断开就变成一片 503。这样的读不记、不盖戳：下一个请求自己读一遍。
+
 新建 `internal/gateway/fallback.go`：
 ```go
 package gateway
@@ -3415,85 +3743,95 @@ func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
 // 这一秒里只读一遍，不管有没有读到过：手上没有快照的时候，上一次的那个
 // 错就是这一秒里每一个请求的答案 —— 库在挂的时候，读的次数是跟着来的
 // 请求走的，不是跟着那一秒走的。
+//
+// 有一件事不记：被调用方掐断的那一次读。那是那一个请求的事，不是库的事
+// —— 记下来就成了这一秒里每一个请求的答案，一个客户端的断开就变成一片
+// 503。这样的读不算一次读：下一个请求自己读一遍。
 func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
-	f.mu.Lock()
-	if time.Since(f.tried) < f.ttl {
-		snap := f.snap
-		err := f.err
-		f.mu.Unlock()
-		if snap != nil {
-			return snap, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		return nil, errors.New("the database did not answer")
-	}
-	if f.wait != nil {
-		// 有人在读库。
-		ch := f.wait
-		stale := f.snap
-		f.mu.Unlock()
-		if stale != nil {
-			return stale, nil
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	for {
 		f.mu.Lock()
-		snap := f.snap
-		err := f.err
-		f.mu.Unlock()
-		if snap == nil {
+		if time.Since(f.tried) < f.ttl {
+			snap := f.snap
+			err := f.err
+			f.mu.Unlock()
+			if snap != nil {
+				return snap, nil
+			}
 			if err != nil {
 				return nil, err
 			}
 			return nil, errors.New("the database did not answer")
 		}
+		if f.wait != nil {
+			// 有人在读库。
+			ch := f.wait
+			stale := f.snap
+			f.mu.Unlock()
+			if stale != nil {
+				return stale, nil
+			}
+			select {
+			case <-ch:
+				// 读的那一头完了。再来一遍：它要么读到了答案（那一趟
+				// 盖了戳，答案在这一秒里），要么它自己被掐断了（那一趟
+				// 不算数，这一趟自己读）。
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		ch := make(chan struct{})
+		f.wait = ch
+		f.mu.Unlock()
+
+		// 信号一定要发出去：等的人等的是它。
+		//
+		// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
+		// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
+		// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
+		defer close(ch)
+		// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
+		// 不是代码后面的那几行。
+		defer func() {
+			f.mu.Lock()
+			if f.wait == ch {
+				f.wait = nil
+			}
+			f.mu.Unlock()
+		}()
+
+		answer, err := f.read(ctx)
+
+		f.mu.Lock()
+		f.wait = nil
+		if err != nil && ctx.Err() != nil {
+			// 读被掐断了：那是调用方的事，不是库的事。这个错不记（记
+			// 下来就是这一秒里每一个请求的答案），这一趟也不算一次读
+			// （不盖戳：下一个请求自己读一遍）。
+			snap := f.snap
+			f.mu.Unlock()
+			if snap != nil {
+				return snap, nil
+			}
+			return nil, err
+		}
+		f.tried = time.Now()
+		if err == nil {
+			f.snap = answer
+			f.err = nil
+		} else {
+			// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
+			// 张表。
+			f.err = err
+		}
+		snap := f.snap
+		f.mu.Unlock()
+
+		if err != nil && snap == nil {
+			return nil, err
+		}
 		return snap, nil
 	}
-	ch := make(chan struct{})
-	f.wait = ch
-	f.mu.Unlock()
-
-	// 信号一定要发出去：等的人等的是它。
-	//
-	// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
-	// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
-	// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
-	defer close(ch)
-	// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
-	// 不是代码后面的那几行。
-	defer func() {
-		f.mu.Lock()
-		if f.wait == ch {
-			f.wait = nil
-		}
-		f.mu.Unlock()
-	}()
-
-	answer, err := f.read(ctx)
-
-	f.mu.Lock()
-	f.wait = nil
-	f.tried = time.Now()
-	if err == nil {
-		f.snap = answer
-		f.err = nil
-	} else {
-		// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
-		// 张表。
-		f.err = err
-	}
-	snap := f.snap
-	f.mu.Unlock()
-
-	if err != nil && snap == nil {
-		return nil, err
-	}
-	return snap, nil
 }
 
 // read asks the database the three things the adapter needs.
@@ -3601,6 +3939,25 @@ func poolReadBudget(cfg config.Usage) int {
 		return 1
 	}
 	return cfg.Refresh.Batch
+}
+
+// keeperOptions gives the options of the keeper the gateway builds.
+//
+// 它是配置变成 KeeperOptions 的唯一一处 —— New() 拿到的就是它。读额度
+// 的夹子（poolReadBudget）也在这一层：夹的是 keeper 拿到的那份预算，
+// 不是那个算预算的函数 —— 接线的那一行要是绕过了夹子，keeper 拿到的就
+// 是"不限"，而补号那一趟已经在打上游了。
+func keeperOptions(cfg config.Config) pool.KeeperOptions {
+	return pool.KeeperOptions{
+		Read:        cfg.Pool.ReadOnAdmit,
+		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
+		ReadBudget:  poolReadBudget(cfg.Usage),
+		ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
+		// 一趟补号自己的时限：跟读额度那一趟用同一把尺子
+		// （usage.refresh.budget）。没有它，一趟能跑 90 秒，而补号
+		// 那一趟每 30 秒就该来一次。
+		PassTimeout: cfg.Usage.Refresh.Budget.Duration(),
+	}
 }
 
 // poolSource gives the pool the accounts it could take.
@@ -4526,7 +4883,7 @@ git commit -F .git/commit_msg.txt
 
 ## 怎么验
 
-计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 72 个测试。
+计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 78 个测试。
 
 做完之后按这个顺序验：
 ```sh
