@@ -584,7 +584,12 @@ func TestTheCursorBreaksTheTie(t *testing.T) {
 	}
 }
 
-func TestPrefersTheAccountWithCredits(t *testing.T) {
+// TestTheCreditsBreakTheTieBetweenAccountsThatWereUsedTheSame says that
+// when two accounts were used the same, the one with more credits wins.
+//
+// 余额现在是最后一条排队的规矩，不是第一条：先比最久没用过的，用得一样
+// 久的时候再看谁剩得多（规格 §6.5）。
+func TestTheCreditsBreakTheTieBetweenAccountsThatWereUsedTheSame(t *testing.T) {
 	p := newFakePool(acc("acc_01"), acc("acc_02"))
 	p.remaining = map[string]float64{"acc_01": 10, "acc_02": 500}
 	r := New(p, Options{MaxAttempts: 3})

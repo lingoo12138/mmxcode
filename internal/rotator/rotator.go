@@ -294,9 +294,9 @@ func (r *Rotator) WindowKey(model string) string {
 //   - a conversation bound to a busy account is answered by another
 //     account, and the binding is left alone as well: a busy account is
 //     not one that cannot answer;
-//   - a conversation with no binding takes the account with the most
-//     credits left, and the least recently used one when those are
-//     equal, and is bound to it;
+//   - a conversation with no binding takes the least recently used
+//     account, and the one with the most credits left when two were
+//     used the same, and is bound to it;
 //   - a request with no conversation at all rotates: the next account
 //     in turn, so the load is spread.
 //
@@ -553,8 +553,8 @@ func accountByID(accounts []store.Account, id string) (store.Account, bool) {
 	return store.Account{}, false
 }
 
-// bestAccount gives the account with the most credits left, and the
-// least recently used one when two have the same.
+// bestAccount gives the account that was used least recently, and the
+// one with the most credits left when two were used the same.
 //
 // An account whose credits have not been read is taken after the ones
 // whose credits are known: a known balance is the better guide, and
