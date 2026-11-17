@@ -61,6 +61,13 @@ func (b *busyAccounts) isBusy(accountID string) bool {
 	return b.at[accountID] >= b.per
 }
 
+// count says how many accounts have a request in the air.
+func (b *busyAccounts) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.at)
+}
+
 // waitForFree waits until an account can answer, or the deadline is over.
 //
 // 等的是一个能答的账号，不是整个网关空下来：别的账号在飞的时候，这个
@@ -77,6 +84,23 @@ func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model stri
 		// 抢走了，一醒就轮着看会转不停。
 		if !sleepCtx(ctx, 25*time.Millisecond) {
 			return false
+		}
+		// 先问一句便宜的：在飞的和试过的加起来，比池里能答的号少，那就
+		// 一定有空位；反过来就是一定没有。中间那一段才去问 rotator ——
+		// 那一次要把池里的名单拷一份（池 400 个号就是 400 行 × 每次
+		// 等待，一秒 40 次）。
+		if s.Pool != nil && s.busy != nil && s.Pool.Len() > 0 {
+			free := s.Pool.Usable() - s.busy.count() - len(used)
+			if free > 0 {
+				return true
+			}
+			if free < 0 {
+				// 一定没有空位：等着就是了。
+				if !time.Now().Before(deadline) {
+					return false
+				}
+				continue
+			}
 		}
 		ok, err := s.Rot.AnyUsable(ctx, model, used)
 		if err == nil && ok {

@@ -322,3 +322,39 @@ func TestTheAccountsThatFailedToBeReadAreNotReadAgain(t *testing.T) {
 		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }
+
+// TestAnAccountThatReadsAsSpentIsLeftOutAndTheNextOneGoesIn says a
+// spent account is marked and left out, and the next candidate goes in.
+//
+// 补号不能停在一个用完的号上：那个号出池，让位给一个冷的（规格 §4.4）。
+func TestAnAccountThatReadsAsSpentIsLeftOutAndTheNextOneGoesIn(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+	}}
+	reader := &fakeReader{left: map[string]float64{"a": 0, "b": 400}}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
+
+	n, err := k.Replenish(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("replenished = %d, want 1", n)
+	}
+	if p.Len() != 1 {
+		t.Fatalf("pool = %d, want 1", p.Len())
+	}
+	entry, ok := p.Get("b")
+	if !ok {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+	if entry.Account.ID != "b" {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+	if len(marker.marks) != 1 || marker.marks[0].AccountID != "a" {
+		t.Fatalf("marks = %v, want just a", marker.marks)
+	}
+}

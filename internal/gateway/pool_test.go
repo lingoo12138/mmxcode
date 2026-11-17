@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"mmxcode/internal/config"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/store"
 )
@@ -132,5 +133,56 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 	}
 	if len(marks) != 1 || marks[0].AccountID != "acc_01" {
 		t.Fatalf("marks = %v, want just acc_01", marks)
+	}
+}
+
+// TestASignedOutAccountLeavesThePool says an account that cannot sign
+// in goes out of the pool.
+//
+// 池里留着一个签不上的号有两个坏处：它占着位置（承诺的并发按池夹），而
+// 且挑号会挑到它 —— 每挑一次就是一次 401 加一次续签。
+func TestASignedOutAccountLeavesThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 库里说它签出了。
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	if p.Len() != 0 {
+		t.Fatalf("pool = %d, want 0", p.Len())
+	}
+}
+
+// TestAnAccountThatIsStillActiveStaysInThePool says a failed sign-in
+// that the database does not call permanent does not empty the pool.
+//
+// 续签抖了一下不是签出：那个号还能答，把它踢出去只是白白少一个能答的
+// 号（承诺的并发按池夹）。
+func TestAnAccountThatIsStillActiveStaysInThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	if p.Len() != 1 {
+		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }

@@ -646,6 +646,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			tok, err := s.Mgr.Token(ctx, plan.AccountID)
 			if err != nil {
 				lastErr = err
+				// 这个号签不上了：它出池，让位给一个冷的。
+				s.dropDeadAccount(ctx, plan.AccountID)
 				return false
 			}
 			client, _, err := s.Mgr.Client(ctx, plan.AccountID)

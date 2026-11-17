@@ -155,6 +155,9 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 读失败的号这一趟不再读：它刚才读不到，再读一次也是读不到，而
 	// 预算是有限的（规格 §6.4）。
 	failed := map[string]bool{}
+	// 这一趟挑过了几个：候选里被刷掉的那些。下一趟问候选的时候要多问
+	// 这么多个 —— 不然问回来的还是那几个刷掉的。
+	passed := 0
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
@@ -162,7 +165,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 		inPool := k.pool.IDs()
-		candidates, err := k.source.Candidates(ctx, want+len(inPool), inPool)
+		candidates, err := k.source.Candidates(ctx, want+len(inPool)+passed, inPool)
 		if err != nil {
 			lastErr = err
 			break
@@ -171,6 +174,8 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 		progressed := false
+		// 这一轮里新刷掉的候选：全是老面孔就是没有新消息，别再问了。
+		fresh := 0
 		for _, c := range candidates {
 			if k.pool.Len() >= want {
 				break
@@ -189,7 +194,10 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				}) {
 					added++
 					progressed = true
+					continue
 				}
+				passed++
+				fresh++
 				continue
 			}
 			if k.opts.ReadBudget > 0 && reads >= k.opts.ReadBudget {
@@ -204,11 +212,18 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				// 读不到：不知道有没有额度，就别进池（进池了挑号也挑不
 				// 到它 —— 没读到数的号排在最后）。这一趟就当它不合格。
 				failed[c.Account.ID] = true
+				passed++
+				fresh++
 				continue
 			}
 			if snap.HasAmounts && snap.Remaining <= 0 {
-				// 读到了：它没有额度。标记掉，别让它占着位置。
+				// 读到了：它没有额度。标记掉，别让它占着位置。这一趟
+				// 也不再读它 —— 读到了就是没有，再读一遍还是没有，而
+				// 预算是有限的。
 				k.markSpent(ctx, c.Account.ID, snap)
+				failed[c.Account.ID] = true
+				passed++
+				fresh++
 				continue
 			}
 			if k.pool.Admit(Entry{
@@ -218,9 +233,14 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			}) {
 				added++
 				progressed = true
+				continue
 			}
+			passed++
+			fresh++
 		}
-		if !progressed {
+		if !progressed && fresh == 0 {
+			// 这一轮什么也没进池，问回来的还是那几个刷掉的：没有新消
+			// 息，别再问了。下一趟重新问。
 			break
 		}
 	}

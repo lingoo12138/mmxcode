@@ -1970,6 +1970,42 @@ func TestTheAccountsThatFailedToBeReadAreNotReadAgain(t *testing.T) {
 		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }
+
+// TestAnAccountThatReadsAsSpentIsLeftOutAndTheNextOneGoesIn says a
+// spent account is marked and left out, and the next candidate goes in.
+//
+// 补号不能停在一个用完的号上：那个号出池，让位给一个冷的（规格 §4.4）。
+func TestAnAccountThatReadsAsSpentIsLeftOutAndTheNextOneGoesIn(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+	}}
+	reader := &fakeReader{left: map[string]float64{"a": 0, "b": 400}}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
+
+	n, err := k.Replenish(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("replenished = %d, want 1", n)
+	}
+	if p.Len() != 1 {
+		t.Fatalf("pool = %d, want 1", p.Len())
+	}
+	entry, ok := p.Get("b")
+	if !ok {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+	if entry.Account.ID != "b" {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+	if len(marker.marks) != 1 || marker.marks[0].AccountID != "a" {
+		t.Fatalf("marks = %v, want just a", marker.marks)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -2143,6 +2179,9 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 读失败的号这一趟不再读：它刚才读不到，再读一次也是读不到，而
 	// 预算是有限的（规格 §6.4）。
 	failed := map[string]bool{}
+	// 这一趟挑过了几个：候选里被刷掉的那些。下一趟问候选的时候要多问
+	// 这么多个 —— 不然问回来的还是那几个刷掉的。
+	passed := 0
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
@@ -2150,7 +2189,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 		inPool := k.pool.IDs()
-		candidates, err := k.source.Candidates(ctx, want+len(inPool), inPool)
+		candidates, err := k.source.Candidates(ctx, want+len(inPool)+passed, inPool)
 		if err != nil {
 			lastErr = err
 			break
@@ -2159,6 +2198,8 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 		progressed := false
+		// 这一轮里新刷掉的候选：全是老面孔就是没有新消息，别再问了。
+		fresh := 0
 		for _, c := range candidates {
 			if k.pool.Len() >= want {
 				break
@@ -2177,7 +2218,10 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				}) {
 					added++
 					progressed = true
+					continue
 				}
+				passed++
+				fresh++
 				continue
 			}
 			if k.opts.ReadBudget > 0 && reads >= k.opts.ReadBudget {
@@ -2192,11 +2236,18 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				// 读不到：不知道有没有额度，就别进池（进池了挑号也挑不
 				// 到它 —— 没读到数的号排在最后）。这一趟就当它不合格。
 				failed[c.Account.ID] = true
+				passed++
+				fresh++
 				continue
 			}
 			if snap.HasAmounts && snap.Remaining <= 0 {
-				// 读到了：它没有额度。标记掉，别让它占着位置。
+				// 读到了：它没有额度。标记掉，别让它占着位置。这一趟
+				// 也不再读它 —— 读到了就是没有，再读一遍还是没有，而
+				// 预算是有限的。
 				k.markSpent(ctx, c.Account.ID, snap)
+				failed[c.Account.ID] = true
+				passed++
+				fresh++
 				continue
 			}
 			if k.pool.Admit(Entry{
@@ -2206,9 +2257,14 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			}) {
 				added++
 				progressed = true
+				continue
 			}
+			passed++
+			fresh++
 		}
-		if !progressed {
+		if !progressed && fresh == 0 {
+			// 这一轮什么也没进池，问回来的还是那几个刷掉的：没有新消
+			// 息，别再问了。下一趟重新问。
 			break
 		}
 	}
@@ -2300,6 +2356,7 @@ import (
 	"testing"
 	"time"
 
+	"mmxcode/internal/config"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/store"
 )
@@ -2427,6 +2484,57 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 	}
 	if len(marks) != 1 || marks[0].AccountID != "acc_01" {
 		t.Fatalf("marks = %v, want just acc_01", marks)
+	}
+}
+
+// TestASignedOutAccountLeavesThePool says an account that cannot sign
+// in goes out of the pool.
+//
+// 池里留着一个签不上的号有两个坏处：它占着位置（承诺的并发按池夹），而
+// 且挑号会挑到它 —— 每挑一次就是一次 401 加一次续签。
+func TestASignedOutAccountLeavesThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 库里说它签出了。
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	if p.Len() != 0 {
+		t.Fatalf("pool = %d, want 0", p.Len())
+	}
+}
+
+// TestAnAccountThatIsStillActiveStaysInThePool says a failed sign-in
+// that the database does not call permanent does not empty the pool.
+//
+// 续签抖了一下不是签出：那个号还能答，把它踢出去只是白白少一个能答的
+// 号（承诺的并发按池夹）。
+func TestAnAccountThatIsStillActiveStaysInThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	if p.Len() != 1 {
+		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }
 ```
@@ -3269,6 +3377,28 @@ func (s *Server) poolLoop() {
 			s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
 		}
 	}
+}
+
+// dropDeadAccount takes an account that cannot sign in out of the pool.
+//
+// 池里留着一个签不上的号有两个坏处：它占着位置（承诺的并发按池夹，池里
+// 少一个能答的号就少承诺一个），而且挑号会挑到它 —— 每挑一次就是一次
+// 401 加一次续签。
+//
+// 库里的状态说了算：还是 active 的就是暂时的（续签抖了一下），那就不动
+// 它 —— 签不上的号总归会再来一次，那一次再看。
+func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
+	if s.Pool == nil || s.Store == nil {
+		return
+	}
+	acc, err := s.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return
+	}
+	if acc.Status != store.StatusSignedOut {
+		return
+	}
+	s.Pool.Remove(accountID)
 }
 ```
 

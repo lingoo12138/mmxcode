@@ -137,3 +137,25 @@ func (s *Server) poolLoop() {
 		}
 	}
 }
+
+// dropDeadAccount takes an account that cannot sign in out of the pool.
+//
+// 池里留着一个签不上的号有两个坏处：它占着位置（承诺的并发按池夹，池里
+// 少一个能答的号就少承诺一个），而且挑号会挑到它 —— 每挑一次就是一次
+// 401 加一次续签。
+//
+// 库里的状态说了算：还是 active 的就是暂时的（续签抖了一下），那就不动
+// 它 —— 签不上的号总归会再来一次，那一次再看。
+func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
+	if s.Pool == nil || s.Store == nil {
+		return
+	}
+	acc, err := s.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return
+	}
+	if acc.Status != store.StatusSignedOut {
+		return
+	}
+	s.Pool.Remove(accountID)
+}
