@@ -45,7 +45,7 @@
 
 外加**并发天花板**（`concurrency.total_max`，规格 §6.9）：池空的时候承诺是从库里数出来的，库里 1000 个号就承诺 200 —— 那一下能从池子撑的数抬到库里的数。天花板把它按住。0 = 不限，跟从前一样。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `internal/config/config_test.go` 末尾加：
 ```go
@@ -175,14 +175,14 @@ func TestTheTotalMaxIsReadFromTheFile(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/config/ -run "TestThePool|TestTheTotalMax"
 ```
 
 Expected: FAIL —— `c.Pool undefined`（还没有这个配置），`c.Concurrency.TotalMax undefined`（还没有天花板）。
 
-- [ ] **Step 3: 写配置**
+- [x] **Step 3: 写配置**
 
 `internal/config/config.go`，加一个结构体：
 ```go
@@ -269,14 +269,14 @@ type Pool struct {
 		},
 ```
 
-- [ ] **Step 4: 跑测试，看它过**
+- [x] **Step 4: 跑测试，看它过**
 ```sh
 go test ./internal/config/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(config): 池的配置 —— 倍数、上限、内存预算
@@ -303,7 +303,7 @@ git commit -F .git/commit_msg.txt
 
 这个任务还带上**会话活跃**那件事（规格 §6.8）：`TouchSessions` 把用过的会话写回去，「活跃会话数」才是个真的数。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 新建 `internal/store/pool_test.go`：
 ```go
@@ -712,14 +712,14 @@ func TestTouchingNoSessionIsNothing(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/store/
 ```
 
 Expected: FAIL —— `s.PoolCandidates undefined`。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 新建 `internal/store/pool.go`：
 ```go
@@ -925,7 +925,7 @@ func (s *Store) TouchSessions(ctx context.Context, sessionKeys []string) error {
 }
 ```
 
-- [ ] **Step 4: `scanAccount` 收下多的那几列**
+- [x] **Step 4: `scanAccount` 收下多的那几列**
 
 候选账号的查询要多读两列（额度和读到的时刻），但账号自己的十列不用再抄一遍 —— `scanAccount` 收下多的目的地：
 
@@ -960,14 +960,14 @@ func scanAccount(sc scanner, extra ...any) (Account, error) {
 }
 ```
 
-- [ ] **Step 5: 跑测试，看它过**
+- [x] **Step 5: 跑测试，看它过**
 ```sh
 go test ./internal/store/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(store): 池的候选账号 —— 对话绑着的号在前，冷号随后
@@ -997,7 +997,7 @@ git commit -F .git/commit_msg.txt
 
 **号按进池的顺序排**（规格 §6.9）：轮转从队首走到队尾，冷号先被挑；一个号出池再进池，它排到队尾。map 的顺序是随机的 —— 随机的顺序让轮转不是轮转。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 新建 `internal/pool/pool_test.go`：
 ```go
@@ -1323,14 +1323,14 @@ func TestTheNamesAreCopies(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/pool/
 ```
 
 Expected: FAIL —— `package pool` 里没有 `Pool`（这个包还不存在）。
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 新建 `internal/pool/pool.go`：
 ```go
@@ -1606,14 +1606,14 @@ func (p *Pool) Accounts() []store.Account {
 }
 ```
 
-- [ ] **Step 4: 跑测试，看它过**
+- [x] **Step 4: 跑测试，看它过**
 ```sh
 go test ./internal/pool/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(pool): 内存里的账号池 —— 有上界，只放选号要用的两样
@@ -1642,7 +1642,7 @@ git commit -F .git/commit_msg.txt
 
 补号读的是上游的钱，所以**一趟读几个是有预算的**（`usage.refresh.batch`，默认 6）：一次读是 2~11 个上游请求，一趟读几百个号就是几千个请求 —— 那不是填池，是打上游（规格 §6.4）。预算用完了这一趟就收手，读不到的号这一趟不再读（预算是有限的，别花在同一个读不到的号上），剩下的号等下一趟。池子短一点，总并发就少承诺一点（不变量 4）—— 那比把上游打疼了强。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 新建 `internal/pool/keeper_test.go`：
 ```go
@@ -2008,7 +2008,7 @@ func TestAnAccountThatReadsAsSpentIsLeftOutAndTheNextOneGoesIn(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/pool/
 ```
@@ -2018,7 +2018,7 @@ Expected: FAIL —— `undefined: NewKeeper`。
 （整包跑，别用 `-run` 筛名字：keeper 的六个测试名里一个都没有 "Keeper"，
 筛了就一个都不跑，红的绿的都看不见。）
 
-- [ ] **Step 3: 写实现**
+- [x] **Step 3: 写实现**
 
 新建 `internal/pool/keeper.go`：
 ```go
@@ -2304,14 +2304,14 @@ func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.Usa
 }
 ```
 
-- [ ] **Step 4: 跑测试，看它过**
+- [x] **Step 4: 跑测试，看它过**
 ```sh
 go test ./internal/pool/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(pool): keeper —— 启动填池不等读，缺号了补进去并读一次额度
@@ -2345,7 +2345,7 @@ git commit -F .git/commit_msg.txt
 
 这一任务还带上**会话活跃**那件事（规格 §6.8）：网关把用过的会话写回库，「活跃会话数」才是个真的数；填池时最近活跃的对话绑着的号排在最前，池子才留得住它们。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 新建 `internal/gateway/pool_test.go`：
 ```go
@@ -2877,7 +2877,7 @@ func TestWithoutAWindowNoConversationHoldsAPlace(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/gateway/ -run "Pool|WholeTable|Used|Conversation"
 ```
@@ -2886,7 +2886,7 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 
 （过滤器里有 `Pool`：`TestTheEmptyPoolReadsTheDatabaseOnce`、`TestTheFilledPoolDoesNotReadTheDatabase` 这几个都带 Pool，别改窄了 —— 筛掉了就一个都不跑，红的绿的都看不见。）
 
-- [ ] **Step 3: 网关里挂上池**
+- [x] **Step 3: 网关里挂上池**
 
 `internal/gateway/gateway.go`，import 里加：
 ```go
@@ -3045,7 +3045,7 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 
 （`fromPool()` 那道门是必要的：池空的时候 `p.pool != nil` 也成立，从空的池里读出来的余额是空的 —— 余额只当门槛，门槛没了，挑号就瞎挑。）
 
-- [ ] **Step 4: 池空的时候，库里的答案留一秒 —— `internal/gateway/fallback.go`**
+- [x] **Step 4: 池空的时候，库里的答案留一秒 —— `internal/gateway/fallback.go`**
 
 新建 `internal/gateway/fallback.go`：
 ```go
@@ -3225,7 +3225,7 @@ func (f *dbFallback) remaining(ctx context.Context, ids []string) map[string]rot
 }
 ```
 
-- [ ] **Step 6: 请求真的用了会话，就记下来**
+- [x] **Step 6: 请求真的用了会话，就记下来**
 
 `internal/gateway/gateway.go`，挑到账号之后（`used[plan.AccountID] = true` 之后）加：
 ```go
@@ -3235,7 +3235,7 @@ func (f *dbFallback) remaining(ctx context.Context, ids []string) map[string]rot
 		s.touches.add(sess.Key)
 ```
 
-- [ ] **Step 7: 写池的驱动 —— `internal/gateway/pool.go`**
+- [x] **Step 7: 写池的驱动 —— `internal/gateway/pool.go`**
 
 新建 `internal/gateway/pool.go`：
 ```go
@@ -3402,7 +3402,7 @@ func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
 }
 ```
 
-- [ ] **Step 8: 写会话活跃的账 —— `internal/gateway/touch.go`**
+- [x] **Step 8: 写会话活跃的账 —— `internal/gateway/touch.go`**
 
 新建 `internal/gateway/touch.go`：
 ```go
@@ -3511,14 +3511,14 @@ func (s *Server) touchLoop() {
 }
 ```
 
-- [ ] **Step 9: 跑测试，看它过**
+- [x] **Step 9: 跑测试，看它过**
 ```sh
 go test ./internal/gateway/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 10: 提交**
+- [x] **Step 10: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(gateway): 选号走池，用过的会话写回库
@@ -3556,7 +3556,7 @@ git commit -F .git/commit_msg.txt
 
 **耗尽了出池**：额度用完的号写完标记就出池，补一个冷的进来。补号是后台的活，不挡客户端。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 新建 `internal/gateway/concurrency_test.go`：
 
@@ -3695,7 +3695,7 @@ func TestTheCeilingMakesThePoolSmaller(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/gateway/ -run "Concurrency|Ceiling|Spent"
 ```
@@ -3712,7 +3712,7 @@ Expected: FAIL —— `TestTheConcurrencyIsNotMoreThanThePool` 挂：库里 100 
 `TestWithoutACeilingThePromiseIsTheOldOne` 的名字里没有 Concurrency，筛窄了
 它们就一个都不跑。）
 
-- [ ] **Step 3: 总并发按池夹，天花板进 `totalFor`**
+- [x] **Step 3: 总并发按池夹，天花板进 `totalFor`**
 
 `internal/gateway/busy.go`，`totalFor` 末尾（`if total < 1 { total = 1 }` 之后、`return total` 之前）插入：
 ```go
@@ -3770,7 +3770,7 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 - `internal/gateway/busy.go` 里的 `spentNow` 函数 —— 耗尽判断搬进池了，它没有调用者了。
 - `internal/gateway/busy.go` 的 import 里的 `"mmxcode/internal/store"` —— 删掉 `spentNow` 之后它就没有用处了。
 
-- [ ] **Step 4: 耗尽了出池，后台补号**
+- [x] **Step 4: 耗尽了出池，后台补号**
 
 `internal/gateway/spent.go`，`markSpent` 里（`s.startBackground(func() { s.correctMark(accountID, groupKey) })` 之后）加：
 ```go
@@ -3779,7 +3779,7 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 	s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
 ```
 
-- [ ] **Step 5: 启动时填池**
+- [x] **Step 5: 启动时填池**
 
 `cmd/mmxcode/serve.go`，`gw := gateway.New(...)` 之后加：
 ```go
@@ -3788,14 +3788,14 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 			gw.SeedPool(ctx)
 ```
 
-- [ ] **Step 6: 跑测试，看它过**
+- [x] **Step 6: 跑测试，看它过**
 ```sh
 go test ./internal/gateway/ ./cmd/mmxcode/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(gateway): 承诺的并发按池夹，额度用完了出池补号
@@ -3827,7 +3827,7 @@ git commit -F .git/commit_msg.txt
 
 **会话黏性不受影响**：绑着的号能答就是它答（`Pick` 里那条 `default`），`better()` 只在「没有绑定」或者「绑着的号答不了」的时候才被问到。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `internal/rotator/rotator_test.go` 末尾加：
 
@@ -3903,7 +3903,7 @@ func TestTheSameAccountsAlwaysGiveTheSameOne(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
+- [x] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/rotator/ -run "LeastUsed|EmptyComesLast|SameAccounts"
 ```
@@ -3913,7 +3913,7 @@ Expected: FAIL —— `TestTheLeastUsedAccountComesFirst` 挂：第二个还是�
 `TestTheSameAccountsAlwaysGiveTheSameOne` 也挂：挑的是 `acc_02`（它排在
 前面），不是按 ID 排出来的 `acc_01`。
 
-- [ ] **Step 3: 改挑选的规矩**
+- [x] **Step 3: 改挑选的规矩**
 
 `internal/rotator/rotator.go`，`better()` 改成：
 ```go
@@ -3953,14 +3953,14 @@ func better(a, b scored) bool {
 }
 ```
 
-- [ ] **Step 4: 跑测试，看它过**
+- [x] **Step 4: 跑测试，看它过**
 ```sh
 go test ./internal/rotator/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(rotator): 挑号改成最久没用过的优先，余额只当门槛
@@ -3989,7 +3989,7 @@ git commit -F .git/commit_msg.txt
 - Modify: `config.docker.yaml`
 - Modify: `README.md`
 
-- [ ] **Step 1: `config.example.yaml` 和 `config.docker.yaml` 加 `pool:` 段**
+- [x] **Step 1: `config.example.yaml` 和 `config.docker.yaml` 加 `pool:` 段**
 
 两个文件都把每一个段都列了出来（`config.docker.yaml` 尤其如此 —— 容器里没有示例文件，段名写错就是「unknown key」），所以两个都要加。加在 `concurrency:` 段后面、`db:` 前面：
 ```yaml
@@ -4011,7 +4011,7 @@ pool:
   read_on_admit: true
 ```
 
-- [ ] **Step 1b: `config.example.yaml` 和 `config.docker.yaml` 的 `concurrency:` 段加 `total_max`**
+- [x] **Step 1b: `config.example.yaml` 和 `config.docker.yaml` 的 `concurrency:` 段加 `total_max`**
 
 两个文件的 `concurrency:` 段都一样，加在 `total_min` 后面、`wait` 前面：
 ```yaml
@@ -4025,7 +4025,7 @@ pool:
   total_max: 0
 ```
 
-- [ ] **Step 2: `README.md` 的配置表加六行**
+- [x] **Step 2: `README.md` 的配置表加六行**
 
 `README.md` 的 `## 配置` 那一节的表格末尾加：
 ```markdown
@@ -4037,7 +4037,7 @@ pool:
 | `pool.read_on_admit` | `true` | 补号时先读一次额度再进池。读到用完了就不进池 |
 ```
 
-- [ ] **Step 3: `README.md` 写一节「账号池」**
+- [x] **Step 3: `README.md` 写一节「账号池」**
 
 加在 `### 代理模型` 前面（`## 配置` 这一节里面，`### 读额度` 的末尾）：
 ```markdown
@@ -4064,7 +4064,7 @@ pool:
 把耗尽标记写准，系统自己会好。
 ```
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 docs: 账号池怎么配 —— 倍数、内存预算、会话窗口
