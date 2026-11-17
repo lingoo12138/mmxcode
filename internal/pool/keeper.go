@@ -29,6 +29,26 @@ type Marker interface {
 	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
 }
 
+// KeeperOptions is how the keeper behaves.
+type KeeperOptions struct {
+	// Read says a newly admitted account's credits are read before it
+	// goes in.
+	Read bool
+	// Cooldown is how long an account that reads as spent is given up
+	// on when the reading says no moment.
+	Cooldown time.Duration
+	// ReadBudget is how many accounts one pass may read the credits of.
+	//
+	// 0 = 不限 —— 别这么配：补号读的是上游的钱，一次读是 2~11 个上游请求
+	//（规格 §6.4），一趟读几百个号就是几千个请求，那不是填池，是打上游。
+	// 预算就是 usage.refresh.batch：那一趟该读几个，就读几个。
+	ReadBudget int
+	// ReadTimeout is how long one reading may take.
+	//
+	// 卡住的账号不拖住整趟：读不到就当它不合格（规格 §5）。
+	ReadTimeout time.Duration
+}
+
 // Keeper keeps the pool full.
 //
 // 两个动作：
@@ -42,12 +62,8 @@ type Keeper struct {
 	source Source
 	reader Reader
 	marker Marker
-	// read says whether a newly admitted account's credits are read
-	// before it goes in.
-	read bool
-	// cooldown is how long an account that reads as spent is given up
-	// on when the reading says no moment.
-	cooldown time.Duration
+	// opts is how the keeper behaves.
+	opts KeeperOptions
 	// mu guards running.
 	mu sync.Mutex
 	// running says a replenishment is in the air.
@@ -58,17 +74,16 @@ type Keeper struct {
 }
 
 // NewKeeper makes a keeper.
-func NewKeeper(p *Pool, source Source, reader Reader, marker Marker, read bool, cooldown time.Duration) *Keeper {
-	if cooldown <= 0 {
-		cooldown = 5 * time.Minute
+func NewKeeper(p *Pool, source Source, reader Reader, marker Marker, opts KeeperOptions) *Keeper {
+	if opts.Cooldown <= 0 {
+		opts.Cooldown = 5 * time.Minute
 	}
 	return &Keeper{
-		pool:     p,
-		source:   source,
-		reader:   reader,
-		marker:   marker,
-		read:     read,
-		cooldown: cooldown,
+		pool:   p,
+		source: source,
+		reader: reader,
+		marker: marker,
+		opts:   opts,
 	}
 }
 
@@ -135,6 +150,11 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 
 	added := 0
 	var lastErr error
+	// 这一趟读了几次：预算是这一趟的，不是整天的。
+	reads := 0
+	// 读失败的号这一趟不再读：它刚才读不到，再读一次也是读不到，而
+	// 预算是有限的（规格 §6.4）。
+	failed := map[string]bool{}
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
@@ -158,7 +178,10 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			if inPool[c.Account.ID] {
 				continue
 			}
-			if !k.read {
+			if failed[c.Account.ID] {
+				continue
+			}
+			if !k.opts.Read {
 				if k.pool.Admit(Entry{
 					Account:   c.Account,
 					Remaining: c.Remaining,
@@ -169,10 +192,18 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				}
 				continue
 			}
-			snap, err := k.reader.RefreshUsage(ctx, c.Account.ID)
+			if k.opts.ReadBudget > 0 && reads >= k.opts.ReadBudget {
+				// 这一趟的预算用完了：剩下的号这一趟不进池 —— 读不到就
+				// 不进（规格 §5），下一趟再说。池子短一点，总并发就
+				// 少承诺一点（不变量 4），那比打上游打疼了强。
+				break
+			}
+			reads++
+			snap, err := k.readOne(ctx, c.Account.ID)
 			if err != nil {
 				// 读不到：不知道有没有额度，就别进池（进池了挑号也挑不
 				// 到它 —— 没读到数的号排在最后）。这一趟就当它不合格。
+				failed[c.Account.ID] = true
 				continue
 			}
 			if snap.HasAmounts && snap.Remaining <= 0 {
@@ -196,6 +227,18 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	return added, lastErr
 }
 
+// readOne reads one account's credits, with the timeout the keeper has.
+//
+// 卡住的账号不拖住整趟：读它花掉的时间有一个上限（规格 §5）。
+func (k *Keeper) readOne(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	if k.opts.ReadTimeout <= 0 {
+		return k.reader.RefreshUsage(ctx, accountID)
+	}
+	rctx, cancel := context.WithTimeout(ctx, k.opts.ReadTimeout)
+	defer cancel()
+	return k.reader.RefreshUsage(rctx, accountID)
+}
+
 // markSpent writes the mark of an account that reads as spent.
 //
 // 窗口键是空的：那是账号级的标记，对所有窗口组都算 —— 读到的积分是零，
@@ -208,7 +251,7 @@ func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.Usa
 		until = snap.ExpiresAt
 	}
 	if until.IsZero() {
-		until = time.Now().Add(k.cooldown)
+		until = time.Now().Add(k.opts.Cooldown)
 	}
 	if k.marker == nil {
 		return

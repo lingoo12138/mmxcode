@@ -48,6 +48,8 @@ type fakeReader struct {
 	left map[string]float64
 	// err is what it answers with, when it is set.
 	err error
+	// fail are the accounts whose reading always fails.
+	fail map[string]bool
 	// asked counts the accounts it was asked about.
 	asked int
 }
@@ -58,6 +60,9 @@ func (f *fakeReader) RefreshUsage(_ context.Context, accountID string) (store.Us
 	f.asked++
 	if f.err != nil {
 		return store.UsageSnapshot{}, f.err
+	}
+	if f.fail[accountID] {
+		return store.UsageSnapshot{}, errors.New("the site did not answer")
 	}
 	left, ok := f.left[accountID]
 	if !ok {
@@ -100,7 +105,7 @@ func TestTheSeedFillsThePoolWithoutAskingTheSite(t *testing.T) {
 	}}
 	reader := &fakeReader{left: map[string]float64{"a": 400, "b": 400}}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	n, err := k.Seed(context.Background(), 2)
 	if err != nil {
@@ -127,7 +132,7 @@ func TestTheReplenishReadsTheCreditsOfANewAccount(t *testing.T) {
 	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
 	reader := &fakeReader{left: map[string]float64{"a": 250}}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	n, err := k.Replenish(context.Background(), 1)
 	if err != nil {
@@ -157,7 +162,7 @@ func TestAnAccountThatReadsAsSpentIsMarkedAndLeftOut(t *testing.T) {
 	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
 	reader := &fakeReader{left: map[string]float64{"a": 0}}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	n, err := k.Replenish(context.Background(), 1)
 	if err != nil {
@@ -183,7 +188,7 @@ func TestAnAccountThatCannotBeReadDoesNotGoIntoThePool(t *testing.T) {
 	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
 	reader := &fakeReader{err: errors.New("the site is not answering")}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	n, err := k.Replenish(context.Background(), 1)
 	if err != nil {
@@ -209,7 +214,7 @@ func TestTheReplenishDoesNotRunTwiceAtOnce(t *testing.T) {
 	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
 	reader := &fakeReader{left: map[string]float64{"a": 400}}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	// The first one holds the keeper busy while the second one comes.
 	k.mu.Lock()
@@ -234,7 +239,7 @@ func TestTheReplenishStopsWhenThereIsNothingToTake(t *testing.T) {
 	src := &fakeSource{}
 	reader := &fakeReader{left: map[string]float64{}}
 	marker := &fakeMarker{}
-	k := NewKeeper(p, src, reader, marker, true, time.Minute)
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{Read: true, Cooldown: time.Minute})
 
 	n, err := k.Replenish(context.Background(), 5)
 	if err != nil {
@@ -245,5 +250,75 @@ func TestTheReplenishStopsWhenThereIsNothingToTake(t *testing.T) {
 	}
 	if p.Len() != 0 {
 		t.Fatalf("pool = %d, want 0", p.Len())
+	}
+}
+
+// TestTheReplenishReadsNoMoreThanTheBudget says one pass reads no more
+// accounts than the budget allows.
+//
+// 补号读的是上游的钱：一次读是 2~11 个上游请求（规格 §6.4），一趟读几百
+// 个号就是几千个请求 —— 那不是填池，是打上游。预算是那一趟的
+// （usage.refresh.batch）：用完了这一趟就收手，剩下的号等下一趟。
+func TestTheReplenishReadsNoMoreThanTheBudget(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+		{Account: anAccount("c")},
+		{Account: anAccount("d")},
+	}}
+	reader := &fakeReader{left: map[string]float64{"a": 400, "b": 400, "c": 400, "d": 400}}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 2,
+	})
+
+	n, err := k.Replenish(context.Background(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.asked != 2 {
+		t.Fatalf("the site was asked %d times, want 2", reader.asked)
+	}
+	if n != 2 {
+		t.Fatalf("added = %d, want 2", n)
+	}
+	if p.Len() != 2 {
+		t.Fatalf("pool = %d, want 2", p.Len())
+	}
+}
+
+// TestTheAccountsThatFailedToBeReadAreNotReadAgain says an account whose
+// reading failed is not read again in the same pass.
+//
+// 它刚才读不到，再读一次也是读不到，而预算是有限的：把预算花在同一个读
+// 不到的号上，后面的号就没得读了。
+func TestTheAccountsThatFailedToBeReadAreNotReadAgain(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+	}}
+	reader := &fakeReader{
+		left: map[string]float64{"b": 400},
+		fail: map[string]bool{"a": true},
+	}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10,
+	})
+
+	n, err := k.Replenish(context.Background(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.asked != 2 {
+		t.Fatalf("the site was asked %d times, want 2", reader.asked)
+	}
+	if n != 1 {
+		t.Fatalf("added = %d, want 1", n)
+	}
+	if p.Len() != 1 {
+		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }

@@ -183,7 +183,12 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	g.Pool = pool.New(0)
 	g.touches = newSessionTouches()
 	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()}, mgr, s,
-		cfg.Pool.ReadOnAdmit, cfg.Rotation.ExhaustedCooldown.Duration())
+		pool.KeeperOptions{
+			Read:        cfg.Pool.ReadOnAdmit,
+			Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
+			ReadBudget:  cfg.Usage.Refresh.Batch,
+			ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
+		})
 	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy, pool: g.Pool, fallback: g.fallback}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
