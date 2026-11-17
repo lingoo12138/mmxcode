@@ -294,8 +294,6 @@ type Concurrency struct {
 // 池多大 = max(总并发, 活跃会话数) × 倍数。倍数是 2：总并发是「该跑多
 // 少个请求」，活跃会话是「有多少段对话在用」，池要装得下它们（会话钉
 // 的号不在池里会被改绑，缓存命中就没了），再留一倍给补号。
-//
-// 零值是每个键自己的规矩，写在各自的字段下面。
 type Pool struct {
 	// Factor is how many times over the demand the pool holds.
 	//

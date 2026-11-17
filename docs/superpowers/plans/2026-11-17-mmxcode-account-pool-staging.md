@@ -73,11 +73,10 @@ func TestThePoolDefaults(t *testing.T) {
 //
 // 这些键名是给用户看的。写错了加载器会当错字拒掉（KnownFields），用户
 // 只看到一句「unknown key」，不知道自己写错了还是网关认错了。
-//
-// 没写的键走默认值：文件只需要写自己要改的。
 func TestThePoolIsReadFromTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	body := "pool:\n  factor: 3\n  max_size: 7\n"
+	body := "pool:\n  factor: 3\n  max_size: 7\n  memory_budget_mb: 64\n" +
+		"  session_window: 30m\n  read_on_admit: false\n"
 	if err := writeFile(path, body); err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +90,58 @@ func TestThePoolIsReadFromTheFile(t *testing.T) {
 	if c.Pool.MaxSize != 7 {
 		t.Errorf("max_size = %d, want 7", c.Pool.MaxSize)
 	}
+	if c.Pool.MemoryBudgetMB != 64 {
+		t.Errorf("memory_budget_mb = %d, want 64", c.Pool.MemoryBudgetMB)
+	}
+	if c.Pool.SessionWindow.Duration() != 30*time.Minute {
+		t.Errorf("session_window = %s, want 30m", c.Pool.SessionWindow)
+	}
+	if c.Pool.ReadOnAdmit {
+		t.Error("read_on_admit = true, want false")
+	}
+}
+
+// TestThePoolKeepsTheDefaultsOfTheKeysThatAreNotWritten says a file
+// only has to write the keys it changes.
+//
+// 整段 pool 不写也是默认值：一个什么都不说的配置文件，网关也得能起来。
+func TestThePoolKeepsTheDefaultsOfTheKeysThatAreNotWritten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "pool:\n  factor: 3\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.Factor != 3 {
+		t.Errorf("factor = %d, want 3", c.Pool.Factor)
+	}
 	if c.Pool.SessionWindow.Duration() != time.Hour {
 		t.Errorf("session_window = %s, want 1h", c.Pool.SessionWindow)
+	}
+	if c.Pool.MemoryBudgetMB != 32 {
+		t.Errorf("memory_budget_mb = %d, want 32", c.Pool.MemoryBudgetMB)
+	}
+	if !c.Pool.ReadOnAdmit {
+		t.Error("read_on_admit = false, want true")
+	}
+}
+
+// TestThePoolRefusesAZeroSessionWindow says the session window does
+// not take a zero.
+//
+// 没有窗口的「活跃」数不清楚：数出来的数是几，取决于拿什么时候比。别的
+// 键写 0 也是错（TestTheOtherDurationsStillRefuseZero）。
+func TestThePoolRefusesAZeroSessionWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "pool:\n  session_window: 0\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("the zero session window was taken")
 	}
 }
 ```
@@ -116,8 +165,6 @@ Expected: FAIL —— `c.Pool undefined`（还没有这个配置）。
 // 池多大 = max(总并发, 活跃会话数) × 倍数。倍数是 2：总并发是「该跑多
 // 少个请求」，活跃会话是「有多少段对话在用」，池要装得下它们（会话钉
 // 的号不在池里会被改绑，缓存命中就没了），再留一倍给补号。
-//
-// 零值是每个键自己的规矩，写在各自的字段下面。
 type Pool struct {
 	// Factor is how many times over the demand the pool holds.
 	//
