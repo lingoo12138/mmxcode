@@ -286,6 +286,34 @@ type Concurrency struct {
 	Wait Duration `yaml:"wait" json:"wait"`
 }
 
+// Pool holds how many accounts the gateway keeps in memory.
+//
+// 池是缓存，不是真相（规格不变量 1）：账号、耗尽标记、会话绑定的真相都
+// 在库里。池存在的理由是选号不用每次扫全表，还有内存有个上界。
+//
+// 池多大 = max(总并发, 活跃会话数) × 倍数。倍数是 2：总并发是「该跑多
+// 少个请求」，活跃会话是「有多少段对话在用」，池要装得下它们（会话钉
+// 的号不在池里会被改绑，缓存命中就没了），再留一倍给补号。
+//
+// 配 0 的时候按说得过去的数算：0 倍数是「池里一个号都没有」，那不是关
+// 掉，是坏了。
+type Pool struct {
+	// Factor is how many times the demand the pool takes.
+	Factor int `yaml:"factor" json:"factor"`
+	// MaxSize caps the pool by the number of accounts. 0 means no cap.
+	MaxSize int `yaml:"max_size" json:"max_size"`
+	// MemoryBudgetMB is how much memory the pool may take.
+	MemoryBudgetMB int `yaml:"memory_budget_mb" json:"memory_budget_mb"`
+	// SessionWindow is how long a session counts as active.
+	SessionWindow Duration `yaml:"session_window" json:"session_window"`
+	// ReadOnAdmit says whether a new account's credits are read before
+	// it goes into the pool.
+	//
+	// 读一次是准的（读到的数说它有额度，它才进池），但读一次是 2~11 个
+	// 上游请求。冷启动的填池不等这个读：池要立刻能用（规格 §6.3）。
+	ReadOnAdmit bool `yaml:"read_on_admit" json:"read_on_admit"`
+}
+
 // Config is the whole configuration.
 type Config struct {
 	Server   Server   `yaml:"server" json:"server"`
@@ -300,6 +328,8 @@ type Config struct {
 	Usage Usage `yaml:"usage" json:"usage"`
 	// Concurrency holds how many requests may be in the air at once.
 	Concurrency Concurrency `yaml:"concurrency" json:"concurrency"`
+	// Pool holds how many accounts the gateway keeps in memory.
+	Pool Pool `yaml:"pool" json:"pool"`
 }
 
 // Default is the configuration a file starts from.
@@ -337,6 +367,13 @@ func Default() Config {
 			TotalRatio: 5,
 			TotalMin:   3,
 			Wait:       Duration(10 * time.Second),
+		},
+		Pool: Pool{
+			Factor:         2,
+			MaxSize:        0,
+			MemoryBudgetMB: 32,
+			SessionWindow:  Duration(time.Hour),
+			ReadOnAdmit:    true,
 		},
 		DB: "/data/mmxcode.db",
 	}

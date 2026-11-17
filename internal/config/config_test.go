@@ -600,6 +600,31 @@ func TestTheConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+// TestThePoolDefaults says what the pool does when nothing is said about
+// it.
+//
+// 池多大 = max(总并发, 活跃会话数) × 倍数。倍数是 2：再留一倍给补号
+// （规格 §6.3）。内存预算是兜底 —— 一个账号 512 字节，32MB 装得下 6 万
+// 多个，实际用不到。
+func TestThePoolDefaults(t *testing.T) {
+	c := Default()
+	if c.Pool.Factor != 2 {
+		t.Errorf("factor = %d, want 2", c.Pool.Factor)
+	}
+	if c.Pool.MaxSize != 0 {
+		t.Errorf("max_size = %d, want 0", c.Pool.MaxSize)
+	}
+	if c.Pool.MemoryBudgetMB != 32 {
+		t.Errorf("memory_budget_mb = %d, want 32", c.Pool.MemoryBudgetMB)
+	}
+	if c.Pool.SessionWindow.Duration() != time.Hour {
+		t.Errorf("session_window = %s, want 1h", c.Pool.SessionWindow)
+	}
+	if !c.Pool.ReadOnAdmit {
+		t.Error("read_on_admit = false, want true")
+	}
+}
+
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }
