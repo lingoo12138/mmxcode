@@ -80,7 +80,7 @@ func TestAnAccountThatIsInThePoolIsNotTakenTwice(t *testing.T) {
 func TestASpentAccountIsNotUsable(t *testing.T) {
 	p := New(4)
 	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(time.Hour))
+	p.MarkSpent("a", "general", time.Now().Add(time.Hour), "quota")
 
 	if p.Usable(time.Now()) != 0 {
 		t.Fatalf("usable = %d, want 0", p.Usable(time.Now()))
@@ -96,7 +96,7 @@ func TestASpentAccountIsNotUsable(t *testing.T) {
 func TestASpentAccountWhoseTimeHasComeIsUsableAgain(t *testing.T) {
 	p := New(4)
 	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(-time.Minute))
+	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
 
 	if p.Usable(time.Now()) != 1 {
 		t.Fatalf("usable = %d, want 1", p.Usable(time.Now()))
@@ -243,7 +243,7 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 			id := fmt.Sprintf("acc_%d", i%32)
 			p.Admit(Entry{Account: anAccount(id)})
 			p.SetRemaining(id, float64(i), true)
-			p.MarkSpent(id, "general", time.Now().Add(time.Hour))
+			p.MarkSpent(id, "general", time.Now().Add(time.Hour), "quota")
 			p.Remove(id)
 		}
 	}()
@@ -272,4 +272,86 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// TestTheCapacityOfZeroMeansNoLimit says a capacity of zero is no limit,
+// whatever is in the pool.
+//
+// 0 = 不限，是池空的时候也是池里有号的时候。同一个 0 在两种状态下是两种
+// 意思的话，池会被永久冻住。
+func TestTheCapacityOfZeroMeansNoLimit(t *testing.T) {
+	p := New(4)
+	p.Admit(Entry{Account: anAccount("a")})
+	p.Admit(Entry{Account: anAccount("b")})
+
+	p.SetCapacity(0)
+
+	if p.Capacity() != 0 {
+		t.Fatalf("capacity = %d, want 0", p.Capacity())
+	}
+	if p.Full() {
+		t.Fatal("the pool is full, want not full")
+	}
+	if !p.Admit(Entry{Account: anAccount("c")}) {
+		t.Fatal("the account did not go into the pool")
+	}
+}
+
+// TestTheCapacityDoesNotTakeAccountsOut says a smaller capacity does not
+// throw accounts away.
+//
+// 缩容请不走任何号：请出去的理由只有一个 —— 额度用完了（规格 §4.4）。池里
+// 超了就是超了，等号一个个地被用完。
+func TestTheCapacityDoesNotTakeAccountsOut(t *testing.T) {
+	p := New(4)
+	p.Admit(Entry{Account: anAccount("a")})
+	p.Admit(Entry{Account: anAccount("b")})
+
+	p.SetCapacity(1)
+
+	if p.Len() != 2 {
+		t.Fatalf("pool = %d, want 2", p.Len())
+	}
+	if p.Capacity() != 1 {
+		t.Fatalf("capacity = %d, want 1", p.Capacity())
+	}
+}
+
+// TestTheSpentListDropsTheExpiredOnes says a spent window that has come
+// back is not in the spent list.
+//
+// 窗口回来了，那个号就回来了（规格 §4.5）：名单里还留着它，挑号就会跳过
+// 一个能用的号。
+func TestTheSpentListDropsTheExpiredOnes(t *testing.T) {
+	p := New(4)
+	p.Admit(Entry{Account: anAccount("a")})
+	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
+
+	if spent := p.Spent(); len(spent) != 0 {
+		t.Fatalf("spent = %v, want none", spent)
+	}
+}
+
+// TestTheNamesAreCopies says the caller cannot break the pool by changing
+// the list it was given.
+//
+// 顺序是轮转靠的东西：rotator 拿着名单从队首走到队尾，冷号先被挑。谁改
+// 了顺序，轮转就不是轮转了。
+func TestTheNamesAreCopies(t *testing.T) {
+	p := New(4)
+	for _, id := range []string{"a", "b", "c"} {
+		p.Admit(Entry{Account: anAccount(id)})
+	}
+
+	accounts := p.Accounts()
+	accounts[0], accounts[2] = accounts[2], accounts[0]
+	accounts[1].Status = store.StatusSignedOut
+
+	again := p.Accounts()
+	if again[0].ID != "a" || again[1].ID != "b" || again[2].ID != "c" {
+		t.Fatalf("accounts = %v, want a, b, c", again)
+	}
+	if again[1].Status != store.StatusActive {
+		t.Fatalf("status = %q, want %q", again[1].Status, store.StatusActive)
+	}
 }
