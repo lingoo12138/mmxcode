@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,11 +82,22 @@ type fakeMarker struct {
 	mu sync.Mutex
 	// marks are the marks that were written.
 	marks []store.Exhausted
+	// err is what it answers with, when it is set.
+	err error
+	// ctxErr is what the context said when the mark was written.
+	ctxErr error
+	// called counts the times it was called.
+	called int
 }
 
-func (f *fakeMarker) SetExhausted(_ context.Context, accountID, windowKey string, until time.Time, reason string) error {
+func (f *fakeMarker) SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.called++
+	f.ctxErr = ctx.Err()
+	if f.err != nil {
+		return f.err
+	}
 	f.marks = append(f.marks, store.Exhausted{
 		AccountID: accountID, WindowKey: windowKey, Until: until, Reason: reason,
 	})
@@ -107,6 +119,87 @@ func (b *blockingReader) RefreshUsage(ctx context.Context, accountID string) (st
 	b.mu.Unlock()
 	<-ctx.Done()
 	return store.UsageSnapshot{}, ctx.Err()
+}
+
+// spentOnTimeout reads the credits only when the pass is over.
+//
+// 它是那种"读回来了，但这一趟的时间已经用完了"的读：读到的数说这个号
+// 没有额度，而写标记的时候这一趟的时限已经到了。
+type spentOnTimeout struct{}
+
+func (s *spentOnTimeout) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	<-ctx.Done()
+	return store.UsageSnapshot{
+		AccountID:  accountID,
+		Granted:    400,
+		Remaining:  0,
+		HasAmounts: true,
+	}, nil
+}
+
+// TestTheMarkThatCouldNotBeWrittenIsReported says a mark that could not
+// be written is said out loud.
+//
+// 标记写不进去，那个号在库里还占着一个位置：下一趟补号还会挑它，再读一
+// 遍（一次读是 2~11 个上游请求），每一趟都是这样，直到它自己好起来。
+// 写不进去又没有人知道，就没有人管它。
+func TestTheMarkThatCouldNotBeWrittenIsReported(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+	}}
+	reader := &fakeReader{left: map[string]float64{"a": 0, "b": 400}}
+	marker := &fakeMarker{err: errors.New("the database did not answer")}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10,
+	})
+
+	n, err := k.Replenish(context.Background(), 2)
+	if err == nil {
+		t.Fatal("the mark that could not be written was not reported")
+	}
+	if !strings.Contains(err.Error(), "the database did not answer") {
+		t.Fatalf("err = %v, want the failure of the mark", err)
+	}
+	// 一个号的标记写不进去，不该把整趟填池都放弃：后面的号照旧进池。
+	if n != 1 {
+		t.Fatalf("replenished = %d, want 1", n)
+	}
+	if _, ok := p.Get("b"); !ok {
+		t.Fatalf("the pool holds %v, want b", p.Accounts())
+	}
+}
+
+// TestTheMarkIsWrittenEvenWhenThePassIsOver says the mark is written
+// even when the pass ran out of time.
+//
+// 标记是关于这个号的事实：它不能因为这一趟跑超时了就丢掉。丢了这个号还
+// 在库里占着位置，下一趟补号还会挑它，一趟读一次（2~11 个上游请求），
+// 一趟接一趟，永远。
+func TestTheMarkIsWrittenEvenWhenThePassIsOver(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{{Account: anAccount("a")}}}
+	reader := &spentOnTimeout{}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10, PassTimeout: 100 * time.Millisecond,
+	})
+
+	_, err := k.Replenish(context.Background(), 1)
+	// 这一趟是被时限掐断的：它报出来的错只能是时限的错。
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the deadline of the pass", err)
+	}
+	if marker.called != 1 {
+		t.Fatalf("the mark was written %d times, want 1", marker.called)
+	}
+	if marker.ctxErr != nil {
+		t.Fatalf("the mark was written with a dead context: %v", marker.ctxErr)
+	}
+	if len(marker.marks) != 1 || marker.marks[0].AccountID != "a" {
+		t.Fatalf("marks = %v, want just a", marker.marks)
+	}
 }
 
 // TestTheReplenishStopsWhenThePassIsOver says one filling pass does not

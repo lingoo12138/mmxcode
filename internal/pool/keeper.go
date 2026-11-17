@@ -2,6 +2,8 @@ package pool
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -60,6 +62,12 @@ type KeeperOptions struct {
 	// 0 = 不限。生产上不该这么配。
 	PassTimeout time.Duration
 }
+
+// markWriteTimeout is how long the writing of a mark may take.
+//
+// 写一行标记是本地库里的一个写，几毫秒的事：5 秒钟是给卡住的库留的余
+// 量，不是给它等的。
+const markWriteTimeout = 5 * time.Second
 
 // Keeper keeps the pool full.
 //
@@ -171,6 +179,11 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 
 	added := 0
 	var lastErr error
+	// markErr is the mark that could not be written.
+	//
+	// 它跟 lastErr 分开记：两个错都要给调用方 —— 少一个，日志里就少一件
+	// 事：一个是这一趟没填上，一个是那个号还在库里占着位置。
+	var markErr error
 	// 这一趟读了几次：预算是这一趟的，不是整天的。
 	reads := 0
 	// 读失败的号这一趟不再读：它刚才读不到，再读一次也是读不到，而
@@ -182,12 +195,12 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
+		if k.pool.Len() >= want {
+			break
+		}
 		if ctx.Err() != nil {
 			// 这一趟的时间用完了：整趟就此打住，不是只放下一个号。下
 			// 一趟重新开始。
-			break
-		}
-		if k.pool.Len() >= want {
 			break
 		}
 		inPool := k.pool.IDs()
@@ -250,7 +263,17 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 				// 读到了：它没有额度。标记掉，别让它占着位置。这一趟
 				// 也不再读它 —— 读到了就是没有，再读一遍还是没有，而
 				// 预算是有限的。
-				k.markSpent(ctx, c.Account.ID, snap)
+				if err := k.markSpent(ctx, c.Account.ID, snap); err != nil {
+					// 写不进去：那个号在库里还占着一个位置，下一趟
+					// 补号还会挑它，再读一遍（2~11 个上游请求），一趟
+					// 接一趟。记下来，别让它悄悄地没有。
+					//
+					// 这一趟不因为它放弃：一个号的标记写不进去，不该
+					// 把整趟填池都扔掉。
+					if markErr == nil {
+						markErr = fmt.Errorf("the mark of %s could not be written: %w", c.Account.ID, err)
+					}
+				}
 				failed[c.Account.ID] = true
 				passed++
 				fresh++
@@ -274,6 +297,16 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			break
 		}
 	}
+	// 这一趟出的错都要说出去：候选问不到是一件事，标记写不进去是另一件
+	// —— 少一件，日志里就少一件。只有一件的时候就是那一个：调用方拿
+	// 到的就是那个错本身。
+	if markErr != nil {
+		if lastErr == nil {
+			lastErr = markErr
+		} else {
+			lastErr = errors.Join(lastErr, markErr)
+		}
+	}
 	return added, lastErr
 }
 
@@ -295,7 +328,12 @@ func (k *Keeper) readOne(ctx context.Context, accountID string) (store.UsageSnap
 // 说的不是「这个模型组用完了」，是「这个号没有额度了」。
 //
 // 什么时候回来：读到的时间在将来就用它，取不到就用冷却时间。
-func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.UsageSnapshot) {
+//
+// 写这一行用的是不跟这一趟的时限走的 ctx：这一趟的时限到了，不该让这
+// 个标记丢掉。丢了这个号还在库里占着一个位置，下一趟补号还会挑它，再
+// 读一遍（一次读是 2~11 个上游请求），一趟接一趟，直到它自己好起来。
+// 标记是这个号的事实，不是一趟的活。
+func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.UsageSnapshot) error {
 	until := time.Time{}
 	if snap.ExpiresAt.After(time.Now()) {
 		until = snap.ExpiresAt
@@ -304,7 +342,9 @@ func (k *Keeper) markSpent(ctx context.Context, accountID string, snap store.Usa
 		until = time.Now().Add(k.opts.Cooldown)
 	}
 	if k.marker == nil {
-		return
+		return nil
 	}
-	_ = k.marker.SetExhausted(ctx, accountID, "", until, "quota")
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markWriteTimeout)
+	defer cancel()
+	return k.marker.SetExhausted(wctx, accountID, "", until, "quota")
 }
