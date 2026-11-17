@@ -1559,15 +1559,22 @@ func (s *Store) accountBySubject(ctx context.Context, db execer, subject string)
 
 type scanner interface{ Scan(dest ...any) error }
 
-func scanAccount(sc scanner) (Account, error) {
+// scanAccount reads one account row.
+//
+// The extra destinations are read after the account's own columns, so a
+// caller that wants more of the row (the credits of a reading, say) does
+// not have to spell the account's ten columns out again.
+func scanAccount(sc scanner, extra ...any) (Account, error) {
 	var (
 		a                     Account
 		userID, email, pg, pu sql.NullString
 		lastErr               sql.NullString
 		createdAt, updatedAt  int64
 	)
-	if err := sc.Scan(&a.ID, &a.Name, &userID, &email, &a.Status, &pg, &pu,
-		&lastErr, &createdAt, &updatedAt); err != nil {
+	dest := []any{&a.ID, &a.Name, &userID, &email, &a.Status, &pg, &pu,
+		&lastErr, &createdAt, &updatedAt}
+	dest = append(dest, extra...)
+	if err := sc.Scan(dest...); err != nil {
 		return Account{}, err
 	}
 	a.UserID = userID.String
