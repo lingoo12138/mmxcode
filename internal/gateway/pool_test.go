@@ -66,6 +66,58 @@ func TestTheReadBudgetIsNeverUnlimited(t *testing.T) {
 	}
 }
 
+// TestTheKeeperOptionsNeverHaveAnUnlimitedReadBudget says the keeper the
+// gateway builds never reads without a budget.
+//
+// keeper 那边的 0 说的是"不限"：补号读的是上游的钱，一次读是 2~11 个上游
+// 请求（规格 §6.4），一趟读几百个号就是几千个请求 —— 那不是填池，是打上
+// 游。而 usage.refresh.batch 配 0 说的是"一个一批"（usage.batch 的那
+// 条规矩），不是"全都读"。所以这一层必须把它夹住。
+//
+// 夹的是 keeper 拿到的那份预算：算预算的函数对了，接线的那一行漏了夹子
+// 也没用 —— 那个 keeper 拿到的就是"不限"。所以这里看的是 New() 用的那
+// 份选项，不是那个函数。
+func TestTheKeeperOptionsNeverHaveAnUnlimitedReadBudget(t *testing.T) {
+	for _, c := range []struct {
+		batch int
+		want  int
+	}{
+		{0, 1}, {-1, 1}, {1, 1}, {6, 6},
+	} {
+		cfg := config.Default()
+		cfg.Usage.Refresh.Batch = c.batch
+		opts := keeperOptions(cfg)
+		if opts.ReadBudget != c.want {
+			t.Errorf("the read budget for batch %d = %d, want %d", c.batch, opts.ReadBudget, c.want)
+		}
+	}
+}
+
+// TestTheKeeperOptionsCarryTheConfiguration says the keeper the gateway
+// builds gets the configuration it should.
+//
+// 别的几项也是配置说了算：读不读额度（pool.read_on_admit）、冷却多久
+// （rotation.exhausted_cooldown）、一个号读多久（usage.refresh.timeout）、
+// 一趟跑多久（usage.refresh.budget）。
+func TestTheKeeperOptionsCarryTheConfiguration(t *testing.T) {
+	cfg := config.Default()
+	cfg.Usage.Refresh.Batch = 0
+	opts := keeperOptions(cfg)
+
+	if opts.Read != cfg.Pool.ReadOnAdmit {
+		t.Errorf("read = %v, want %v", opts.Read, cfg.Pool.ReadOnAdmit)
+	}
+	if opts.Cooldown != cfg.Rotation.ExhaustedCooldown.Duration() {
+		t.Errorf("cooldown = %v, want %v", opts.Cooldown, cfg.Rotation.ExhaustedCooldown.Duration())
+	}
+	if opts.ReadTimeout != cfg.Usage.Refresh.Timeout.Duration() {
+		t.Errorf("read timeout = %v, want %v", opts.ReadTimeout, cfg.Usage.Refresh.Timeout.Duration())
+	}
+	if opts.PassTimeout != cfg.Usage.Refresh.Budget.Duration() {
+		t.Errorf("pass timeout = %v, want %v", opts.PassTimeout, cfg.Usage.Refresh.Budget.Duration())
+	}
+}
+
 // TestThePickerReadsThePoolAndNotTheWholeTable says picking an account
 // reads the pool, not the whole table.
 //

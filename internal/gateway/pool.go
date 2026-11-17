@@ -26,6 +26,25 @@ func poolReadBudget(cfg config.Usage) int {
 	return cfg.Refresh.Batch
 }
 
+// keeperOptions gives the options of the keeper the gateway builds.
+//
+// 它是配置变成 KeeperOptions 的唯一一处 —— New() 拿到的就是它。读额度
+// 的夹子（poolReadBudget）也在这一层：夹的是 keeper 拿到的那份预算，
+// 不是那个算预算的函数 —— 接线的那一行要是绕过了夹子，keeper 拿到的就
+// 是"不限"，而补号那一趟已经在打上游了。
+func keeperOptions(cfg config.Config) pool.KeeperOptions {
+	return pool.KeeperOptions{
+		Read:        cfg.Pool.ReadOnAdmit,
+		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
+		ReadBudget:  poolReadBudget(cfg.Usage),
+		ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
+		// 一趟补号自己的时限：跟读额度那一趟用同一把尺子
+		// （usage.refresh.budget）。没有它，一趟能跑 90 秒，而补号
+		// 那一趟每 30 秒就该来一次。
+		PassTimeout: cfg.Usage.Refresh.Budget.Duration(),
+	}
+}
+
 // poolSource gives the pool the accounts it could take.
 type poolSource struct {
 	s *store.Store
