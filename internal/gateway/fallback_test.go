@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -133,6 +134,85 @@ func TestTheFilledPoolDoesNotReadTheDatabase(t *testing.T) {
 	if cs.accounts != 0 || cs.exhausted != 0 || cs.snapshots != 0 {
 		t.Fatalf("the database was read: %d accounts, %d marks, %d snapshots",
 			cs.accounts, cs.exhausted, cs.snapshots)
+	}
+}
+
+// TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow says a database
+// that does not answer is not asked again before the window is over.
+//
+// 库从来没答过的时候（手上没有快照），后来的每一个请求都会去读一遍整张
+// 表：库在挂的时候，读的次数是跟着来的请求走的，不是跟着那一秒走的。
+// 记住上一次的那个错，这一秒里来的请求就都拿那个错走。
+func TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow(t *testing.T) {
+	_, cs := oneAccount(t)
+	cs.fail = true
+	f := newDBFallback(cs, time.Minute)
+	ctx := context.Background()
+
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the database that does not answer was not reported")
+	}
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the database that does not answer was not reported the second time")
+	}
+	if cs.accounts != 1 {
+		t.Fatalf("the accounts were read %d times, want 1", cs.accounts)
+	}
+}
+
+// panickingStore breaks on the first read and answers after that.
+//
+// 它站在读库的那一头：库崩了的时候，网关不能跟着崩，也不能从此吊死。
+type panickingStore struct {
+	poolStore
+	mu sync.Mutex
+	// broken says the store already broke once.
+	broken bool
+}
+
+func (p *panickingStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	p.mu.Lock()
+	broken := p.broken
+	p.broken = true
+	p.mu.Unlock()
+	if !broken {
+		panic("the store broke")
+	}
+	return p.poolStore.ListAccounts(ctx)
+}
+
+// TestTheFallbackSurvivesAPanicInTheRead says a read that panics does
+// not wedge the fallback.
+//
+// 读库的那一头要是炸了，发出去的信号就没人收了：后来的每一个请求都吊
+// 在一个不会有人关的通道上，等到自己的 ctx 死了才走 —— 兜底这一辈子就废
+// 了（进程还在，net/http 会 recover handler 的 panic）。
+func TestTheFallbackSurvivesAPanicInTheRead(t *testing.T) {
+	_, cs := oneAccount(t)
+	f := newDBFallback(&panickingStore{poolStore: cs}, time.Minute)
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("the panic did not come out")
+			}
+		}()
+		_, _ = f.get(context.Background())
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	snap, err := f.get(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("the fallback did not come back: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("the fallback took %v, want less than a second", elapsed)
+	}
+	if len(snap.accounts) != 1 {
+		t.Fatalf("accounts = %v, want just acc_01", snap.accounts)
 	}
 }
 

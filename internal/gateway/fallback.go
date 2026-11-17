@@ -29,6 +29,12 @@ type dbFallback struct {
 	s     poolStore
 	tried time.Time
 	snap  *dbAnswer
+	// err is what the last read answered with.
+	//
+	// 它是给"库从来没答过"的时候准备的：手上没有快照，那就只剩这个错可
+	// 以给。没有它，这一秒里来的每一个请求都会去读一遍整张表 —— 库在挂
+	// 的时候，读的次数是跟着来的请求走的，不是跟着那一秒走的。
+	err error
 	// wait is the signal of the refresh in the air.
 	//
 	// 一次只读一遍：等的人等的是这个信号，不是那把锁 —— 锁里不做读库的
@@ -59,12 +65,23 @@ func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
 // 读失败了还是给答案：手上有一份旧的（可能过期）就拿它，没有才报错。
 // 一个请求失败比一片 429 强：旧的那份挑出来的号顶多撞一次空，撞空的
 // 代价是一个请求。
+//
+// 这一秒里只读一遍，不管有没有读到过：手上没有快照的时候，上一次的那个
+// 错就是这一秒里每一个请求的答案 —— 库在挂的时候，读的次数是跟着来的
+// 请求走的，不是跟着那一秒走的。
 func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.mu.Lock()
-	if f.snap != nil && time.Since(f.tried) < f.ttl {
+	if time.Since(f.tried) < f.ttl {
 		snap := f.snap
+		err := f.err
 		f.mu.Unlock()
-		return snap, nil
+		if snap != nil {
+			return snap, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("the database did not answer")
 	}
 	if f.wait != nil {
 		// 有人在读库。
@@ -81,8 +98,12 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 		}
 		f.mu.Lock()
 		snap := f.snap
+		err := f.err
 		f.mu.Unlock()
 		if snap == nil {
+			if err != nil {
+				return nil, err
+			}
 			return nil, errors.New("the database did not answer")
 		}
 		return snap, nil
@@ -91,6 +112,22 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.wait = ch
 	f.mu.Unlock()
 
+	// 信号一定要发出去：等的人等的是它。
+	//
+	// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
+	// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
+	// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
+	defer close(ch)
+	// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
+	// 不是代码后面的那几行。
+	defer func() {
+		f.mu.Lock()
+		if f.wait == ch {
+			f.wait = nil
+		}
+		f.mu.Unlock()
+	}()
+
 	answer, err := f.read(ctx)
 
 	f.mu.Lock()
@@ -98,10 +135,14 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.tried = time.Now()
 	if err == nil {
 		f.snap = answer
+		f.err = nil
+	} else {
+		// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
+		// 张表。
+		f.err = err
 	}
 	snap := f.snap
 	f.mu.Unlock()
-	close(ch)
 
 	if err != nil && snap == nil {
 		return nil, err
