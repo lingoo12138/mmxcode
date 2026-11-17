@@ -1178,11 +1178,12 @@ func TestTheCreditsOfAnAccountAreWritten(t *testing.T) {
 	}
 }
 
-// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands
-// out its accounts in the order they went in.
+// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands out
+// its accounts — and its entries — in the order they went in.
 //
 // 顺序是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转 ——
-// 冷号（先进来的）该先被挑。
+// 冷号（先进来的）该先被挑。名单和条目是同一套顺序：两套顺序会让挑号的人
+// 不知道自己在走哪一套。
 func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
 	p := New(4)
 	for _, id := range []string{"a", "b", "c"} {
@@ -1196,6 +1197,16 @@ func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
 	for i, want := range []string{"a", "b", "c"} {
 		if accounts[i].ID != want {
 			t.Fatalf("accounts = %v, want a, b, c", accounts)
+		}
+	}
+
+	entries := p.Entries()
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if entries[i].Account.ID != want {
+			t.Fatalf("entries = %v, want a, b, c", entries)
 		}
 	}
 }
@@ -1379,7 +1390,8 @@ Expected: FAIL —— `package pool` 里没有 `Pool`（这个包还不存在）
 // 池存在的理由有两个：
 //
 //   - 选号不该每次都把整张账号表读一遍。1000 个号就是 1000 行 × 每个
-//     请求，池把它变成一次内存里的查表。
+//     请求，池把它变成一次内存里的查表 —— 外加一份名单的拷贝（池多大
+//     就拷多大：比全表读小几十倍，但不是零）。
 //   - 池有上界。库里的号再多，池里也只有「并发 + 会话」那么多个。
 //
 // 池里放的是选号要用的三样：账号行、剩余积分、耗尽标记。计划窗口
@@ -1448,6 +1460,8 @@ type Pool struct {
 // New makes a pool that may hold capacity accounts.
 //
 // A capacity of zero means no limit.
+//
+// 负数按 0 算 —— 也是「不限」。
 func New(capacity int) *Pool {
 	if capacity < 0 {
 		capacity = 0
@@ -1458,6 +1472,9 @@ func New(capacity int) *Pool {
 // Capacity is how many accounts the pool may hold.
 //
 // 0 means no limit.
+//
+// 它可以比 Len() 小：缩容不请走任何号（见 SetCapacity），池里 40 个、cap
+// 10 的时候就是这样 —— 进不去新的了，要等号一个个地被用完。
 func (p *Pool) Capacity() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1474,6 +1491,8 @@ func (p *Pool) Capacity() int {
 // 的理由只有一个：额度用完了（规格 §4.4）。
 //
 // 0 = 不限，不管池里现在有几个。
+//
+// 负数按 0 算 —— 也是「不限」。
 func (p *Pool) SetCapacity(n int) {
 	if n < 0 {
 		n = 0
@@ -1595,6 +1614,8 @@ func (p *Pool) IDs() map[string]bool {
 //
 // reason 是为什么用完的（现在是 "quota"）：它跟着名单一起给出去，别的地方
 // 看得见为什么这个号被搁下了。
+//
+// until 是零值 = 立刻回来：这个号马上又能答了（窗口回来了，规格 §4.5）。
 func (p *Pool) MarkSpent(accountID, windowKey string, until time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1668,11 +1689,14 @@ func (p *Pool) Accounts() []store.Account {
 // 过期的不算：窗口回来了，那个号就回来了（规格 §4.5）。
 //
 // 给的是一份新的：拿着它的人可以随便改。
+//
+// 容量不按池的大小预留：这份名单在稳态下几乎总是空的（号被标记用完的同时
+// 就出池了），按池的大小预留就是每个请求白分配几百个号的钱。
 func (p *Pool) Spent() []store.Exhausted {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	out := make([]store.Exhausted, 0, len(p.byID))
+	out := make([]store.Exhausted, 0)
 	for _, id := range p.order {
 		e, ok := p.byID[id]
 		if !ok || !e.Spent {
@@ -2138,7 +2162,8 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		if k.pool.Len() >= want {
 			break
 		}
-		candidates, err := k.source.Candidates(ctx, want+len(k.pool.IDs()), k.pool.IDs())
+		inPool := k.pool.IDs()
+		candidates, err := k.source.Candidates(ctx, want+len(inPool), inPool)
 		if err != nil {
 			lastErr = err
 			break
@@ -2151,7 +2176,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			if k.pool.Len() >= want {
 				break
 			}
-			if k.pool.IDs()[c.Account.ID] {
+			if inPool[c.Account.ID] {
 				continue
 			}
 			if !k.read {

@@ -175,11 +175,12 @@ func TestTheCreditsOfAnAccountAreWritten(t *testing.T) {
 	}
 }
 
-// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands
-// out its accounts in the order they went in.
+// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands out
+// its accounts — and its entries — in the order they went in.
 //
 // 顺序是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转 ——
-// 冷号（先进来的）该先被挑。
+// 冷号（先进来的）该先被挑。名单和条目是同一套顺序：两套顺序会让挑号的人
+// 不知道自己在走哪一套。
 func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
 	p := New(4)
 	for _, id := range []string{"a", "b", "c"} {
@@ -193,6 +194,16 @@ func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
 	for i, want := range []string{"a", "b", "c"} {
 		if accounts[i].ID != want {
 			t.Fatalf("accounts = %v, want a, b, c", accounts)
+		}
+	}
+
+	entries := p.Entries()
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if entries[i].Account.ID != want {
+			t.Fatalf("entries = %v, want a, b, c", entries)
 		}
 	}
 }

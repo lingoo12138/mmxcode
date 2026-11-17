@@ -141,7 +141,8 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		if k.pool.Len() >= want {
 			break
 		}
-		candidates, err := k.source.Candidates(ctx, want+len(k.pool.IDs()), k.pool.IDs())
+		inPool := k.pool.IDs()
+		candidates, err := k.source.Candidates(ctx, want+len(inPool), inPool)
 		if err != nil {
 			lastErr = err
 			break
@@ -154,7 +155,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			if k.pool.Len() >= want {
 				break
 			}
-			if k.pool.IDs()[c.Account.ID] {
+			if inPool[c.Account.ID] {
 				continue
 			}
 			if !k.read {
