@@ -98,7 +98,7 @@ func (p *Pool) Capacity() int {
 //
 // 所以缩容不会请走任何号：池里已经有 40 个的时候调 SetCapacity(10)，池里
 // 还是 40 个 —— 但也进不去新的了（满了），要等号一个个地被用完。请出去
-// 的理由只有一个：额度用完了（规格 §4.4）。
+// 的理由只有两个：额度用完了（规格 §4.4），还有它签不上了。
 //
 // 0 = 不限，不管池里现在有几个。
 //
@@ -152,7 +152,8 @@ func (p *Pool) Admit(e Entry) bool {
 //
 // It says whether the account was in the pool.
 //
-// 一个号出池只有一个理由：额度用完了（规格 §4.4）。别的理由都不出池 ——
+// 一个号出池有两个理由：额度用完了（规格 §4.4），还有它签不上了
+// （signed_out，网关那边把它踢出池，见 dropDeadAccount）。别的理由都不出池 ——
 // 「一阵子没用」不是理由：会话钉在号上，把它换出去，缓存命中就没了。
 func (p *Pool) Remove(accountID string) bool {
 	p.mu.Lock()

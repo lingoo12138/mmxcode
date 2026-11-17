@@ -175,4 +175,10 @@ func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
 		return
 	}
 	s.Pool.Remove(accountID)
+	// 池里少了一个号：补一个进去。补号是后台的活，不挡客户端（规格
+	// §4.4）—— 签不上这个号的那个请求已经等过了，不能再让它等下去。
+	//
+	// 不等下一趟（最多三十秒）：池短着的时候，承诺的并发就少一个（不变
+	// 量 4），这一段里网关白答应着做不到的事。
+	s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
 }

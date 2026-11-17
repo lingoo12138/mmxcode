@@ -194,6 +194,62 @@ func TestASpentAccountLeavesThePoolEvenWhenTheMarkIsNotWritten(t *testing.T) {
 	}
 }
 
+// TestADeadAccountIsReplacedAtOnce says the pool is filled again right
+// after a dead account leaves it.
+//
+// 签不上的号出池以后，池里就少了一个 —— 而池短着的时候，承诺的并发就少
+// 一个（不变量 4）。等下一趟补号（最多三十秒）才补上，这中间那一段，
+// 网关白答应着做不到的事。
+func TestADeadAccountIsReplacedAtOnce(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 一个签出的号，一个好的号。
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	cfg := config.Default()
+	// 补号的时候不读额度：读额度是问上游的，这个测试不碰上游。
+	cfg.Pool.ReadOnAdmit = false
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	keeper := pool.NewKeeper(p, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()},
+		&fakeReader{}, s, pool.KeeperOptions{
+			Read: false, Cooldown: time.Minute, ReadBudget: 1,
+			ReadTimeout: time.Second, PassTimeout: 5 * time.Second,
+		})
+	g := &Server{
+		Store:      s,
+		Cfg:        cfg,
+		Pool:       p,
+		Keeper:     keeper,
+		lifeCtx:    lifeCtx,
+		lifeCancel: cancel,
+		bgSem:      make(chan struct{}, 1),
+	}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	// 补号是后台的活：等它一会儿。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := p.Get("acc_02"); ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the pool holds %v, want acc_02", p.Accounts())
+}
+
 // TestASignedOutAccountLeavesThePool says an account that cannot sign
 // in goes out of the pool.
 //
