@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,18 +14,20 @@ import (
 //
 // 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
 // 三样，每一样都是全表读。
-//
-// 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
-// 三样，每一样都是全表读。
 type readCountingStore struct {
 	*store.Store
 	accounts  int
 	exhausted int
 	snapshots int
+	// fail says the database stopped answering.
+	fail bool
 }
 
 func (c *readCountingStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
 	c.accounts++
+	if c.fail {
+		return nil, errors.New("the database did not answer")
+	}
 	return c.Store.ListAccounts(ctx)
 }
 
@@ -130,5 +133,29 @@ func TestTheFilledPoolDoesNotReadTheDatabase(t *testing.T) {
 	if cs.accounts != 0 || cs.exhausted != 0 || cs.snapshots != 0 {
 		t.Fatalf("the database was read: %d accounts, %d marks, %d snapshots",
 			cs.accounts, cs.exhausted, cs.snapshots)
+	}
+}
+
+// TestTheOldAnswerIsServedWhenTheDatabaseIsUnhappy says a failing read
+// does not take the answer away.
+//
+// 库不答的时候，手上有旧的一份就拿它：挑出来的号顶多撞一次空，撞空的
+// 代价是一个请求 —— 那比一片 503 强。
+func TestTheOldAnswerIsServedWhenTheDatabaseIsUnhappy(t *testing.T) {
+	_, cs := oneAccount(t)
+	ctx := context.Background()
+	ad := poolAdapter{s: cs, fallback: newDBFallback(cs, time.Nanosecond)}
+
+	if _, err := ad.Accounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs.fail = true
+
+	accounts, err := ad.Accounts(ctx)
+	if err != nil {
+		t.Fatalf("the answer was taken away: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "acc_01" {
+		t.Fatalf("accounts = %v, want just acc_01", accounts)
 	}
 }
