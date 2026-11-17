@@ -229,8 +229,12 @@ func TestTheReplenishStopsWhenThePassIsOver(t *testing.T) {
 	start := time.Now()
 	n, err := k.Replenish(ctx, 5)
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
+	// 这一趟是被时限掐断的：它报出来的错就是那个时限的错。
+	//
+	// 以前这里报的是"没有错"：池短着，日志里却什么都没有 —— 看得见的
+	// 只有"这一趟没填上"，看不见"这一趟没跑完"。两件事要分开说。
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the deadline of the pass", err)
 	}
 	if n != 0 {
 		t.Fatalf("replenished = %d, want 0", n)

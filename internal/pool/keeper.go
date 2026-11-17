@@ -151,6 +151,10 @@ func (k *Keeper) Seed(ctx context.Context, want int) (int, error) {
 //
 // 一次只跑一趟：已经在跑的那一趟没有跑完，这一次就不跑 —— 池里的号不
 // 会因为跑两趟就多出来，而上游的请求会翻倍。
+//
+// 出错的时候说的是这一趟出的错：候选问不到、标记写不进去、这一趟被它
+// 自己的时限掐断。三件都说出去 —— 池短着的时候，日志里要看得见是"没
+// 填上"还是"没跑完"。
 func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	if want <= 0 {
 		return 0, nil
@@ -192,6 +196,12 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 这一趟挑过了几个：候选里被刷掉的那些。下一趟问候选的时候要多问
 	// 这么多个 —— 不然问回来的还是那几个刷掉的。
 	passed := 0
+	// cutShort says the pass was cut short by its own deadline.
+	//
+	// 它跟"这一趟没填上"是两件事：填池没填满是结果，被时限掐断是原因。
+	// 掐断了还报"没有错"，池短着的时候日志里就什么都看不见 —— 只看得见
+	// 池短了，看不见为什么。
+	cutShort := false
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
@@ -201,6 +211,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		if ctx.Err() != nil {
 			// 这一趟的时间用完了：整趟就此打住，不是只放下一个号。下
 			// 一趟重新开始。
+			cutShort = true
 			break
 		}
 		inPool := k.pool.IDs()
@@ -221,6 +232,7 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 			}
 			if ctx.Err() != nil {
 				// 这一趟的时间用完了：不再读下一个号，也不再问候选。
+				cutShort = true
 				break
 			}
 			if inPool[c.Account.ID] {
@@ -300,11 +312,22 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 这一趟出的错都要说出去：候选问不到是一件事，标记写不进去是另一件
 	// —— 少一件，日志里就少一件。只有一件的时候就是那一个：调用方拿
 	// 到的就是那个错本身。
-	if markErr != nil {
+	switch {
+	case lastErr != nil && markErr != nil:
+		lastErr = errors.Join(lastErr, markErr)
+	case lastErr == nil:
+		lastErr = markErr
+	}
+	if cutShort {
+		// 这一趟是被时限掐断的：也说出去 —— 池短着的时候，日志里要看得
+		// 见是"这一趟没跑完"，不是"这一趟跑完了，池还是短"。
+		//
+		// 别的事也有错的时候，两件都留着：那个错是这一趟的错，这个错是
+		// 这一趟为什么没跑完。
 		if lastErr == nil {
-			lastErr = markErr
+			lastErr = ctx.Err()
 		} else {
-			lastErr = errors.Join(lastErr, markErr)
+			lastErr = errors.Join(lastErr, ctx.Err())
 		}
 	}
 	return added, lastErr
