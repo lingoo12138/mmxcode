@@ -27,8 +27,8 @@ import (
 // BytesPerAccount is what one account in the pool takes, in bytes.
 //
 // 它是量出来的：账号行（id/name/user_id/email/status 五个字符串）加上
-// 剩余积分、耗尽标记和 map 的索引，一行 395 字节。这里取 512 —— 宁可高
-// 一点，内存预算算得保守些。
+// 剩余积分和 map 的索引，一行 395 字节。这里取 512 —— 宁可高一点，内存
+// 预算算得保守些。
 //
 // 池里不留第二份账号行：名单是每次现给的那一份（见 Accounts）。
 const BytesPerAccount = 512
