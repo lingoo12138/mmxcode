@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -155,6 +156,41 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 	}
 	if len(marks) != 1 || marks[0].AccountID != "acc_01" {
 		t.Fatalf("marks = %v, want just acc_01", marks)
+	}
+}
+
+// failingMarkStore does not write the marks.
+type failingMarkStore struct {
+	poolStore
+}
+
+func (f *failingMarkStore) SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
+	return errors.New("the database did not answer")
+}
+
+// TestASpentAccountLeavesThePoolEvenWhenTheMarkIsNotWritten says an
+// account that is spent leaves the pool even when the mark could not be
+// written.
+//
+// 标记写不进去的时候，那个号在池里留着：它带着一份旧的数（看着还有额
+// 度），下一次就被挑中，每一次都是一次白花的请求，直到库缓过来。
+//
+// 池是缓存：把一个库里还觉得好的号丢出去是安全的（它以后还能再进来），
+// 而把一个已经用完的号留在池里，每一次挑它都是一次白花的请求。标记的
+// 真相在库里，池只是缓存。
+func TestASpentAccountLeavesThePoolEvenWhenTheMarkIsNotWritten(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	ad := poolAdapter{s: &failingMarkStore{poolStore: s}, pool: p}
+
+	err := ad.MarkExhausted(ctx, "acc_01", "general", time.Now().Add(time.Hour), "quota")
+	if err == nil {
+		t.Fatal("the mark that could not be written was not reported")
+	}
+	if p.Len() != 0 {
+		t.Fatalf("pool = %d, want 0", p.Len())
 	}
 }
 

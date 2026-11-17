@@ -359,18 +359,21 @@ func (p poolAdapter) UpstreamID(ctx context.Context, key string) (string, error)
 }
 
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
-	if err := p.s.SetExhausted(ctx, accountID, windowKey, until, reason); err != nil {
-		return err
-	}
+	err := p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
 	if p.pool != nil {
-		// 标记写下去了，这个号就出池：它接不了活了，让位给一个冷的
-		//（规格 §4.4）。补号是后台的活。
+		// 这个号出池：它接不了活了，让位给一个冷的（规格 §4.4）。补号
+		// 是后台的活。
 		//
-		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标
-		// 记的真相在库里（那个号出池之后，填池也不收它）。
+		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标记的
+		// 真相在库里（那个号出池之后，填池也不收它）。
+		//
+		// 标记写不写得进去，池里都不留它：池是缓存，把一个库里还觉得好
+		// 的号丢出去是安全的（它以后还能再进来），而把一个已经用完的号
+		// 留在池里，它带着一份看着还有额度的旧数，每一次被挑中都是一次
+		// 白花的请求。
 		p.pool.Remove(accountID)
 	}
-	return nil
+	return err
 }
 
 // RemainingAll gives the credits left of a whole list of accounts.
