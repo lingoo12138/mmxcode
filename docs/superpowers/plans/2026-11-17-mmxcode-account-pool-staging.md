@@ -1434,7 +1434,7 @@ func (p *Pool) Capacity() int {
 //
 // 所以缩容不会请走任何号：池里已经有 40 个的时候调 SetCapacity(10)，池里
 // 还是 40 个 —— 但也进不去新的了（满了），要等号一个个地被用完。请出去
-// 的理由只有一个：额度用完了（规格 §4.4）。
+// 的理由只有两个：额度用完了（规格 §4.4），还有它签不上了。
 //
 // 0 = 不限，不管池里现在有几个。
 //
@@ -1488,7 +1488,8 @@ func (p *Pool) Admit(e Entry) bool {
 //
 // It says whether the account was in the pool.
 //
-// 一个号出池只有一个理由：额度用完了（规格 §4.4）。别的理由都不出池 ——
+// 一个号出池有两个理由：额度用完了（规格 §4.4），还有它签不上了
+// （signed_out，网关那边把它踢出池，见 dropDeadAccount）。别的理由都不出池 ——
 // 「一阵子没用」不是理由：会话钉在号上，把它换出去，缓存命中就没了。
 func (p *Pool) Remove(accountID string) bool {
 	p.mu.Lock()
@@ -1642,6 +1643,11 @@ git commit -F .git/commit_msg.txt
 
 补号读的是上游的钱，所以**一趟读几个是有预算的**（`usage.refresh.batch`，默认 6）：一次读是 2~11 个上游请求，一趟读几百个号就是几千个请求 —— 那不是填池，是打上游（规格 §6.4）。预算用完了这一趟就收手，读不到的号这一趟不再读（预算是有限的，别花在同一个读不到的号上），剩下的号等下一趟。池子短一点，总并发就少承诺一点（不变量 4）—— 那比把上游打疼了强。
 
+预算还有两把尺子，都是从配置里借的：
+
+- **写 0 按 1 算**（跟 `usage.batch()` 一个规矩）：0 不是「不读」，0 是「读一个」。keeper 那边的 0 说的是「不限」，所以接线的那一层必须先夹住 —— 一个写 `usage.refresh.batch: 0` 的人不该把补号那一趟的预算打开。
+- **一趟自己的时限**（`usage.refresh.budget`，默认 30s）：没有它，一趟的时长是「预算 × 每个号的时限」（6 × 15 秒 = 90 秒），而补号那一趟每 30 秒就该来一次 —— 中间那几趟都被「上一趟还在跑」挡掉了，补号的速度就悄悄降下来了。
+
 - [x] **Step 1: 写失败的测试**
 
 新建 `internal/pool/keeper_test.go`：
@@ -1738,6 +1744,64 @@ func (f *fakeMarker) SetExhausted(_ context.Context, accountID, windowKey string
 		AccountID: accountID, WindowKey: windowKey, Until: until, Reason: reason,
 	})
 	return nil
+}
+
+// blockingReader reads the credits only when the reading is over.
+//
+// 它是卡住的那种读：上游不答，网关等的是它自己那一趟的时间到。
+type blockingReader struct {
+	mu sync.Mutex
+	// asked counts the accounts it was asked about.
+	asked int
+}
+
+func (b *blockingReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	b.mu.Lock()
+	b.asked++
+	b.mu.Unlock()
+	<-ctx.Done()
+	return store.UsageSnapshot{}, ctx.Err()
+}
+
+// TestTheReplenishStopsWhenThePassIsOver says one filling pass does not
+// run past its own deadline.
+//
+// 补号那一趟每 30 秒该来一次（poolLoop）。一趟要是能跑 90 秒（6 个号 ×
+// 每个 15 秒），中间那两趟都被"上一趟还在跑"挡掉了，补号的速度就悄悄
+// 降下来了 —— 池短着，承诺的并发就少一个。
+func TestTheReplenishStopsWhenThePassIsOver(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+		{Account: anAccount("c")},
+		{Account: anAccount("d")},
+		{Account: anAccount("e")},
+	}}
+	reader := &blockingReader{}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10, PassTimeout: 100 * time.Millisecond,
+	})
+	// 这一趟的时间到了就收手：ctx 是网关自己的命，不是这一趟的。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	n, err := k.Replenish(ctx, 5)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("replenished = %d, want 0", n)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("the pass took %v, want less than a second", elapsed)
+	}
+	if reader.asked > 1 {
+		t.Fatalf("the site was asked %d times, want at most 1", reader.asked)
+	}
 }
 
 // TestTheSeedFillsThePoolWithoutAskingTheSite says the pool is filled
@@ -2066,11 +2130,23 @@ type KeeperOptions struct {
 	// 0 = 不限 —— 别这么配：补号读的是上游的钱，一次读是 2~11 个上游请求
 	//（规格 §6.4），一趟读几百个号就是几千个请求，那不是填池，是打上游。
 	// 预算就是 usage.refresh.batch：那一趟该读几个，就读几个。
+	//
+	// 生产上不要拿 0 来表示"不限"：调用它的那一层（gateway）必须先把它
+	// 夹住 —— 那边 0 的意思是"一个一批"，不是"全都读"。
 	ReadBudget int
 	// ReadTimeout is how long one reading may take.
 	//
 	// 卡住的账号不拖住整趟：读不到就当它不合格（规格 §5）。
 	ReadTimeout time.Duration
+	// PassTimeout is how long one pass may take.
+	//
+	// 一趟补号的上限：候选是问出来的，读额度是问上游的，两样都要时间。
+	// 没有这个上限，一趟的时长是"预算 × 每个号的时限"（6 × 15 秒 = 90
+	// 秒），而补号那一趟每 30 秒就该来一次 —— 中间那几趟都被"上一趟还
+	// 在跑"挡掉了，补号的速度就悄悄降下来了。
+	//
+	// 0 = 不限。生产上不该这么配。
+	PassTimeout time.Duration
 }
 
 // Keeper keeps the pool full.
@@ -2172,6 +2248,15 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		k.mu.Unlock()
 	}()
 
+	// 这一趟自己的时限：候选是问出来的，读额度是问上游的，两样都要时间。
+	// 没有它，一趟能跑"预算 × 每个号的时限"，而补号那一趟每 30 秒就该来
+	// 一次 —— 中间那几趟都被"上一趟还在跑"挡掉了，补号的速度悄悄降下来。
+	if k.opts.PassTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, k.opts.PassTimeout)
+		defer cancel()
+	}
+
 	added := 0
 	var lastErr error
 	// 这一趟读了几次：预算是这一趟的，不是整天的。
@@ -2185,6 +2270,11 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
+		if ctx.Err() != nil {
+			// 这一趟的时间用完了：整趟就此打住，不是只放下一个号。下
+			// 一趟重新开始。
+			break
+		}
 		if k.pool.Len() >= want {
 			break
 		}
@@ -2202,6 +2292,10 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		fresh := 0
 		for _, c := range candidates {
 			if k.pool.Len() >= want {
+				break
+			}
+			if ctx.Err() != nil {
+				// 这一趟的时间用完了：不再读下一个号，也不再问候选。
 				break
 			}
 			if inPool[c.Account.ID] {
@@ -2353,6 +2447,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -2392,6 +2487,28 @@ func (c *listingStore) ListAccounts(ctx context.Context) ([]store.Account, error
 func (c *listingStore) ListExhausted(ctx context.Context) ([]store.Exhausted, error) {
 	c.listed++
 	return c.Store.ListExhausted(ctx)
+}
+
+// TestTheReadBudgetIsNeverUnlimited says the keeper's read budget is
+// never "unlimited".
+//
+// keeper 那边的 0 说的是"不限"：补号读的是上游的钱，一次读是 2~11 个上游
+// 请求（规格 §6.4），一趟读几百个号就是几千个请求 —— 那不是填池，是打上
+// 游。而 usage.refresh.batch 配 0 说的是"一个一批"（usage.batch 的那
+// 条规矩），不是"全都读"。所以这一层必须把它夹住。
+func TestTheReadBudgetIsNeverUnlimited(t *testing.T) {
+	for _, c := range []struct {
+		batch int
+		want  int
+	}{
+		{0, 1}, {-1, 1}, {1, 1}, {6, 6},
+	} {
+		cfg := config.Default()
+		cfg.Usage.Refresh.Batch = c.batch
+		if got := poolReadBudget(cfg.Usage); got != c.want {
+			t.Errorf("the read budget for batch %d = %d, want %d", c.batch, got, c.want)
+		}
+	}
 }
 
 // TestThePickerReadsThePoolAndNotTheWholeTable says picking an account
@@ -2487,6 +2604,97 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 	}
 }
 
+// failingMarkStore does not write the marks.
+type failingMarkStore struct {
+	poolStore
+}
+
+func (f *failingMarkStore) SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
+	return errors.New("the database did not answer")
+}
+
+// TestASpentAccountLeavesThePoolEvenWhenTheMarkIsNotWritten says an
+// account that is spent leaves the pool even when the mark could not be
+// written.
+//
+// 标记写不进去的时候，那个号在池里留着：它带着一份旧的数（看着还有额
+// 度），下一次就被挑中，每一次都是一次白花的请求，直到库缓过来。
+//
+// 池是缓存：把一个库里还觉得好的号丢出去是安全的（它以后还能再进来），
+// 而把一个已经用完的号留在池里，每一次挑它都是一次白花的请求。标记的
+// 真相在库里，池只是缓存。
+func TestASpentAccountLeavesThePoolEvenWhenTheMarkIsNotWritten(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	ad := poolAdapter{s: &failingMarkStore{poolStore: s}, pool: p}
+
+	err := ad.MarkExhausted(ctx, "acc_01", "general", time.Now().Add(time.Hour), "quota")
+	if err == nil {
+		t.Fatal("the mark that could not be written was not reported")
+	}
+	if p.Len() != 0 {
+		t.Fatalf("pool = %d, want 0", p.Len())
+	}
+}
+
+// TestADeadAccountIsReplacedAtOnce says the pool is filled again right
+// after a dead account leaves it.
+//
+// 签不上的号出池以后，池里就少了一个 —— 而池短着的时候，承诺的并发就少
+// 一个（不变量 4）。等下一趟补号（最多三十秒）才补上，这中间那一段，
+// 网关白答应着做不到的事。
+func TestADeadAccountIsReplacedAtOnce(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 一个签出的号，一个好的号。
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusSignedOut, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "b", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	cfg := config.Default()
+	// 补号的时候不读额度：读额度是问上游的，这个测试不碰上游。
+	cfg.Pool.ReadOnAdmit = false
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	keeper := pool.NewKeeper(p, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()},
+		&fakeReader{}, s, pool.KeeperOptions{
+			Read: false, Cooldown: time.Minute, ReadBudget: 1,
+			ReadTimeout: time.Second, PassTimeout: 5 * time.Second,
+		})
+	g := &Server{
+		Store:      s,
+		Cfg:        cfg,
+		Pool:       p,
+		Keeper:     keeper,
+		lifeCtx:    lifeCtx,
+		lifeCancel: cancel,
+		bgSem:      make(chan struct{}, 1),
+	}
+
+	g.dropDeadAccount(ctx, "acc_01")
+
+	// 补号是后台的活：等它一会儿。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := p.Get("acc_02"); ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the pool holds %v, want acc_02", p.Accounts())
+}
+
 // TestASignedOutAccountLeavesThePool says an account that cannot sign
 // in goes out of the pool.
 //
@@ -2550,6 +2758,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -2680,6 +2889,85 @@ func TestTheFilledPoolDoesNotReadTheDatabase(t *testing.T) {
 	if cs.accounts != 0 || cs.exhausted != 0 || cs.snapshots != 0 {
 		t.Fatalf("the database was read: %d accounts, %d marks, %d snapshots",
 			cs.accounts, cs.exhausted, cs.snapshots)
+	}
+}
+
+// TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow says a database
+// that does not answer is not asked again before the window is over.
+//
+// 库从来没答过的时候（手上没有快照），后来的每一个请求都会去读一遍整张
+// 表：库在挂的时候，读的次数是跟着来的请求走的，不是跟着那一秒走的。
+// 记住上一次的那个错，这一秒里来的请求就都拿那个错走。
+func TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow(t *testing.T) {
+	_, cs := oneAccount(t)
+	cs.fail = true
+	f := newDBFallback(cs, time.Minute)
+	ctx := context.Background()
+
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the database that does not answer was not reported")
+	}
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the database that does not answer was not reported the second time")
+	}
+	if cs.accounts != 1 {
+		t.Fatalf("the accounts were read %d times, want 1", cs.accounts)
+	}
+}
+
+// panickingStore breaks on the first read and answers after that.
+//
+// 它站在读库的那一头：库崩了的时候，网关不能跟着崩，也不能从此吊死。
+type panickingStore struct {
+	poolStore
+	mu sync.Mutex
+	// broken says the store already broke once.
+	broken bool
+}
+
+func (p *panickingStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	p.mu.Lock()
+	broken := p.broken
+	p.broken = true
+	p.mu.Unlock()
+	if !broken {
+		panic("the store broke")
+	}
+	return p.poolStore.ListAccounts(ctx)
+}
+
+// TestTheFallbackSurvivesAPanicInTheRead says a read that panics does
+// not wedge the fallback.
+//
+// 读库的那一头要是炸了，发出去的信号就没人收了：后来的每一个请求都吊
+// 在一个不会有人关的通道上，等到自己的 ctx 死了才走 —— 兜底这一辈子就废
+// 了（进程还在，net/http 会 recover handler 的 panic）。
+func TestTheFallbackSurvivesAPanicInTheRead(t *testing.T) {
+	_, cs := oneAccount(t)
+	f := newDBFallback(&panickingStore{poolStore: cs}, time.Minute)
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("the panic did not come out")
+			}
+		}()
+		_, _ = f.get(context.Background())
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	snap, err := f.get(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("the fallback did not come back: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("the fallback took %v, want less than a second", elapsed)
+	}
+	if len(snap.accounts) != 1 {
+		t.Fatalf("accounts = %v, want just acc_01", snap.accounts)
 	}
 }
 
@@ -2927,8 +3215,12 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 		pool.KeeperOptions{
 			Read:        cfg.Pool.ReadOnAdmit,
 			Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
-			ReadBudget:  cfg.Usage.Refresh.Batch,
+			ReadBudget:  poolReadBudget(cfg.Usage),
 			ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
+			// 一趟补号自己的时限：跟读额度那一趟用同一把尺子
+			// （usage.refresh.budget）。没有它，一趟能跑 90 秒，而补号
+			// 那一趟每 30 秒就该来一次。
+			PassTimeout: cfg.Usage.Refresh.Budget.Duration(),
 		})
 ```
 
@@ -3009,18 +3301,21 @@ func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
 `internal/gateway/gateway.go`，`poolAdapter` 的 `MarkExhausted` 改成：
 ```go
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
-	if err := p.s.SetExhausted(ctx, accountID, windowKey, until, reason); err != nil {
-		return err
-	}
+	err := p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
 	if p.pool != nil {
-		// 标记写下去了，这个号就出池：它接不了活了，让位给一个冷的
-		//（规格 §4.4）。补号是后台的活。
+		// 这个号出池：它接不了活了，让位给一个冷的（规格 §4.4）。补号
+		// 是后台的活。
 		//
-		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标
-		// 记的真相在库里（那个号出池之后，填池也不收它）。
+		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标记的
+		// 真相在库里（那个号出池之后，填池也不收它）。
+		//
+		// 标记写不写得进去，池里都不留它：池是缓存，把一个库里还觉得好
+		// 的号丢出去是安全的（它以后还能再进来），而把一个已经用完的号
+		// 留在池里，它带着一份看着还有额度的旧数，每一次被挑中都是一次
+		// 白花的请求。
 		p.pool.Remove(accountID)
 	}
-	return nil
+	return err
 }
 ```
 
@@ -3080,6 +3375,12 @@ type dbFallback struct {
 	s     poolStore
 	tried time.Time
 	snap  *dbAnswer
+	// err is what the last read answered with.
+	//
+	// 它是给"库从来没答过"的时候准备的：手上没有快照，那就只剩这个错可
+	// 以给。没有它，这一秒里来的每一个请求都会去读一遍整张表 —— 库在挂
+	// 的时候，读的次数是跟着来的请求走的，不是跟着那一秒走的。
+	err error
 	// wait is the signal of the refresh in the air.
 	//
 	// 一次只读一遍：等的人等的是这个信号，不是那把锁 —— 锁里不做读库的
@@ -3110,12 +3411,23 @@ func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
 // 读失败了还是给答案：手上有一份旧的（可能过期）就拿它，没有才报错。
 // 一个请求失败比一片 429 强：旧的那份挑出来的号顶多撞一次空，撞空的
 // 代价是一个请求。
+//
+// 这一秒里只读一遍，不管有没有读到过：手上没有快照的时候，上一次的那个
+// 错就是这一秒里每一个请求的答案 —— 库在挂的时候，读的次数是跟着来的
+// 请求走的，不是跟着那一秒走的。
 func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.mu.Lock()
-	if f.snap != nil && time.Since(f.tried) < f.ttl {
+	if time.Since(f.tried) < f.ttl {
 		snap := f.snap
+		err := f.err
 		f.mu.Unlock()
-		return snap, nil
+		if snap != nil {
+			return snap, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("the database did not answer")
 	}
 	if f.wait != nil {
 		// 有人在读库。
@@ -3132,8 +3444,12 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 		}
 		f.mu.Lock()
 		snap := f.snap
+		err := f.err
 		f.mu.Unlock()
 		if snap == nil {
+			if err != nil {
+				return nil, err
+			}
 			return nil, errors.New("the database did not answer")
 		}
 		return snap, nil
@@ -3142,6 +3458,22 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.wait = ch
 	f.mu.Unlock()
 
+	// 信号一定要发出去：等的人等的是它。
+	//
+	// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
+	// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
+	// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
+	defer close(ch)
+	// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
+	// 不是代码后面的那几行。
+	defer func() {
+		f.mu.Lock()
+		if f.wait == ch {
+			f.wait = nil
+		}
+		f.mu.Unlock()
+	}()
+
 	answer, err := f.read(ctx)
 
 	f.mu.Lock()
@@ -3149,10 +3481,14 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.tried = time.Now()
 	if err == nil {
 		f.snap = answer
+		f.err = nil
+	} else {
+		// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
+		// 张表。
+		f.err = err
 	}
 	snap := f.snap
 	f.mu.Unlock()
-	close(ch)
 
 	if err != nil && snap == nil {
 		return nil, err
@@ -3246,9 +3582,26 @@ import (
 	"log"
 	"time"
 
+	"mmxcode/internal/config"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/store"
 )
+
+// poolReadBudget gives how many accounts one filling pass may read the
+// credits of.
+//
+// 配 0 的时候按 1 算，跟读额度那一趟是同一条规矩（usage.batch）：0 个一
+// 批是一趟也读不了，那不是关掉，是坏了。
+//
+// keeper 那边的 0 说的是"不限"，所以这一层必须先把它夹住：不夹住的话，
+// 一个写 `usage.refresh.batch: 0` 的人把补号那一趟的预算打开了 —— 一趟
+// 把候选表读一遍，一次读是 2~11 个上游请求（规格 §6.4）。
+func poolReadBudget(cfg config.Usage) int {
+	if cfg.Refresh.Batch <= 0 {
+		return 1
+	}
+	return cfg.Refresh.Batch
+}
 
 // poolSource gives the pool the accounts it could take.
 type poolSource struct {
@@ -3399,6 +3752,12 @@ func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
 		return
 	}
 	s.Pool.Remove(accountID)
+	// 池里少了一个号：补一个进去。补号是后台的活，不挡客户端（规格
+	// §4.4）—— 签不上这个号的那个请求已经等过了，不能再让它等下去。
+	//
+	// 不等下一趟（最多三十秒）：池短着的时候，承诺的并发就少一个（不变
+	// 量 4），这一段里网关白答应着做不到的事。
+	s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
 }
 ```
 
@@ -3554,7 +3913,7 @@ git commit -F .git/commit_msg.txt
 
 再往上还有一道**天花板**（`concurrency.total_max`，规格 §6.9）：池空的时候承诺是从库里数出来的，库里 1000 个号就承诺 200 —— 那一下能从池子撑的数抬到库里的数。天花板把它按住。0 = 不限，跟从前一样。
 
-**耗尽了出池**：额度用完的号写完标记就出池，补一个冷的进来。补号是后台的活，不挡客户端。
+**耗尽了出池**：额度用完的号写完标记就出池，补一个冷的进来。补号是后台的活，不挡客户端。**标记写不写得进去，那个号都出池**：池是缓存，把一个库里还觉得好的号丢出去是安全的（它以后还能再进来），而把一个已经用完的号留在池里，它带着一份看着还有额度的旧数，每一次被挑中都是一次白花的请求。
 
 - [x] **Step 1: 写失败的测试**
 
@@ -3786,6 +4145,90 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 			// 池要立刻能用：启动的时候用库里最后读到的数填上，不问站点
 			//（规格 §6.3）。
 			gw.SeedPool(ctx)
+```
+
+- [x] **Step 5b: 等空位的时候别拷名单**
+
+等一个空位的请求每 25 毫秒问一次 rotator 有没有能答的号，问一次就是一份名单的拷贝（池 400 个号就是 400 行 × 每秒 40 次）。先问一句便宜的：在飞的和试过的加起来，比池里能答的号少，那就**一定**有空位 —— 这是一个够用的证明，证明了就自己答，不必再问。
+
+反过来不成立：算出来是负数**不代表「一定没有空位」**。在飞的和试过的里面，有不在池子里的号（池空着的时候从库里挑的号、用完了已经出池的号）—— 那些数把差值算小了。宁可多问一句 rotator（它是权威），也别在明明有空位的时候判成「一个都没有」：那会让请求白等到超时，然后回一个不该有的 429。
+
+`internal/gateway/busy.go` 加一个 `count()`（现在只有 `isBusy`）：
+```go
+// count says how many accounts have a request in the air.
+func (b *busyAccounts) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.at)
+}
+```
+
+`internal/gateway/busy.go`，`waitForFree` 里（`if !sleepCtx(ctx, 25*time.Millisecond) {` 那一段之后、`ok, err := s.Rot.AnyUsable(ctx, model, used)` 之前）插入：
+```go
+		// 先问一句便宜的：在飞的和试过的加起来，比池里能答的号少，那就
+		// 一定有空位 —— 这一句是够的，它是个充足条件。其余的都去问
+		// rotator：谁在飞、谁能用、谁被标记用完了，只有它知道，而那一
+		// 次要把池里的名单拷一份（池 400 个号就是 400 行 × 每次等待，
+		// 一秒 40 次）。
+		if s.Pool != nil && s.busy != nil && s.Pool.Len() > 0 {
+			free := s.Pool.Usable() - s.busy.count() - len(used)
+			if free > 0 {
+				// 一定有空位：池里能答的号比在飞的加试过的还多，那一定
+				// 有一个既不忙也没试过。
+				return true
+			}
+			// 其余的都说不准：free 是个下限，不是确数 —— 在飞的那几个
+			// 和试过的那几个里面，有的不在池里（池空的时候从库里拿的
+			// 号，还有用完了出了池、请求还在飞的号）。所以负数说的是
+			// "不知道"，不是"没有"：当成"没有"就跳过了 rotator，而
+			// rotator 才是那个知道有没有空位的。
+		}
+```
+
+`internal/gateway/busy_test.go` 加一个测试：池里有两个号，一个在飞，`used` 里有一个**不在池里**的号 —— 差值是负的，但池里还有一个空着的号：请求必须很快找到它（几毫秒），不能等到超时。
+```go
+// TestTheFreeAccountIsFoundEvenWhenTheCountIsShort says a free account
+// is found even when the count says the pool is short.
+//
+// free 是个下限，不是确数：在飞的那几个和试过的那几个里面，有的不在池
+// 里 —— 池空的时候从库里拿的号，还有用完了出了池、请求还在飞的号。所以
+// 负数说的是"不知道"，不是"没有"：当成"没有"就跳过了 rotator，而
+// rotator 才知道到底有没有空位。于是这个请求等满了 concurrency.wait，
+// 回一个本该不会有的 429。
+func TestTheFreeAccountIsFoundEvenWhenTheCountIsShort(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_02", Status: store.StatusActive}})
+	busy := newBusyAccounts(1)
+	// acc_01 上有一个请求在飞。
+	if !busy.take("acc_01") {
+		t.Fatal("the account did not take the request")
+	}
+	ad := poolAdapter{s: s, busy: busy, pool: p}
+	g := &Server{
+		Pool: p,
+		busy: busy,
+		Rot: rotator.New(ad, rotator.Options{
+			MaxAttempts: 3,
+			Cooldown:    time.Minute,
+			WindowGroup: manager.WindowGroup,
+		}),
+	}
+	// 试过的那些里面有一个不在池里。
+	used := map[string]bool{"acc_01": true, "acc_x": true}
+
+	start := time.Now()
+	ok := g.waitForFree(ctx, time.Now().Add(3*time.Second), "m", used)
+	elapsed := time.Since(start)
+	if !ok {
+		t.Fatalf("the free account was not found (it took %v)", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("the request waited %v, want it to find the free account", elapsed)
+	}
+}
 ```
 
 - [x] **Step 6: 跑测试，看它过**
@@ -4079,7 +4522,7 @@ git commit -F .git/commit_msg.txt
 
 ## 怎么验
 
-计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 65 个测试。
+计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 72 个测试。
 
 做完之后按这个顺序验：
 ```sh
