@@ -993,7 +993,7 @@ git commit -F .git/commit_msg.txt
 - Create: `internal/pool/pool.go`
 - Create: `internal/pool/pool_test.go`
 
-池是内存里的一个集合：账号行、剩余积分、耗尽标记。**它不放计划窗口** —— 选号用不上，放进去每个账号从 400 字节变成 2.2 KB。
+池是内存里的一个集合：账号行、剩余积分。**它不放计划窗口** —— 选号用不上，放进去每个账号从 400 字节变成 2.2 KB。
 
 **号按进池的顺序排**（规格 §6.9）：轮转从队首走到队尾，冷号先被挑；一个号出池再进池，它排到队尾。map 的顺序是随机的 —— 随机的顺序让轮转不是轮转。
 
@@ -1075,45 +1075,14 @@ func TestAnAccountThatIsInThePoolIsNotTakenTwice(t *testing.T) {
 	}
 }
 
-// TestASpentAccountIsNotUsable says an account whose window is spent
-// cannot answer.
-//
-// 它的窗口什么时候回来，标记说了算：还在将来，它就接不了活（规格
-// §4.2）。
-func TestASpentAccountIsNotUsable(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(time.Hour), "quota")
-
-	if p.Usable(time.Now()) != 0 {
-		t.Fatalf("usable = %d, want 0", p.Usable(time.Now()))
-	}
-	spent := p.Spent()
-	if len(spent) != 1 || spent[0].AccountID != "a" {
-		t.Fatalf("spent = %v, want just a", spent)
-	}
-}
-
-// TestASpentAccountWhoseTimeHasComeIsUsableAgain says a spent account
-// comes back when its window comes back.
-func TestASpentAccountWhoseTimeHasComeIsUsableAgain(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
-
-	if p.Usable(time.Now()) != 1 {
-		t.Fatalf("usable = %d, want 1", p.Usable(time.Now()))
-	}
-}
-
 // TestAnAccountThatIsSignedOutIsNotUsable says an account that is not
 // signed in cannot answer.
 func TestAnAccountThatIsSignedOutIsNotUsable(t *testing.T) {
 	p := New(4)
 	p.Admit(Entry{Account: store.Account{ID: "a", Status: store.StatusSignedOut}})
 
-	if p.Usable(time.Now()) != 0 {
-		t.Fatalf("usable = %d, want 0", p.Usable(time.Now()))
+	if p.Usable() != 0 {
+		t.Fatalf("usable = %d, want 0", p.Usable())
 	}
 }
 
@@ -1257,7 +1226,6 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 			id := fmt.Sprintf("acc_%d", i%32)
 			p.Admit(Entry{Account: anAccount(id)})
 			p.SetRemaining(id, float64(i), true)
-			p.MarkSpent(id, "general", time.Now().Add(time.Hour), "quota")
 			p.Remove(id)
 		}
 	}()
@@ -1276,8 +1244,7 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 			p.Entries()
 			p.IDs()
 			p.Accounts()
-			p.Spent()
-			p.Usable(time.Now())
+			p.Usable()
 			p.Len()
 			p.Full()
 		}
@@ -1331,21 +1298,6 @@ func TestTheCapacityDoesNotTakeAccountsOut(t *testing.T) {
 	}
 }
 
-// TestTheSpentListDropsTheExpiredOnes says a spent window that has come
-// back is not in the spent list.
-//
-// 窗口回来了，那个号就回来了（规格 §4.5）：名单里还留着它，挑号就会跳过
-// 一个能用的号。
-func TestTheSpentListDropsTheExpiredOnes(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
-
-	if spent := p.Spent(); len(spent) != 0 {
-		t.Fatalf("spent = %v, want none", spent)
-	}
-}
-
 // TestTheNamesAreCopies says the caller cannot break the pool by changing
 // the list it was given.
 //
@@ -1394,14 +1346,16 @@ Expected: FAIL —— `package pool` 里没有 `Pool`（这个包还不存在）
 //     就拷多大：比全表读小几十倍，但不是零）。
 //   - 池有上界。库里的号再多，池里也只有「并发 + 会话」那么多个。
 //
-// 池里放的是选号要用的三样：账号行、剩余积分、耗尽标记。计划窗口
-// （windows_json）不放 —— 选号用不上它，放进去每个账号从 400 字节变成
-// 2.2 KB，内存账翻五倍。
+// 池里放的是选号要用的两样：账号行、剩余积分。计划窗口（windows_json）
+// 不放 —— 选号用不上它，放进去每个账号从 400 字节变成 2.2 KB，内存账翻
+// 五倍。
+//
+// 耗尽标记不放：额度用完的号直接出池了（规格 §4.4），池里没有用完的号，
+// 也就没有标记要记。标记的真相在库里。
 package pool
 
 import (
 	"sync"
-	"time"
 
 	"mmxcode/internal/store"
 )
@@ -1427,14 +1381,6 @@ type Entry struct {
 	// 它是 false 的时候 Remaining 说不了话：这个号还没被读过。不是 0
 	// —— 0 是「读到了，没有了」。
 	Known bool
-	// Spent says the account's window is spent.
-	Spent bool
-	// SpentUntil is when the window comes back.
-	SpentUntil time.Time
-	// SpentGroup is the window group that is spent.
-	SpentGroup string
-	// SpentReason is why the window is spent.
-	SpentReason string
 }
 
 // Pool is the set of accounts the gateway keeps in memory.
@@ -1607,28 +1553,6 @@ func (p *Pool) IDs() map[string]bool {
 	return out
 }
 
-// MarkSpent marks an account's window spent.
-//
-// 标记的是「这个窗口用完了，什么时候回来」：池里的号照旧留着，只是它
-// 不再能被挑到 —— 挑号的那一套会看 Spent 和 SpentUntil。
-//
-// reason 是为什么用完的（现在是 "quota"）：它跟着名单一起给出去，别的地方
-// 看得见为什么这个号被搁下了。
-//
-// until 是零值 = 立刻回来：这个号马上又能答了（窗口回来了，规格 §4.5）。
-func (p *Pool) MarkSpent(accountID, windowKey string, until time.Time, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byID[accountID]
-	if !ok {
-		return
-	}
-	e.Spent = true
-	e.SpentGroup = windowKey
-	e.SpentUntil = until
-	e.SpentReason = reason
-}
-
 // SetRemaining writes the credits of an account that is in the pool.
 //
 // 一个不在池里的号没有地方可写：它不是池的成员，它的数跟挑号无关。
@@ -1645,17 +1569,14 @@ func (p *Pool) SetRemaining(accountID string, left float64, known bool) {
 
 // Usable is how many accounts in the pool can answer right now.
 //
-// 能答 = 签入中（status 是 active）而且它的窗口没有用完。窗口的时刻已
-// 经过去的标记不算用完 —— 那个号回来了（规格 §4.5）。
-func (p *Pool) Usable(now time.Time) int {
+// 能答 = 签入中（status 是 active）。用完的号不在池里：额度用完就出池
+// （规格 §4.4）。
+func (p *Pool) Usable() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	n := 0
 	for _, e := range p.byID {
 		if e.Account.Status != store.StatusActive {
-			continue
-		}
-		if e.Spent && e.SpentUntil.After(now) {
 			continue
 		}
 		n++
@@ -1683,37 +1604,6 @@ func (p *Pool) Accounts() []store.Account {
 	}
 	return out
 }
-
-// Spent gives the accounts in the pool whose window is spent.
-//
-// 过期的不算：窗口回来了，那个号就回来了（规格 §4.5）。
-//
-// 给的是一份新的：拿着它的人可以随便改。
-//
-// 容量不按池的大小预留：这份名单在稳态下几乎总是空的（号被标记用完的同时
-// 就出池了），按池的大小预留就是每个请求白分配几百个号的钱。
-func (p *Pool) Spent() []store.Exhausted {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	out := make([]store.Exhausted, 0)
-	for _, id := range p.order {
-		e, ok := p.byID[id]
-		if !ok || !e.Spent {
-			continue
-		}
-		if !e.SpentUntil.After(now) {
-			continue
-		}
-		out = append(out, store.Exhausted{
-			AccountID: e.Account.ID,
-			WindowKey: e.SpentGroup,
-			Until:     e.SpentUntil,
-			Reason:    e.SpentReason,
-		})
-	}
-	return out
-}
 ```
 
 - [ ] **Step 4: 跑测试，看它过**
@@ -1726,10 +1616,10 @@ Expected: PASS。
 - [ ] **Step 5: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
-feat(pool): 内存里的账号池 —— 有上界，只放选号要用的三样
+feat(pool): 内存里的账号池 —— 有上界，只放选号要用的两样
 
-账号行、剩余积分、耗尽标记。计划窗口不放：选号用不上它，放进去内存账
-从 395 字节变 2.2 KB（规格 §5.5）。
+账号行、剩余积分。计划窗口不放：选号用不上它，放进去内存账从 395 字节变
+2.2 KB（规格 §5.5）。
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -2551,6 +2441,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -2562,18 +2453,20 @@ import (
 //
 // 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
 // 三样，每一样都是全表读。
-//
-// 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
-// 三样，每一样都是全表读。
 type readCountingStore struct {
 	*store.Store
 	accounts  int
 	exhausted int
 	snapshots int
+	// fail says the database stopped answering.
+	fail bool
 }
 
 func (c *readCountingStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
 	c.accounts++
+	if c.fail {
+		return nil, errors.New("the database did not answer")
+	}
 	return c.Store.ListAccounts(ctx)
 }
 
@@ -2679,6 +2572,30 @@ func TestTheFilledPoolDoesNotReadTheDatabase(t *testing.T) {
 	if cs.accounts != 0 || cs.exhausted != 0 || cs.snapshots != 0 {
 		t.Fatalf("the database was read: %d accounts, %d marks, %d snapshots",
 			cs.accounts, cs.exhausted, cs.snapshots)
+	}
+}
+
+// TestTheOldAnswerIsServedWhenTheDatabaseIsUnhappy says a failing read
+// does not take the answer away.
+//
+// 库不答的时候，手上有旧的一份就拿它：挑出来的号顶多撞一次空，撞空的
+// 代价是一个请求 —— 那比一片 503 强。
+func TestTheOldAnswerIsServedWhenTheDatabaseIsUnhappy(t *testing.T) {
+	_, cs := oneAccount(t)
+	ctx := context.Background()
+	ad := poolAdapter{s: cs, fallback: newDBFallback(cs, time.Nanosecond)}
+
+	if _, err := ad.Accounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs.fail = true
+
+	accounts, err := ad.Accounts(ctx)
+	if err != nil {
+		t.Fatalf("the answer was taken away: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "acc_01" {
+		t.Fatalf("accounts = %v, want just acc_01", accounts)
 	}
 }
 ```
@@ -2969,7 +2886,10 @@ func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
 ```go
 func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
 	if p.fromPool() {
-		return p.pool.Spent(), nil
+		// 池里的号没有标记：额度用完的号当场出池（规格 §4.4），填池的
+		// 时候也不收有标记的号。所以这一份是空的 —— 标记的真相在库
+		// 里，池空的时候从库里拿。
+		return nil, nil
 	}
 	if p.fallback != nil {
 		return p.fallback.exhausted(ctx)
@@ -2987,7 +2907,9 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 	if p.pool != nil {
 		// 标记写下去了，这个号就出池：它接不了活了，让位给一个冷的
 		//（规格 §4.4）。补号是后台的活。
-		p.pool.MarkSpent(accountID, windowKey, until, reason)
+		//
+		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标
+		// 记的真相在库里（那个号出池之后，填池也不收它）。
 		p.pool.Remove(accountID)
 	}
 	return nil
@@ -3023,6 +2945,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -3044,11 +2967,16 @@ import (
 // 中它，撞一次空，换号重试。撞一次空的代价是一个请求；不缓存的代价是
 // 每一波并发都把整张表读一遍。前者便宜得多。
 type dbFallback struct {
-	mu   sync.Mutex
-	ttl  time.Duration
-	s    poolStore
-	at   time.Time
-	snap *dbAnswer
+	mu    sync.Mutex
+	ttl   time.Duration
+	s     poolStore
+	tried time.Time
+	snap  *dbAnswer
+	// wait is the signal of the refresh in the air.
+	//
+	// 一次只读一遍：等的人等的是这个信号，不是那把锁 —— 锁里不做读库的
+	// 活（读库要几毫秒到几十毫秒，锁里读库就是把所有人吊在库上）。
+	wait chan struct{}
 }
 
 // dbAnswer is one answer from the database.
@@ -3068,13 +2996,66 @@ func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
 
 // get gives the snapshot, taking a new one when the old is stale.
 //
-// 它一次只让一个取：等的时候拿着锁（活儿很便宜，几毫秒）。
+// 它一次只读一遍：读的时候别人等的是那个信号。手上有旧的一份就拿旧的
+// 先走 —— 过期也比等着强，客户端自己会超时，而网关不该把它吊在读库上。
+//
+// 读失败了还是给答案：手上有一份旧的（可能过期）就拿它，没有才报错。
+// 一个请求失败比一片 429 强：旧的那份挑出来的号顶多撞一次空，撞空的
+// 代价是一个请求。
 func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.snap != nil && time.Since(f.at) < f.ttl {
-		return f.snap, nil
+	if f.snap != nil && time.Since(f.tried) < f.ttl {
+		snap := f.snap
+		f.mu.Unlock()
+		return snap, nil
 	}
+	if f.wait != nil {
+		// 有人在读库。
+		ch := f.wait
+		stale := f.snap
+		f.mu.Unlock()
+		if stale != nil {
+			return stale, nil
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		f.mu.Lock()
+		snap := f.snap
+		f.mu.Unlock()
+		if snap == nil {
+			return nil, errors.New("the database did not answer")
+		}
+		return snap, nil
+	}
+	ch := make(chan struct{})
+	f.wait = ch
+	f.mu.Unlock()
+
+	answer, err := f.read(ctx)
+
+	f.mu.Lock()
+	f.wait = nil
+	f.tried = time.Now()
+	if err == nil {
+		f.snap = answer
+	}
+	snap := f.snap
+	f.mu.Unlock()
+	close(ch)
+
+	if err != nil && snap == nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// read asks the database the three things the adapter needs.
+//
+// 读库的活儿在这里，不在锁里：账号、耗尽标记、余额快照。
+func (f *dbFallback) read(ctx context.Context) (*dbAnswer, error) {
 	accounts, err := f.s.ListAccounts(ctx)
 	if err != nil {
 		return nil, err
@@ -3096,9 +3077,7 @@ func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
 		}
 		remaining[s.AccountID] = rotator.Remaining{Left: s.Remaining, Known: true}
 	}
-	f.snap = &dbAnswer{accounts: accounts, exhausted: exhausted, remaining: remaining}
-	f.at = time.Now()
-	return f.snap, nil
+	return &dbAnswer{accounts: accounts, exhausted: exhausted, remaining: remaining}, nil
 }
 
 // accounts gives the accounts of the snapshot.
@@ -3189,7 +3168,8 @@ func (p poolSource) Candidates(ctx context.Context, limit int, exclude map[strin
 //
 // 池多大 = max(总并发, 活跃会话数) × 倍数（规格 §6.3）：
 //
-//   - 总并发是「该跑多少个请求」= 可用账号数 ÷ 5（小规模至少 3）；
+//   - 总并发是「该跑多少个请求」= 可用账号数 ÷ concurrency.total_ratio
+//     （小规模至少 concurrency.total_min 个）；
 //   - 活跃会话数是「有多少段对话在用」—— 会话钉在号上，钉住的号不在池
 //     里会被改绑，缓存命中就没了，所以池要装得下它们；
 //   - 倍数是 2：再留一倍给补号（补号要读一次额度，那段时间位置空着）。
@@ -3267,10 +3247,17 @@ func (s *Server) TopUpPool(ctx context.Context) {
 //
 // 每 scan_every 一趟：池里少了号就补上。补号是上游的活，所以它在后台，
 // 而且一次只跑一趟（规格 §6.4）。
+//
+// 间隔跟读额度那一趟是同一把尺子（usage.refresh.scan_every，0 就交回
+// schedule.usage_refresh）：写 0 的人说的是「别那么频繁」，不是「每 30 秒
+// 一趟」。
 func (s *Server) poolLoop() {
 	every := s.Cfg.Usage.Refresh.ScanEvery.Duration()
 	if every <= 0 {
-		every = 30 * time.Second
+		every = s.Cfg.Schedule.UsageRefresh.Duration()
+	}
+	if every <= 0 {
+		every = 15 * time.Minute
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -3636,7 +3623,7 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 		return 1
 	}
 	want := totalFor(usable, s.Cfg.Concurrency)
-	inPool := s.Pool.Usable(time.Now())
+	inPool := s.Pool.Usable()
 	switch {
 	case inPool == 0:
 		// 池是空的：还没填上，或者填池失败。跟从前一样，从库里数。

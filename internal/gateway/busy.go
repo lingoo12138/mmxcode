@@ -139,11 +139,13 @@ func (g *gate) waitFor(ctx context.Context, limit int, wait time.Duration) bool 
 
 // totalFor gives the total concurrency for a number of usable accounts.
 //
-// 总并发 = max(floor(可用账号数 / 5), min(可用账号数, 3))，再按天花板截下来
+// 总并发 = max(可用账号数 ÷ total_ratio, min(可用账号数, total_min))，
+// 再按天花板截下来
 //
 // 五分之一在用，四分之五留着：100 个账号同时只用 20 个，这 20 个把额
 // 度用完了，还有 80 个是满的可以接。小规模的时候至少 min(账号数, 3)
-// 个：5 个账号只跑 1 个太憋屈。
+// 个：5 个账号只跑 1 个太憋屈。（比例和底都是配置说了算：
+// concurrency.total_ratio 和 concurrency.total_min，默认 5 和 3。）
 func totalFor(usable int, cfg config.Concurrency) int {
 	ratio := cfg.TotalRatio
 	if ratio < 1 {
@@ -189,12 +191,16 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 	if s.Store == nil {
 		return 1
 	}
+	if s.Pool == nil {
+		// 没有池就没有「池夹」这回事：承诺还是从前那样按库里数。
+		return 1
+	}
 	usable, err := s.Store.CountUsable(ctx)
 	if err != nil {
 		return 1
 	}
 	want := totalFor(usable, s.Cfg.Concurrency)
-	inPool := s.Pool.Usable(time.Now())
+	inPool := s.Pool.Usable()
 	switch {
 	case inPool == 0:
 		// 池是空的：还没填上，或者填池失败。跟从前一样，从库里数。

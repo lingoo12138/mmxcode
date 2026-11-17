@@ -35,7 +35,8 @@ func (p poolSource) Candidates(ctx context.Context, limit int, exclude map[strin
 //
 // 池多大 = max(总并发, 活跃会话数) × 倍数（规格 §6.3）：
 //
-//   - 总并发是「该跑多少个请求」= 可用账号数 ÷ 5（小规模至少 3）；
+//   - 总并发是「该跑多少个请求」= 可用账号数 ÷ concurrency.total_ratio
+//     （小规模至少 concurrency.total_min 个）；
 //   - 活跃会话数是「有多少段对话在用」—— 会话钉在号上，钉住的号不在池
 //     里会被改绑，缓存命中就没了，所以池要装得下它们；
 //   - 倍数是 2：再留一倍给补号（补号要读一次额度，那段时间位置空着）。
@@ -113,10 +114,17 @@ func (s *Server) TopUpPool(ctx context.Context) {
 //
 // 每 scan_every 一趟：池里少了号就补上。补号是上游的活，所以它在后台，
 // 而且一次只跑一趟（规格 §6.4）。
+//
+// 间隔跟读额度那一趟是同一把尺子（usage.refresh.scan_every，0 就交回
+// schedule.usage_refresh）：写 0 的人说的是「别那么频繁」，不是「每 30 秒
+// 一趟」。
 func (s *Server) poolLoop() {
 	every := s.Cfg.Usage.Refresh.ScanEvery.Duration()
 	if every <= 0 {
-		every = 30 * time.Second
+		every = s.Cfg.Schedule.UsageRefresh.Duration()
+	}
+	if every <= 0 {
+		every = 15 * time.Minute
 	}
 	t := time.NewTicker(every)
 	defer t.Stop()

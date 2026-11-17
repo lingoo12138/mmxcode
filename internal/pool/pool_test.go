@@ -72,45 +72,14 @@ func TestAnAccountThatIsInThePoolIsNotTakenTwice(t *testing.T) {
 	}
 }
 
-// TestASpentAccountIsNotUsable says an account whose window is spent
-// cannot answer.
-//
-// 它的窗口什么时候回来，标记说了算：还在将来，它就接不了活（规格
-// §4.2）。
-func TestASpentAccountIsNotUsable(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(time.Hour), "quota")
-
-	if p.Usable(time.Now()) != 0 {
-		t.Fatalf("usable = %d, want 0", p.Usable(time.Now()))
-	}
-	spent := p.Spent()
-	if len(spent) != 1 || spent[0].AccountID != "a" {
-		t.Fatalf("spent = %v, want just a", spent)
-	}
-}
-
-// TestASpentAccountWhoseTimeHasComeIsUsableAgain says a spent account
-// comes back when its window comes back.
-func TestASpentAccountWhoseTimeHasComeIsUsableAgain(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
-
-	if p.Usable(time.Now()) != 1 {
-		t.Fatalf("usable = %d, want 1", p.Usable(time.Now()))
-	}
-}
-
 // TestAnAccountThatIsSignedOutIsNotUsable says an account that is not
 // signed in cannot answer.
 func TestAnAccountThatIsSignedOutIsNotUsable(t *testing.T) {
 	p := New(4)
 	p.Admit(Entry{Account: store.Account{ID: "a", Status: store.StatusSignedOut}})
 
-	if p.Usable(time.Now()) != 0 {
-		t.Fatalf("usable = %d, want 0", p.Usable(time.Now()))
+	if p.Usable() != 0 {
+		t.Fatalf("usable = %d, want 0", p.Usable())
 	}
 }
 
@@ -254,7 +223,6 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 			id := fmt.Sprintf("acc_%d", i%32)
 			p.Admit(Entry{Account: anAccount(id)})
 			p.SetRemaining(id, float64(i), true)
-			p.MarkSpent(id, "general", time.Now().Add(time.Hour), "quota")
 			p.Remove(id)
 		}
 	}()
@@ -273,8 +241,7 @@ func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
 			p.Entries()
 			p.IDs()
 			p.Accounts()
-			p.Spent()
-			p.Usable(time.Now())
+			p.Usable()
 			p.Len()
 			p.Full()
 		}
@@ -325,21 +292,6 @@ func TestTheCapacityDoesNotTakeAccountsOut(t *testing.T) {
 	}
 	if p.Capacity() != 1 {
 		t.Fatalf("capacity = %d, want 1", p.Capacity())
-	}
-}
-
-// TestTheSpentListDropsTheExpiredOnes says a spent window that has come
-// back is not in the spent list.
-//
-// 窗口回来了，那个号就回来了（规格 §4.5）：名单里还留着它，挑号就会跳过
-// 一个能用的号。
-func TestTheSpentListDropsTheExpiredOnes(t *testing.T) {
-	p := New(4)
-	p.Admit(Entry{Account: anAccount("a")})
-	p.MarkSpent("a", "general", time.Now().Add(-time.Minute), "quota")
-
-	if spent := p.Spent(); len(spent) != 0 {
-		t.Fatalf("spent = %v, want none", spent)
 	}
 }
 

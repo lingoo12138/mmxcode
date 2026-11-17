@@ -326,7 +326,10 @@ func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
 
 func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
 	if p.fromPool() {
-		return p.pool.Spent(), nil
+		// 池里的号没有标记：额度用完的号当场出池（规格 §4.4），填池的
+		// 时候也不收有标记的号。所以这一份是空的 —— 标记的真相在库
+		// 里，池空的时候从库里拿。
+		return nil, nil
 	}
 	if p.fallback != nil {
 		return p.fallback.exhausted(ctx)
@@ -358,7 +361,9 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 	if p.pool != nil {
 		// 标记写下去了，这个号就出池：它接不了活了，让位给一个冷的
 		//（规格 §4.4）。补号是后台的活。
-		p.pool.MarkSpent(accountID, windowKey, until, reason)
+		//
+		// 池里不留标记：它已经不在池里了，留着也没有人能看见 —— 标
+		// 记的真相在库里（那个号出池之后，填池也不收它）。
 		p.pool.Remove(accountID)
 	}
 	return nil

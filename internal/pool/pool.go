@@ -10,14 +10,16 @@
 //     就拷多大：比全表读小几十倍，但不是零）。
 //   - 池有上界。库里的号再多，池里也只有「并发 + 会话」那么多个。
 //
-// 池里放的是选号要用的三样：账号行、剩余积分、耗尽标记。计划窗口
-// （windows_json）不放 —— 选号用不上它，放进去每个账号从 400 字节变成
-// 2.2 KB，内存账翻五倍。
+// 池里放的是选号要用的两样：账号行、剩余积分。计划窗口（windows_json）
+// 不放 —— 选号用不上它，放进去每个账号从 400 字节变成 2.2 KB，内存账翻
+// 五倍。
+//
+// 耗尽标记不放：额度用完的号直接出池了（规格 §4.4），池里没有用完的号，
+// 也就没有标记要记。标记的真相在库里。
 package pool
 
 import (
 	"sync"
-	"time"
 
 	"mmxcode/internal/store"
 )
@@ -43,14 +45,6 @@ type Entry struct {
 	// 它是 false 的时候 Remaining 说不了话：这个号还没被读过。不是 0
 	// —— 0 是「读到了，没有了」。
 	Known bool
-	// Spent says the account's window is spent.
-	Spent bool
-	// SpentUntil is when the window comes back.
-	SpentUntil time.Time
-	// SpentGroup is the window group that is spent.
-	SpentGroup string
-	// SpentReason is why the window is spent.
-	SpentReason string
 }
 
 // Pool is the set of accounts the gateway keeps in memory.
@@ -223,28 +217,6 @@ func (p *Pool) IDs() map[string]bool {
 	return out
 }
 
-// MarkSpent marks an account's window spent.
-//
-// 标记的是「这个窗口用完了，什么时候回来」：池里的号照旧留着，只是它
-// 不再能被挑到 —— 挑号的那一套会看 Spent 和 SpentUntil。
-//
-// reason 是为什么用完的（现在是 "quota"）：它跟着名单一起给出去，别的地方
-// 看得见为什么这个号被搁下了。
-//
-// until 是零值 = 立刻回来：这个号马上又能答了（窗口回来了，规格 §4.5）。
-func (p *Pool) MarkSpent(accountID, windowKey string, until time.Time, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byID[accountID]
-	if !ok {
-		return
-	}
-	e.Spent = true
-	e.SpentGroup = windowKey
-	e.SpentUntil = until
-	e.SpentReason = reason
-}
-
 // SetRemaining writes the credits of an account that is in the pool.
 //
 // 一个不在池里的号没有地方可写：它不是池的成员，它的数跟挑号无关。
@@ -261,17 +233,14 @@ func (p *Pool) SetRemaining(accountID string, left float64, known bool) {
 
 // Usable is how many accounts in the pool can answer right now.
 //
-// 能答 = 签入中（status 是 active）而且它的窗口没有用完。窗口的时刻已
-// 经过去的标记不算用完 —— 那个号回来了（规格 §4.5）。
-func (p *Pool) Usable(now time.Time) int {
+// 能答 = 签入中（status 是 active）。用完的号不在池里：额度用完就出池
+// （规格 §4.4）。
+func (p *Pool) Usable() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	n := 0
 	for _, e := range p.byID {
 		if e.Account.Status != store.StatusActive {
-			continue
-		}
-		if e.Spent && e.SpentUntil.After(now) {
 			continue
 		}
 		n++
@@ -296,37 +265,6 @@ func (p *Pool) Accounts() []store.Account {
 			continue
 		}
 		out = append(out, e.Account)
-	}
-	return out
-}
-
-// Spent gives the accounts in the pool whose window is spent.
-//
-// 过期的不算：窗口回来了，那个号就回来了（规格 §4.5）。
-//
-// 给的是一份新的：拿着它的人可以随便改。
-//
-// 容量不按池的大小预留：这份名单在稳态下几乎总是空的（号被标记用完的同时
-// 就出池了），按池的大小预留就是每个请求白分配几百个号的钱。
-func (p *Pool) Spent() []store.Exhausted {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	out := make([]store.Exhausted, 0)
-	for _, id := range p.order {
-		e, ok := p.byID[id]
-		if !ok || !e.Spent {
-			continue
-		}
-		if !e.SpentUntil.After(now) {
-			continue
-		}
-		out = append(out, store.Exhausted{
-			AccountID: e.Account.ID,
-			WindowKey: e.SpentGroup,
-			Until:     e.SpentUntil,
-			Reason:    e.SpentReason,
-		})
 	}
 	return out
 }
