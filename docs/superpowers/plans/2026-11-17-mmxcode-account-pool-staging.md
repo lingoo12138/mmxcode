@@ -658,7 +658,7 @@ func TestTouchingNoSessionIsNothing(t *testing.T) {
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
-go test ./internal/store/ -run "Candidate|Usable|RecentSession|Touch"
+go test ./internal/store/
 ```
 
 Expected: FAIL —— `s.PoolCandidates undefined`。
