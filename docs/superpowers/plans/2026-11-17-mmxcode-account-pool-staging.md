@@ -239,10 +239,13 @@ git commit -F .git/commit_msg.txt
 ### Task 2: store —— 候选账号的查询
 
 **Files:**
+- Modify: `internal/store/store.go`
 - Create: `internal/store/pool.go`
 - Create: `internal/store/pool_test.go`
 
-池要装的号从哪儿来：库里。查询给的是**最冷的那些** —— 从没读过的排最前，读过的按最后读到的时刻从早到晚。冷号先进池，被用熟的号留给会话（规格 §6.5）。
+池要装的号从哪儿来：库里。排队的规矩是三层：**最近活跃的对话绑着的号**（会话钉在号上，钉住的号不在池里就会被改绑，规格不变量 3）→ **从没读过的号，最新的导入在前**（新导入的几乎肯定没被用过）→ **读得最早的号**（最冷的那些）。
+
+这个任务还带上**会话活跃**那件事（规格 §6.8）：`TouchSessions` 把用过的会话写回去，「活跃会话数」才是个真的数。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -274,6 +277,33 @@ func saveReading(t *testing.T, s *Store, accountID string, remaining float64, at
 	}
 }
 
+// makeAccountAt puts an account in the store with a said creation time.
+//
+// 导入的时刻是「这个号有多新」的凭据。
+func makeAccountAt(t *testing.T, s *Store, id string, createdAt time.Time) {
+	t.Helper()
+	err := s.CreateAccount(context.Background(), Account{
+		ID: id, Name: id, Status: StatusActive, CreatedAt: createdAt, UpdatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// candidateIDs gives the ids of the candidates, in order.
+func candidateIDs(t *testing.T, s *Store, limit int, exclude map[string]bool, since time.Time) []string {
+	t.Helper()
+	cands, err := s.PoolCandidates(context.Background(), limit, exclude, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(cands))
+	for _, c := range cands {
+		ids = append(ids, c.Account.ID)
+	}
+	return ids
+}
+
 // TestTheCandidatesAreTheColdestFirst says the pool is filled with the
 // accounts that were used least, not the ones that were used most.
 //
@@ -281,7 +311,6 @@ func saveReading(t *testing.T, s *Store, accountID string, remaining float64, at
 // 前 —— 它还没有数，读一次就知道它有没有额度。
 func TestTheCandidatesAreTheColdestFirst(t *testing.T) {
 	s := openTest(t)
-	ctx := context.Background()
 	makeAccount(t, s, "warm")
 	makeAccount(t, s, "cold")
 	makeAccount(t, s, "never")
@@ -289,14 +318,7 @@ func TestTheCandidatesAreTheColdestFirst(t *testing.T) {
 	saveReading(t, s, "warm", 10, now.Add(-time.Hour))
 	saveReading(t, s, "cold", 400, now.Add(-24*time.Hour))
 
-	cands, err := s.PoolCandidates(ctx, 10, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ids []string
-	for _, c := range cands {
-		ids = append(ids, c.Account.ID)
-	}
+	ids := candidateIDs(t, s, 10, nil, now.Add(-time.Hour))
 	want := []string{"never", "cold", "warm"}
 	if len(ids) != len(want) {
 		t.Fatalf("candidates = %v, want %v", ids, want)
@@ -305,6 +327,96 @@ func TestTheCandidatesAreTheColdestFirst(t *testing.T) {
 		if ids[i] != id {
 			t.Fatalf("candidates = %v, want %v", ids, want)
 		}
+	}
+}
+
+// TestANewlyImportedAccountComesBeforeAnOldOne says the accounts that
+// were never read are taken newest first.
+//
+// 新导入的号几乎肯定没被用过：用过就会被读，读过就有数。导入很久还没
+// 数的号多半是被用过的，它的额度早就不知道剩多少了（规格 §6.5）。
+func TestANewlyImportedAccountComesBeforeAnOldOne(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+	makeAccountAt(t, s, "old", now.Add(-30*24*time.Hour))
+	makeAccountAt(t, s, "new", now)
+
+	ids := candidateIDs(t, s, 10, nil, now.Add(-time.Hour))
+	if len(ids) != 2 || ids[0] != "new" || ids[1] != "old" {
+		t.Fatalf("candidates = %v, want [new old]", ids)
+	}
+}
+
+// TestTheAccountsThatConversationsAreBoundToComeFirst says the account
+// a live conversation is bound to is the first one into the pool.
+//
+// 会话钉在号上，钉住的号不在池里就会被改绑，缓存命中就没了（规格不变
+// 量 3）。所以池子先装它们。
+func TestTheAccountsThatConversationsAreBoundToComeFirst(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	makeAccount(t, s, "busy")
+	makeAccount(t, s, "quiet")
+	// 绑着的那号是被用过的：它有读数，是热的。
+	saveReading(t, s, "busy", 400, now.Add(-time.Minute))
+	if err := s.BindSession(ctx, "a-conversation", "busy"); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := candidateIDs(t, s, 10, nil, now.Add(-time.Hour))
+	if len(ids) != 2 || ids[0] != "busy" {
+		t.Fatalf("candidates = %v, want busy first", ids)
+	}
+}
+
+// TestAConversationThatWasNotUsedLatelyDoesNotComeFirst says a
+// conversation that was not used lately does not hold a place in the
+// pool.
+//
+// 「用过」是网关写进去的（TouchSessions）。写不进去的对话不算活跃。
+func TestAConversationThatWasNotUsedLatelyDoesNotComeFirst(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	makeAccount(t, s, "busy")
+	makeAccount(t, s, "quiet")
+	saveReading(t, s, "busy", 400, now.Add(-time.Minute))
+	if err := s.BindSession(ctx, "a-conversation", "busy"); err != nil {
+		t.Fatal(err)
+	}
+	// 把时钟拨回去：这个对话两小时前用过，之后没人碰它。
+	s.Clock = func() time.Time { return now.Add(-2 * time.Hour) }
+	if err := s.TouchSessions(ctx, []string{"a-conversation"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Clock = time.Now
+
+	ids := candidateIDs(t, s, 10, nil, now.Add(-time.Hour))
+	if len(ids) != 2 || ids[0] != "quiet" {
+		t.Fatalf("candidates = %v, want quiet first", ids)
+	}
+}
+
+// TestTheLimitIsALimit says the caller gets at most what it asked for.
+//
+// 多取的那些行是为了把被排除的补上，但补齐之后要截断 —— 调用方说要多
+// 少，就是多少。
+func TestTheLimitIsALimit(t *testing.T) {
+	s := openTest(t)
+	now := time.Now()
+	makeAccount(t, s, "a")
+	makeAccount(t, s, "b")
+	makeAccount(t, s, "c")
+
+	ids := candidateIDs(t, s, 1, nil, now.Add(-time.Hour))
+	if len(ids) != 1 {
+		t.Fatalf("candidates = %v, want 1", ids)
+	}
+	// 被排除的那个正好排在前面：多取的行补上了它，截断之后还是 limit 个。
+	ids = candidateIDs(t, s, 1, map[string]bool{"a": true}, now.Add(-time.Hour))
+	if len(ids) != 1 {
+		t.Fatalf("candidates = %v, want 1", ids)
 	}
 }
 
@@ -318,7 +430,7 @@ func TestACandidateThatWasNeverReadSaysNothingAboutItsCredits(t *testing.T) {
 	ctx := context.Background()
 	makeAccount(t, s, "a")
 
-	cands, err := s.PoolCandidates(ctx, 10, nil)
+	cands, err := s.PoolCandidates(ctx, 10, nil, time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +443,9 @@ func TestACandidateThatWasNeverReadSaysNothingAboutItsCredits(t *testing.T) {
 	if cands[0].Remaining != 0 {
 		t.Fatalf("remaining = %v, want 0", cands[0].Remaining)
 	}
+	if !cands[0].LastReadAt.IsZero() {
+		t.Fatalf("last read at = %v, want the zero time", cands[0].LastReadAt)
+	}
 }
 
 // TestACandidateThatWasReadCarriesItsCredits says a candidate that was
@@ -339,9 +454,10 @@ func TestACandidateThatWasReadCarriesItsCredits(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	makeAccount(t, s, "a")
-	saveReading(t, s, "a", 123, time.Now())
+	at := time.Now().Add(-time.Minute)
+	saveReading(t, s, "a", 123, at)
 
-	cands, err := s.PoolCandidates(ctx, 10, nil)
+	cands, err := s.PoolCandidates(ctx, 10, nil, time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,22 +470,21 @@ func TestACandidateThatWasReadCarriesItsCredits(t *testing.T) {
 	if cands[0].Remaining != 123 {
 		t.Fatalf("remaining = %v, want 123", cands[0].Remaining)
 	}
+	if cands[0].LastReadAt.UnixMilli() != at.UnixMilli() {
+		t.Fatalf("last read at = %v, want %v", cands[0].LastReadAt, at)
+	}
 }
 
 // TestTheAccountsInThePoolAreNotCandidates says the accounts that are
 // already in the pool are not offered again.
 func TestTheAccountsInThePoolAreNotCandidates(t *testing.T) {
 	s := openTest(t)
-	ctx := context.Background()
 	makeAccount(t, s, "a")
 	makeAccount(t, s, "b")
 
-	cands, err := s.PoolCandidates(ctx, 10, map[string]bool{"a": true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cands) != 1 || cands[0].Account.ID != "b" {
-		t.Fatalf("candidates = %v, want just b", cands)
+	ids := candidateIDs(t, s, 10, map[string]bool{"a": true}, time.Now().Add(-time.Hour))
+	if len(ids) != 1 || ids[0] != "b" {
+		t.Fatalf("candidates = %v, want just b", ids)
 	}
 }
 
@@ -386,14 +501,34 @@ func TestAnAccountThatIsSpentIsNotACandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := s.PoolCandidates(ctx, 10, nil)
+	ids := candidateIDs(t, s, 10, nil, time.Now().Add(-time.Hour))
+	if len(ids) != 1 || ids[0] != "b" {
+		t.Fatalf("candidates = %v, want just b", ids)
+	}
+}
+
+// TestAnAccountWhoseMarkHasExpiredIsACandidate says an account whose
+// window is back is offered again.
+//
+// 标记的时刻过去了，窗口就回来了，那个号又能接活了（规格 §4.5）。
+func TestAnAccountWhoseMarkHasExpiredIsACandidate(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	makeAccount(t, s, "a")
+	if err := s.SetExhausted(ctx, "a", "", time.Now().Add(-time.Minute), "quota"); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := candidateIDs(t, s, 10, nil, time.Now().Add(-time.Hour))
+	if len(ids) != 1 || ids[0] != "a" {
+		t.Fatalf("candidates = %v, want just a", ids)
+	}
+	n, err := s.CountUsable(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range cands {
-		if c.Account.ID == "a" {
-			t.Fatal("a spent account is not a candidate")
-		}
+	if n != 1 {
+		t.Fatalf("usable = %d, want 1", n)
 	}
 }
 
@@ -407,12 +542,9 @@ func TestAnAccountThatIsSignedOutIsNotACandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cands, err := s.PoolCandidates(ctx, 10, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cands) != 0 {
-		t.Fatalf("candidates = %v, want none", cands)
+	ids := candidateIDs(t, s, 10, nil, time.Now().Add(-time.Hour))
+	if len(ids) != 0 {
+		t.Fatalf("candidates = %v, want none", ids)
 	}
 }
 
@@ -468,11 +600,65 @@ func TestTheRecentSessionsAreCounted(t *testing.T) {
 		t.Fatalf("recent sessions = %d, want 0", n)
 	}
 }
+
+// TestTouchingASessionMakesItActive says a session that was used is
+// counted as active.
+//
+// 「用过」只有网关知道：它把用过的会话写回去（规格 §6.3）。写回去的
+// 那一批，是一批一次写的。
+func TestTouchingASessionMakesItActive(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	makeAccount(t, s, "a")
+	if err := s.BindSession(ctx, "old", "a"); err != nil {
+		t.Fatal(err)
+	}
+	// 这个会话两小时前绑的，之后没人碰它。
+	s.Clock = func() time.Time { return now.Add(-2 * time.Hour) }
+	if err := s.TouchSessions(ctx, []string{"old"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Clock = time.Now
+
+	n, err := s.CountRecentSessions(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("recent sessions = %d, want 0", n)
+	}
+	if err := s.TouchSessions(ctx, []string{"old"}); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.CountRecentSessions(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("recent sessions = %d, want 1", n)
+	}
+}
+
+// TestTouchingNoSessionIsNothing says touching nothing does not touch
+// the database.
+//
+// 空的批次不该发一条语句出去。
+func TestTouchingNoSessionIsNothing(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if err := s.TouchSessions(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchSessions(ctx, []string{""}); err != nil {
+		t.Fatal(err)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
-go test ./internal/store/ -run "Candidate|Usable|RecentSession"
+go test ./internal/store/ -run "Candidate|Usable|RecentSession|Touch"
 ```
 
 Expected: FAIL —— `s.PoolCandidates undefined`。
@@ -487,8 +673,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
+
+// touchBatch is how many sessions one statement touches.
+//
+// SQLite has a limit on how many placeholders a statement may have (999
+// is the old default). A batch bigger than that would not run at all.
+const touchBatch = 500
 
 // Candidate is an account that could be admitted to the pool.
 //
@@ -500,10 +693,14 @@ type Candidate struct {
 	// Remaining is how many credits are left. It says something only
 	// when Known is true.
 	Remaining float64
-	// Known says the credits have been read.
+	// Known says the credits are known.
 	//
-	// 它是 false 的时候 Remaining 说不了话：这个号从来没被读过。不是 0
-	// —— 0 是「读到了，没有了」。
+	// 它是 false 的时候 Remaining 说不了话：这个号的额度不知道是多少。
+	// 不是 0 —— 0 是「读到了，没有了」。
+	//
+	// 它和 LastReadAt 是两回事：读过一次但那次没有数（HasAmounts 是
+	// false）的号，是「读过了，数额不知道」：Known 是 false，LastReadAt
+	// 不是零。
 	Known bool
 	// LastReadAt is when the credits were read last. It is the zero
 	// time when they never were.
@@ -512,16 +709,26 @@ type Candidate struct {
 
 // PoolCandidates gives the accounts that could be admitted to the pool.
 //
-// **最冷的在前**：从来没读过的排最前，读过的按最后读到的时刻从早到晚。
-// 冷号先进池 —— 被用熟的号留给会话（规格 §6.5）。
+// 谁先进池（排队的规矩）：
+//
+//  1. **最近活跃的对话绑着的号** —— 它们不能丢：会话钉在号上，钉住的号
+//     不在池里就会被改绑，缓存命中就没了（规格不变量 3）。
+//  2. **从没读过的号，最新的导入排前面** —— 新导入的号几乎肯定没被用过
+//     （用过就会被读，读过就有数）。导入很久还没数的号多半是被用过的，
+//     它的额度早就不知道剩多少了。
+//  3. **读过、但读得最早的号** —— 最冷的那些：它们闲着，闲着的号额度
+//     还没被消耗光。
 //
 // 排除掉的：exclude 里有的（已经在池里）、状态不是 active 的、现在被
 // 标记用完的（标记的时刻还在将来的才算；过去的标记已经回来了，那个号
 // 可以再进池）。
 //
+// since 是「多久以前算活跃」：只有这段时间里被碰过的会话，它绑着的号
+// 才排在最前。
+//
 // 读多少行：要 limit 个候选，外加 exclude 里那么多行 —— 被排除的那些也
-// 占着行号，所以要多取一些才够数。
-func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[string]bool) ([]Candidate, error) {
+// 占着行号，所以要多取一些才够数。回来的是**至多** limit 个。
+func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[string]bool, since time.Time) ([]Candidate, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -537,8 +744,14 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 		  AND NOT EXISTS (
 			SELECT 1 FROM exhausted_windows e
 			WHERE e.account_id = a.id AND e.until > ?)
-		ORDER BY (u.created_at IS NULL) DESC, u.created_at ASC, a.created_at ASC
-		LIMIT ?`, StatusActive, ms(s.now()), limit+len(exclude))
+		ORDER BY
+			(EXISTS (SELECT 1 FROM sessions s
+				WHERE s.account_id = a.id AND s.updated_at >= ?)) DESC,
+			(u.created_at IS NULL) DESC,
+			u.created_at ASC,
+			a.created_at DESC,
+			a.id
+		LIMIT ?`, StatusActive, ms(s.now()), ms(since), limit+len(exclude))
 	if err != nil {
 		return nil, fmt.Errorf("pool candidates: %w", err)
 	}
@@ -547,28 +760,14 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 	for rows.Next() {
 		var (
 			c         Candidate
-			userID    sql.NullString
-			email     sql.NullString
-			pg        sql.NullString
-			pu        sql.NullString
-			lastErr   sql.NullString
-			createdAt int64
-			updatedAt int64
 			remaining sql.NullFloat64
 			readAt    sql.NullInt64
 		)
-		if err := rows.Scan(&c.Account.ID, &c.Account.Name, &userID, &email, &c.Account.Status,
-			&pg, &pu, &lastErr, &createdAt, &updatedAt,
-			&remaining, &readAt); err != nil {
+		a, err := scanAccount(rows, &remaining, &readAt)
+		if err != nil {
 			return nil, fmt.Errorf("pool candidates: %w", err)
 		}
-		c.Account.UserID = userID.String
-		c.Account.Email = email.String
-		c.Account.ProxyGroup = pg.String
-		c.Account.ProxyURL = pu.String
-		c.Account.LastError = lastErr.String
-		c.Account.CreatedAt = fromMS(createdAt)
-		c.Account.UpdatedAt = fromMS(updatedAt)
+		c.Account = a
 		c.Remaining = remaining.Float64
 		c.Known = remaining.Valid
 		c.LastReadAt = fromMS(readAt.Int64)
@@ -579,6 +778,9 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("pool candidates: %w", err)
+	}
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -608,6 +810,10 @@ func (s *Store) CountUsable(ctx context.Context) (int, error) {
 // 缓存命中的地方 —— 池要装得下它们（规格 §6.3）。
 //
 // 会话表从来不删（规格 §8），所以数的是「最近碰过的」，不是「一共有的」。
+//
+// 「碰过」是网关写进去的（TouchSessions）：每次请求真的用了这个会话，
+// 网关就把它的 updated_at 刷新一下。刷新是攒着写的 —— 一批一次，不是
+// 每个请求写一行。
 func (s *Store) CountRecentSessions(ctx context.Context, since time.Time) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
@@ -617,26 +823,109 @@ func (s *Store) CountRecentSessions(ctx context.Context, since time.Time) (int, 
 	}
 	return n, nil
 }
+
+// TouchSessions marks sessions as used now.
+//
+// 「用过」是活跃会话唯一的凭据。updated_at 只在改绑的时候刷新：一段一直
+// 用同一个号的对话从来不改绑，它的 updated_at 就停在当初绑定的那一刻，
+// 一小时以后看起来就不活跃了 —— 而它明明一直在用。
+//
+// 一次改一批：每个请求写一行是浪费，锁也白抢。网关那边攒一批再一次写
+// 掉，这里也按批写 —— 一条语句的占位符个数有上限。
+func (s *Store) TouchSessions(ctx context.Context, sessionKeys []string) error {
+	if len(sessionKeys) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(sessionKeys))
+	keys := make([]string, 0, len(sessionKeys))
+	for _, k := range sessionKeys {
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	for start := 0; start < len(keys); start += touchBatch {
+		end := start + touchBatch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[start:end]
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, ms(s.now()))
+		for _, k := range chunk {
+			args = append(args, k)
+		}
+		q := "UPDATE sessions SET updated_at = ? WHERE session_key IN (" + marks + ")"
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("touch the sessions: %w", err)
+		}
+	}
+	return nil
+}
 ```
 
-- [ ] **Step 4: 跑测试，看它过**
+- [ ] **Step 4: `scanAccount` 收下多的那几列**
+
+候选账号的查询要多读两列（额度和读到的时刻），但账号自己的十列不用再抄一遍 —— `scanAccount` 收下多的目的地：
+
+`internal/store/store.go`，`scanAccount` 改成：
+```go
+// scanAccount reads one account row.
+//
+// The extra destinations are read after the account's own columns, so a
+// caller that wants more of the row (the credits of a reading, say) does
+// not have to spell the account's ten columns out again.
+func scanAccount(sc scanner, extra ...any) (Account, error) {
+	var (
+		a                     Account
+		userID, email, pg, pu sql.NullString
+		lastErr               sql.NullString
+		createdAt, updatedAt  int64
+	)
+	dest := []any{&a.ID, &a.Name, &userID, &email, &a.Status, &pg, &pu,
+		&lastErr, &createdAt, &updatedAt}
+	dest = append(dest, extra...)
+	if err := sc.Scan(dest...); err != nil {
+		return Account{}, err
+	}
+	a.UserID = userID.String
+	a.Email = email.String
+	a.ProxyGroup = pg.String
+	a.ProxyURL = pu.String
+	a.LastError = lastErr.String
+	a.CreatedAt = fromMS(createdAt)
+	a.UpdatedAt = fromMS(updatedAt)
+	return a, nil
+}
+```
+
+- [ ] **Step 5: 跑测试，看它过**
 ```sh
 go test ./internal/store/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
-feat(store): 池的候选账号 —— 最冷的在前，用完的和签出的不算
+feat(store): 池的候选账号 —— 对话绑着的号在前，冷号随后
 
-冷号先进池：被用熟的号留给会话（规格 §6.5）。从来没读过的号排在最
-前 —— 它还没有数，读一次就知道它有没有额度。
+排队的规矩：最近活跃的对话绑着的号（会话钉在号上，钉住的号不在池里就
+会被改绑，规格不变量 3）→ 从没读过的号（新导入的在前）→ 读得最早的号。
+用完的和签出的不算；limit 就是 limit，多取的行补齐被排除的之后截断。
+
+加上 TouchSessions：把用过的会话写回去，「活跃会话数」才是个真的数
+（规格 §6.8）。
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
-git add internal/store/pool.go internal/store/pool_test.go
+git add internal/store/store.go internal/store/pool.go internal/store/pool_test.go
 git commit -F .git/commit_msg.txt
 ```
 
@@ -1666,8 +1955,12 @@ git commit -F .git/commit_msg.txt
 - Modify: `internal/gateway/gateway.go`
 - Create: `internal/gateway/pool.go`
 - Create: `internal/gateway/pool_test.go`
+- Create: `internal/gateway/touch.go`
+- Create: `internal/gateway/touch_test.go`
 
 网关的 rotator 现在靠一个 `poolAdapter` 从「库」拿账号、耗尽标记和余额。这一步把适配器的来源换成池：**池里有就读池，池是空的还是从库里读** —— 网关不能因为池空着就一个请求都答不了（规格不变量 1）。
+
+这一任务还带上**会话活跃**那件事（规格 §6.8）：网关把用过的会话写回库，「活跃会话数」才是个真的数；填池时最近活跃的对话绑着的号排在最前，池子才留得住它们。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1859,12 +2152,181 @@ func TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试，看它失败**
-```sh
-go test ./internal/gateway/ -run "Pool|WholeTable"
+新建 `internal/gateway/touch_test.go`：
+```go
+package gateway
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"mmxcode/internal/config"
+	"mmxcode/internal/store"
+)
+
+// TestTheUsedSessionsAreWritten says a session that was used is written
+// back into the database.
+//
+// 「用过」是活跃会话唯一的凭据：网关不问上游，它只知道这段对话被用过
+// （规格 §6.3）。不写回去，池子就不会留着它绑着的号。
+func TestTheUsedSessionsAreWritten(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindSession(ctx, "a-conversation", "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	g := &Server{Store: s, Cfg: config.Default(), touches: newSessionTouches()}
+
+	// 这个会话两小时前用过，之后没人碰它。
+	s.Clock = func() time.Time { return now.Add(-2 * time.Hour) }
+	g.touches.add("a-conversation")
+	g.flushTouches(ctx)
+	s.Clock = time.Now
+
+	n, err := s.CountRecentSessions(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("recent sessions = %d, want 0", n)
+	}
+
+	// 刚用过：它是活跃的。
+	g.touches.add("a-conversation")
+	g.flushTouches(ctx)
+	n, err = s.CountRecentSessions(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("recent sessions = %d, want 1", n)
+	}
+}
+
+// TestTheUsedSessionsAreWrittenOnlyOnce says a session that was used
+// twice is written once.
+//
+// 写的是「用过没有」，不是「用了几次」。
+func TestTheUsedSessionsAreWrittenOnlyOnce(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindSession(ctx, "a-conversation", "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	g := &Server{Store: s, Cfg: config.Default(), touches: newSessionTouches()}
+
+	g.touches.add("a-conversation")
+	g.touches.add("a-conversation")
+	keys := g.touches.take()
+	if len(keys) != 1 {
+		t.Fatalf("keys = %v, want one", keys)
+	}
+	// 拿了就是归网关了：下一批不该再有它。
+	if again := g.touches.take(); len(again) != 0 {
+		t.Fatalf("keys = %v, want none", again)
+	}
+}
+
+// TestTheAccountAConversationIsBoundToComesFirst says the account a live
+// conversation is bound to is the first one the pool takes.
+//
+// 会话钉在号上，钉住的号不在池里就会被改绑，缓存命中就没了（规格不变
+// 量 3）。
+func TestTheAccountAConversationIsBoundToComesFirst(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	for _, id := range []string{"acc_busy", "acc_quiet"} {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 绑着的那号是被用过的：它有读数，是热的。
+	if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_busy", Granted: 400, Remaining: 400, HasAmounts: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindSession(ctx, "a-conversation", "acc_busy"); err != nil {
+		t.Fatal(err)
+	}
+
+	src := poolSource{s: s, window: time.Hour}
+	cands, err := src.Candidates(ctx, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(cands))
+	}
+	if cands[0].Account.ID != "acc_busy" {
+		t.Fatalf("candidates = %v, want acc_busy first", cands)
+	}
+}
+
+// TestWithoutAWindowNoConversationHoldsAPlace says a gateway with no
+// session window counts no conversation as active.
+//
+// 窗口是「多久算活跃」的那把尺子：没有它就没有「活跃」，一个号也不因
+// 为对话而排在前面。
+func TestWithoutAWindowNoConversationHoldsAPlace(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	for _, id := range []string{"acc_busy", "acc_quiet"} {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveUsageSnapshot(ctx, store.UsageSnapshot{
+		AccountID: "acc_busy", Granted: 400, Remaining: 400, HasAmounts: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 这个会话两小时前绑的：没有窗口的时候它不算活跃。
+	s.Clock = func() time.Time { return now.Add(-2 * time.Hour) }
+	if err := s.BindSession(ctx, "a-conversation", "acc_busy"); err != nil {
+		t.Fatal(err)
+	}
+	s.Clock = time.Now
+
+	src := poolSource{s: s}
+	cands, err := src.Candidates(ctx, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(cands))
+	}
+	if cands[0].Account.ID != "acc_quiet" {
+		t.Fatalf("candidates = %v, want acc_quiet first", cands)
+	}
+}
 ```
 
-Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool` 字段。
+- [ ] **Step 2: 跑测试，看它失败**
+```sh
+go test ./internal/gateway/ -run "Pool|WholeTable|Used|Conversation"
+```
+
+Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool` 字段，`sessionTouches` 不存在。
 
 - [ ] **Step 3: 网关里挂上池**
 
@@ -1873,7 +2335,7 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	"mmxcode/internal/pool"
 ```
 
-`internal/gateway/gateway.go`，`Server` 里加两个字段：
+`internal/gateway/gateway.go`，`Server` 里加三个字段：
 ```go
 	// Pool is the accounts the gateway keeps in memory.
 	//
@@ -1883,13 +2345,19 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	// Keeper fills the pool: at startup with what the database knows,
 	// and later with the accounts that are needed.
 	Keeper *pool.Keeper
+	// touches are the sessions that were used and not written yet.
+	//
+	// 它们是「活跃会话」唯一的凭据（规格 §6.3）：会话用过没有，只有网
+	// 关知道。攒着写回去，写一次算一批。
+	touches *sessionTouches
 ```
 
 `internal/gateway/gateway.go`，`New()` 里（`g.Rot = rotator.New(...)` 之前）加：
 ```go
 	// 池：选号从它读，不再每次扫全表（规格 §6.2）。
 	g.Pool = pool.New(0)
-	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s}, mgr, s,
+	g.touches = newSessionTouches()
+	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()}, mgr, s,
 		cfg.Pool.ReadOnAdmit, cfg.Rotation.ExhaustedCooldown.Duration())
 ```
 
@@ -1902,6 +2370,14 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 ```go
 	// 池要一直是满的：每 scan_every 一趟看看少了几个，补上。
 	go g.poolLoop()
+	// 用过的会话要写回去：一批一次，它们是「活跃会话数」的凭据（规格
+	// §6.3）。它在后台组里：关网关时要等它把最后一批写完，不然它会往
+	// 一个正在关着的库上写。
+	g.bgWG.Add(1)
+	go func() {
+		defer g.bgWG.Done()
+		g.touchLoop()
+	}()
 ```
 
 `internal/gateway/gateway.go`，`poolAdapter` 加一个字段：
@@ -1965,7 +2441,17 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 	}
 ```
 
-- [ ] **Step 4: 写池的驱动 —— `internal/gateway/pool.go`**
+- [ ] **Step 5: 请求真的用了会话，就记下来**
+
+`internal/gateway/gateway.go`，挑到账号之后（`used[plan.AccountID] = true` 之后）加：
+```go
+		// 这段对话用过：记下来，攒一批写回库（规格 §6.3）。它的
+		// updated_at 是「活跃会话数」的凭据 —— 池要靠它把这段对话绑
+		// 着的号留在池里。
+		s.touches.add(sess.Key)
+```
+
+- [ ] **Step 6: 写池的驱动 —— `internal/gateway/pool.go`**
 
 新建 `internal/gateway/pool.go`：
 ```go
@@ -1981,11 +2467,25 @@ import (
 )
 
 // poolSource gives the pool the accounts it could take.
-type poolSource struct{ s *store.Store }
+type poolSource struct {
+	s *store.Store
+	// window is how long a session counts as active.
+	//
+	// 它是「这段对话还在用吗」的那把尺子：这段时间里被碰过的对话，它绑
+	// 着的号要留在池里（规格不变量 3）。
+	window time.Duration
+}
 
-// Candidates gives the accounts that are not in the pool, coldest first.
+// Candidates gives the accounts that are not in the pool, in the order
+// they should go in.
 func (p poolSource) Candidates(ctx context.Context, limit int, exclude map[string]bool) ([]store.Candidate, error) {
-	return p.s.PoolCandidates(ctx, limit, exclude)
+	// 没有窗口就是没有「活跃」：没有对话算活跃，一个号也不因为对话而
+	// 排在前面（规格 §6.3 的那一项直接不算）。
+	since := time.Now()
+	if p.window > 0 {
+		since = time.Now().Add(-p.window)
+	}
+	return p.s.PoolCandidates(ctx, limit, exclude, since)
 }
 
 // poolTarget says how many accounts the pool should hold.
@@ -2088,25 +2588,138 @@ func (s *Server) poolLoop() {
 }
 ```
 
-- [ ] **Step 5: 跑测试，看它过**
+- [ ] **Step 7: 写会话活跃的账 —— `internal/gateway/touch.go`**
+
+新建 `internal/gateway/touch.go`：
+```go
+package gateway
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+)
+
+// touchEvery is how often the used sessions are written into the database.
+//
+// 攒着写，不是每个请求写一行：一行 SQLite 写相对上游那一下请求不算什
+// 么，但它会跟读额度抢写锁，而读额度是要紧的活（规格 §6.4）。
+//
+// 20 秒够细了：「活跃」的窗口是 1 小时，20 秒的差别看不出来。
+const touchEvery = 20 * time.Second
+
+// touchTimeout is how long the write of the used sessions may take.
+//
+// 写不进去不是要命的事：这一批的 updated_at 旧一点，下一批会再写一次。
+// 但它不能拖着请求不放 —— 等一个空位比等一次写更值得等。
+const touchTimeout = 5 * time.Second
+
+// sessionTouches holds the sessions that were used, waiting to be written.
+//
+// 它是内存里的账：会话用过没有，只有网关知道（规格 §6.3）。它记不住什
+// 么 —— 进程一停就没了 —— 但那没关系：重启之后头几趟请求会把它写回去。
+type sessionTouches struct {
+	mu sync.Mutex
+	// keys are the sessions that were used and not written yet.
+	keys map[string]bool
+}
+
+// newSessionTouches makes an empty ledger.
+func newSessionTouches() *sessionTouches {
+	return &sessionTouches{keys: map[string]bool{}}
+}
+
+// add remembers that a session was used.
+func (t *sessionTouches) add(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.keys[sessionKey] = true
+}
+
+// take gives the sessions that were used and forgets them.
+//
+// 拿了就是归网关了：写不进去也得放下 —— 留着只会让下一批更大，而下一批
+// 会再写一次同样的键。
+func (t *sessionTouches) take() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.keys) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.keys))
+	for k := range t.keys {
+		out = append(out, k)
+	}
+	t.keys = map[string]bool{}
+	return out
+}
+
+// flushTouches writes the sessions that were used into the database.
+//
+// 写不进去就记一笔：写不进去的会话看起来不活跃，池子就少留一个号 ——
+// 说出来才知道少了什么。
+func (s *Server) flushTouches(ctx context.Context) {
+	keys := s.touches.take()
+	if len(keys) == 0 {
+		return
+	}
+	if err := s.Store.TouchSessions(ctx, keys); err != nil {
+		log.Printf("the %d used sessions could not be written: %v", len(keys), err)
+	}
+}
+
+// touchLoop writes the used sessions into the database now and then.
+//
+// 每 touchEvery 一趟：把这一阵子用过的会话写回去。它们的 updated_at 是
+// 「活跃会话数」唯一的凭据（规格 §6.3）—— 不写回去，一段一直在用的对话
+// 看起来就像不活跃，池子就不会留着它绑着的号，缓存命中也就没了。
+func (s *Server) touchLoop() {
+	t := time.NewTicker(touchEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.lifeCtx.Done():
+			// 走之前把攒着的写回去：最后这一批不该丢。
+			ctx, cancel := context.WithTimeout(context.Background(), touchTimeout)
+			s.flushTouches(ctx)
+			cancel()
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(s.lifeCtx, touchTimeout)
+			s.flushTouches(ctx)
+			cancel()
+		}
+	}
+}
+```
+
+- [ ] **Step 8: 跑测试，看它过**
 ```sh
 go test ./internal/gateway/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 9: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
-feat(gateway): 选号走池 —— 不再每个请求扫一遍全表
+feat(gateway): 选号走池，用过的会话写回库
 
 适配器的来源换成池：池里有就读池，池是空的还是从库里读 —— 网关不能因
 为池空着就一个请求都答不了（规格不变量 1）。标记写下去的时候那个号
 出池，让位给一个冷的。
 
+用过的会话攒着写回库（规格 §6.8）：sessions.updated_at 原来只在改绑时
+刷新，一直在用的对话看起来不活跃 —— 池子公式里「活跃会话数」那一项
+永远是 0，而且重启后被绑定的号不在池里，每段对话丢一次上下文缓存。
+
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
-git add internal/gateway/gateway.go internal/gateway/pool.go internal/gateway/pool_test.go
+git add internal/gateway/gateway.go internal/gateway/pool.go internal/gateway/pool_test.go internal/gateway/touch.go internal/gateway/touch_test.go
 git commit -F .git/commit_msg.txt
 ```
 
