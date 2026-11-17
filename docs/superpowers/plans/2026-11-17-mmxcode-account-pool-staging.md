@@ -28,16 +28,22 @@
 | 池里的号按「一阵子没用」换出 | 换出要重读额度，贵；而且会把会话钉的号换掉，缓存命中率掉。**只按额度用完出池** |
 | 池里的计划窗口（`windows_json`） | 选号用不上；放进去内存账从 395B 变 2168B |
 | 一个号同时跑多个请求 | `concurrency.per_account` 已经是 1，不动 |
+| **读额度的令牌桶** | 现在读额度的开销是 `usage.refresh` 的 4 并发 + 6 个/30s，已经有上界。池子跑起来、看到真实的耗尽形态之前先不动它 —— 参数要拿真的数据来定（另开一份规格） |
+| **每个窗口组一个熔断器** | 一个组的额度用完了，那个组该不该停手，现在靠「标记用完 → 出池」就够了（另开一份规格） |
+| **失败的号短冷却** | 现在失败的号只是这一趟换下一个（重试上限 3）。失败是「额度没了」还是「网络抖」是两种病，不能一起治（另开一份规格） |
+| **把池里读到的余额写回去**（`pool.SetRemaining`） | 定时读额度的那趟在 `internal/scheduler` / `internal/manager` 里，它们手里没有池。接起来要改那两处的结构 —— 跟「池归谁管」一起做（另开一份规格） |
 
 ---
 
-### Task 1: 配置 —— 池多大、倍数、内存预算
+### Task 1: 配置 —— 池多大、倍数、内存预算、并发天花板
 
 **Files:**
 - Modify: `internal/config/config.go`
 - Modify: `internal/config/config_test.go`
 
 池的大小 = max(总并发, 活跃会话数) × 倍数（规格 §6.3）。倍数 2：再留一倍给补号用。内存预算是个兜底 —— 一个账号按 512 字节算，32MB 装得下 6 万多个号。
+
+外加**并发天花板**（`concurrency.total_max`，规格 §6.9）：池空的时候承诺是从库里数出来的，库里 1000 个号就承诺 200 —— 那一下能从池子撑的数抬到库里的数。天花板把它按住。0 = 不限，跟从前一样。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -144,14 +150,37 @@ func TestThePoolRefusesAZeroSessionWindow(t *testing.T) {
 		t.Fatal("the zero session window was taken")
 	}
 }
+
+// TestTheTotalMaxIsReadFromTheFile says the ceiling's key is the one the
+// file uses, and that it is off by default.
+//
+// 天花板是「并发可控」的那根杆：不管池子里有多少个号、库里有多少个号，
+// 承诺的并发不超过它。默认 0 = 不限，跟从前一样。
+func TestTheTotalMaxIsReadFromTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "concurrency:\n  total_max: 12\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Concurrency.TotalMax != 12 {
+		t.Errorf("total_max = %d, want 12", c.Concurrency.TotalMax)
+	}
+	if Default().Concurrency.TotalMax != 0 {
+		t.Errorf("the default total_max = %d, want 0", Default().Concurrency.TotalMax)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
-go test ./internal/config/ -run TestThePoolDefaults
+go test ./internal/config/ -run "TestThePool|TestTheTotalMax"
 ```
 
-Expected: FAIL —— `c.Pool undefined`（还没有这个配置）。
+Expected: FAIL —— `c.Pool undefined`（还没有这个配置），`c.Concurrency.TotalMax undefined`（还没有天花板）。
 
 - [ ] **Step 3: 写配置**
 
@@ -210,6 +239,33 @@ type Pool struct {
 			MemoryBudgetMB: 32,
 			SessionWindow:  Duration(time.Hour),
 			ReadOnAdmit:    true,
+		},
+```
+
+`internal/config/config.go`，`Concurrency` 里加一个字段（挨着 `TotalMin` 放）：
+```go
+	// TotalMax is the ceiling on the total concurrency.
+	//
+	// 天花板：不管池子里有多少个号、库里有多少个号，承诺的并发不超过
+	// 它。0 = 不限（用可用账号数 ÷ 5 算出来的那个数）。
+	//
+	// 它是「并发可控」的那根杆：池子的大小是按承诺的并发算的
+	// （max(总并发, 活跃会话数) × 倍数），所以天花板定 64，池子就是
+	// 128 个号 —— 「n×2」那个说法才有着落。
+	//
+	// 池空的时候它也在：那时候承诺从库里数，库里有多少号就承诺多少，
+	// 那一下能从 20 抬到 80。天花板就是给这一下准备的。
+	TotalMax int `yaml:"total_max" json:"total_max"`
+```
+
+`internal/config/config.go`，`Default()` 里 `Concurrency` 那一段改成：
+```go
+		Concurrency: Concurrency{
+			PerAccount: 1,
+			TotalRatio: 5,
+			TotalMin:   3,
+			TotalMax:   0,
+			Wait:       Duration(10 * time.Second),
 		},
 ```
 
@@ -939,6 +995,8 @@ git commit -F .git/commit_msg.txt
 
 池是内存里的一个集合：账号行、剩余积分、耗尽标记。**它不放计划窗口** —— 选号用不上，放进去每个账号从 400 字节变成 2.2 KB。
 
+**号按进池的顺序排**（规格 §6.9）：轮转从队首走到队尾，冷号先被挑；一个号出池再进池，它排到队尾。map 的顺序是随机的 —— 随机的顺序让轮转不是轮转。
+
 - [ ] **Step 1: 写失败的测试**
 
 新建 `internal/pool/pool_test.go`：
@@ -946,6 +1004,8 @@ git commit -F .git/commit_msg.txt
 package pool
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -1117,6 +1177,105 @@ func TestTheCreditsOfAnAccountAreWritten(t *testing.T) {
 		t.Fatalf("entry = %+v, want 123 known", e)
 	}
 }
+
+// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands
+// out its accounts in the order they went in.
+//
+// 顺序是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转 ——
+// 冷号（先进来的）该先被挑。
+func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
+	p := New(4)
+	for _, id := range []string{"a", "b", "c"} {
+		p.Admit(Entry{Account: anAccount(id)})
+	}
+
+	accounts := p.Accounts()
+	if len(accounts) != 3 {
+		t.Fatalf("accounts = %d, want 3", len(accounts))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if accounts[i].ID != want {
+			t.Fatalf("accounts = %v, want a, b, c", accounts)
+		}
+	}
+}
+
+// TestAnAccountThatComesBackGoesToTheEnd says an account that left the
+// pool and came back goes to the end of the order.
+//
+// 它刚用过：排到队尾，下一轮轮转才轮到它。
+func TestAnAccountThatComesBackGoesToTheEnd(t *testing.T) {
+	p := New(4)
+	p.Admit(Entry{Account: anAccount("a")})
+	p.Admit(Entry{Account: anAccount("b")})
+	p.Remove("a")
+	p.Admit(Entry{Account: anAccount("a")})
+
+	accounts := p.Accounts()
+	if len(accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(accounts))
+	}
+	if accounts[0].ID != "b" || accounts[1].ID != "a" {
+		t.Fatalf("accounts = %v, want b then a", accounts)
+	}
+}
+
+// TestThePoolIsSafeWhileItIsUsed says the pool can be read and written at
+// the same time.
+//
+// 聊天那条路读它，后台补号那条路写它 —— 两边同时。这个包里说的「并发
+// 安全」得有一道测试钉住，不然那只是注释里的一句话。
+//
+// 就算没有 -race（这台机器上没有 C 编译器），Go 自己会喊：并发读写同一
+// 张 map 是 fatal error，跑一次就够。
+func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
+	p := New(64)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 一边写：进池、写余额、标记用完、出池。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := fmt.Sprintf("acc_%d", i%32)
+			p.Admit(Entry{Account: anAccount(id)})
+			p.SetRemaining(id, float64(i), true)
+			p.MarkSpent(id, "general", time.Now().Add(time.Hour))
+			p.Remove(id)
+		}
+	}()
+
+	// 一边读：拿账号、看余额、数能答的。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.Get("acc_1")
+			p.Entries()
+			p.IDs()
+			p.Accounts()
+			p.Spent()
+			p.Usable(time.Now())
+			p.Len()
+			p.Full()
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -1156,8 +1315,9 @@ import (
 // BytesPerAccount is what one account in the pool takes, in bytes.
 //
 // 它是量出来的：账号行（id/name/user_id/email/status 五个字符串）加上
-// 剩余积分、耗尽标记和 map 的索引，一行 395 字节。这里取 512 —— 宁可
-// 高一点，内存预算算得保守些。
+// 剩余积分、耗尽标记和 map 的索引，一行 395 字节；账号行那份快照再存一
+// 份 —— 实测一共约 460 字节。这里取 512 —— 宁可高一点，内存预算算得保
+// 守些。
 const BytesPerAccount = 512
 
 // Entry is one account in the pool.
@@ -1184,6 +1344,8 @@ type Entry struct {
 //
 // 它是并发安全的：聊天那条路读它，后台补号那条路写它。
 //
+// 池要用 New 造：零值的池没有那张表，往里放东西会 panic。
+//
 // 账号名单和用完的名单各有一份现成的快照：挑号每个请求都要问一次，问
 // 的时候不该现凑一份。快照是整份换掉的，不是就地改的 —— 拿着它的人看
 // 到的一直是完整的一份。
@@ -1191,6 +1353,13 @@ type Pool struct {
 	mu   sync.RWMutex
 	byID map[string]*Entry
 	cap  int
+	// order is the accounts in the order they went in.
+	//
+	// 顺序就是进池的顺序：轮转的时候从队首走到队尾，冷号（先进来的）
+	// 先被挑。一个号出池再进池，它排到队尾 —— 它刚用过。
+	//
+	// 它是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转。
+	order []string
 	// accounts is the snapshot of the accounts in the pool.
 	accounts []store.Account
 	// spent is the snapshot of the accounts whose window is spent.
@@ -1220,12 +1389,18 @@ func (p *Pool) Capacity() int {
 //
 // 0 means no limit. It never takes accounts out: the pool shrinks by
 // accounts being spent, not by being told to.
+//
+// 所以容量不许缩到比现在的号数还小：缩小的意思是「把号请出去」，而请
+// 出去的理由只有一个 —— 额度用完了（规格 §4.4）。
 func (p *Pool) SetCapacity(n int) {
 	if n < 0 {
 		n = 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if n < len(p.byID) {
+		n = len(p.byID)
+	}
 	p.cap = n
 }
 
@@ -1261,6 +1436,7 @@ func (p *Pool) Admit(e Entry) bool {
 	}
 	entry := e
 	p.byID[e.Account.ID] = &entry
+	p.order = append(p.order, e.Account.ID)
 	p.rebuild()
 	return true
 }
@@ -1278,8 +1454,22 @@ func (p *Pool) Remove(accountID string) bool {
 		return false
 	}
 	delete(p.byID, accountID)
+	p.dropFromOrder(accountID)
 	p.rebuild()
 	return true
+}
+
+// dropFromOrder takes an account out of the order.
+//
+// 顺序是进池的顺序：出池的号从顺序里去掉，它再进来的时候排到队尾。
+func (p *Pool) dropFromOrder(accountID string) {
+	for i, id := range p.order {
+		if id != accountID {
+			continue
+		}
+		p.order = append(p.order[:i], p.order[i+1:]...)
+		return
+	}
 }
 
 // Get gives one entry of the pool.
@@ -1371,6 +1561,9 @@ func (p *Pool) Usable(now time.Time) int {
 // 给的是现成的那一份：挑号每个请求都要问一次，问的时候不该现凑一份。
 // 那一份是整份换掉的，不是就地改的 —— 拿着它的人看到的一直是完整的一
 // 份。
+//
+// **那一份是池的**：拿着它的人只许读，不许改。改了顺序就乱了 —— 顺序
+// 是进池的顺序，轮转靠它。
 func (p *Pool) Accounts() []store.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1378,19 +1571,36 @@ func (p *Pool) Accounts() []store.Account {
 }
 
 // Spent gives the accounts in the pool whose window is spent.
+//
+// 过期的不算：窗口回来了，那个号就回来了（规格 §4.5）。所以它给的是一
+// 份新的名单，拿着它的人可以改。
 func (p *Pool) Spent() []store.Exhausted {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.spent
+	now := time.Now()
+	out := make([]store.Exhausted, 0, len(p.spent))
+	for _, e := range p.spent {
+		if !e.Until.After(now) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // rebuild makes the snapshots again.
 //
 // 它在写锁底下跑：换的是整份，不是就地改。
+//
+// 账号按进池的顺序排：轮转从队首走到队尾。
 func (p *Pool) rebuild() {
 	accounts := make([]store.Account, 0, len(p.byID))
 	spent := make([]store.Exhausted, 0, len(p.byID))
-	for _, e := range p.byID {
+	for _, id := range p.order {
+		e, ok := p.byID[id]
+		if !ok {
+			continue
+		}
 		accounts = append(accounts, e.Account)
 		if !e.Spent {
 			continue
@@ -1960,8 +2170,12 @@ git commit -F .git/commit_msg.txt
 - Create: `internal/gateway/pool_test.go`
 - Create: `internal/gateway/touch.go`
 - Create: `internal/gateway/touch_test.go`
+- Create: `internal/gateway/fallback.go`
+- Create: `internal/gateway/fallback_test.go`
 
 网关的 rotator 现在靠一个 `poolAdapter` 从「库」拿账号、耗尽标记和余额。这一步把适配器的来源换成池：**池里有就读池，池是空的还是从库里读** —— 网关不能因为池空着就一个请求都答不了（规格不变量 1）。
+
+**池空的时候从库里读，读出来的结果缓存一秒**（规格 §6.9）：账号、耗尽标记、余额这三样都是全表读 —— 1000 个号就是 2.6MB，一个请求一次。几十个并发就是一波几百 MB。缓存一秒，那一波只读一次。
 
 这一任务还带上**会话活跃**那件事（规格 §6.8）：网关把用过的会话写回库，「活跃会话数」才是个真的数；填池时最近活跃的对话绑着的号排在最前，池子才留得住它们。
 
@@ -2110,6 +2324,144 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 「承诺的并发按池夹」那两个测试不在这里 —— 它们测的是 Task 6 改的
 `totalConcurrency`，写在这里的话这一步就绿不了了。它们在 Task 6 的
 `internal/gateway/concurrency_test.go` 里。
+
+新建 `internal/gateway/fallback_test.go`：
+```go
+package gateway
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"mmxcode/internal/pool"
+	"mmxcode/internal/store"
+)
+
+// readCountingStore counts the reads of the database.
+//
+// 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
+// 三样，每一样都是全表读。
+//
+// 它数的是三样：账号、耗尽标记、余额快照 —— 池空的时候适配器问的就是这
+// 三样，每一样都是全表读。
+type readCountingStore struct {
+	*store.Store
+	accounts  int
+	exhausted int
+	snapshots int
+}
+
+func (c *readCountingStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	c.accounts++
+	return c.Store.ListAccounts(ctx)
+}
+
+func (c *readCountingStore) ListExhausted(ctx context.Context) ([]store.Exhausted, error) {
+	c.exhausted++
+	return c.Store.ListExhausted(ctx)
+}
+
+func (c *readCountingStore) LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error) {
+	c.snapshots++
+	return c.Store.LatestUsageSnapshots(ctx)
+}
+
+// oneAccount makes a store with one signed-in account.
+func oneAccount(t *testing.T) (*store.Store, *readCountingStore) {
+	t.Helper()
+	s := openGatewayStore(t)
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return s, &readCountingStore{Store: s}
+}
+
+// TestTheEmptyPoolReadsTheDatabaseOnce says the database is read once
+// for a batch of questions while the pool is empty.
+//
+// 池空的时候适配器回到从前的样子，从库里拿账号、标记和余额。那三样都是
+// 全表读：一个请求一次就是 2.6MB 的垃圾，几十个并发就是一波几百 MB。
+// 缓存一秒，那一波只读一次。
+func TestTheEmptyPoolReadsTheDatabaseOnce(t *testing.T) {
+	_, cs := oneAccount(t)
+	ctx := context.Background()
+	ad := poolAdapter{s: cs, fallback: newDBFallback(cs, time.Minute)}
+
+	for i := 0; i < 3; i++ {
+		if _, err := ad.Accounts(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ad.Exhausted(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ad.RemainingAll(ctx, []string{"acc_01"})
+	}
+
+	if cs.accounts != 1 {
+		t.Fatalf("the accounts were read %d times, want 1", cs.accounts)
+	}
+	if cs.exhausted != 1 {
+		t.Fatalf("the exhausted marks were read %d times, want 1", cs.exhausted)
+	}
+	if cs.snapshots != 1 {
+		t.Fatalf("the snapshots were read %d times, want 1", cs.snapshots)
+	}
+}
+
+// TestTheEmptyPoolReadsTheDatabaseAgainAfterTheWindow says the cached
+// answer does not last forever.
+//
+// 缓存久了就 stale：刚被标记成「用完」的号还看得出能用。窗口一小，它
+// 就重新读一次。
+func TestTheEmptyPoolReadsTheDatabaseAgainAfterTheWindow(t *testing.T) {
+	_, cs := oneAccount(t)
+	ctx := context.Background()
+	ad := poolAdapter{s: cs, fallback: newDBFallback(cs, time.Nanosecond)}
+
+	if _, err := ad.Accounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if _, err := ad.Accounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if cs.accounts != 2 {
+		t.Fatalf("the accounts were read %d times, want 2", cs.accounts)
+	}
+}
+
+// TestTheFilledPoolDoesNotReadTheDatabase says the pool answers and the
+// database is left alone.
+//
+// 池里有号的时候，那三样都从池里拿 —— 这就是池存在的理由。
+func TestTheFilledPoolDoesNotReadTheDatabase(t *testing.T) {
+	_, cs := oneAccount(t)
+	ctx := context.Background()
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	ad := poolAdapter{s: cs, pool: p, fallback: newDBFallback(cs, time.Minute)}
+
+	accounts, err := ad.Accounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "acc_01" {
+		t.Fatalf("accounts = %v, want just acc_01", accounts)
+	}
+	if _, err := ad.Exhausted(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cs.accounts != 0 || cs.exhausted != 0 || cs.snapshots != 0 {
+		t.Fatalf("the database was read: %d accounts, %d marks, %d snapshots",
+			cs.accounts, cs.exhausted, cs.snapshots)
+	}
+}
+```
 
 新建 `internal/gateway/touch_test.go`：
 ```go
@@ -2285,7 +2637,9 @@ func TestWithoutAWindowNoConversationHoldsAPlace(t *testing.T) {
 go test ./internal/gateway/ -run "Pool|WholeTable|Used|Conversation"
 ```
 
-Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool` 字段，`sessionTouches` 不存在。
+Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool` 字段，`sessionTouches` 不存在，`newDBFallback` 不存在。
+
+（过滤器里有 `Pool`：`TestTheEmptyPoolReadsTheDatabaseOnce`、`TestTheFilledPoolDoesNotReadTheDatabase` 这几个都带 Pool，别改窄了 —— 筛掉了就一个都不跑，红的绿的都看不见。）
 
 - [ ] **Step 3: 网关里挂上池**
 
@@ -2309,6 +2663,12 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	// 它们是「活跃会话」唯一的凭据（规格 §6.3）：会话用过没有，只有网
 	// 关知道。攒着写回去，写一次算一批。
 	touches *sessionTouches
+	// fallback is the database's answer, cached, for the time the pool
+	// is empty.
+	//
+	// 池空的时候要从库里拿账号、标记和余额 —— 那三样都是全表读（规格
+	// §6.9）。缓存一秒，让那一波并发只读一次。
+	fallback *dbFallback
 ```
 
 `internal/gateway/gateway.go`，`New()` 里（`g.Rot = rotator.New(...)` 之前）加：
@@ -2316,13 +2676,15 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	// 池：选号从它读，不再每次扫全表（规格 §6.2）。
 	g.Pool = pool.New(0)
 	g.touches = newSessionTouches()
+	// 池空的时候的那份兜底：库里的答案留一秒（规格 §6.9）。
+	g.fallback = newDBFallback(s, concurrencyCacheTTL)
 	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()}, mgr, s,
 		cfg.Pool.ReadOnAdmit, cfg.Rotation.ExhaustedCooldown.Duration())
 ```
 
 `internal/gateway/gateway.go`，`rotator.New(...)` 那行改成：
 ```go
-	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy, pool: g.Pool}, rotator.Options{
+	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy, pool: g.Pool, fallback: g.fallback}, rotator.Options{
 ```
 
 `internal/gateway/gateway.go`，`New()` 末尾（`return g` 之前）加：
@@ -2346,25 +2708,48 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 	// 它是空的（还没填上，或者填池失败）的时候，适配器回到从前的样子，
 	// 从库里拿：网关不能因为池空着就一个请求都答不了。
 	pool *pool.Pool
+	// fallback is the database's answer, cached, for the time the pool
+	// is empty.
+	//
+	// 池空的时候那三样都是全表读（规格 §6.9）：缓存一秒，让那一波并发只
+	// 读一次。
+	fallback *dbFallback
+```
+
+`internal/gateway/gateway.go`，`poolAdapter` 加一个问法（挨着 `Accounts` 放）：
+```go
+// fromPool says whether the pool has something to give.
+//
+// 池空着的时候（还没填上，或者填池失败）适配器回到从前的样子，从库里
+// 拿：网关不能因为池空着就一个请求都答不了（规格不变量 1）。
+func (p poolAdapter) fromPool() bool {
+	return p.pool != nil && p.pool.Len() > 0
+}
 ```
 
 `internal/gateway/gateway.go`，`poolAdapter` 的 `Accounts` 改成：
 ```go
 func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
-	if p.pool == nil || p.pool.Len() == 0 {
-		return p.s.ListAccounts(ctx)
+	if p.fromPool() {
+		return p.pool.Accounts(), nil
 	}
-	return p.pool.Accounts(), nil
+	if p.fallback != nil {
+		return p.fallback.accounts(ctx)
+	}
+	return p.s.ListAccounts(ctx)
 }
 ```
 
 `internal/gateway/gateway.go`，`poolAdapter` 的 `Exhausted` 改成：
 ```go
 func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
-	if p.pool == nil || p.pool.Len() == 0 {
-		return p.s.ListExhausted(ctx)
+	if p.fromPool() {
+		return p.pool.Spent(), nil
 	}
-	return p.pool.Spent(), nil
+	if p.fallback != nil {
+		return p.fallback.exhausted(ctx)
+	}
+	return p.s.ListExhausted(ctx)
 }
 ```
 
@@ -2386,7 +2771,7 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 
 `internal/gateway/gateway.go`，`poolAdapter` 的 `RemainingAll` 开头（`out := map[string]rotator.Remaining{}` 之后、`wanted := ...` 之前）插入：
 ```go
-	if p.pool != nil {
+	if p.fromPool() {
 		for id := range wanted {
 			e, ok := p.pool.Get(id)
 			if !ok || !e.Known {
@@ -2398,9 +2783,137 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 		}
 		return out
 	}
+	if p.fallback != nil {
+		return p.fallback.remaining(ctx, accountIDs)
+	}
 ```
 
-- [ ] **Step 5: 请求真的用了会话，就记下来**
+（`fromPool()` 那道门是必要的：池空的时候 `p.pool != nil` 也成立，从空的池里读出来的余额是空的 —— 余额只当门槛，门槛没了，挑号就瞎挑。）
+
+- [ ] **Step 4: 池空的时候，库里的答案留一秒 —— `internal/gateway/fallback.go`**
+
+新建 `internal/gateway/fallback.go`：
+```go
+package gateway
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"mmxcode/internal/rotator"
+	"mmxcode/internal/store"
+)
+
+// dbFallback is the database's answer for the rotator, taken while
+// the pool is empty.
+//
+// 池空的时候适配器回到从前的样子，从库里拿账号、耗尽标记和余额。那三样
+// 都是全表读：1000 个号的账号表 + 标记表 + 全部最新快照（连 windows_json
+// 一起），一个请求一次就是 2.6MB 的垃圾，几十个并发就是一波几百 MB。
+//
+// 所以这里留一份缓存，一秒一份。这一阵子的答案是一个样的 ——
+// concurrencyLimit 用的就是同一个道理。缓存让那一波并发只读一次。
+//
+// 它会过期一秒。这一秒里刚被标记成「用完」的号还看得出能用：请求会挑
+// 中它，撞一次空，换号重试。撞一次空的代价是一个请求；不缓存的代价是
+// 每一波并发都把整张表读一遍。前者便宜得多。
+type dbFallback struct {
+	mu   sync.Mutex
+	ttl  time.Duration
+	s    poolStore
+	at   time.Time
+	snap *dbAnswer
+}
+
+// dbAnswer is one answer from the database.
+type dbAnswer struct {
+	accounts  []store.Account
+	exhausted []store.Exhausted
+	remaining map[string]rotator.Remaining
+}
+
+// newDBFallback makes the cache.
+func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
+	if ttl <= 0 {
+		ttl = time.Second
+	}
+	return &dbFallback{s: s, ttl: ttl}
+}
+
+// get gives the snapshot, taking a new one when the old is stale.
+//
+// 它一次只让一个取：等的时候拿着锁（活儿很便宜，几毫秒）。
+func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snap != nil && time.Since(f.at) < f.ttl {
+		return f.snap, nil
+	}
+	accounts, err := f.s.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	exhausted, err := f.s.ListExhausted(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snaps, err := f.s.LatestUsageSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	remaining := make(map[string]rotator.Remaining, len(snaps))
+	for _, s := range snaps {
+		if !s.HasAmounts {
+			// 没读到余额的账号不算有余额：留空，让 rotator 把它排在后面
+			//（规格不变量 2）。
+			continue
+		}
+		remaining[s.AccountID] = rotator.Remaining{Left: s.Remaining, Known: true}
+	}
+	f.snap = &dbAnswer{accounts: accounts, exhausted: exhausted, remaining: remaining}
+	f.at = time.Now()
+	return f.snap, nil
+}
+
+// accounts gives the accounts of the snapshot.
+func (f *dbFallback) accounts(ctx context.Context) ([]store.Account, error) {
+	snap, err := f.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snap.accounts, nil
+}
+
+// exhausted gives the exhaustion marks of the snapshot.
+func (f *dbFallback) exhausted(ctx context.Context) ([]store.Exhausted, error) {
+	snap, err := f.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snap.exhausted, nil
+}
+
+// remaining gives the credits of the snapshot, for the accounts asked for.
+//
+// 留空的是「没读到余额」的账号：rotator 把它们排在有数的号后面（规格
+// 不变量 2）。
+func (f *dbFallback) remaining(ctx context.Context, ids []string) map[string]rotator.Remaining {
+	snap, err := f.get(ctx)
+	if err != nil {
+		return map[string]rotator.Remaining{}
+	}
+	out := make(map[string]rotator.Remaining, len(ids))
+	for _, id := range ids {
+		if rem, ok := snap.remaining[id]; ok {
+			out[id] = rem
+		}
+	}
+	return out
+}
+```
+
+- [ ] **Step 6: 请求真的用了会话，就记下来**
 
 `internal/gateway/gateway.go`，挑到账号之后（`used[plan.AccountID] = true` 之后）加：
 ```go
@@ -2410,7 +2923,7 @@ func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey str
 		s.touches.add(sess.Key)
 ```
 
-- [ ] **Step 6: 写池的驱动 —— `internal/gateway/pool.go`**
+- [ ] **Step 7: 写池的驱动 —— `internal/gateway/pool.go`**
 
 新建 `internal/gateway/pool.go`：
 ```go
@@ -2547,7 +3060,7 @@ func (s *Server) poolLoop() {
 }
 ```
 
-- [ ] **Step 7: 写会话活跃的账 —— `internal/gateway/touch.go`**
+- [ ] **Step 8: 写会话活跃的账 —— `internal/gateway/touch.go`**
 
 新建 `internal/gateway/touch.go`：
 ```go
@@ -2656,14 +3169,14 @@ func (s *Server) touchLoop() {
 }
 ```
 
-- [ ] **Step 8: 跑测试，看它过**
+- [ ] **Step 9: 跑测试，看它过**
 ```sh
 go test ./internal/gateway/
 ```
 
 Expected: PASS。
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 ```sh
 cat > .git/commit_msg.txt <<'EOF'
 feat(gateway): 选号走池，用过的会话写回库
@@ -2672,13 +3185,16 @@ feat(gateway): 选号走池，用过的会话写回库
 为池空着就一个请求都答不了（规格不变量 1）。标记写下去的时候那个号
 出池，让位给一个冷的。
 
+池空的时候从库里读的那三样都是全表读，一个请求一次就是 2.6MB。缓存一
+秒，让那一波并发只读一次（规格 §6.9）。
+
 用过的会话攒着写回库（规格 §6.8）：sessions.updated_at 原来只在改绑时
 刷新，一直在用的对话看起来不活跃 —— 池子公式里「活跃会话数」那一项
 永远是 0，而且重启后被绑定的号不在池里，每段对话丢一次上下文缓存。
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
-git add internal/gateway/gateway.go internal/gateway/pool.go internal/gateway/pool_test.go internal/gateway/touch.go internal/gateway/touch_test.go
+git add internal/gateway/gateway.go internal/gateway/pool.go internal/gateway/pool_test.go internal/gateway/touch.go internal/gateway/touch_test.go internal/gateway/fallback.go internal/gateway/fallback_test.go
 git commit -F .git/commit_msg.txt
 ```
 
@@ -2693,6 +3209,8 @@ git commit -F .git/commit_msg.txt
 - Modify: `cmd/mmxcode/serve.go`
 
 **总并发**：`totalFor(usable)` 是从「库里有多少能用的号」算出来的。现在池里有几个号才算几个 —— 池里没有那么多号，就只能承诺那么多，承诺了接不住就是一片 429（规格不变量 4）。池是空的（还没填上，或者填池失败）的时候从库里数：网关得能干活。
+
+再往上还有一道**天花板**（`concurrency.total_max`，规格 §6.9）：池空的时候承诺是从库里数出来的，库里 1000 个号就承诺 200 —— 那一下能从池子撑的数抬到库里的数。天花板把它按住。0 = 不限，跟从前一样。
 
 **耗尽了出池**：额度用完的号写完标记就出池，补一个冷的进来。补号是后台的活，不挡客户端。
 
@@ -2715,25 +3233,36 @@ import (
 	"mmxcode/internal/store"
 )
 
+// manyAccounts makes a store with n signed-in accounts.
+//
+// 号的名字是数出来的：acc_a0、acc_b0 …… acc_a1 —— 头一个永远是 acc_a0，
+// 测试好往池里放它。
+func manyAccounts(t *testing.T, n int) *store.Store {
+	t.Helper()
+	s := openGatewayStore(t)
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		if err := s.CreateAccount(context.Background(), store.Account{
+			ID:     "acc_" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
+			Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s
+}
+
 // TestTheConcurrencyIsNotMoreThanThePool says the gateway does not
 // promise more requests than the pool can carry.
 //
 // 承诺了接不住就是一片 429（规格不变量 4）。
 func TestTheConcurrencyIsNotMoreThanThePool(t *testing.T) {
-	s := openGatewayStore(t)
+	s := manyAccounts(t, 100)
 	ctx := context.Background()
 	cfg := config.Default()
 	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
 
 	// 库里有很多能用的号，池里只有一个。
-	for i := 0; i < 100; i++ {
-		if err := s.CreateAccount(ctx, store.Account{
-			ID:     "acc_" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
-			Status: store.StatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	g.Pool.Admit(pool.Entry{Account: store.Account{ID: "acc_a0", Status: store.StatusActive}})
 
 	if got := g.totalConcurrency(ctx); got != 1 {
@@ -2744,52 +3273,103 @@ func TestTheConcurrencyIsNotMoreThanThePool(t *testing.T) {
 // TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty says a
 // gateway whose pool is empty still promises what it used to.
 func TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty(t *testing.T) {
-	s := openGatewayStore(t)
+	s := manyAccounts(t, 10)
 	ctx := context.Background()
 	cfg := config.Default()
 	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
-	for i := 0; i < 10; i++ {
-		if err := s.CreateAccount(ctx, store.Account{
-			ID: "acc_" + string(rune('a'+i)), Status: store.StatusActive,
-			CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	if got := g.totalConcurrency(ctx); got != 3 {
 		t.Fatalf("concurrency = %d, want 3", got)
+	}
+}
+
+// TestTheConcurrencyDoesNotGoOverTheCeiling says the promised
+// concurrency never goes over the ceiling.
+//
+// 天花板是「并发可控」的那根杆。池空的时候承诺从库里数：库里 100 个号就
+// 承诺 20 个 —— 那一下能从池子撑的数抬到库里的数。天花板把它按在运营定
+// 的那个数上。
+func TestTheConcurrencyDoesNotGoOverTheCeiling(t *testing.T) {
+	s := manyAccounts(t, 100)
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Concurrency.TotalMax = 5
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
+
+	if got := g.totalConcurrency(ctx); got != 5 {
+		t.Fatalf("concurrency = %d, want 5", got)
+	}
+}
+
+// TestTheCeilingDoesNotRaiseThePromise says the ceiling only lowers it.
+//
+// 池里只有两个号，承诺五个是接不住的：承诺了接不住就是一片 429（规格
+// 不变量 4）。
+func TestTheCeilingDoesNotRaiseThePromise(t *testing.T) {
+	s := manyAccounts(t, 100)
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Concurrency.TotalMax = 5
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
+	g.Pool.Admit(pool.Entry{Account: store.Account{ID: "acc_a0", Status: store.StatusActive}})
+	g.Pool.Admit(pool.Entry{Account: store.Account{ID: "acc_b0", Status: store.StatusActive}})
+
+	if got := g.totalConcurrency(ctx); got != 2 {
+		t.Fatalf("concurrency = %d, want 2", got)
+	}
+}
+
+// TestWithoutACeilingThePromiseIsTheOldOne says nothing changes when no
+// ceiling is set.
+//
+// 0 = 不限：跟从前一样，池空的时候从库里数。
+func TestWithoutACeilingThePromiseIsTheOldOne(t *testing.T) {
+	s := manyAccounts(t, 100)
+	ctx := context.Background()
+	cfg := config.Default()
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
+
+	if got := g.totalConcurrency(ctx); got != 20 {
+		t.Fatalf("concurrency = %d, want 20", got)
 	}
 }
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
-go test ./internal/gateway/ -run "Concurrency|Spent"
+go test ./internal/gateway/ -run "Concurrency|Ceiling|Spent"
 ```
 
 Expected: FAIL —— `TestTheConcurrencyIsNotMoreThanThePool` 挂：库里 100 个号，
 `totalConcurrency` 还是从库里数（100 ÷ 5 = 20），池里只有一个号就该只承诺 1。
+`TestTheConcurrencyDoesNotGoOverTheCeiling` 也挂：天花板定 5，承诺的还是 20。
 
 （`TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty` 和 Task 5 的
 `TestASpentAccountLeavesThePool` 这时候是过的 —— 它们是回归的护栏，不是这一
 步要做的事。）
 
-- [ ] **Step 3: 总并发按池夹**
+（过滤器里有 `Ceiling`：`TestTheCeilingDoesNotRaiseThePromise` 和
+`TestWithoutACeilingThePromiseIsTheOldOne` 的名字里没有 Concurrency，筛窄了
+它们就一个都不跑。）
+
+- [ ] **Step 3: 总并发按池夹，再按天花板按住**
 
 `internal/gateway/busy.go`，`totalConcurrency` 改成：
 ```go
 // totalConcurrency says how many requests may be in the air at once.
 //
-// 承诺的并发 = min(期望并发, 池里能用的号数)：
+// 承诺的并发 = min(期望并发, 池里能用的号数)，再封在天花板里：
 //
 //   - 期望并发 = 可用账号数 ÷ 5（小规模至少 3），跟从前一样；
-//   - 池里能用的号数 = 池里签入中、没有被标记用完的号。
+//   - 池里能用的号数 = 池里签入中、没有被标记用完的号；
+//   - 天花板 = concurrency.total_max（配 0 是不限）。
 //
 // 池里没有那么多号，就只能承诺那么多 —— 承诺了接不住就是一片 429（规格
 // 不变量 4）。
 //
-// 池是空的（还没填上，或者填池失败）的时候从库里数：网关得能干活。
+// 池是空的（还没填上，或者填池失败）的时候从库里数：网关得能干活。但
+// 那一下能从 20 抬到 80（库里 400 个号 ÷ 5），所以天花板正好是给这一
+// 下准备的：它把承诺按在运营定的那个数上。
 func (s *Server) totalConcurrency(ctx context.Context) int {
 	if s.Store == nil {
 		return 1
@@ -2800,12 +3380,15 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 	}
 	want := totalFor(usable, s.Cfg.Concurrency)
 	inPool := s.Pool.Usable(time.Now())
-	if inPool == 0 {
+	switch {
+	case inPool == 0:
 		// 池是空的：还没填上，或者填池失败。跟从前一样，从库里数。
-		return want
+	case inPool < want:
+		// 池里的号不够：只能承诺这么多。
+		want = inPool
 	}
-	if inPool < want {
-		return inPool
+	if top := s.Cfg.Concurrency.TotalMax; top > 0 && want > top {
+		want = top
 	}
 	return want
 }
@@ -2849,18 +3432,187 @@ feat(gateway): 承诺的并发按池夹，额度用完了出池补号
 池里没有那么多号，就只能承诺那么多 —— 承诺了接不住就是一片 429（规格
 不变量 4）。池是空的还是从库里数：网关得能干活。
 
+再往上有天花板（concurrency.total_max）：池空的那一下承诺从库里数，能
+从 20 抬到 200。天花板是运营的那根杆（规格 §6.9）。
+
 标记写下去的时候那个号出池，让位给一个冷的。补号在后台跑，不挡客户
 端。
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
-git add internal/gateway/busy.go internal/gateway/spent.go cmd/mmxcode/serve.go
+git add internal/gateway/busy.go internal/gateway/spent.go internal/gateway/concurrency_test.go cmd/mmxcode/serve.go
 git commit -F .git/commit_msg.txt
 ```
 
 ---
 
-### Task 7: 文档 —— 配置怎么写
+### Task 7: 选号的顺序 —— 最久没用过的排前面
+
+**Files:**
+- Modify: `internal/rotator/rotator.go`
+- Modify: `internal/rotator/rotator_test.go`
+
+**为什么改**：从前挑号的第一条是「余额多的排前面」。那不是「先烧哪个」的问题 —— 那是把最富的号先烧光，池子从一头空过去，然后一波补号、一波读额度（规格 §6.5、§6.9）。这一版把余额降成「门槛」：读到 0 的号排在最后面；剩下的按「最久没用过的」排，用量摊开。余额只用来判门槛和打平手。
+
+**会话黏性不受影响**：绑着的号能答就是它答（`Pick` 里那条 `default`），`better()` 只在「没有绑定」或者「绑着的号答不了」的时候才被问到。
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/rotator/rotator_test.go` 末尾加：
+
+```go
+// TestTheLeastUsedAccountComesFirst says the accounts are used evenly.
+//
+// 挑号的第一条是「最久没用过的排前面」，不是「余额最多的排前面」：余额
+// 最多的一批号会被一起烧完，池子一下子掏空，然后一起补号、一起读额度
+// （规格 §6.5）。
+func TestTheLeastUsedAccountComesFirst(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.remaining = map[string]float64{"acc_01": 400, "acc_02": 100}
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 第一个号两个都没用过过，按余额，余额多的先。
+	plan, err := r.Pick(context.Background(), "talk-1", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_01" {
+		t.Fatalf("account = %s, want acc_01", plan.AccountID)
+	}
+
+	// 第二个号：acc_01 刚用过，acc_02 没用过。用最久没用的那个。
+	plan, err = r.Pick(context.Background(), "talk-2", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_02" {
+		t.Fatalf("account = %s, want acc_02", plan.AccountID)
+	}
+}
+
+// TestAnAccountThatIsEmptyComesLast says an account that was read and
+// found empty is not picked while another account has credits.
+//
+// 读到 0 就是知道它空了：挑它就是撞一次空，撞空要一个上游请求，还占着
+// 并发。
+func TestAnAccountThatIsEmptyComesLast(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.remaining = map[string]float64{"acc_01": 0, "acc_02": 400}
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 先用有额度的那个。
+	if _, err := r.Pick(context.Background(), "talk-1", "chat", nil); err != nil {
+		t.Fatal(err)
+	}
+	// acc_01 从没用过（它最久没用过），但它读到的是 0：它接不了活了。
+	plan, err := r.Pick(context.Background(), "talk-2", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_02" {
+		t.Fatalf("account = %s, want acc_02", plan.AccountID)
+	}
+}
+
+// TestTheSameAccountsAlwaysGiveTheSameOne says the choice is stable.
+//
+// 一样的情况挑出同一个号来：随机的挑法让同一个号被反复烧，缓存命中也
+// 说不准。
+func TestTheSameAccountsAlwaysGiveTheSameOne(t *testing.T) {
+	p := newFakePool(acc("acc_02"), acc("acc_01"))
+	p.remaining = map[string]float64{"acc_01": 100, "acc_02": 100}
+	r := New(p, Options{MaxAttempts: 3})
+
+	plan, err := r.Pick(context.Background(), "talk-1", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_01" {
+		t.Fatalf("account = %s, want acc_01", plan.AccountID)
+	}
+}
+```
+
+- [ ] **Step 2: 跑测试，看它失败**
+```sh
+go test ./internal/rotator/ -run "LeastUsed|EmptyComesLast|SameAccounts"
+```
+
+Expected: FAIL —— `TestTheLeastUsedAccountComesFirst` 挂：第二个还是挑了
+`acc_01`（它的余额多），没有换成最久没用过的 `acc_02`。
+`TestTheSameAccountsAlwaysGiveTheSameOne` 也挂：挑的是 `acc_02`（它排在
+前面），不是按 ID 排出来的 `acc_01`。
+
+- [ ] **Step 3: 改挑选的规矩**
+
+`internal/rotator/rotator.go`，`better()` 改成：
+```go
+// better says one account is a better pick than another.
+//
+// 挑号的规矩，从要紧的到不要紧的：
+//
+//  1. 读到余额的排前面 —— 那是能拿来比较的数字。没读到的不算零，它排在
+//     有数的号后面（规格不变量 2）。
+//  2. 读到「0」的排到有数的号后面 —— 它接不了活了，挑它就是撞一次空，
+//     撞空要一个上游请求，还占着并发。
+//  3. 最久没用过的排前面 —— 把用量摊开：所有号一起耗尽会把池子一下子
+//     掏空，然后一起补号、一起读额度（规格 §6.5）。
+//  4. 一样的话余额多的排前面。
+//  5. 再一样就按 ID 排 —— 稳定：同样的情况挑出同一个号来。
+func better(a, b scored) bool {
+	if a.known != b.known {
+		// 读到余额的排前面：那是能拿来比较的数字
+		return a.known
+	}
+	if a.known {
+		aEmpty := a.left <= 0
+		bEmpty := b.left <= 0
+		if aEmpty != bEmpty {
+			// 读到 0 的排后面：它撞空是必然的。
+			return bEmpty
+		}
+	}
+	if !a.usedAt.Equal(b.usedAt) {
+		// 最久没用过的排前面
+		return a.usedAt.Before(b.usedAt)
+	}
+	if a.known && a.left != b.left {
+		return a.left > b.left
+	}
+	return a.acc.ID < b.acc.ID
+}
+```
+
+- [ ] **Step 4: 跑测试，看它过**
+```sh
+go test ./internal/rotator/
+```
+
+Expected: PASS。
+
+- [ ] **Step 5: 提交**
+```sh
+cat > .git/commit_msg.txt <<'EOF'
+feat(rotator): 挑号改成最久没用过的优先，余额只当门槛
+
+从前第一条是「余额多的排前面」：那是把最富的号先烧光，池子从一头空过去，
+然后一波补号、一波读额度（规格 §6.5）。这一版把余额降成门槛 —— 读到 0
+的排最后面，剩下的按最久没用过的排，用量摊开。
+
+再加两条兜底：一样的时候按 ID 排（同样的情况挑出同一个号来），读到 0
+的号排在有数的号后面（挑它就是撞一次空）。
+
+会话黏性不受影响：绑着的号能答就是它答。
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+EOF
+git add internal/rotator/rotator.go internal/rotator/rotator_test.go
+git commit -F .git/commit_msg.txt
+```
+
+---
+
+### Task 8: 文档 —— 配置怎么写
 
 **Files:**
 - Modify: `config.example.yaml`
@@ -2889,10 +3641,25 @@ pool:
   read_on_admit: true
 ```
 
-- [ ] **Step 2: `README.md` 的配置表加五行**
+- [ ] **Step 1b: `config.example.yaml` 和 `config.docker.yaml` 的 `concurrency:` 段加 `total_max`**
+
+两个文件的 `concurrency:` 段都一样，加在 `total_min` 后面、`wait` 前面：
+```yaml
+  # 总并发的天花板：不管池子里有多少个号、库里有多少个号，承诺的并发都
+  # 不超过它。0 = 不限（跟从前一样）。
+  #
+  # 池空的时候承诺是从库里数出来的 —— 库里 1000 个号就承诺 200，那一下能
+  # 从池子撑的数抬到库里的数。天花板是给这一下准备的。池子的大小是按承
+  # 诺的并发算的（max(总并发, 活跃会话数) × 倍数），所以天花板定 64，池
+  # 子就是 128 个号。
+  total_max: 0
+```
+
+- [ ] **Step 2: `README.md` 的配置表加六行**
 
 `README.md` 的 `## 配置` 那一节的表格末尾加：
 ```markdown
+| `concurrency.total_max` | `0` | 总并发的天花板。0 = 不限 |
 | `pool.factor` | `2` | 池装几个号 = max(总并发, 活跃会话数) × 它 |
 | `pool.max_size` | `0` | 池里最多几个号。0 = 不限 |
 | `pool.memory_budget_mb` | `32` | 池的内存预算（兜底）。一个号按 512 字节算 |
@@ -2917,6 +3684,9 @@ pool:
   一次额度。
 - **承诺的并发按池夹**：池里只有几个号就只承诺几个 —— 承诺了接不住就是
   一片 429。
+- **总并发还有个天花板**：`concurrency.total_max`。0 = 不限；定一个数，
+  承诺的并发就永远不超过它 —— 池空的那一下（承诺从库里数）最容易失控，
+  天花板是给它的。
 - **会话照旧黏在一个号上**：只有额度用完才改绑。
 
 冷启动填池不等读额度：读一次是 2~11 个上游请求，填满 400 个号要半个
@@ -2982,4 +3752,5 @@ sqlite3 mmxcode.db "select count(*) from accounts where status='active'"
 
 - **卡片那条路拆两段读**（`LatestUsageSnapshots` 全量读 `windows_json`）。200–1000 个号时它只占 2MB；10 万个号才是生死线（207MB/请求）。另开一份规格。
 - **会话绑定的内存缓存**。现在每请求一次主键索引查询，几十微秒，池化之后每请求本来也只剩这一次数库。
+- **读额度的令牌桶、每个窗口组的熔断器、失败的号短冷却、池里余额的写回**。这一版先把并发按住（天花板 + 池夹），把选号的顺序摆正（最久没用过的优先）；池子跑起来、看到真的耗尽形态之后再定这些的参数 —— 现在定就是猜。
 
