@@ -89,16 +89,28 @@ Expected: FAIL —— `c.Pool undefined`（还没有这个配置）。
 // 少个请求」，活跃会话是「有多少段对话在用」，池要装得下它们（会话钉
 // 的号不在池里会被改绑，缓存命中就没了），再留一倍给补号。
 //
-// 配 0 的时候按说得过去的数算：0 倍数是「池里一个号都没有」，那不是关
-// 掉，是坏了。
+// 零值是每个键自己的规矩，写在各自的字段下面。
 type Pool struct {
-	// Factor is how many times the demand the pool takes.
+	// Factor is how many times over the demand the pool holds.
+	//
+	// 池装几个号 = max(总并发, 活跃会话数) × 这个倍数（2 = 装两倍）。
+	//
+	// 配 0 按 1 算：0 倍数是「池里一个号都没有」，那不是关掉，是坏了。
 	Factor int `yaml:"factor" json:"factor"`
 	// MaxSize caps the pool by the number of accounts. 0 means no cap.
+	//
+	// 配 0 是不限：这时候池的大小由内存预算和库里能用的号数说了算。
 	MaxSize int `yaml:"max_size" json:"max_size"`
 	// MemoryBudgetMB is how much memory the pool may take.
+	//
+	// 一个号按 512 字节算。配 0 是不设内存上限。
 	MemoryBudgetMB int `yaml:"memory_budget_mb" json:"memory_budget_mb"`
 	// SessionWindow is how long a session counts as active.
+	//
+	// 「活跃」= 这段时间里被碰过的会话，按最后一次碰的时间算。会话表从
+	// 来不删，所以数的是最近碰过的，不是一共有的。
+	//
+	// 配 0 是错的（配置文件会拒），因为一个没有窗口的「活跃」数不清楚。
 	SessionWindow Duration `yaml:"session_window" json:"session_window"`
 	// ReadOnAdmit says whether a new account's credits are read before
 	// it goes into the pool.
