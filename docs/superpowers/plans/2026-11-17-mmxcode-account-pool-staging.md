@@ -4107,6 +4107,10 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 	if s.Store == nil {
 		return 1
 	}
+	if s.Pool == nil {
+		// 没有池就没有「池夹」这回事：承诺还是从前那样按库里数。
+		return 1
+	}
 	usable, err := s.Store.CountUsable(ctx)
 	if err != nil {
 		return 1
