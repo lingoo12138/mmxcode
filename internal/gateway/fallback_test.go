@@ -160,6 +160,120 @@ func TestTheFailingDatabaseIsNotReadAgainBeforeTheWindow(t *testing.T) {
 	}
 }
 
+// ctxStore answers only while the context is alive.
+//
+// 它站在读库的那一头：客户端走了的时候，读就该跟着断 —— 库没坏，是那
+// 一头不要答案了。
+type ctxStore struct {
+	*store.Store
+	mu sync.Mutex
+	// reads counts the reads it was asked for.
+	reads int
+}
+
+func (c *ctxStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.Store.ListAccounts(ctx)
+}
+
+// slowStore holds the first read until the context is done.
+//
+// 它是那种"读库里那一头慢"的库：第一个人的 ctx 断了，读就断在那儿。
+type slowStore struct {
+	*store.Store
+	mu sync.Mutex
+	// reads counts the reads it was asked for.
+	reads int
+	// started says the first read began.
+	started chan struct{}
+}
+
+func (s *slowStore) ListAccounts(ctx context.Context) ([]store.Account, error) {
+	s.mu.Lock()
+	s.reads++
+	first := s.reads == 1
+	s.mu.Unlock()
+	if first {
+		close(s.started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.ListAccounts(ctx)
+}
+
+// TestTheCancelledCallerDoesNotPoisonTheNextOne says a read that was
+// cut short by the caller is not remembered as the database's answer.
+//
+// 客户端走了的时候，读到一半就断了 —— 那是它的事，不是库的事。这个错
+// 不能被记住：记住了一秒，这一秒里来的每一个请求都拿到"context
+// canceled"，一个客户端的断开就变成一片 503。下一个请求要自己读一遍。
+func TestTheCancelledCallerDoesNotPoisonTheNextOne(t *testing.T) {
+	s, _ := oneAccount(t)
+	c := &ctxStore{Store: s}
+	f := newDBFallback(c, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.get(ctx); err == nil {
+		t.Fatal("the cancelled read was not reported")
+	}
+
+	snap, err := f.get(context.Background())
+	if err != nil {
+		t.Fatalf("the next caller got the cancellation: %v", err)
+	}
+	if len(snap.accounts) != 1 || snap.accounts[0].ID != "acc_01" {
+		t.Fatalf("accounts = %v, want just acc_01", snap.accounts)
+	}
+	if c.reads != 2 {
+		t.Fatalf("the store was read %d times, want 2", c.reads)
+	}
+}
+
+// TestTheWaiterReadsAgainWhenTheReaderWasCutShort says a waiter does
+// not inherit the reader's cancellation.
+//
+// 一次只读一遍：等的人等的是那个信号。读的那一头被掐断了，等的人醒来
+// 的时候手上什么都没有 —— 它得自己读一遍，而不是接着那个取消。
+func TestTheWaiterReadsAgainWhenTheReaderWasCutShort(t *testing.T) {
+	s, _ := oneAccount(t)
+	c := &slowStore{Store: s, started: make(chan struct{})}
+	f := newDBFallback(c, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := f.get(ctx)
+		first <- err
+	}()
+	<-c.started
+	// 读的那一头还在库里等：来第二个请求，它得等。
+	second := make(chan error, 1)
+	go func() {
+		_, err := f.get(context.Background())
+		second <- err
+	}()
+	cancel()
+
+	if err := <-first; err == nil {
+		t.Fatal("the cancelled read was not reported")
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("the waiter inherited the cancellation: %v", err)
+	}
+	if c.reads != 2 {
+		t.Fatalf("the store was read %d times, want 2", c.reads)
+	}
+}
+
 // panickingStore breaks on the first read and answers after that.
 //
 // 它站在读库的那一头：库崩了的时候，网关不能跟着崩，也不能从此吊死。

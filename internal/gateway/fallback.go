@@ -69,85 +69,95 @@ func newDBFallback(s poolStore, ttl time.Duration) *dbFallback {
 // 这一秒里只读一遍，不管有没有读到过：手上没有快照的时候，上一次的那个
 // 错就是这一秒里每一个请求的答案 —— 库在挂的时候，读的次数是跟着来的
 // 请求走的，不是跟着那一秒走的。
+//
+// 有一件事不记：被调用方掐断的那一次读。那是那一个请求的事，不是库的事
+// —— 记下来就成了这一秒里每一个请求的答案，一个客户端的断开就变成一片
+// 503。这样的读不算一次读：下一个请求自己读一遍。
 func (f *dbFallback) get(ctx context.Context) (*dbAnswer, error) {
-	f.mu.Lock()
-	if time.Since(f.tried) < f.ttl {
-		snap := f.snap
-		err := f.err
-		f.mu.Unlock()
-		if snap != nil {
-			return snap, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		return nil, errors.New("the database did not answer")
-	}
-	if f.wait != nil {
-		// 有人在读库。
-		ch := f.wait
-		stale := f.snap
-		f.mu.Unlock()
-		if stale != nil {
-			return stale, nil
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	for {
 		f.mu.Lock()
-		snap := f.snap
-		err := f.err
-		f.mu.Unlock()
-		if snap == nil {
+		if time.Since(f.tried) < f.ttl {
+			snap := f.snap
+			err := f.err
+			f.mu.Unlock()
+			if snap != nil {
+				return snap, nil
+			}
 			if err != nil {
 				return nil, err
 			}
 			return nil, errors.New("the database did not answer")
 		}
+		if f.wait != nil {
+			// 有人在读库。
+			ch := f.wait
+			stale := f.snap
+			f.mu.Unlock()
+			if stale != nil {
+				return stale, nil
+			}
+			select {
+			case <-ch:
+				// 读的那一头完了。再来一遍：它要么读到了答案（那一趟
+				// 盖了戳，答案在这一秒里），要么它自己被掐断了（那一趟
+				// 不算数，这一趟自己读）。
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		ch := make(chan struct{})
+		f.wait = ch
+		f.mu.Unlock()
+
+		// 信号一定要发出去：等的人等的是它。
+		//
+		// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
+		// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
+		// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
+		defer close(ch)
+		// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
+		// 不是代码后面的那几行。
+		defer func() {
+			f.mu.Lock()
+			if f.wait == ch {
+				f.wait = nil
+			}
+			f.mu.Unlock()
+		}()
+
+		answer, err := f.read(ctx)
+
+		f.mu.Lock()
+		f.wait = nil
+		if err != nil && ctx.Err() != nil {
+			// 读被掐断了：那是调用方的事，不是库的事。这个错不记（记
+			// 下来就是这一秒里每一个请求的答案），这一趟也不算一次读
+			// （不盖戳：下一个请求自己读一遍）。
+			snap := f.snap
+			f.mu.Unlock()
+			if snap != nil {
+				return snap, nil
+			}
+			return nil, err
+		}
+		f.tried = time.Now()
+		if err == nil {
+			f.snap = answer
+			f.err = nil
+		} else {
+			// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
+			// 张表。
+			f.err = err
+		}
+		snap := f.snap
+		f.mu.Unlock()
+
+		if err != nil && snap == nil {
+			return nil, err
+		}
 		return snap, nil
 	}
-	ch := make(chan struct{})
-	f.wait = ch
-	f.mu.Unlock()
-
-	// 信号一定要发出去：等的人等的是它。
-	//
-	// 读的那一头要是 panic 了，这个 defer 照样跑 —— 不然后来的每一个请
-	// 求都吊在一个不会有人关的通道上，等到自己的 ctx 死了才走，兜底这一
-	// 辈子就废了（进程还在，net/http 会 recover handler 的 panic）。
-	defer close(ch)
-	// 那个"有人在读"的标记也要放开：同样是那个道理，panic 走的是 defer，
-	// 不是代码后面的那几行。
-	defer func() {
-		f.mu.Lock()
-		if f.wait == ch {
-			f.wait = nil
-		}
-		f.mu.Unlock()
-	}()
-
-	answer, err := f.read(ctx)
-
-	f.mu.Lock()
-	f.wait = nil
-	f.tried = time.Now()
-	if err == nil {
-		f.snap = answer
-		f.err = nil
-	} else {
-		// 读不到：记住这个错。这一秒里来的请求就拿它走，不必再读一遍整
-		// 张表。
-		f.err = err
-	}
-	snap := f.snap
-	f.mu.Unlock()
-
-	if err != nil && snap == nil {
-		return nil, err
-	}
-	return snap, nil
 }
 
 // read asks the database the three things the adapter needs.
