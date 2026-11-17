@@ -92,6 +92,64 @@ func (f *fakeMarker) SetExhausted(_ context.Context, accountID, windowKey string
 	return nil
 }
 
+// blockingReader reads the credits only when the reading is over.
+//
+// 它是卡住的那种读：上游不答，网关等的是它自己那一趟的时间到。
+type blockingReader struct {
+	mu sync.Mutex
+	// asked counts the accounts it was asked about.
+	asked int
+}
+
+func (b *blockingReader) RefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
+	b.mu.Lock()
+	b.asked++
+	b.mu.Unlock()
+	<-ctx.Done()
+	return store.UsageSnapshot{}, ctx.Err()
+}
+
+// TestTheReplenishStopsWhenThePassIsOver says one filling pass does not
+// run past its own deadline.
+//
+// 补号那一趟每 30 秒该来一次（poolLoop）。一趟要是能跑 90 秒（6 个号 ×
+// 每个 15 秒），中间那两趟都被"上一趟还在跑"挡掉了，补号的速度就悄悄
+// 降下来了 —— 池短着，承诺的并发就少一个。
+func TestTheReplenishStopsWhenThePassIsOver(t *testing.T) {
+	p := New(10)
+	src := &fakeSource{all: []store.Candidate{
+		{Account: anAccount("a")},
+		{Account: anAccount("b")},
+		{Account: anAccount("c")},
+		{Account: anAccount("d")},
+		{Account: anAccount("e")},
+	}}
+	reader := &blockingReader{}
+	marker := &fakeMarker{}
+	k := NewKeeper(p, src, reader, marker, KeeperOptions{
+		Read: true, Cooldown: time.Minute, ReadBudget: 10, PassTimeout: 100 * time.Millisecond,
+	})
+	// 这一趟的时间到了就收手：ctx 是网关自己的命，不是这一趟的。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	n, err := k.Replenish(ctx, 5)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("replenished = %d, want 0", n)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("the pass took %v, want less than a second", elapsed)
+	}
+	if reader.asked > 1 {
+		t.Fatalf("the site was asked %d times, want at most 1", reader.asked)
+	}
+}
+
 // TestTheSeedFillsThePoolWithoutAskingTheSite says the pool is filled
 // at startup without asking the site for anything.
 //

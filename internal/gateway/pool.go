@@ -5,9 +5,26 @@ import (
 	"log"
 	"time"
 
+	"mmxcode/internal/config"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/store"
 )
+
+// poolReadBudget gives how many accounts one filling pass may read the
+// credits of.
+//
+// 配 0 的时候按 1 算，跟读额度那一趟是同一条规矩（usage.batch）：0 个一
+// 批是一趟也读不了，那不是关掉，是坏了。
+//
+// keeper 那边的 0 说的是"不限"，所以这一层必须先把它夹住：不夹住的话，
+// 一个写 `usage.refresh.batch: 0` 的人把补号那一趟的预算打开了 —— 一趟
+// 把候选表读一遍，一次读是 2~11 个上游请求（规格 §6.4）。
+func poolReadBudget(cfg config.Usage) int {
+	if cfg.Refresh.Batch <= 0 {
+		return 1
+	}
+	return cfg.Refresh.Batch
+}
 
 // poolSource gives the pool the accounts it could take.
 type poolSource struct {

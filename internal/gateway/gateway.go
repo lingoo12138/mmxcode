@@ -186,8 +186,12 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 		pool.KeeperOptions{
 			Read:        cfg.Pool.ReadOnAdmit,
 			Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
-			ReadBudget:  cfg.Usage.Refresh.Batch,
+			ReadBudget:  poolReadBudget(cfg.Usage),
 			ReadTimeout: cfg.Usage.Refresh.Timeout.Duration(),
+			// 一趟补号自己的时限：跟读额度那一趟用同一把尺子
+			// （usage.refresh.budget）。没有它，一趟能跑 90 秒，而补号
+			// 那一趟每 30 秒就该来一次。
+			PassTimeout: cfg.Usage.Refresh.Budget.Duration(),
 		})
 	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy, pool: g.Pool, fallback: g.fallback}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,

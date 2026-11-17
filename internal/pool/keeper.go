@@ -42,11 +42,23 @@ type KeeperOptions struct {
 	// 0 = 不限 —— 别这么配：补号读的是上游的钱，一次读是 2~11 个上游请求
 	//（规格 §6.4），一趟读几百个号就是几千个请求，那不是填池，是打上游。
 	// 预算就是 usage.refresh.batch：那一趟该读几个，就读几个。
+	//
+	// 生产上不要拿 0 来表示"不限"：调用它的那一层（gateway）必须先把它
+	// 夹住 —— 那边 0 的意思是"一个一批"，不是"全都读"。
 	ReadBudget int
 	// ReadTimeout is how long one reading may take.
 	//
 	// 卡住的账号不拖住整趟：读不到就当它不合格（规格 §5）。
 	ReadTimeout time.Duration
+	// PassTimeout is how long one pass may take.
+	//
+	// 一趟补号的上限：候选是问出来的，读额度是问上游的，两样都要时间。
+	// 没有这个上限，一趟的时长是"预算 × 每个号的时限"（6 × 15 秒 = 90
+	// 秒），而补号那一趟每 30 秒就该来一次 —— 中间那几趟都被"上一趟还
+	// 在跑"挡掉了，补号的速度就悄悄降下来了。
+	//
+	// 0 = 不限。生产上不该这么配。
+	PassTimeout time.Duration
 }
 
 // Keeper keeps the pool full.
@@ -148,6 +160,15 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		k.mu.Unlock()
 	}()
 
+	// 这一趟自己的时限：候选是问出来的，读额度是问上游的，两样都要时间。
+	// 没有它，一趟能跑"预算 × 每个号的时限"，而补号那一趟每 30 秒就该来
+	// 一次 —— 中间那几趟都被"上一趟还在跑"挡掉了，补号的速度悄悄降下来。
+	if k.opts.PassTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, k.opts.PassTimeout)
+		defer cancel()
+	}
+
 	added := 0
 	var lastErr error
 	// 这一趟读了几次：预算是这一趟的，不是整天的。
@@ -161,6 +182,11 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 	// 一趟最多试这么多候选：候选都读不出东西来的时候，别把整张表试
 	// 完 —— 试到没有新的候选为止。
 	for attempts := 0; attempts < want*3+3; attempts++ {
+		if ctx.Err() != nil {
+			// 这一趟的时间用完了：整趟就此打住，不是只放下一个号。下
+			// 一趟重新开始。
+			break
+		}
 		if k.pool.Len() >= want {
 			break
 		}
@@ -178,6 +204,10 @@ func (k *Keeper) Replenish(ctx context.Context, want int) (int, error) {
 		fresh := 0
 		for _, c := range candidates {
 			if k.pool.Len() >= want {
+				break
+			}
+			if ctx.Err() != nil {
+				// 这一趟的时间用完了：不再读下一个号，也不再问候选。
 				break
 			}
 			if inPool[c.Account.ID] {

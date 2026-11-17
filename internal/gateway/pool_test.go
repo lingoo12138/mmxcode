@@ -43,6 +43,28 @@ func (c *listingStore) ListExhausted(ctx context.Context) ([]store.Exhausted, er
 	return c.Store.ListExhausted(ctx)
 }
 
+// TestTheReadBudgetIsNeverUnlimited says the keeper's read budget is
+// never "unlimited".
+//
+// keeper 那边的 0 说的是"不限"：补号读的是上游的钱，一次读是 2~11 个上游
+// 请求（规格 §6.4），一趟读几百个号就是几千个请求 —— 那不是填池，是打上
+// 游。而 usage.refresh.batch 配 0 说的是"一个一批"（usage.batch 的那
+// 条规矩），不是"全都读"。所以这一层必须把它夹住。
+func TestTheReadBudgetIsNeverUnlimited(t *testing.T) {
+	for _, c := range []struct {
+		batch int
+		want  int
+	}{
+		{0, 1}, {-1, 1}, {1, 1}, {6, 6},
+	} {
+		cfg := config.Default()
+		cfg.Usage.Refresh.Batch = c.batch
+		if got := poolReadBudget(cfg.Usage); got != c.want {
+			t.Errorf("the read budget for batch %d = %d, want %d", c.batch, got, c.want)
+		}
+	}
+}
+
 // TestThePickerReadsThePoolAndNotTheWholeTable says picking an account
 // reads the pool, not the whole table.
 //
