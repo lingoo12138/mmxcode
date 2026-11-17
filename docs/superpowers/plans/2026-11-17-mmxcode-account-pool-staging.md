@@ -3333,6 +3333,24 @@ func TestWithoutACeilingThePromiseIsTheOldOne(t *testing.T) {
 		t.Fatalf("concurrency = %d, want 20", got)
 	}
 }
+
+// TestTheCeilingMakesThePoolSmaller says the pool is sized after the
+// promise, and the promise is capped.
+//
+// 池多大 = max(总并发, 活跃会话数) × 倍数（规格 §6.3）。总并发被天花板
+// 按住了，池就跟着小 —— 「n×2」那个说法才有着落（规格 §6.9）。
+func TestTheCeilingMakesThePoolSmaller(t *testing.T) {
+	s := manyAccounts(t, 100)
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Concurrency.TotalMax = 5
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(0)}
+
+	// 天花板 5，倍数 2 → 池装 10 个号；没有天花板的时候是 20 × 2 = 40。
+	if got := g.poolTarget(ctx); got != 10 {
+		t.Fatalf("pool target = %d, want 10", got)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -3352,17 +3370,31 @@ Expected: FAIL —— `TestTheConcurrencyIsNotMoreThanThePool` 挂：库里 100 
 `TestWithoutACeilingThePromiseIsTheOldOne` 的名字里没有 Concurrency，筛窄了
 它们就一个都不跑。）
 
-- [ ] **Step 3: 总并发按池夹，再按天花板按住**
+- [ ] **Step 3: 总并发按池夹，天花板进 `totalFor`**
+
+`internal/gateway/busy.go`，`totalFor` 末尾（`if total < 1 { total = 1 }` 之后、`return total` 之前）插入：
+```go
+	// 天花板：运营定的那根杆（规格 §6.9）。它在这里，不在
+	// totalConcurrency 里 —— 池的大小是按承诺的并发算的
+	// （max(总并发, 活跃会话数) × 倍数），天花板压承诺的时候，池也跟着小。
+	if top := cfg.TotalMax; top > 0 && total > top {
+		total = top
+	}
+```
+
+**为什么放在 `totalFor` 里，不放在 `totalConcurrency` 里**：池的大小是按
+承诺的并发算的（规格 §6.3）。天花板放在 `totalConcurrency` 里的话，承诺被
+按住了，池却还按没被按住的那个数去装 —— 「n×2」那个说法就落空了。放在
+`totalFor` 里，两边看的都是同一个数。
 
 `internal/gateway/busy.go`，`totalConcurrency` 改成：
 ```go
 // totalConcurrency says how many requests may be in the air at once.
 //
-// 承诺的并发 = min(期望并发, 池里能用的号数)，再封在天花板里：
+// 承诺的并发 = min(期望并发, 池里能用的号数)：
 //
-//   - 期望并发 = 可用账号数 ÷ 5（小规模至少 3），跟从前一样；
-//   - 池里能用的号数 = 池里签入中、没有被标记用完的号；
-//   - 天花板 = concurrency.total_max（配 0 是不限）。
+//   - 期望并发 = 可用账号数 ÷ 5（小规模至少 3），按天花板截下来，跟从前一样；
+//   - 池里能用的号数 = 池里签入中、没有被标记用完的号。
 //
 // 池里没有那么多号，就只能承诺那么多 —— 承诺了接不住就是一片 429（规格
 // 不变量 4）。
@@ -3386,9 +3418,6 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 	case inPool < want:
 		// 池里的号不够：只能承诺这么多。
 		want = inPool
-	}
-	if top := s.Cfg.Concurrency.TotalMax; top > 0 && want > top {
-		want = top
 	}
 	return want
 }
@@ -3709,7 +3738,7 @@ git commit -F .git/commit_msg.txt
 
 ## 怎么验
 
-计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，新增 43 个测试。
+计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，新增 56 个测试。
 
 做完之后按这个顺序验：
 ```sh
