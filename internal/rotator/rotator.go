@@ -611,16 +611,38 @@ type scored struct {
 }
 
 // better says one account is a better pick than another.
+//
+// 挑号的规矩，从要紧的到不要紧的：
+//
+//  1. 读到余额的排前面 —— 那是能拿来比较的数字。没读到的不算零，它排在
+//     有数的号后面（规格不变量 2）。
+//  2. 读到「0」的排到有数的号后面 —— 它接不了活了，挑它就是撞一次空，
+//     撞空要一个上游请求，还占着并发。
+//  3. 最久没用过的排前面 —— 把用量摊开：别让一个号被别的号挤在后面一直
+//     闲着，到头来被一口气烧光（规格 §6.5）。
+//  4. 一样的话余额多的排前面。
+//  5. 再一样就按 ID 排 —— 稳定：同样的情况挑出同一个号来。
 func better(a, b scored) bool {
 	if a.known != b.known {
 		// 读到余额的排前面：那是能拿来比较的数字
 		return a.known
 	}
+	if a.known {
+		aEmpty := a.left <= 0
+		bEmpty := b.left <= 0
+		if aEmpty != bEmpty {
+			// 读到 0 的排后面：它撞空是必然的。
+			return bEmpty
+		}
+	}
+	if !a.usedAt.Equal(b.usedAt) {
+		// 最久没用过的排前面
+		return a.usedAt.Before(b.usedAt)
+	}
 	if a.known && a.left != b.left {
 		return a.left > b.left
 	}
-	// 一样就用最久没用的那个
-	return a.usedAt.Before(b.usedAt)
+	return a.acc.ID < b.acc.ID
 }
 
 // nextAccount gives the next account in the rotation.

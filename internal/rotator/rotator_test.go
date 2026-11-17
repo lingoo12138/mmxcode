@@ -1098,3 +1098,73 @@ func TestTheUpstreamMessageIsReadTheSameWay(t *testing.T) {
 		}
 	}
 }
+
+// TestTheLeastUsedAccountComesFirst says the accounts are used evenly.
+//
+// 挑号的第一条是「最久没用过的排前面」，不是「余额最多的排前面」：一个号
+// 被别的号挤在后面一直闲着，到头来被一口气烧光（规格 §6.5）。
+func TestTheLeastUsedAccountComesFirst(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.remaining = map[string]float64{"acc_01": 400, "acc_02": 100}
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 第一个号两个都没用过过，按余额，余额多的先。
+	plan, err := r.Pick(context.Background(), "talk-1", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_01" {
+		t.Fatalf("account = %s, want acc_01", plan.AccountID)
+	}
+
+	// 第二个号：acc_01 刚用过，acc_02 没用过。用最久没用的那个。
+	plan, err = r.Pick(context.Background(), "talk-2", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_02" {
+		t.Fatalf("account = %s, want acc_02", plan.AccountID)
+	}
+}
+
+// TestAnAccountThatIsEmptyComesLast says an account that was read and
+// found empty is not picked while another account has credits.
+//
+// 读到 0 就是知道它空了：挑它就是撞一次空，撞空要一个上游请求，还占着
+// 并发。
+func TestAnAccountThatIsEmptyComesLast(t *testing.T) {
+	p := newFakePool(acc("acc_01"), acc("acc_02"))
+	p.remaining = map[string]float64{"acc_01": 0, "acc_02": 400}
+	r := New(p, Options{MaxAttempts: 3})
+
+	// 先用有额度的那个。
+	if _, err := r.Pick(context.Background(), "talk-1", "chat", nil); err != nil {
+		t.Fatal(err)
+	}
+	// acc_01 从没用过（它最久没用过），但它读到的是 0：它接不了活了。
+	plan, err := r.Pick(context.Background(), "talk-2", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_02" {
+		t.Fatalf("account = %s, want acc_02", plan.AccountID)
+	}
+}
+
+// TestTheSameAccountsAlwaysGiveTheSameOne says the choice is stable.
+//
+// 一样的情况挑出同一个号来：随机的挑法让同一个号被反复烧，缓存命中也
+// 说不准。
+func TestTheSameAccountsAlwaysGiveTheSameOne(t *testing.T) {
+	p := newFakePool(acc("acc_02"), acc("acc_01"))
+	p.remaining = map[string]float64{"acc_01": 100, "acc_02": 100}
+	r := New(p, Options{MaxAttempts: 3})
+
+	plan, err := r.Pick(context.Background(), "talk-1", "chat", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AccountID != "acc_01" {
+		t.Fatalf("account = %s, want acc_01", plan.AccountID)
+	}
+}
