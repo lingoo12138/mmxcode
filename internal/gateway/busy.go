@@ -86,21 +86,22 @@ func (s *Server) waitForFree(ctx context.Context, deadline time.Time, model stri
 			return false
 		}
 		// 先问一句便宜的：在飞的和试过的加起来，比池里能答的号少，那就
-		// 一定有空位；反过来就是一定没有。中间那一段才去问 rotator ——
-		// 那一次要把池里的名单拷一份（池 400 个号就是 400 行 × 每次
-		// 等待，一秒 40 次）。
+		// 一定有空位 —— 这一句是够的，它是个充足条件。其余的都去问
+		// rotator：谁在飞、谁能用、谁被标记用完了，只有它知道，而那一
+		// 次要把池里的名单拷一份（池 400 个号就是 400 行 × 每次等待，
+		// 一秒 40 次）。
 		if s.Pool != nil && s.busy != nil && s.Pool.Len() > 0 {
 			free := s.Pool.Usable() - s.busy.count() - len(used)
 			if free > 0 {
+				// 一定有空位：池里能答的号比在飞的加试过的还多，那一定
+				// 有一个既不忙也没试过。
 				return true
 			}
-			if free < 0 {
-				// 一定没有空位：等着就是了。
-				if !time.Now().Before(deadline) {
-					return false
-				}
-				continue
-			}
+			// 其余的都说不准：free 是个下限，不是确数 —— 在飞的那几个
+			// 和试过的那几个里面，有的不在池里（池空的时候从库里拿的
+			// 号，还有用完了出了池、请求还在飞的号）。所以负数说的是
+			// "不知道"，不是"没有"：当成"没有"就跳过了 rotator，而
+			// rotator 才是那个知道有没有空位的。
 		}
 		ok, err := s.Rot.AnyUsable(ctx, model, used)
 		if err == nil && ok {

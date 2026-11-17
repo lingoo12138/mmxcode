@@ -10,9 +10,53 @@ import (
 
 	"mmxcode/internal/config"
 	"mmxcode/internal/manager"
+	"mmxcode/internal/pool"
 	"mmxcode/internal/rotator"
 	"mmxcode/internal/store"
 )
+
+// TestTheFreeAccountIsFoundEvenWhenTheCountIsShort says a free account
+// is found even when the count says the pool is short.
+//
+// free 是个下限，不是确数：在飞的那几个和试过的那几个里面，有的不在池
+// 里 —— 池空的时候从库里拿的号，还有用完了出了池、请求还在飞的号。所以
+// 负数说的是"不知道"，不是"没有"：当成"没有"就跳过了 rotator，而
+// rotator 才知道到底有没有空位。于是这个请求等满了 concurrency.wait，
+// 回一个本该不会有的 429。
+func TestTheFreeAccountIsFoundEvenWhenTheCountIsShort(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_02", Status: store.StatusActive}})
+	busy := newBusyAccounts(1)
+	// acc_01 上有一个请求在飞。
+	if !busy.take("acc_01") {
+		t.Fatal("the account did not take the request")
+	}
+	ad := poolAdapter{s: s, busy: busy, pool: p}
+	g := &Server{
+		Pool: p,
+		busy: busy,
+		Rot: rotator.New(ad, rotator.Options{
+			MaxAttempts: 3,
+			Cooldown:    time.Minute,
+			WindowGroup: manager.WindowGroup,
+		}),
+	}
+	// 试过的那些里面有一个不在池里。
+	used := map[string]bool{"acc_01": true, "acc_x": true}
+
+	start := time.Now()
+	ok := g.waitForFree(ctx, time.Now().Add(3*time.Second), "m", used)
+	elapsed := time.Since(start)
+	if !ok {
+		t.Fatalf("the free account was not found (it took %v)", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("the request waited %v, want it to find the free account", elapsed)
+	}
+}
 
 // TestAnAccountTakesOneRequestAtATime says an account takes one
 // request at a time.
