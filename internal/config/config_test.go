@@ -702,6 +702,29 @@ func TestThePoolRefusesAZeroSessionWindow(t *testing.T) {
 	}
 }
 
+// TestTheTotalMaxIsReadFromTheFile says the ceiling's key is the one the
+// file uses, and that it is off by default.
+//
+// 天花板是「并发可控」的那根杆：不管池子里有多少个号、库里有多少个号，
+// 承诺的并发不超过它。默认 0 = 不限，跟从前一样。
+func TestTheTotalMaxIsReadFromTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "concurrency:\n  total_max: 12\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Concurrency.TotalMax != 12 {
+		t.Errorf("total_max = %d, want 12", c.Concurrency.TotalMax)
+	}
+	if Default().Concurrency.TotalMax != 0 {
+		t.Errorf("the default total_max = %d, want 0", Default().Concurrency.TotalMax)
+	}
+}
+
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }

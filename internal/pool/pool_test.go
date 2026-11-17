@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,4 +173,103 @@ func TestTheCreditsOfAnAccountAreWritten(t *testing.T) {
 	if !e.Known || e.Remaining != 123 {
 		t.Fatalf("entry = %+v, want 123 known", e)
 	}
+}
+
+// TestThePoolGivesItsAccountsInTheOrderTheyWentIn says the pool hands
+// out its accounts in the order they went in.
+//
+// 顺序是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转 ——
+// 冷号（先进来的）该先被挑。
+func TestThePoolGivesItsAccountsInTheOrderTheyWentIn(t *testing.T) {
+	p := New(4)
+	for _, id := range []string{"a", "b", "c"} {
+		p.Admit(Entry{Account: anAccount(id)})
+	}
+
+	accounts := p.Accounts()
+	if len(accounts) != 3 {
+		t.Fatalf("accounts = %d, want 3", len(accounts))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if accounts[i].ID != want {
+			t.Fatalf("accounts = %v, want a, b, c", accounts)
+		}
+	}
+}
+
+// TestAnAccountThatComesBackGoesToTheEnd says an account that left the
+// pool and came back goes to the end of the order.
+//
+// 它刚用过：排到队尾，下一轮轮转才轮到它。
+func TestAnAccountThatComesBackGoesToTheEnd(t *testing.T) {
+	p := New(4)
+	p.Admit(Entry{Account: anAccount("a")})
+	p.Admit(Entry{Account: anAccount("b")})
+	p.Remove("a")
+	p.Admit(Entry{Account: anAccount("a")})
+
+	accounts := p.Accounts()
+	if len(accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(accounts))
+	}
+	if accounts[0].ID != "b" || accounts[1].ID != "a" {
+		t.Fatalf("accounts = %v, want b then a", accounts)
+	}
+}
+
+// TestThePoolIsSafeWhileItIsUsed says the pool can be read and written at
+// the same time.
+//
+// 聊天那条路读它，后台补号那条路写它 —— 两边同时。这个包里说的「并发
+// 安全」得有一道测试钉住，不然那只是注释里的一句话。
+//
+// 就算没有 -race（这台机器上没有 C 编译器），Go 自己会喊：并发读写同一
+// 张 map 是 fatal error，跑一次就够。
+func TestThePoolIsSafeWhileItIsUsed(t *testing.T) {
+	p := New(64)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 一边写：进池、写余额、标记用完、出池。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := fmt.Sprintf("acc_%d", i%32)
+			p.Admit(Entry{Account: anAccount(id)})
+			p.SetRemaining(id, float64(i), true)
+			p.MarkSpent(id, "general", time.Now().Add(time.Hour))
+			p.Remove(id)
+		}
+	}()
+
+	// 一边读：拿账号、看余额、数能答的。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.Get("acc_1")
+			p.Entries()
+			p.IDs()
+			p.Accounts()
+			p.Spent()
+			p.Usable(time.Now())
+			p.Len()
+			p.Full()
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

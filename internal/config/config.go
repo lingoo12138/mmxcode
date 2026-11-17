@@ -282,6 +282,18 @@ type Concurrency struct {
 	//
 	// 5 个账号只跑 1 个太憋屈：小规模的时候用 min(账号数, 3)。
 	TotalMin int `yaml:"total_min" json:"total_min"`
+	// TotalMax is the ceiling on the total concurrency.
+	//
+	// 天花板：不管池子里有多少个号、库里有多少个号，承诺的并发不超过
+	// 它。0 = 不限（用可用账号数 ÷ 5 算出来的那个数）。
+	//
+	// 它是「并发可控」的那根杆：池子的大小是按承诺的并发算的
+	// （max(总并发, 活跃会话数) × 倍数），所以天花板定 64，池子就是
+	// 128 个号 —— 「n×2」那个说法才有着落。
+	//
+	// 池空的时候它也在：那时候承诺从库里数，库里有多少号就承诺多少，
+	// 那一下能从 20 抬到 80。天花板就是给这一下准备的。
+	TotalMax int `yaml:"total_max" json:"total_max"`
 	// Wait is how long a request waits for a free place.
 	Wait Duration `yaml:"wait" json:"wait"`
 }
@@ -376,6 +388,7 @@ func Default() Config {
 			PerAccount: 1,
 			TotalRatio: 5,
 			TotalMin:   3,
+			TotalMax:   0,
 			Wait:       Duration(10 * time.Second),
 		},
 		Pool: Pool{

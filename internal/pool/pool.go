@@ -24,8 +24,9 @@ import (
 // BytesPerAccount is what one account in the pool takes, in bytes.
 //
 // 它是量出来的：账号行（id/name/user_id/email/status 五个字符串）加上
-// 剩余积分、耗尽标记和 map 的索引，一行 395 字节。这里取 512 —— 宁可
-// 高一点，内存预算算得保守些。
+// 剩余积分、耗尽标记和 map 的索引，一行 395 字节；账号行那份快照再存一
+// 份 —— 实测一共约 460 字节。这里取 512 —— 宁可高一点，内存预算算得保
+// 守些。
 const BytesPerAccount = 512
 
 // Entry is one account in the pool.
@@ -52,6 +53,8 @@ type Entry struct {
 //
 // 它是并发安全的：聊天那条路读它，后台补号那条路写它。
 //
+// 池要用 New 造：零值的池没有那张表，往里放东西会 panic。
+//
 // 账号名单和用完的名单各有一份现成的快照：挑号每个请求都要问一次，问
 // 的时候不该现凑一份。快照是整份换掉的，不是就地改的 —— 拿着它的人看
 // 到的一直是完整的一份。
@@ -59,6 +62,13 @@ type Pool struct {
 	mu   sync.RWMutex
 	byID map[string]*Entry
 	cap  int
+	// order is the accounts in the order they went in.
+	//
+	// 顺序就是进池的顺序：轮转的时候从队首走到队尾，冷号（先进来的）
+	// 先被挑。一个号出池再进池，它排到队尾 —— 它刚用过。
+	//
+	// 它是给「轮转」用的：map 的顺序是随机的，随机的顺序让轮转不是轮转。
+	order []string
 	// accounts is the snapshot of the accounts in the pool.
 	accounts []store.Account
 	// spent is the snapshot of the accounts whose window is spent.
@@ -88,12 +98,18 @@ func (p *Pool) Capacity() int {
 //
 // 0 means no limit. It never takes accounts out: the pool shrinks by
 // accounts being spent, not by being told to.
+//
+// 所以容量不许缩到比现在的号数还小：缩小的意思是「把号请出去」，而请
+// 出去的理由只有一个 —— 额度用完了（规格 §4.4）。
 func (p *Pool) SetCapacity(n int) {
 	if n < 0 {
 		n = 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if n < len(p.byID) {
+		n = len(p.byID)
+	}
 	p.cap = n
 }
 
@@ -129,6 +145,7 @@ func (p *Pool) Admit(e Entry) bool {
 	}
 	entry := e
 	p.byID[e.Account.ID] = &entry
+	p.order = append(p.order, e.Account.ID)
 	p.rebuild()
 	return true
 }
@@ -146,8 +163,22 @@ func (p *Pool) Remove(accountID string) bool {
 		return false
 	}
 	delete(p.byID, accountID)
+	p.dropFromOrder(accountID)
 	p.rebuild()
 	return true
+}
+
+// dropFromOrder takes an account out of the order.
+//
+// 顺序是进池的顺序：出池的号从顺序里去掉，它再进来的时候排到队尾。
+func (p *Pool) dropFromOrder(accountID string) {
+	for i, id := range p.order {
+		if id != accountID {
+			continue
+		}
+		p.order = append(p.order[:i], p.order[i+1:]...)
+		return
+	}
 }
 
 // Get gives one entry of the pool.
@@ -239,6 +270,9 @@ func (p *Pool) Usable(now time.Time) int {
 // 给的是现成的那一份：挑号每个请求都要问一次，问的时候不该现凑一份。
 // 那一份是整份换掉的，不是就地改的 —— 拿着它的人看到的一直是完整的一
 // 份。
+//
+// **那一份是池的**：拿着它的人只许读，不许改。改了顺序就乱了 —— 顺序
+// 是进池的顺序，轮转靠它。
 func (p *Pool) Accounts() []store.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -246,19 +280,36 @@ func (p *Pool) Accounts() []store.Account {
 }
 
 // Spent gives the accounts in the pool whose window is spent.
+//
+// 过期的不算：窗口回来了，那个号就回来了（规格 §4.5）。所以它给的是一
+// 份新的名单，拿着它的人可以改。
 func (p *Pool) Spent() []store.Exhausted {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.spent
+	now := time.Now()
+	out := make([]store.Exhausted, 0, len(p.spent))
+	for _, e := range p.spent {
+		if !e.Until.After(now) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // rebuild makes the snapshots again.
 //
 // 它在写锁底下跑：换的是整份，不是就地改。
+//
+// 账号按进池的顺序排：轮转从队首走到队尾。
 func (p *Pool) rebuild() {
 	accounts := make([]store.Account, 0, len(p.byID))
 	spent := make([]store.Exhausted, 0, len(p.byID))
-	for _, e := range p.byID {
+	for _, id := range p.order {
+		e, ok := p.byID[id]
+		if !ok {
+			continue
+		}
 		accounts = append(accounts, e.Account)
 		if !e.Spent {
 			continue
