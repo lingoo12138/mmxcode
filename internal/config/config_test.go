@@ -600,6 +600,10 @@ func TestTheConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func writeFile(path, body string) error {
+	return os.WriteFile(path, []byte(body), 0o600)
+}
+
 // TestThePoolDefaults says what the pool does when nothing is said about
 // it.
 //
@@ -625,6 +629,30 @@ func TestThePoolDefaults(t *testing.T) {
 	}
 }
 
-func writeFile(path, body string) error {
-	return os.WriteFile(path, []byte(body), 0o600)
+// TestThePoolIsReadFromTheFile says the pool's keys are the ones the
+// file uses.
+//
+// 这些键名是给用户看的。写错了加载器会当错字拒掉（KnownFields），用户
+// 只看到一句「unknown key」，不知道自己写错了还是网关认错了。
+//
+// 没写的键走默认值：文件只需要写自己要改的。
+func TestThePoolIsReadFromTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "pool:\n  factor: 3\n  max_size: 7\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.Factor != 3 {
+		t.Errorf("factor = %d, want 3", c.Pool.Factor)
+	}
+	if c.Pool.MaxSize != 7 {
+		t.Errorf("max_size = %d, want 7", c.Pool.MaxSize)
+	}
+	if c.Pool.SessionWindow.Duration() != time.Hour {
+		t.Errorf("session_window = %s, want 1h", c.Pool.SessionWindow)
+	}
 }

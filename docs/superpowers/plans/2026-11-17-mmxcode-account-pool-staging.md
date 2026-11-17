@@ -67,6 +67,34 @@ func TestThePoolDefaults(t *testing.T) {
 		t.Error("read_on_admit = false, want true")
 	}
 }
+
+// TestThePoolIsReadFromTheFile says the pool's keys are the ones the
+// file uses.
+//
+// 这些键名是给用户看的。写错了加载器会当错字拒掉（KnownFields），用户
+// 只看到一句「unknown key」，不知道自己写错了还是网关认错了。
+//
+// 没写的键走默认值：文件只需要写自己要改的。
+func TestThePoolIsReadFromTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "pool:\n  factor: 3\n  max_size: 7\n"
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.Factor != 3 {
+		t.Errorf("factor = %d, want 3", c.Pool.Factor)
+	}
+	if c.Pool.MaxSize != 7 {
+		t.Errorf("max_size = %d, want 7", c.Pool.MaxSize)
+	}
+	if c.Pool.SessionWindow.Duration() != time.Hour {
+		t.Errorf("session_window = %s, want 1h", c.Pool.SessionWindow)
+	}
+}
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -2152,11 +2180,12 @@ git commit -F .git/commit_msg.txt
 
 **Files:**
 - Modify: `config.example.yaml`
+- Modify: `config.docker.yaml`
 - Modify: `README.md`
 
-- [ ] **Step 1: `config.example.yaml` 加 `pool:` 段**
+- [ ] **Step 1: `config.example.yaml` 和 `config.docker.yaml` 加 `pool:` 段**
 
-加在 `concurrency:` 段后面：
+两个文件都把每一个段都列了出来（`config.docker.yaml` 尤其如此 —— 容器里没有示例文件，段名写错就是「unknown key」），所以两个都要加。加在 `concurrency:` 段后面、`db:` 前面：
 ```yaml
 # 账号池：网关把账号放在内存里的一个池子里，挑号不再每次扫全表。
 #
@@ -2218,7 +2247,7 @@ docs: 账号池怎么配 —— 倍数、内存预算、会话窗口
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
-git add config.example.yaml README.md
+git add config.example.yaml config.docker.yaml README.md
 git commit -F .git/commit_msg.txt
 ```
 
