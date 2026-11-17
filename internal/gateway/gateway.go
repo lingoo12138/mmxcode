@@ -38,6 +38,7 @@ import (
 	"mmxcode/internal/config"
 	"mmxcode/internal/convert"
 	"mmxcode/internal/manager"
+	"mmxcode/internal/pool"
 	"mmxcode/internal/rotator"
 	"mmxcode/internal/site"
 	"mmxcode/internal/store"
@@ -64,6 +65,19 @@ type Server struct {
 	Store *store.Store
 	// Rot picks the account.
 	Rot *rotator.Rotator
+	// Pool is the accounts the gateway keeps in memory.
+	//
+	// 池是缓存，不是真相（规格不变量 1）：账号、耗尽标记、会话绑定的真
+	// 相都在库里。池存在的理由是选号不用每次扫全表，还有内存有个上界。
+	Pool *pool.Pool
+	// Keeper fills the pool: at startup with what the database knows,
+	// and later with the accounts that are needed.
+	Keeper *pool.Keeper
+	// touches are the sessions that were used and not written yet.
+	//
+	// 它们是「活跃会话」唯一的凭据（规格 §6.3）：会话用过没有，只有网
+	// 关知道。攒着写回去，写一次算一批。
+	touches *sessionTouches
 	// Reader reads the credits of an account. It is a field so that a
 	// test can stand in for the network: the gateway's only way to the
 	// network for the credits goes through it.
@@ -124,6 +138,12 @@ type Server struct {
 	// concTTL is how long the cached value is kept. A test sets it to
 	// zero to turn the cache off.
 	concTTL time.Duration
+	// fallback is the database's answer, cached, for the time the pool
+	// is empty.
+	//
+	// 池空的时候要从库里拿账号、标记和余额 —— 那三样都是全表读（规格
+	// §6.9）。缓存一秒，让那一波并发只读一次。
+	fallback *dbFallback
 }
 
 // concurrencyCacheTTL is how long the total concurrency is kept.
@@ -149,6 +169,8 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	g.NativeChatCompletions.Store(true)
 	g.busy = newBusyAccounts(cfg.Concurrency.PerAccount)
 	g.gate = &gate{}
+	// 池空的时候的那份兜底：库里的答案留一秒（规格 §6.9）。
+	g.fallback = newDBFallback(s, concurrencyCacheTTL)
 	g.lifeCtx, g.lifeCancel = context.WithCancel(context.Background())
 	// 后台的读有上限：到顶了就跳过那一次，不排队。
 	limit := cfg.Usage.Refresh.Concurrency
@@ -157,12 +179,27 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store, webui http.Han
 	}
 	g.bgSem = make(chan struct{}, limit)
 	g.concTTL = concurrencyCacheTTL
-	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy}, rotator.Options{
+	// 池：选号从它读，不再每次扫全表（规格 §6.2）。
+	g.Pool = pool.New(0)
+	g.touches = newSessionTouches()
+	g.Keeper = pool.NewKeeper(g.Pool, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()}, mgr, s,
+		cfg.Pool.ReadOnAdmit, cfg.Rotation.ExhaustedCooldown.Duration())
+	g.Rot = rotator.New(poolAdapter{s: s, busy: g.busy, pool: g.Pool, fallback: g.fallback}, rotator.Options{
 		MaxAttempts: cfg.Rotation.MaxAttempts,
 		Cooldown:    cfg.Rotation.ExhaustedCooldown.Duration(),
 		WindowGroup: manager.WindowGroup,
 		Strategy:    cfg.Rotation.Strategy,
 	})
+	// 池要一直是满的：每 scan_every 一趟看看少了几个，补上。
+	go g.poolLoop()
+	// 用过的会话要写回去：一批一次，它们是「活跃会话数」的凭据（规格
+	// §6.3）。它在后台组里：关网关时要等它把最后一批写完，不然它会往
+	// 一个正在关着的库上写。
+	g.bgWG.Add(1)
+	go func() {
+		defer g.bgWG.Done()
+		g.touchLoop()
+	}()
 	return g
 }
 
@@ -251,13 +288,44 @@ type poolAdapter struct {
 	s poolStore
 	// busy counts the requests in the air per account.
 	busy *busyAccounts
+	// pool is the accounts kept in memory.
+	//
+	// 它是空的（还没填上，或者填池失败）的时候，适配器回到从前的样子，
+	// 从库里拿：网关不能因为池空着就一个请求都答不了。
+	pool *pool.Pool
+	// fallback is the database's answer, cached, for the time the pool
+	// is empty.
+	//
+	// 池空的时候那三样都是全表读（规格 §6.9）：缓存一秒，让那一波并发只
+	// 读一次。
+	fallback *dbFallback
+}
+
+// fromPool says whether the pool has something to give.
+//
+// 池空着的时候（还没填上，或者填池失败）适配器回到从前的样子，从库里
+// 拿：网关不能因为池空着就一个请求都答不了（规格不变量 1）。
+func (p poolAdapter) fromPool() bool {
+	return p.pool != nil && p.pool.Len() > 0
 }
 
 func (p poolAdapter) Accounts(ctx context.Context) ([]store.Account, error) {
+	if p.fromPool() {
+		return p.pool.Accounts(), nil
+	}
+	if p.fallback != nil {
+		return p.fallback.accounts(ctx)
+	}
 	return p.s.ListAccounts(ctx)
 }
 
 func (p poolAdapter) Exhausted(ctx context.Context) ([]store.Exhausted, error) {
+	if p.fromPool() {
+		return p.pool.Spent(), nil
+	}
+	if p.fallback != nil {
+		return p.fallback.exhausted(ctx)
+	}
 	return p.s.ListExhausted(ctx)
 }
 
@@ -279,7 +347,16 @@ func (p poolAdapter) UpstreamID(ctx context.Context, key string) (string, error)
 }
 
 func (p poolAdapter) MarkExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error {
-	return p.s.SetExhausted(ctx, accountID, windowKey, until, reason)
+	if err := p.s.SetExhausted(ctx, accountID, windowKey, until, reason); err != nil {
+		return err
+	}
+	if p.pool != nil {
+		// 标记写下去了，这个号就出池：它接不了活了，让位给一个冷的
+		//（规格 §4.4）。补号是后台的活。
+		p.pool.MarkSpent(accountID, windowKey, until, reason)
+		p.pool.Remove(accountID)
+	}
+	return nil
 }
 
 // RemainingAll gives the credits left of a whole list of accounts.
@@ -299,6 +376,21 @@ func (p poolAdapter) RemainingAll(ctx context.Context, accountIDs []string) map[
 	wanted := make(map[string]bool, len(accountIDs))
 	for _, id := range accountIDs {
 		wanted[id] = true
+	}
+	if p.fromPool() {
+		for id := range wanted {
+			e, ok := p.pool.Get(id)
+			if !ok || !e.Known {
+				// 没读到余额的账号不算有余额：留空，让 rotator 把它排在
+				// 后面。
+				continue
+			}
+			out[id] = rotator.Remaining{Left: e.Remaining, Known: true}
+		}
+		return out
+	}
+	if p.fallback != nil {
+		return p.fallback.remaining(ctx, accountIDs)
 	}
 	snaps, err := p.s.LatestUsageSnapshots(ctx)
 	if err != nil {
@@ -531,6 +623,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		// 抢到了：这个账号归这个请求了。这一次算一次尝试：它真的被问
 		// 过上游了。
 		used[plan.AccountID] = true
+		// 这段对话用过：记下来，攒一批写回库（规格 §6.3）。它的
+		// updated_at 是「活跃会话数」的凭据 —— 池要靠它把这段对话绑
+		// 着的号留在池里。
+		s.touches.add(sess.Key)
 		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
 		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
 		// 结束的。
