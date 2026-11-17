@@ -4079,7 +4079,7 @@ git commit -F .git/commit_msg.txt
 
 ## 怎么验
 
-计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 61 个测试。
+计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，这一支新增 65 个测试。
 
 做完之后按这个顺序验：
 ```sh
