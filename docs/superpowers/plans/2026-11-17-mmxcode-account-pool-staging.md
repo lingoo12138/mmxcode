@@ -1698,10 +1698,13 @@ func TestTheReplenishStopsWhenThereIsNothingToTake(t *testing.T) {
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
-go test ./internal/pool/ -run Keeper
+go test ./internal/pool/
 ```
 
-Expected: FAIL —— `NewKeeper undefined`。
+Expected: FAIL —— `undefined: NewKeeper`。
+
+（整包跑，别用 `-run` 筛名字：keeper 的六个测试名里一个都没有 "Keeper"，
+筛了就一个都不跑，红的绿的都看不见。）
 
 - [ ] **Step 3: 写实现**
 
@@ -1973,7 +1976,6 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/store"
 )
@@ -2103,54 +2105,11 @@ func TestASpentAccountLeavesThePool(t *testing.T) {
 		t.Fatalf("marks = %v, want just acc_01", marks)
 	}
 }
-
-// TestTheConcurrencyIsNotMoreThanThePool says the gateway does not
-// promise more requests than the pool can carry.
-//
-// 承诺了接不住就是一片 429（规格不变量 4）。
-func TestTheConcurrencyIsNotMoreThanThePool(t *testing.T) {
-	s := openGatewayStore(t)
-	ctx := context.Background()
-	cfg := config.Default()
-	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
-
-	// 库里有很多能用的号，池里只有一个。
-	for i := 0; i < 100; i++ {
-		if err := s.CreateAccount(ctx, store.Account{
-			ID:     "acc_" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
-			Status: store.StatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	g.Pool.Admit(pool.Entry{Account: store.Account{ID: "acc_a0", Status: store.StatusActive}})
-
-	if got := g.totalConcurrency(ctx); got != 1 {
-		t.Fatalf("concurrency = %d, want 1", got)
-	}
-}
-
-// TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty says a
-// gateway whose pool is empty still promises what it used to.
-func TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty(t *testing.T) {
-	s := openGatewayStore(t)
-	ctx := context.Background()
-	cfg := config.Default()
-	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
-	for i := 0; i < 10; i++ {
-		if err := s.CreateAccount(ctx, store.Account{
-			ID: "acc_" + string(rune('a'+i)), Status: store.StatusActive,
-			CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if got := g.totalConcurrency(ctx); got != 3 {
-		t.Fatalf("concurrency = %d, want 3", got)
-	}
-}
 ```
+
+「承诺的并发按池夹」那两个测试不在这里 —— 它们测的是 Task 6 改的
+`totalConcurrency`，写在这里的话这一步就绿不了了。它们在 Task 6 的
+`internal/gateway/concurrency_test.go` 里。
 
 新建 `internal/gateway/touch_test.go`：
 ```go
@@ -2728,6 +2687,7 @@ git commit -F .git/commit_msg.txt
 ### Task 6: 承诺的并发按池夹 + 耗尽了出池补号
 
 **Files:**
+- Create: `internal/gateway/concurrency_test.go`
 - Modify: `internal/gateway/busy.go`
 - Modify: `internal/gateway/spent.go`
 - Modify: `cmd/mmxcode/serve.go`
@@ -2738,18 +2698,82 @@ git commit -F .git/commit_msg.txt
 
 - [ ] **Step 1: 写失败的测试**
 
-测试在 Task 5 的 `internal/gateway/pool_test.go` 里已经有了：
+新建 `internal/gateway/concurrency_test.go`：
 
-- `TestTheConcurrencyIsNotMoreThanThePool` —— 库里有 100 个号，池里只有 1 个，承诺的并发是 1。
-- `TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty` —— 池是空的，承诺的并发跟从前一样。
-- `TestASpentAccountLeavesThePool` —— 标记写下去，那个号出池。
+（`openGatewayStore` 是 Task 5 在 `internal/gateway/pool_test.go` 里写的，同一个包，直接用 —— 别再抄一份。）
+
+```go
+package gateway
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"mmxcode/internal/config"
+	"mmxcode/internal/pool"
+	"mmxcode/internal/store"
+)
+
+// TestTheConcurrencyIsNotMoreThanThePool says the gateway does not
+// promise more requests than the pool can carry.
+//
+// 承诺了接不住就是一片 429（规格不变量 4）。
+func TestTheConcurrencyIsNotMoreThanThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	cfg := config.Default()
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
+
+	// 库里有很多能用的号，池里只有一个。
+	for i := 0; i < 100; i++ {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID:     "acc_" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
+			Status: store.StatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.Pool.Admit(pool.Entry{Account: store.Account{ID: "acc_a0", Status: store.StatusActive}})
+
+	if got := g.totalConcurrency(ctx); got != 1 {
+		t.Fatalf("concurrency = %d, want 1", got)
+	}
+}
+
+// TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty says a
+// gateway whose pool is empty still promises what it used to.
+func TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	cfg := config.Default()
+	g := &Server{Store: s, Cfg: cfg, Pool: pool.New(10)}
+	for i := 0; i < 10; i++ {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: "acc_" + string(rune('a'+i)), Status: store.StatusActive,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := g.totalConcurrency(ctx); got != 3 {
+		t.Fatalf("concurrency = %d, want 3", got)
+	}
+}
+```
 
 - [ ] **Step 2: 跑测试，看它失败**
 ```sh
 go test ./internal/gateway/ -run "Concurrency|Spent"
 ```
 
-Expected: FAIL —— `totalConcurrency` 还是从库里数，`MarkExhausted` 还没让号出池。
+Expected: FAIL —— `TestTheConcurrencyIsNotMoreThanThePool` 挂：库里 100 个号，
+`totalConcurrency` 还是从库里数（100 ÷ 5 = 20），池里只有一个号就该只承诺 1。
+
+（`TestTheConcurrencyFallsBackToTheDatabaseWhenThePoolIsEmpty` 和 Task 5 的
+`TestASpentAccountLeavesThePool` 这时候是过的 —— 它们是回归的护栏，不是这一
+步要做的事。）
 
 - [ ] **Step 3: 总并发按池夹**
 
@@ -2915,7 +2939,7 @@ git commit -F .git/commit_msg.txt
 
 ## 怎么验
 
-计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，新增 26 个测试。
+计划里的每一段 Go 都跑过（在一个干净的副本里）：`go build ./...`、`go vet ./...`、`gofmt -l` 全干净，`go test ./...` 每个包都过，新增 43 个测试。
 
 做完之后按这个顺序验：
 ```sh
