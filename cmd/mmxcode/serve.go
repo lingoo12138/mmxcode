@@ -49,6 +49,9 @@ func newServeCmd(e *env) *cobra.Command {
 			ui := webui.New(e.mgr, e.cfg, e.store)
 			e.wireImport(ui)
 			gw := gateway.New(e.mgr, e.cfg, e.store, ui)
+			// 池要立刻能用：启动的时候用库里最后读到的数填上，不问站点
+			//（规格 §6.3）。
+			gw.SeedPool(ctx)
 			sc := scheduler.New(e.mgr, e.cfg)
 
 			srv := &http.Server{

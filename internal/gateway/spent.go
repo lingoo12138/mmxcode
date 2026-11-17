@@ -127,6 +127,9 @@ func (s *Server) markSpent(ctx context.Context, accountID, groupKey string) {
 	// 后台的活儿有上限：到顶了这一次就不读，标记照着上面写的那份留
 	// 着（冷却时间），下一次再说。
 	s.startBackground(func() { s.correctMark(accountID, groupKey) })
+	// 池里少了一个号：补一个进去。补号是后台的活，不挡客户端（规格
+	// §4.4）。
+	s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
 }
 
 // correctMark reads the account and puts the mark's time right.

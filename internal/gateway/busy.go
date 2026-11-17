@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"mmxcode/internal/config"
-	"mmxcode/internal/store"
 )
 
 // busyAccounts counts the requests in the air per account.
@@ -140,7 +139,7 @@ func (g *gate) waitFor(ctx context.Context, limit int, wait time.Duration) bool 
 
 // totalFor gives the total concurrency for a number of usable accounts.
 //
-// 总并发 = max(floor(可用账号数 / 5), min(可用账号数, 3))
+// 总并发 = max(floor(可用账号数 / 5), min(可用账号数, 3))，再按天花板截下来
 //
 // 五分之一在用，四分之五留着：100 个账号同时只用 20 个，这 20 个把额
 // 度用完了，还有 80 个是满的可以接。小规模的时候至少 min(账号数, 3)
@@ -164,48 +163,44 @@ func totalFor(usable int, cfg config.Concurrency) int {
 	if total < 1 {
 		total = 1
 	}
+	// 天花板：运营定的那根杆（规格 §6.9）。它在这里，不在
+	// totalConcurrency 里 —— 池的大小是按承诺的并发算的
+	// （max(总并发, 活跃会话数) × 倍数），天花板压承诺的时候，池也跟着小。
+	if top := cfg.TotalMax; top > 0 && total > top {
+		total = top
+	}
 	return total
 }
 
 // totalConcurrency says how many requests may be in the air at once.
 //
-// 可用账号数 = 状态是 active（签入中）且没有被标记用完的账号数。账号
-// 用完了不算：它现在也接不了活。
+// 承诺的并发 = min(期望并发, 池里能用的号数)：
+//
+//   - 期望并发 = 可用账号数 ÷ 5（小规模至少 3），按天花板截下来，跟从前一样；
+//   - 池里能用的号数 = 池里签入中、没有被标记用完的号。
+//
+// 池里没有那么多号，就只能承诺那么多 —— 承诺了接不住就是一片 429（规格
+// 不变量 4）。
+//
+// 池是空的（还没填上，或者填池失败）的时候从库里数：网关得能干活。但
+// 那一下能从 20 抬到 80（库里 400 个号 ÷ 5），所以天花板正好是给这一
+// 下准备的：它把承诺按在运营定的那个数上。
 func (s *Server) totalConcurrency(ctx context.Context) int {
 	if s.Store == nil {
 		return 1
 	}
-	accounts, err := s.Store.ListAccounts(ctx)
+	usable, err := s.Store.CountUsable(ctx)
 	if err != nil {
 		return 1
 	}
-	exhausted, err := s.Store.ListExhausted(ctx)
-	if err != nil {
-		return 1
+	want := totalFor(usable, s.Cfg.Concurrency)
+	inPool := s.Pool.Usable(time.Now())
+	switch {
+	case inPool == 0:
+		// 池是空的：还没填上，或者填池失败。跟从前一样，从库里数。
+	case inPool < want:
+		// 池里的号不够：只能承诺这么多。
+		want = inPool
 	}
-	now := time.Now()
-	usable := 0
-	for _, a := range accounts {
-		if a.Status != store.StatusActive {
-			continue
-		}
-		if spentNow(exhausted, a.ID, now) {
-			continue
-		}
-		usable++
-	}
-	return totalFor(usable, s.Cfg.Concurrency)
-}
-
-// spentNow says whether an account is marked as spent right now.
-func spentNow(exhausted []store.Exhausted, accountID string, now time.Time) bool {
-	for _, e := range exhausted {
-		if e.AccountID != accountID {
-			continue
-		}
-		if e.Until.After(now) {
-			return true
-		}
-	}
-	return false
+	return want
 }
