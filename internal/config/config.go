@@ -195,7 +195,6 @@ type Rotation struct {
 }
 
 // Schedule holds the timers.
-// Schedule holds the timers.
 type Schedule struct {
 	// CheckinAt is when the daily check-in runs, HH:MM.
 	//
