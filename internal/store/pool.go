@@ -44,10 +44,13 @@ type Candidate struct {
 //
 //  1. **最近活跃的对话绑着的号** —— 它们不能丢：会话钉在号上，钉住的号
 //     不在池里就会被改绑，缓存命中就没了（规格不变量 3）。
-//  2. **从没读过的号，最新的导入排前面** —— 新导入的号几乎肯定没被用过
+//  2. **今天签到过的号** —— 签到刚给了积分（七天有效），它一定还有额度；
+//     而从没读过的号有没有额度是**不知道的**，填池那一趟要读它，读到 0
+//     就白读一次（规格 §5.3）。
+//  3. **从没读过的号，最新的导入排前面** —— 新导入的号几乎肯定没被用过
 //     （用过就会被读，读过就有数）。导入很久还没数的号多半是被用过的，
 //     它的额度早就不知道剩多少了。
-//  3. **读过、但读得最早的号** —— 最冷的那些：它们闲着，闲着的号额度
+//  4. **读过、但读得最早的号** —— 最冷的那些：它们闲着，闲着的号额度
 //     还没被消耗光。
 //
 // 排除掉的：exclude 里有的（已经在池里）、状态不是 active 的、现在被
@@ -84,7 +87,7 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 			u.created_at ASC,
 			a.created_at DESC,
 			a.id
-		LIMIT ?`, StatusActive, ms(s.now()), ms(since), DayKey(s.now()), limit+len(exclude))
+		LIMIT ?`, StatusActive, ms(s.now()), ms(since), s.Today(), limit+len(exclude))
 	if err != nil {
 		return nil, fmt.Errorf("pool candidates: %w", err)
 	}

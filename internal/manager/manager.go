@@ -1069,7 +1069,7 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
-	day := store.DayKey(time.Now())
+	day := m.Store.Today()
 	if err := m.Store.SaveCheckin(ctx, store.Checkin{
 		AccountID: accountID,
 		Day:       day,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -79,6 +80,51 @@ func TestTheAccountsWithoutACheckinAreTheOnesThatHaveNotSignedInToday(t *testing
 	}
 	if len(got) != 1 || got[0].ID != "waiting" {
 		t.Fatalf("the accounts = %+v, want just the waiting one", got)
+	}
+}
+
+// TestTheCheckinIndexReachesAnOldFile says a file that is already at the
+// old version gets the index on the day.
+//
+// 老库停在版本 5，走不到 migrateConform 里那几条索引（那一步只把版本 1
+// 的库带到版本 2）。索引是新的那一步建的：没有它，「今天谁签到了」就是
+// 全表扫 —— 一天一个号一行，1000 个号一年 36 万行（规格 §5.3）。
+func TestTheCheckinIndexReachesAnOldFile(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	// 把它退回到老版本：索引没有。
+	if _, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_checkins_day"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion-1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='checkins'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		if name == "idx_checkins_day" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the old file did not get the index on the day")
 	}
 }
 

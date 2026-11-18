@@ -40,6 +40,15 @@ func DayKey(t time.Time) string {
 	return t.In(checkinZone).Format("2006-01-02")
 }
 
+// Today is the site's day, by the store's clock.
+//
+// 签到这一件事只有一个"今天"：签到那一趟的名单（今天谁还没签）、签到的
+// 积分进池（今天谁签了）、候选的排序（今天谁签过）—— 它们得说的是同
+// 一个日子。库里带着自己的钟（Store.Clock），测试拿它把日子钉住。
+func (s *Store) Today() string {
+	return DayKey(s.now())
+}
+
 // CheckinCredit is what one account's check-in gave.
 type CheckinCredit struct {
 	// AccountID is the account.

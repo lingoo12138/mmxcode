@@ -355,7 +355,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 5
+const schemaVersion = 6
 
 // migrations are the steps, in order.
 //
@@ -366,6 +366,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migratePlanError,
 	migrateBatchImport,
 	migrateAPIKeys,
+	migrateCheckinIndex,
 }
 
 // migrateMake makes the tables that are not there.
@@ -520,6 +521,23 @@ func migrateAPIKeys(ctx context.Context, conn *sql.Conn) error {
 			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
 				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
 			}
+		}
+		return nil
+	})
+}
+
+// migrateCheckinIndex gives the check-ins an index on the day.
+//
+// 「今天谁签到了」是签到那一趟的名单，也是签到的积分进池的那条路（规格
+// §5.3）。一天一个号一行，1000 个号一年就是 36 万行 —— 没有索引就是全表
+// 扫，而那一趟是补号那一趟（每 15 分钟一趟）都在问的。
+//
+// 这一步是单独的：索引那几条在 migrateConform 里，而老库停在版本 5 ——
+// 走不到那一步（那一步只把版本 1 的库带到版本 2）。
+func migrateCheckinIndex(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 6, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)"); err != nil {
+			return fmt.Errorf("migrate: the index on the check-in day: %w", err)
 		}
 		return nil
 	})

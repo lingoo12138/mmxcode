@@ -259,10 +259,12 @@ var tables = []table{
 // 签到的行要按日子找：「今天谁签到了」是签到那一趟的名单，也是积分进
 // 池的那条路（规格 §5.3）。一天一个号一行，1000 个号一年就是 36 万行
 // —— 没有索引就是全表扫。
+//
+// 那条按天的索引不在这里：它由 migrateCheckinIndex 建（版本 6 的那一步），
+// 因为老库停在版本 5，走不到这里 —— 这里只把版本 1 的库带到版本 2。
 var indexStatements = []string{
 	"CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
-	"CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)",
 	"DROP INDEX IF EXISTS idx_checkins_account",
 }
 
