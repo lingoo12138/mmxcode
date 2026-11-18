@@ -12,6 +12,7 @@ import (
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/config"
 	"mmxcode/internal/manager"
+	"mmxcode/internal/store"
 	"mmxcode/internal/usage"
 )
 
@@ -79,8 +80,16 @@ func CheckinDelay(base time.Duration, window time.Duration) time.Duration {
 //
 // The time is a wall-clock time in the local zone. When the moment has
 // passed, it is tomorrow's.
+// NextCheckin gives the moment the daily check-in runs.
+//
+// The time is a wall-clock time in the site's zone: the site counts its
+// days in China, so a check-in has to land on the site's day（规格 §5.1）。
+// The machine's own timezone is not the site's, and using it puts the
+// check-in on the wrong day — or eight hours late.
 func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
-	next := time.Date(now.Year(), now.Month(), now.Day(), at.Hour(), at.Minute(), 0, 0, now.Location())
+	loc := store.CheckinZone()
+	n := now.In(loc)
+	next := time.Date(n.Year(), n.Month(), n.Day(), at.Hour(), at.Minute(), 0, 0, loc)
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}
@@ -88,9 +97,18 @@ func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 }
 
 // CheckinAll claims every account's daily credits.
+// CheckinAll claims every account's daily credits.
+//
+// 只签今天还没签的号（规格 §5.2）：签过的再签一次，站点只会答 done，白
+// 花一次调用 —— 而今天没签到的那部分，正是服务器 00:00 没开着时漏掉
+// 的那部分。
+//
+// 「今天」是站点的那一天（大陆时间），跟管理器写进去的那一行是同一个
+// 日子。
 func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
-	accounts, err := s.Mgr.Accounts(ctx)
+	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, store.DayKey(time.Now()))
 	if err != nil {
+		fmt.Printf("checkin: the accounts to check in could not be read: %v\n", err)
 		return nil
 	}
 	out := make([]CheckinResult, 0, len(accounts))
@@ -273,7 +291,7 @@ func (s *Scheduler) usageEvery() time.Duration {
 func (s *Scheduler) Run(ctx context.Context) {
 	at, err := time.Parse("15:04", s.Cfg.Schedule.CheckinAt)
 	if err != nil {
-		at = time.Date(0, 1, 1, 9, 0, 0, 0, time.Local)
+		at = time.Date(0, 1, 1, 0, 0, 0, 0, time.Local)
 	}
 	usageEvery := s.usageEvery()
 	tokenEvery := s.Cfg.Schedule.TokenRefresh.Duration()
@@ -298,22 +316,36 @@ func (s *Scheduler) Run(ctx context.Context) {
 		}
 		s.run(ctx, every, s.Relogin)
 	}
+	// 启动时补签：服务器 00:00 没开着的时候，那一天的签到就没人做了
+	// （规格 §5.2）。起进程的时候补一趟：签的是今天还没签的号。
+	//
+	// 它是后台的活：网关不等它（一个号一个号地签，1000 个号要 1000 秒）。
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.checkinAll(ctx)
+	}()
 	for {
-		next := NextCheckin(time.Now(), at, 30*time.Minute)
+		next := NextCheckin(time.Now(), at, s.Cfg.Schedule.CheckinJitter.Duration())
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
-			for _, r := range s.CheckinAll(ctx) {
-				if r.Error != "" {
-					fmt.Printf("checkin %s: %s\n", r.AccountID, r.Error)
-					continue
-				}
-				fmt.Printf("checkin %s: %s\n", r.AccountID, r.Outcome)
-			}
+			s.checkinAll(ctx)
 		}
+	}
+}
+
+// checkinAll runs the check-in and says what happened.
+func (s *Scheduler) checkinAll(ctx context.Context) {
+	for _, r := range s.CheckinAll(ctx) {
+		if r.Error != "" {
+			fmt.Printf("checkin %s: %s\n", r.AccountID, r.Error)
+			continue
+		}
+		fmt.Printf("checkin %s: %s\n", r.AccountID, r.Outcome)
 	}
 }
 

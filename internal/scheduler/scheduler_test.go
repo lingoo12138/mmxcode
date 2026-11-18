@@ -46,21 +46,49 @@ func TestCheckinDelayFits(t *testing.T) {
 	}
 }
 
+// TestNextCheckin says the daily check-in runs at the site's time.
+//
+// 站点按大陆时间算一天，签到要落在那一天里（规格 §5.1）。
 func TestNextCheckin(t *testing.T) {
 	at, err := time.Parse("15:04", "09:00")
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 11, 13, 8, 0, 0, 0, time.UTC)
-	got := NextCheckin(now, at, 30*time.Minute)
-	// 今天 09:00 还没到，应该是今天
-	if got.Day() != 13 {
-		t.Fatalf("next = %v", got)
+	// 大陆时间 2026-11-13 08:00（= UTC 2026-11-13 00:00）：今天 09:00
+	// 还没到，是今天。
+	now := time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC)
+	got := NextCheckin(now, at, 0)
+	want := time.Date(2026, 11, 13, 1, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next = %v, want %v", got, want)
 	}
-	now = time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
-	got = NextCheckin(now, at, 30*time.Minute)
-	if got.Day() != 14 {
-		t.Fatalf("next = %v, want tomorrow", got)
+	// 大陆时间 10:00（= UTC 02:00）：今天 09:00 过了，是明天。
+	now = time.Date(2026, 11, 13, 2, 0, 0, 0, time.UTC)
+	got = NextCheckin(now, at, 0)
+	want = time.Date(2026, 11, 14, 1, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next = %v, want %v", got, want)
+	}
+}
+
+// TestTheNextCheckinDoesNotDependOnTheMachinesZone says the daily
+// check-in is at the site's midnight, whatever the machine's timezone is.
+//
+// 一台 UTC 的机器上「00:00」是大陆时间 08:00 —— 差 8 个钟头；一台东京
+// 的机器上「00:00」是大陆时间前一天 23:00，签到落在站点的**前一天**，
+// 那天的积分拿不到（规格 §5.1）。
+func TestTheNextCheckinDoesNotDependOnTheMachinesZone(t *testing.T) {
+	at, err := time.Parse("15:04", "00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// UTC 的 2026-11-18 20:00 是大陆时间的 11-19 04:00：下一个大陆时
+	// 间的 00:00 是 11-20 的，也就是 UTC 的 11-19 16:00。
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	got := NextCheckin(now, at, 0)
+	want := time.Date(2026, 11, 19, 16, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next = %v, want %v", got, want)
 	}
 }
 
@@ -588,4 +616,134 @@ func TestTheSchedulerCanBeWaitedFor(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the scheduler's work was not waited for")
 	}
+}
+
+// TestTheCheckinSkipsTheAccountsThatSignedInToday says the accounts that
+// were checked in today are not checked in again.
+//
+// 签过的再签一次，站点只会答 done，白花一次调用 —— 而今天没签到的那部
+// 分，正是服务器 00:00 没开着时漏掉的那部分（规格 §5.2）。
+func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
+	var claims int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			claims++
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	for _, id := range []string{"acc_done", "acc_waiting"} {
+		s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	// 这个号今天签过了。
+	s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_done", Day: store.DayKey(now), Outcome: "claimed",
+		Credit: 25, CreatedAt: now,
+	})
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	results := sc.CheckinAll(ctx)
+	if len(results) != 1 || results[0].AccountID != "acc_waiting" {
+		t.Fatalf("the results = %+v, want just the waiting account", results)
+	}
+	if claims != 1 {
+		t.Fatalf("the claims = %d, want 1", claims)
+	}
+}
+
+// TestTheCheckinIsMadeUpOnStartup says the accounts that have not signed
+// in today are checked in when the process starts.
+//
+// 服务器 00:00 没开着的时候，那一天的签到就没人做了 —— 起进程的时候补
+// 一趟，签的是今天还没签的号（规格 §5.2）。
+func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
+	var claims int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			claims++
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go sc.Run(runCtx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if claims > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the check-in was not made up on startup")
 }
