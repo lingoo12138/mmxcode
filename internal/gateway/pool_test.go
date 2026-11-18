@@ -352,3 +352,151 @@ func TestAnAccountThatIsStillActiveStaysInThePool(t *testing.T) {
 		t.Fatalf("pool = %d, want 1", p.Len())
 	}
 }
+
+// TestTheCheckinCreditsGoIntoThePool says the credits a check-in gave
+// reach the pool.
+//
+// 池里那一份是进池那一刻的：签到给了积分，池不知道，那个号就排在有数
+// 的号后面，签到给的七天积分白瞎（规格 §5.3）。
+func TestTheCheckinCreditsGoIntoThePool(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_01", Day: store.DayKey(now), Outcome: "claimed",
+		Credit: 25, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.refreshCheckinCredits(ctx)
+
+	e, ok := p.Get("acc_01")
+	if !ok {
+		t.Fatal("the account left the pool")
+	}
+	if !e.Known || e.Remaining != 25 {
+		t.Fatalf("the pool's number = %v (known %v), want 25 and known", e.Remaining, e.Known)
+	}
+}
+
+// TestThePoolDoesNotSayMoreThanItKnows says a check-in does not make the
+// pool's number bigger than it really is.
+//
+// 池里那一份可能是签到**之后**读到的（读额度那一趟会把签到的积分读进
+// 去）。那时候再加上签到的积分，就是说它有更多的额度（规格 §5.3）。
+func TestThePoolDoesNotSayMoreThanItKnows(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_01", Day: store.DayKey(now), Outcome: "claimed",
+		Credit: 25, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{
+		Account:   store.Account{ID: "acc_01", Status: store.StatusActive},
+		Remaining: 100, Known: true,
+	})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.refreshCheckinCredits(ctx)
+
+	e, _ := p.Get("acc_01")
+	if e.Remaining != 100 {
+		t.Fatalf("the pool's number = %v, want the 100 it already had", e.Remaining)
+	}
+}
+
+// TestAnAccountThatWasNeverReadIsKnownAfterItsCheckIn says a check-in
+// makes an account that was never read a known one.
+//
+// 没读到的不算零，它排在有数的号后面（规格不变量 2）。签到给了积分，它
+// 就确实有额度了 —— 别让它排在最后（规格 §5.3）。
+func TestAnAccountThatWasNeverReadIsKnownAfterItsCheckIn(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_01", Day: store.DayKey(now), Outcome: "claimed",
+		Credit: 25, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	g := &Server{Store: s, Cfg: config.Default(), Pool: p}
+
+	g.refreshCheckinCredits(ctx)
+
+	e, _ := p.Get("acc_01")
+	if !e.Known || e.Remaining != 25 {
+		t.Fatalf("the pool's number = %v (known %v), want 25 and known", e.Remaining, e.Known)
+	}
+}
+
+// TestTheTopUpPutsTheCheckinCreditsIn says the pass that fills the pool
+// is the pass that puts the check-in's credits in.
+//
+// 每一趟补号（30 秒一趟）都跑的那一趟，就是换积分的那一趟：接线漏了，
+// 签到的积分就永远进不了池（规格 §5.3）。
+func TestTheTopUpPutsTheCheckinCreditsIn(t *testing.T) {
+	s := openGatewayStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_01", Day: store.DayKey(now), Outcome: "claimed",
+		Credit: 25, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New(10)
+	p.Admit(pool.Entry{Account: store.Account{ID: "acc_01", Status: store.StatusActive}})
+	cfg := config.Default()
+	// 补号的时候不读额度：读额度是问上游的，这个测试不碰上游。
+	cfg.Pool.ReadOnAdmit = false
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	keeper := pool.NewKeeper(p, poolSource{s: s, window: cfg.Pool.SessionWindow.Duration()},
+		&fakeReader{}, s, pool.KeeperOptions{
+			Read: false, Cooldown: time.Minute, ReadBudget: 1,
+			ReadTimeout: time.Second, PassTimeout: 5 * time.Second,
+		})
+	g := &Server{
+		Store: s, Cfg: cfg, Pool: p, Keeper: keeper,
+		lifeCtx: lifeCtx, lifeCancel: cancel,
+		bgSem: make(chan struct{}, 1),
+	}
+
+	g.TopUpPool(ctx)
+
+	e, _ := p.Get("acc_01")
+	if !e.Known || e.Remaining != 25 {
+		t.Fatalf("the pool's number = %v (known %v), want 25 and known", e.Remaining, e.Known)
+	}
+}

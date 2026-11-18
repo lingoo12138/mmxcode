@@ -136,6 +136,8 @@ func (s *Server) SeedPool(ctx context.Context) {
 func (s *Server) TopUpPool(ctx context.Context) {
 	want := s.poolTarget(ctx)
 	s.Pool.SetCapacity(want)
+	// 签到的积分先换进池里：池里那一份是进池那一刻的（规格 §5.3）。
+	s.refreshCheckinCredits(ctx)
 	n, err := s.Keeper.Replenish(ctx, want)
 	if err != nil {
 		log.Printf("the account pool could not be filled: %v", err)
@@ -200,4 +202,36 @@ func (s *Server) dropDeadAccount(ctx context.Context, accountID string) {
 	// 不等下一趟（最多三十秒）：池短着的时候，承诺的并发就少一个（不变
 	// 量 4），这一段里网关白答应着做不到的事。
 	s.startBackground(func() { s.TopUpPool(s.lifeCtx) })
+}
+
+// refreshCheckinCredits puts the credits the check-ins gave into the pool.
+//
+// 签到给了积分，池里那一份是进池那一刻的：那个号排在有数的号后面，签到
+// 给的七天积分就白瞎了（规格 §5.3）。
+//
+// 新数是「池里那一份」和「签到给的」里大的那个，不是两份加起来：池里那
+// 一份可能是签到之后读到的（读额度那一趟会把签到的积分读进去），再加
+// 一遍就是说它有更多的额度。
+//
+// 不在池里的号不在这里管：补号的候选排序里今天签过的排前面，它自己会
+// 进来（规格 §5.3）。
+func (s *Server) refreshCheckinCredits(ctx context.Context) {
+	if s.Pool == nil || s.Store == nil {
+		return
+	}
+	credits, err := s.Store.DayCheckins(ctx, store.DayKey(time.Now()))
+	if err != nil {
+		log.Printf("the check-in credits could not be read: %v", err)
+		return
+	}
+	for _, c := range credits {
+		e, ok := s.Pool.Get(c.AccountID)
+		if !ok {
+			continue
+		}
+		if e.Known && e.Remaining >= c.Credit {
+			continue
+		}
+		s.Pool.SetRemaining(c.AccountID, c.Credit, true)
+	}
 }
