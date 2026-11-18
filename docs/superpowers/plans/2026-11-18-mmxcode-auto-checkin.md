@@ -343,7 +343,8 @@ func DayKey(t time.Time) string {
 }
 ```
 
-`internal/store/schema.go` 的 `indexStatements` 改成：
+`internal/store/schema.go` 的 `indexStatements` —— 那条按天的索引**不在**
+这里（它有自己的一步，见下面）：
 
 ```go
 // The indexes.
@@ -351,13 +352,126 @@ func DayKey(t time.Time) string {
 // 签到的行要按日子找：「今天谁签到了」是签到那一趟的名单，也是积分进
 // 池的那条路（规格 §5.3）。一天一个号一行，1000 个号一年就是 36 万行
 // —— 没有索引就是全表扫。
+//
+// 那条按天的索引不在这里：它由 migrateCheckinIndex 建（版本 6 的那一步），
+// 因为老库停在版本 5，走不到这里 —— 这里只把版本 1 的库带到版本 2。
 var indexStatements = []string{
 	"CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
-	"CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)",
 	"DROP INDEX IF EXISTS idx_checkins_account",
 }
 ```
+
+索引要有自己的一步：`indexStatements` 只在 migrateConform 那一步里跑，而那
+一步只把版本 1 的库带到版本 2 —— 停在版本 5 的老库走不到它。老库没有那个
+索引，「今天谁签到了」就变成全表扫（一年 36 万行），而那是补号那一趟
+（每 15 分钟一趟）都在问的。
+
+`internal/store/store.go`：版本往上抬一步，加一步建索引的：
+
+```go
+// schemaVersion is the version a file is at when the steps are done.
+const schemaVersion = 6
+
+// migrations are the steps, in order.
+//
+// The step at index n brings a file at version n to version n+1.
+var migrations = []func(ctx context.Context, conn *sql.Conn) error{
+	migrateMake,
+	migrateConform,
+	migratePlanError,
+	migrateBatchImport,
+	migrateAPIKeys,
+	migrateCheckinIndex,
+}
+```
+
+```go
+// migrateCheckinIndex gives the check-ins an index on the day.
+//
+// 「今天谁签到了」是签到那一趟的名单，也是签到的积分进池的那条路（规格
+// §5.3）。一天一个号一行，1000 个号一年就是 36 万行 —— 没有索引就是全表
+// 扫，而那一趟是补号那一趟（每 15 分钟一趟）都在问的。
+//
+// 这一步是单独的：索引那几条在 migrateConform 里，而老库停在版本 5 ——
+// 走不到那一步（那一步只把版本 1 的库带到版本 2）。
+func migrateCheckinIndex(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 6, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)"); err != nil {
+			return fmt.Errorf("migrate: the index on the check-in day: %w", err)
+		}
+		return nil
+	})
+}
+```
+
+「今天是哪一天」也得只有一个钟：签到那一趟的名单（今天谁还没签）、签到
+的积分进池（今天谁签了）、候选的排序（今天谁签过）—— 它们得说的是同一
+个日子。库里带着自己的钟（`Store.Clock`），测试拿它把日子钉住。
+
+`internal/store/checkins.go` 加一个：
+
+```go
+// Today is the site's day, by the store's clock.
+//
+// 签到这一件事只有一个"今天"：签到那一趟的名单（今天谁还没签）、签到的
+// 积分进池（今天谁签了）、候选的排序（今天谁签过）—— 它们得说的是同
+// 一个日子。库里带着自己的钟（Store.Clock），测试拿它把日子钉住。
+func (s *Store) Today() string {
+	return DayKey(s.now())
+}
+```
+
+这条也要有测试（老库要拿到索引）—— 加在 `internal/store/checkins_query_test.go`：
+
+```go
+// TestTheCheckinIndexReachesAnOldFile says a file that is already at the
+// old version gets the index on the day.
+//
+// 老库停在版本 5，走不到 migrateConform 里那几条索引（那一步只把版本 1
+// 的库带到版本 2）。索引是新的那一步建的：没有它，「今天谁签到了」就是
+// 全表扫 —— 一天一个号一行，1000 个号一年 36 万行（规格 §5.3）。
+func TestTheCheckinIndexReachesAnOldFile(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	// 把它退回到老版本：索引没有。
+	if _, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_checkins_day"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion-1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='checkins'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		if name == "idx_checkins_day" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the old file did not get the index on the day")
+	}
+}
+```
+
+（那个文件的 import 要多一个 `fmt`。）
 
 - [ ] **Step 4: 跑测试，确认它过了**
 
@@ -580,7 +694,7 @@ func (s *Server) refreshCheckinCredits(ctx context.Context) {
 	if s.Pool == nil || s.Store == nil {
 		return
 	}
-	credits, err := s.Store.DayCheckins(ctx, store.DayKey(time.Now()))
+	credits, err := s.Store.DayCheckins(ctx, s.Store.Today())
 	if err != nil {
 		log.Printf("the check-in credits could not be read: %v", err)
 		return
@@ -729,7 +843,7 @@ Expected: FAIL —— 候选是 `[never checked]`（从没读过的排在前面�
 			u.created_at ASC,
 			a.created_at DESC,
 			a.id
-		LIMIT ?`, StatusActive, ms(s.now()), ms(since), DayKey(s.now()), limit+len(exclude))
+		LIMIT ?`, StatusActive, ms(s.now()), ms(since), s.Today(), limit+len(exclude))
 ```
 
 `PoolCandidates` 的注释里补上这一条（在「2. 从没读过的号」前面）：
@@ -949,6 +1063,9 @@ Expected: FAIL —— 现在按本机时区算，`TestTheNextCheckinDoesNotDepen
 // days in China, so a check-in has to land on the site's day（规格 §5.1）。
 // The machine's own timezone is not the site's, and using it puts the
 // check-in on the wrong day — or eight hours late.
+//
+// When the moment has passed, it is tomorrow's. The jitter is added on
+// top: a few instances together spread themselves out that way.
 func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 	loc := store.CheckinZone()
 	n := now.In(loc)
@@ -956,7 +1073,64 @@ func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}
-	return next.Add(CheckinDelay(0, jitter))
+	// 抖动不许把签到推到站点的第二天去：「23:50」抖 30 分钟就是 00:20 ——
+	// 那是另一天的积分，那一份拿不到（规格 §5.1）。跨了就不抖。
+	d := CheckinDelay(0, jitter)
+	if store.DayKey(next.Add(d)) != store.DayKey(next) {
+		d = 0
+	}
+	return next.Add(d)
+}
+```
+
+抖动这件事要有测试（它是一个键，不是一个写死的数）—— 加在
+`internal/scheduler/scheduler_test.go`：
+
+```go
+// TestTheNextCheckinIsJittered says the daily check-in may be held back.
+//
+// 抖动是配置里的一个键（schedule.checkin_jitter）：几个实例一起跑的时候
+// 抖一下就散开了。零是它的默认值（不抖），写死 30 分钟是另一回事 ——
+// 那是 §5.1 里点名要去掉的。
+func TestTheNextCheckinIsJittered(t *testing.T) {
+	at, err := time.Parse("15:04", "00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	// 不抖的时候是那一刻。
+	want := time.Date(2026, 11, 19, 16, 0, 0, 0, time.UTC)
+	seen := map[time.Time]bool{}
+	for i := 0; i < 40; i++ {
+		got := NextCheckin(now, at, 30*time.Minute)
+		if got.Before(want) || !got.Before(want.Add(30*time.Minute)) {
+			t.Fatalf("next = %v, want between %v and %v", got, want, want.Add(30*time.Minute))
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("the check-in time does not jitter")
+	}
+}
+
+// TestTheJitterDoesNotCrossTheSitesMidnight says the jitter cannot push
+// the check-in into the next day.
+//
+// 「23:50」抖 30 分钟就是 00:20 —— 那是站点第二天的积分，那一份拿不到，
+// 而且站点只给一天一次（规格 §5.1）。跨了就不抖。
+func TestTheJitterDoesNotCrossTheSitesMidnight(t *testing.T) {
+	at, err := time.Parse("15:04", "23:50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// UTC 的 11-18 20:00 是大陆时间的 11-19 04:00：今天 23:50 还没到。
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	for i := 0; i < 40; i++ {
+		got := NextCheckin(now, at, 30*time.Minute)
+		if day := store.DayKey(got); day != "2026-11-19" {
+			t.Fatalf("the check-in landed on %s, want 2026-11-19", day)
+		}
+	}
 }
 ```
 
@@ -1027,7 +1201,7 @@ feat(scheduler): 下一趟签到是大陆时间的下一个 00:00
 // 签过的再签一次，站点只会答 done，白花一次调用 —— 而今天没签到的那部
 // 分，正是服务器 00:00 没开着时漏掉的那部分（规格 §5.2）。
 func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
-	var claims int
+	var claims atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/minimax-cloud/api/v1/signin/status":
@@ -1040,7 +1214,7 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 				{"day_no":6,"status":1,"is_today":false,"points":25},
 				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
 		case "/minimax-cloud/api/v1/signin/claim":
-			claims++
+			claims.Add(1)
 			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
 		default:
 			w.Write([]byte(`{}`))
@@ -1082,8 +1256,8 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 	if len(results) != 1 || results[0].AccountID != "acc_waiting" {
 		t.Fatalf("the results = %+v, want just the waiting account", results)
 	}
-	if claims != 1 {
-		t.Fatalf("the claims = %d, want 1", claims)
+	if n := claims.Load(); n != 1 {
+		t.Fatalf("the claims = %d, want 1", n)
 	}
 }
 
@@ -1093,7 +1267,7 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 // 服务器 00:00 没开着的时候，那一天的签到就没人做了 —— 起进程的时候补
 // 一趟，签的是今天还没签的号（规格 §5.2）。
 func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
-	var claims int
+	var claims atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/minimax-cloud/api/v1/signin/status":
@@ -1106,7 +1280,7 @@ func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
 				{"day_no":6,"status":1,"is_today":false,"points":25},
 				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
 		case "/minimax-cloud/api/v1/signin/claim":
-			claims++
+			claims.Add(1)
 			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
 		default:
 			w.Write([]byte(`{}`))
@@ -1143,7 +1317,7 @@ func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if claims > 0 {
+		if claims.Load() > 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1172,7 +1346,7 @@ Expected: FAIL —— `TestTheCheckinSkipsTheAccountsThatSignedInToday` 拿到�
 // 「今天」是站点的那一天（大陆时间），跟管理器写进去的那一行是同一个
 // 日子。
 func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
-	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, store.DayKey(time.Now()))
+	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, s.Mgr.Store.Today())
 	if err != nil {
 		fmt.Printf("checkin: the accounts to check in could not be read: %v\n", err)
 		return nil
@@ -1204,7 +1378,14 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 
 ```go
 // checkinAll runs the check-in and says what happened.
+//
+// 一趟签到一趟签到：两趟不叠着跑。起进程的补签和 00:00 那趟会碰上
+// （23:59 起进程，补签还没跑完就到 00:00）—— 叠着跑就是同一个号被站点
+// 拒一次（白花一次调用，规格 §5.2）。后到的那趟等前一趟跑完，名单是
+// 现读的，前一趟签过的号不在里面。
 func (s *Scheduler) checkinAll(ctx context.Context) {
+	s.checkinMu.Lock()
+	defer s.checkinMu.Unlock()
 	for _, r := range s.CheckinAll(ctx) {
 		if r.Error != "" {
 			fmt.Printf("checkin %s: %s\n", r.AccountID, r.Error)
@@ -1214,6 +1395,99 @@ func (s *Scheduler) checkinAll(ctx context.Context) {
 	}
 }
 ```
+
+`Scheduler` 上多一把锁（结构体里 `wg` 的下面）：
+
+```go
+	// checkinMu keeps two check-in passes from running at once.
+	//
+	// 起进程的补签和 00:00 那趟会碰上：23:59 起进程，补签还没跑完就
+	// 到 00:00。叠着跑就是同一个号被站点拒一次 —— 白花一次调用（规格
+	// §5.2）。
+	checkinMu sync.Mutex
+```
+
+这件事也要有测试 —— 加在 `internal/scheduler/scheduler_test.go`：
+
+```go
+// TestTheCheckinPassesDoNotOverlap says two check-in passes do not run at
+// the same time.
+//
+// 起进程的补签和 00:00 那趟会碰上：23:59 起进程，补签还没跑完就到 00:00。
+// 叠着跑就是同一个号被站点拒一次 —— 白花一次调用（规格 §5.2）。
+func TestTheCheckinPassesDoNotOverlap(t *testing.T) {
+	var claims atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			claims.Add(1)
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	// 前一趟还在跑（这里就是拿着锁的那一趟）。
+	sc.checkinMu.Lock()
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		sc.checkinAll(ctx)
+	}()
+	<-started
+	time.Sleep(200 * time.Millisecond)
+	if n := claims.Load(); n != 0 {
+		t.Fatalf("the claims = %d while another pass was running, want 0", n)
+	}
+	sc.checkinMu.Unlock()
+
+	// 前一趟完了，后一趟才跑。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if claims.Load() > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the pass did not run after the other one was done")
+}
+```
+
+（那个文件的 import 里多一个 `"sync/atomic"`；测签到次数的计数器都用
+`atomic.Int64` —— 处理请求的是另一个线程。）
 
 `Run` 里，`for {` 那个循环之前：
 
@@ -1273,6 +1547,8 @@ feat(scheduler): 只签今天没签的号，起进程时补签一趟
 **Files:**
 - Modify: `cmd/mmxcode/serve.go`
 - Modify: `README.md`
+- Modify: `config.example.yaml`
+- Modify: `config.docker.yaml`
 
 - [ ] **Step 1: 改 `cmd/mmxcode/serve.go` 的那句错话**
 
@@ -1291,6 +1567,50 @@ feat(scheduler): 只签今天没签的号，起进程时补签一趟
 ```
 | `schedule.checkin_at` | `"00:00"` | 每天签到的时间，**大陆时间**，`HH:MM`。站点按大陆时间算一天，签到要落在那一天里 |
 | `schedule.checkin_jitter` | `"0"` | 签到最多往后推多久。几个实例一起跑的时候抖一下就散开了 |
+```
+
+发出去的两份配置也要改：它们写着 `09:00`，而那个 `09:00` 现在说的是
+**大陆时间**的 09:00 —— 照着配置跑的人，签到比说好的晚九个钟头。
+
+`config.example.yaml` 和 `config.docker.yaml` 的 `schedule` 那一段改成：
+
+```yaml
+schedule:
+  # 每天签到的时间，大陆时间（站点按大陆时间算一天）
+  checkin_at: "00:00"
+  # 签到最多往后推多久（几个实例一起跑的时候抖一下就散开了）
+  checkin_jitter: 0s
+  usage_refresh: 15m
+  token_refresh: 5m
+  egress_health: 2m
+```
+
+这两份配置也要有测试（它们跟默认值说的一样）—— 加在
+`internal/config/config_test.go`：
+
+```go
+// TestTheShippedConfigsCheckInAtTheSitesMidnight says the configs that
+// ship with the program agree with the default.
+//
+// 发出去的配置写着 09:00，README 写着 00:00：照着配置文件跑的人，签到
+// 就落在 09:00 —— 比说好的晚九个钟头（规格 §5.1）。而且 09:00 现在是
+// **大陆时间**的 09:00：老配置里的那个 09:00 说的是本机时区。
+func TestTheShippedConfigsCheckInAtTheSitesMidnight(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		c, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.Schedule.CheckinAt != Default().Schedule.CheckinAt {
+			t.Errorf("%s: checkin_at = %q, want %q",
+				name, c.Schedule.CheckinAt, Default().Schedule.CheckinAt)
+		}
+		if c.Schedule.CheckinJitter.Duration() != Default().Schedule.CheckinJitter.Duration() {
+			t.Errorf("%s: checkin_jitter = %s, want %s",
+				name, c.Schedule.CheckinJitter, Default().Schedule.CheckinJitter)
+		}
+	}
+}
 ```
 
 - [ ] **Step 3: README 加一节「### 签到」**
@@ -1349,6 +1669,37 @@ docs: 签到的时间、时区和补签写进 README
 签到按大陆时间 00:00（站点按大陆时间算一天），起进程时补签今天漏掉
 的号，签到的积分进池（规格 §5.1、§5.2、§5.3）。
 ```
+
+---
+
+## 评审后的修补
+
+两轮评审（规格对不对、代码好不好）在实现之后跑过。它们找到的东西都补进
+上面的任务里了 —— 计划跟代码是逐字对着的（`check_plan_files.py` 报
+stale declarations: 0）。
+
+| 找到的 | 在哪儿 |
+|---|---|
+| 发出去的两份配置还写着 `09:00` —— 那个 `09:00` 现在是大陆时间的 09:00 | Task 7 |
+| 索引那条只跑在 migrateConform 里，老库（版本 5）走不到：一年 36 万行的全表扫 | Task 1（版本 6 的那一步） |
+| 「今天」有三个钟（库的钟和墙上时间各算各的） | Task 1（`Store.Today`）、Task 2、Task 3、Task 6 |
+| 启动时的补签和 00:00 那趟会叠着跑：同一个号被站点拒一次 | Task 6（`checkinMu`） |
+| 抖动可能把签到推到站点的第二天（`23:50` 抖 30 分钟） | Task 5 |
+| 抖动这个键没有测试钉着 | Task 5 |
+| `NextCheckin`、`CheckinAll` 的注释重了、跟代码对不上 | Task 5、Task 6 |
+| `OptionalDuration` 的注释说「只有一个键的零是合法的」 | Task 4 |
+| `PoolCandidates` 的注释里没有「今天签过的排前面」这条 | Task 3 |
+| 测签到次数的计数器是普通变量（处理请求的是另一个线程） | Task 6 |
+
+两件没改的，说明理由：
+
+- **签不上的号不在签到名单里**（`AccountsWithoutCheckin` 只给 active 的
+  号）：签不上的号要的是重登，不是签到。它签回来的那天是 active 了，下一
+  趟自然就在名单里。
+- **名单读不出来的时候那一天就过去了**：`CheckinAll` 读到名单失败会打印
+  出来（`checkin: the accounts to check in could not be read: …`），日志里
+  看得见；库是本地的 SQLite，一个偶发的错就是极小概率的事，为它加一遍重
+  试不如让它在日志里说话。
 
 ---
 
