@@ -219,7 +219,7 @@ func (s *Server) refreshCheckinCredits(ctx context.Context) {
 	if s.Pool == nil || s.Store == nil {
 		return
 	}
-	credits, err := s.Store.DayCheckins(ctx, store.DayKey(time.Now()))
+	credits, err := s.Store.DayCheckins(ctx, s.Store.Today())
 	if err != nil {
 		log.Printf("the check-in credits could not be read: %v", err)
 		return
