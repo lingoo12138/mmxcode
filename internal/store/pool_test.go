@@ -401,3 +401,36 @@ func TestTouchingNoSessionIsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestTheAccountsThatCheckedInComeFirst says the accounts that were
+// checked in today are the first ones into the pool.
+//
+// 签到过的号一定刚拿到积分（七天有效），而从没读过的号有没有额度是**不
+// 知道的** —— 填池那一趟要读它，读到 0 就白读一次（2~11 个上游请求，
+// 规格 §5.3）。
+func TestTheAccountsThatCheckedInComeFirst(t *testing.T) {
+	s := openTest(t)
+	at := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	s.Clock = func() time.Time { return at }
+	makeAccount(t, s, "checked")
+	makeAccount(t, s, "never")
+	// 签过的那个号是有数的（它被读过），另一个从来没读过。
+	saveReading(t, s, "checked", 10, at.Add(-24*time.Hour))
+	if err := s.SaveCheckin(context.Background(), Checkin{
+		AccountID: "checked", Day: DayKey(at), Outcome: "claimed",
+		Credit: 25, CreatedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := candidateIDs(t, s, 10, nil, at.Add(-time.Hour))
+	want := []string{"checked", "never"}
+	if len(ids) != len(want) {
+		t.Fatalf("candidates = %v, want %v", ids, want)
+	}
+	for i, id := range want {
+		if ids[i] != id {
+			t.Fatalf("candidates = %v, want %v", ids, want)
+		}
+	}
+}

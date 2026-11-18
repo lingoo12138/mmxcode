@@ -78,11 +78,13 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 		ORDER BY
 			(EXISTS (SELECT 1 FROM sessions s
 				WHERE s.account_id = a.id AND s.updated_at >= ?)) DESC,
+			(EXISTS (SELECT 1 FROM checkins c
+				WHERE c.account_id = a.id AND c.day = ?)) DESC,
 			(u.created_at IS NULL) DESC,
 			u.created_at ASC,
 			a.created_at DESC,
 			a.id
-		LIMIT ?`, StatusActive, ms(s.now()), ms(since), limit+len(exclude))
+		LIMIT ?`, StatusActive, ms(s.now()), ms(since), DayKey(s.now()), limit+len(exclude))
 	if err != nil {
 		return nil, fmt.Errorf("pool candidates: %w", err)
 	}
