@@ -195,11 +195,21 @@ type Rotation struct {
 }
 
 // Schedule holds the timers.
+// Schedule holds the timers.
 type Schedule struct {
-	CheckinAt    string   `yaml:"checkin_at" json:"checkin_at"`
-	UsageRefresh Duration `yaml:"usage_refresh" json:"usage_refresh"`
-	TokenRefresh Duration `yaml:"token_refresh" json:"token_refresh"`
-	EgressHealth Duration `yaml:"egress_health" json:"egress_health"`
+	// CheckinAt is when the daily check-in runs, HH:MM.
+	//
+	// 它是**大陆时间**：站点按大陆时间算一天，签到要落在站点的那一天
+	// 里（规格 §5.1）。
+	CheckinAt string `yaml:"checkin_at" json:"checkin_at"`
+	// CheckinJitter is how long the daily check-in may be held back.
+	//
+	// 它的零是有意思的：不抖。几个实例一起跑的时候，抖一下就散开了
+	// （规格 §5.1）。
+	CheckinJitter OptionalDuration `yaml:"checkin_jitter" json:"checkin_jitter"`
+	UsageRefresh  Duration         `yaml:"usage_refresh" json:"usage_refresh"`
+	TokenRefresh  Duration         `yaml:"token_refresh" json:"token_refresh"`
+	EgressHealth  Duration         `yaml:"egress_health" json:"egress_health"`
 }
 
 // Batch is how a batch import runs.
@@ -362,10 +372,11 @@ func Default() Config {
 		Upstream: Upstream{Timeout: Duration(120 * time.Second), Site: "global"},
 		Rotation: Rotation{Strategy: "sticky", MaxAttempts: 3, ExhaustedCooldown: Duration(5 * time.Minute)},
 		Schedule: Schedule{
-			CheckinAt:    "09:00",
-			UsageRefresh: Duration(15 * time.Minute),
-			TokenRefresh: Duration(5 * time.Minute),
-			EgressHealth: Duration(2 * time.Minute),
+			CheckinAt:     "00:00",
+			CheckinJitter: OptionalDuration(0),
+			UsageRefresh:  Duration(15 * time.Minute),
+			TokenRefresh:  Duration(5 * time.Minute),
+			EgressHealth:  Duration(2 * time.Minute),
 		},
 		Batch: Batch{
 			Interval: Duration(3 * time.Second),

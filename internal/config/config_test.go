@@ -28,8 +28,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Rotation.ExhaustedCooldown.Duration() != 5*time.Minute {
 		t.Fatalf("cooldown = %v, want 5m", c.Rotation.ExhaustedCooldown)
 	}
-	if c.Schedule.CheckinAt != "09:00" {
-		t.Fatalf("checkin_at = %q, want 09:00", c.Schedule.CheckinAt)
+	if c.Schedule.CheckinAt != "00:00" {
+		t.Fatalf("checkin_at = %q, want 00:00", c.Schedule.CheckinAt)
 	}
 	if c.Schedule.UsageRefresh.Duration() != 15*time.Minute {
 		t.Fatalf("usage_refresh = %v, want 15m", c.Schedule.UsageRefresh)
@@ -727,4 +727,19 @@ func TestTheTotalMaxIsReadFromTheFile(t *testing.T) {
 
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
+}
+
+// TestTheCheckinDefaults says when the check-in runs by default.
+//
+// 按大陆时间 00:00（规格 §5.1）：站点按大陆时间算一天，签到要落在那
+// 一天的头里，签到给的积分才能用满七天。抖动是 0：一天一个实例，号又
+// 是一个一个签的，抖动只是把开始往后推。
+func TestTheCheckinDefaults(t *testing.T) {
+	c := Default()
+	if c.Schedule.CheckinAt != "00:00" {
+		t.Errorf("checkin_at = %q, want 00:00", c.Schedule.CheckinAt)
+	}
+	if c.Schedule.CheckinJitter.Duration() != 0 {
+		t.Errorf("checkin_jitter = %s, want 0", c.Schedule.CheckinJitter)
+	}
 }
