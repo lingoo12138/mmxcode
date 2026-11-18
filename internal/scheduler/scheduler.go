@@ -44,6 +44,12 @@ type Scheduler struct {
 	// 等在飞的那些停下来 —— 库是接着关的，它不该往一个正在关着的库上
 	// 写。
 	wg sync.WaitGroup
+	// checkinMu keeps two check-in passes from running at once.
+	//
+	// 起进程的补签和 00:00 那趟会碰上：23:59 起进程，补签还没跑完就
+	// 到 00:00。叠着跑就是同一个号被站点拒一次 —— 白花一次调用（规格
+	// §5.2）。
+	checkinMu sync.Mutex
 }
 
 // New makes a scheduler.
@@ -78,14 +84,13 @@ func CheckinDelay(base time.Duration, window time.Duration) time.Duration {
 
 // NextCheckin gives the moment the daily check-in runs.
 //
-// The time is a wall-clock time in the local zone. When the moment has
-// passed, it is tomorrow's.
-// NextCheckin gives the moment the daily check-in runs.
-//
 // The time is a wall-clock time in the site's zone: the site counts its
 // days in China, so a check-in has to land on the site's day（规格 §5.1）。
 // The machine's own timezone is not the site's, and using it puts the
 // check-in on the wrong day — or eight hours late.
+//
+// When the moment has passed, it is tomorrow's. The jitter is added on
+// top: a few instances together spread themselves out that way.
 func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 	loc := store.CheckinZone()
 	n := now.In(loc)
@@ -93,10 +98,15 @@ func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 	if !next.After(now) {
 		next = next.AddDate(0, 0, 1)
 	}
-	return next.Add(CheckinDelay(0, jitter))
+	// 抖动不许把签到推到站点的第二天去：「23:50」抖 30 分钟就是 00:20 ——
+	// 那是另一天的积分，那一份拿不到（规格 §5.1）。跨了就不抖。
+	d := CheckinDelay(0, jitter)
+	if store.DayKey(next.Add(d)) != store.DayKey(next) {
+		d = 0
+	}
+	return next.Add(d)
 }
 
-// CheckinAll claims every account's daily credits.
 // CheckinAll claims every account's daily credits.
 //
 // 只签今天还没签的号（规格 §5.2）：签过的再签一次，站点只会答 done，白
@@ -106,7 +116,7 @@ func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 // 「今天」是站点的那一天（大陆时间），跟管理器写进去的那一行是同一个
 // 日子。
 func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
-	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, store.DayKey(time.Now()))
+	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, s.Mgr.Store.Today())
 	if err != nil {
 		fmt.Printf("checkin: the accounts to check in could not be read: %v\n", err)
 		return nil
@@ -339,7 +349,14 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // checkinAll runs the check-in and says what happened.
+//
+// 一趟签到一趟签到：两趟不叠着跑。起进程的补签和 00:00 那趟会碰上
+// （23:59 起进程，补签还没跑完就到 00:00）—— 叠着跑就是同一个号被站点
+// 拒一次（白花一次调用，规格 §5.2）。后到的那趟等前一趟跑完，名单是
+// 现读的，前一趟签过的号不在里面。
 func (s *Scheduler) checkinAll(ctx context.Context) {
+	s.checkinMu.Lock()
+	defer s.checkinMu.Unlock()
 	for _, r := range s.CheckinAll(ctx) {
 		if r.Error != "" {
 			fmt.Printf("checkin %s: %s\n", r.AccountID, r.Error)

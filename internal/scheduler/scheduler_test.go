@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -624,7 +625,7 @@ func TestTheSchedulerCanBeWaitedFor(t *testing.T) {
 // 签过的再签一次，站点只会答 done，白花一次调用 —— 而今天没签到的那部
 // 分，正是服务器 00:00 没开着时漏掉的那部分（规格 §5.2）。
 func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
-	var claims int
+	var claims atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/minimax-cloud/api/v1/signin/status":
@@ -637,7 +638,7 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 				{"day_no":6,"status":1,"is_today":false,"points":25},
 				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
 		case "/minimax-cloud/api/v1/signin/claim":
-			claims++
+			claims.Add(1)
 			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
 		default:
 			w.Write([]byte(`{}`))
@@ -679,8 +680,8 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 	if len(results) != 1 || results[0].AccountID != "acc_waiting" {
 		t.Fatalf("the results = %+v, want just the waiting account", results)
 	}
-	if claims != 1 {
-		t.Fatalf("the claims = %d, want 1", claims)
+	if n := claims.Load(); n != 1 {
+		t.Fatalf("the claims = %d, want 1", n)
 	}
 }
 
@@ -690,7 +691,7 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 // 服务器 00:00 没开着的时候，那一天的签到就没人做了 —— 起进程的时候补
 // 一趟，签的是今天还没签的号（规格 §5.2）。
 func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
-	var claims int
+	var claims atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/minimax-cloud/api/v1/signin/status":
@@ -703,7 +704,7 @@ func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
 				{"day_no":6,"status":1,"is_today":false,"points":25},
 				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
 		case "/minimax-cloud/api/v1/signin/claim":
-			claims++
+			claims.Add(1)
 			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
 		default:
 			w.Write([]byte(`{}`))
@@ -740,10 +741,131 @@ func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if claims > 0 {
+		if claims.Load() > 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("the check-in was not made up on startup")
+}
+
+// TestTheNextCheckinIsJittered says the daily check-in may be held back.
+//
+// 抖动是配置里的一个键（schedule.checkin_jitter）：几个实例一起跑的时候
+// 抖一下就散开了。零是它的默认值（不抖），写死 30 分钟是另一回事 ——
+// 那是 §5.1 里点名要去掉的。
+func TestTheNextCheckinIsJittered(t *testing.T) {
+	at, err := time.Parse("15:04", "00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	// 不抖的时候是那一刻。
+	want := time.Date(2026, 11, 19, 16, 0, 0, 0, time.UTC)
+	seen := map[time.Time]bool{}
+	for i := 0; i < 40; i++ {
+		got := NextCheckin(now, at, 30*time.Minute)
+		if got.Before(want) || !got.Before(want.Add(30*time.Minute)) {
+			t.Fatalf("next = %v, want between %v and %v", got, want, want.Add(30*time.Minute))
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("the check-in time does not jitter")
+	}
+}
+
+// TestTheJitterDoesNotCrossTheSitesMidnight says the jitter cannot push
+// the check-in into the next day.
+//
+// 「23:50」抖 30 分钟就是 00:20 —— 那是站点第二天的积分，那一份拿不到，
+// 而且站点只给一天一次（规格 §5.1）。跨了就不抖。
+func TestTheJitterDoesNotCrossTheSitesMidnight(t *testing.T) {
+	at, err := time.Parse("15:04", "23:50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// UTC 的 11-18 20:00 是大陆时间的 11-19 04:00：今天 23:50 还没到。
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	for i := 0; i < 40; i++ {
+		got := NextCheckin(now, at, 30*time.Minute)
+		if day := store.DayKey(got); day != "2026-11-19" {
+			t.Fatalf("the check-in landed on %s, want 2026-11-19", day)
+		}
+	}
+}
+
+// TestTheCheckinPassesDoNotOverlap says two check-in passes do not run at
+// the same time.
+//
+// 起进程的补签和 00:00 那趟会碰上：23:59 起进程，补签还没跑完就到 00:00。
+// 叠着跑就是同一个号被站点拒一次 —— 白花一次调用（规格 §5.2）。
+func TestTheCheckinPassesDoNotOverlap(t *testing.T) {
+	var claims atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			claims.Add(1)
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, UserID: "1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	s.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "tok", Refresh: "ref",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	})
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	// 前一趟还在跑（这里就是拿着锁的那一趟）。
+	sc.checkinMu.Lock()
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		sc.checkinAll(ctx)
+	}()
+	<-started
+	time.Sleep(200 * time.Millisecond)
+	if n := claims.Load(); n != 0 {
+		t.Fatalf("the claims = %d while another pass was running, want 0", n)
+	}
+	sc.checkinMu.Unlock()
+
+	// 前一趟完了，后一趟才跑。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if claims.Load() > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the pass did not run after the other one was done")
 }
