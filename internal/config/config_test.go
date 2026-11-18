@@ -743,3 +743,26 @@ func TestTheCheckinDefaults(t *testing.T) {
 		t.Errorf("checkin_jitter = %s, want 0", c.Schedule.CheckinJitter)
 	}
 }
+
+// TestTheShippedConfigsCheckInAtTheSitesMidnight says the configs that
+// ship with the program agree with the default.
+//
+// 发出去的配置写着 09:00，README 写着 00:00：照着配置文件跑的人，签到
+// 就落在 09:00 —— 比说好的晚九个钟头（规格 §5.1）。而且 09:00 现在是
+// **大陆时间**的 09:00：老配置里的那个 09:00 说的是本机时区。
+func TestTheShippedConfigsCheckInAtTheSitesMidnight(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		c, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.Schedule.CheckinAt != Default().Schedule.CheckinAt {
+			t.Errorf("%s: checkin_at = %q, want %q",
+				name, c.Schedule.CheckinAt, Default().Schedule.CheckinAt)
+		}
+		if c.Schedule.CheckinJitter.Duration() != Default().Schedule.CheckinJitter.Duration() {
+			t.Errorf("%s: checkin_jitter = %s, want %s",
+				name, c.Schedule.CheckinJitter, Default().Schedule.CheckinJitter)
+		}
+	}
+}

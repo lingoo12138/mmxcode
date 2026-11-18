@@ -72,10 +72,11 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 // or "fall back to the default" — a schedule that quietly runs at a
 // time nobody asked for. Both are worse than refusing to start.
 //
-// 有一个地方的零是合法的：usage.refresh.scan_every。那一个键用的是
-// 自己的类型（OptionalDuration），零在那里是"间隔交回
-// schedule.usage_refresh" —— 是人写的意思。别的键没有这个意思，所以
-// 它们还是拒绝零。
+// 有两个地方的零是合法的：usage.refresh.scan_every 和
+// schedule.checkin_jitter。那两个键用的是自己的类型
+// （OptionalDuration），零在第一个键那里是"间隔交回
+// schedule.usage_refresh"，在第二个键那里是"不抖" —— 都是人写的意思。
+// 别的键没有这个意思，所以它们还是拒绝零。
 func parseDuration(s string) (time.Duration, error) {
 	v, err := time.ParseDuration(s)
 	if err != nil {
@@ -89,8 +90,9 @@ func parseDuration(s string) (time.Duration, error) {
 
 // parseOptionalDuration reads a duration that may be zero.
 //
-// 零在这里是许的：只有一个键有合法的 0（usage.refresh.scan_every），
-// 它说的是"间隔交回 schedule.usage_refresh"。负数仍然不是：负的间隔
+// 零在这里是许的：两个键有合法的 0（usage.refresh.scan_every、
+// schedule.checkin_jitter），第一个说的是"间隔交回
+// schedule.usage_refresh"，第二个说的是"不抖"。负数仍然不是：负的间隔
 // 没有意思，而且它会顺着"小于等于 0 就按默认来"那条路，变成一个没人
 // 要的间隔。
 func parseOptionalDuration(s string) (time.Duration, error) {
@@ -106,8 +108,10 @@ func parseOptionalDuration(s string) (time.Duration, error) {
 
 // OptionalDuration is a time.Duration that may be zero.
 //
-// 它只给一个键用：usage.refresh.scan_every。那个键的零有确切的意思
-// ——"间隔交回 schedule.usage_refresh"（规格 §9）—— 所以它得写得进去。
+// 它只给两个键用：usage.refresh.scan_every 和
+// schedule.checkin_jitter。那两个键的零有确切的意思
+// ——"间隔交回 schedule.usage_refresh"（规格 §9）和"不抖"—— 所以它们
+// 得写得进去。
 //
 // 别的时长仍然拒绝零：零在那边是"没有时限"或者"悄悄按默认来"，两个
 // 都比拒绝更坏。那些地方用的是 Duration。

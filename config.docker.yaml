@@ -21,7 +21,10 @@ rotation:
   exhausted_cooldown: 5m
 
 schedule:
-  checkin_at: "09:00"
+  # 每天签到的时间，大陆时间（站点按大陆时间算一天）
+  checkin_at: "00:00"
+  # 签到最多往后推多久（几个实例一起跑的时候抖一下就散开了）
+  checkin_jitter: 0s
   usage_refresh: 15m
   token_refresh: 5m
   egress_health: 2m
