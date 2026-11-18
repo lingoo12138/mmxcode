@@ -256,11 +256,13 @@ var tables = []table{
 
 // The indexes.
 //
-// The check-ins need none of their own: the unique (account_id, day)
-// is already an index over the account and the day.
+// 签到的行要按日子找：「今天谁签到了」是签到那一趟的名单，也是积分进
+// 池的那条路（规格 §5.3）。一天一个号一行，1000 个号一年就是 36 万行
+// —— 没有索引就是全表扫。
 var indexStatements = []string{
 	"CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
+	"CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)",
 	"DROP INDEX IF EXISTS idx_checkins_account",
 }
 

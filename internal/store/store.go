@@ -2312,31 +2312,6 @@ func (s *Store) EgressHealth(ctx context.Context) ([]EgressHealth, error) {
 	return out, nil
 }
 
-// checkinZone is the timezone a check-in day is counted in.
-//
-// The site counts its days in China, so a day here is that zone's day.
-// The zone is loaded by name, so the name is never ambiguous: "CST" is
-// China Standard Time here and US Central somewhere else. A machine
-// without the timezone database gets the same offset under a name that
-// says what it is.
-var checkinZone = loadCheckinZone()
-
-// loadCheckinZone gives the timezone a check-in day is counted in.
-func loadCheckinZone() *time.Location {
-	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		return loc
-	}
-	return time.FixedZone("UTC+8", 8*3600)
-}
-
-// DayKey is the day a check-in is counted for.
-//
-// The day is the site's day, so that the day rolls over at the same
-// hour for every account, whatever the machine's own timezone is.
-func DayKey(t time.Time) string {
-	return t.In(checkinZone).Format("2006-01-02")
-}
-
 func boolInt(b bool) int {
 	if b {
 		return 1
