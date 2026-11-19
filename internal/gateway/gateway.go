@@ -28,8 +28,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -803,7 +805,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 					lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 					quota = false
 					quotaMsg = ""
-					if !sleepCtx(ctx, backoff(try)) {
+					wait, waitOK := waitBeforeRetry(resp, try)
+					if !waitOK {
+						// 上游让等太久：等是等不到的，换一个号。
+						// 那个窗口不记成用完 —— 限流不是额度的事。
+						lastErr = fmt.Errorf("HTTP %d: the upstream asked to wait longer than %s",
+							resp.StatusCode, maxWaitForTheSameAccount)
+						return false
+					}
+					if !sleepCtx(ctx, wait) {
 						return true
 					}
 					continue
@@ -1306,16 +1316,93 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// retryAfter reads the upstream's Retry-After header.
+//
+// 它说的是「什么时候再来」：两种写法 —— 一个秒数（"120"），或者一个
+// HTTP 日期（"Wed, 21 Oct 2015 07:28:00 GMT"）。读不出来就当没有。
+//
+// 已经过去的日期是「现在就可以再来」：不是没有，是一个零。
+func retryAfter(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0, false
+	}
+	d := t.Sub(now)
+	if d < 0 {
+		d = 0
+	}
+	return d, true
+}
+
 // backoff is how long to wait before asking again.
 //
 // The wait grows with the attempt and is short enough that a request
 // does not hang for long.
+//
+// 抖动是加在上面的：形状不能变 —— 半秒、一秒、两秒、四秒，封顶四秒。
 func backoff(attempt int) time.Duration {
 	d := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
+	d = jitter(d)
 	if d > 4*time.Second {
 		d = 4 * time.Second
 	}
 	return d
+}
+
+// jitter spreads a wait over a fifth of it, up and down.
+//
+// 一批请求同时撞上限流的时候，它们会同时退避、同时再问 —— 那是最坏的：
+// 每一遍都正好落在同一个限流窗口的边上。加一点随机，它们就散开了。
+//
+// 上下都是五分之一：最多多等两成，也最多少等两成。
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	span := d / 5
+	if span <= 0 {
+		return d
+	}
+	return d - span + time.Duration(rand.Int63n(int64(2*span)+1))
+}
+
+// maxWaitForTheSameAccount is how long the gateway waits for an account
+// the upstream has just refused.
+//
+// 上游说「120 秒后再来」的时候，等是等不到的：客户端等不起，那个号也
+// 不该被占着一分钟。超过这个数就不等了 —— 换一个号更快。
+const maxWaitForTheSameAccount = 10 * time.Second
+
+// waitBeforeRetry says how long to wait before asking the same account
+// again.
+//
+// 上游说了什么时候再来，它说的算：限流窗口里再去敲门就是白烧上游的次数。
+// 没有说的话，用自己的退避。
+//
+// 上游说的太远的时候：不等，换号（第二个返回值是 false）。
+func waitBeforeRetry(resp *http.Response, attempt int) (time.Duration, bool) {
+	wait := backoff(attempt)
+	if resp == nil {
+		return wait, true
+	}
+	d, ok := retryAfter(resp.Header.Get("Retry-After"), time.Now())
+	if !ok {
+		return wait, true
+	}
+	if d > maxWaitForTheSameAccount {
+		return 0, false
+	}
+	return d, true
 }
 
 // sleepCtx waits, unless the request is over.
