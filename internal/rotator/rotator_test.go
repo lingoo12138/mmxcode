@@ -19,13 +19,15 @@ type fakePool struct {
 	marked    []markedWindow
 	remaining map[string]float64
 
-	// sessionErr is what SessionAccount fails with.
+	// sessionErr is what SessionState fails with.
 	sessionErr error
 	// bindErr is what BindSession fails with.
 	bindErr error
 	// remainingCalls counts the questions asked for one account's
 	// credits.
 	remainingCalls int
+	// sessionReads counts the reads of the session's row.
+	sessionReads int
 }
 
 // markedWindow is one window the pool was told to mark spent.
@@ -53,12 +55,19 @@ func (p *fakePool) BindSession(_ context.Context, key, accountID string) error {
 	return nil
 }
 
-func (p *fakePool) SessionAccount(_ context.Context, key string) (string, bool, error) {
+// SessionState gives the session's row in one read.
+//
+// 那一行的两列（钉在哪个号上、上游的 id）一起拿：分开问就是两次往返。
+func (p *fakePool) SessionState(_ context.Context, key string) (store.SessionState, error) {
+	p.sessionReads++
 	if p.sessionErr != nil {
-		return "", false, p.sessionErr
+		return store.SessionState{}, p.sessionErr
 	}
 	id, ok := p.sessions[key]
-	return id, ok, nil
+	if !ok {
+		return store.SessionState{Known: true}, nil
+	}
+	return store.SessionState{Known: true, AccountID: id}, nil
 }
 
 func (p *fakePool) Remaining(_ context.Context, accountID string) (float64, bool) {
@@ -113,6 +122,22 @@ func (p *busyPool) Busy(_ context.Context, accountID string) bool {
 
 func acc(id string) store.Account {
 	return store.Account{ID: id, Name: id, Status: store.StatusActive}
+}
+
+// TestTheSessionRowIsReadInOneGo says the rotator reads the session's
+// row in one read.
+//
+// 那一行的两列是同一行：分开读就是两次往返，而每个请求都要问这一行。
+func TestTheSessionRowIsReadInOneGo(t *testing.T) {
+	p := newFakePool(acc("acc_01"))
+	r := newRotator(p, Options{Strategy: StrategySticky})
+
+	if _, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.sessionReads; got != 1 {
+		t.Errorf("the reads of the session row = %d, want 1", got)
+	}
 }
 
 func TestPickBindsSessionToAnAccount(t *testing.T) {

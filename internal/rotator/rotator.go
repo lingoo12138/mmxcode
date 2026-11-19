@@ -55,8 +55,10 @@ type Pool interface {
 	Exhausted(ctx context.Context) ([]store.Exhausted, error)
 	// BindSession points a session at an account.
 	BindSession(ctx context.Context, sessionKey, accountID string) error
-	// SessionAccount gives the account a session is bound to.
-	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	// SessionState gives the session's row in one read.
+	//
+	// 那一行的两列（钉在哪个号上、上游的 id）一起拿：分开问就是两次往返。
+	SessionState(ctx context.Context, sessionKey string) (store.SessionState, error)
 	// MarkExhausted marks an account's window spent.
 	//
 	// The order is the account, the window key, the time it comes
@@ -187,6 +189,11 @@ type Plan struct {
 	// bound one had already been tried, and the session stayed where
 	// it was.
 	Retried bool
+	// UpstreamID is the id the upstream knows this conversation by.
+	//
+	// 它是跟着那一行一起读出来的：那一行每个请求都要问一次，所以问出来的
+	// 东西就跟着走，不用再问一遍。
+	UpstreamID string
 }
 
 // Rotator picks accounts.
@@ -334,14 +341,41 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 
 	sticky := r.opts.Strategy != StrategyRoundRobin
 
-	if sticky && sessionKey != "" {
-		boundID, ok, err := r.pool.SessionAccount(ctx, sessionKey)
+	// 这一段对话在库里那一行：钉在哪个号上、上游的 id。
+	//
+	// 那一行以前是分开读的（两次往返），而每个请求都要问它一次。
+	var state store.SessionState
+	if sessionKey != "" {
+		var err error
+		state, err = r.pool.SessionState(ctx, sessionKey)
 		if err != nil {
-			// A read error is not an unbound session. Were it taken
-			// for one, the binding that is there would be overwritten.
-			return Plan{}, fmt.Errorf("the session binding could not be read: %w", err)
+			// 读不出来不是「没绑定」：当成没绑定的话，库里那个绑定会被覆
+			// 盖掉。
+			return Plan{}, fmt.Errorf("the session row could not be read: %w", err)
 		}
-		if ok {
+	}
+
+	// 上游的 id：那一行里的那个。
+	//
+	// 那一行没有 id（新的对话）：问池子要一个 —— 它会编一个写下去。
+	//
+	// 只有「那一行还没有 id」的时候才问：问一次就是一次写，而热路径上那一
+	// 行已经有 id 了（那一行每个请求都要读一次，所以问出来的东西就跟着
+	// 走，不用再问一遍）。
+	upstreamID := state.UpstreamID
+	if upstreamID == "" && sessionKey != "" {
+		if ids, ok := r.pool.(UpstreamIDs); ok {
+			var err error
+			upstreamID, err = ids.UpstreamID(ctx, sessionKey)
+			if err != nil {
+				return Plan{}, fmt.Errorf("the upstream id could not be read: %w", err)
+			}
+		}
+	}
+
+	if sticky && sessionKey != "" {
+		if state.AccountID != "" {
+			boundID := state.AccountID
 			bound, found := accountByID(accounts, boundID)
 			switch {
 			case !found, bound.Status != store.StatusActive:
@@ -359,7 +393,7 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 					return Plan{}, err
 				}
 				r.markUsed(a.ID)
-				return r.plan(a, group, false, true), nil
+				return r.plan(a, group, false, true, upstreamID), nil
 			case r.isBusy(ctx, boundID):
 				// The bound account is busy: another account answers
 				// this request, and the conversation stays where it
@@ -369,11 +403,11 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 					return Plan{}, err
 				}
 				r.markUsed(a.ID)
-				return r.plan(a, group, false, true), nil
+				return r.plan(a, group, false, true, upstreamID), nil
 			default:
 				// The bound account can answer: it answers.
 				r.markUsed(boundID)
-				return r.plan(store.Account{ID: boundID}, group, false, false), nil
+				return r.plan(store.Account{ID: boundID}, group, false, false, upstreamID), nil
 			}
 		}
 	}
@@ -391,7 +425,7 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 			return Plan{}, fmt.Errorf("the session binding could not be written: %w", err)
 		}
 		r.markUsed(a.ID)
-		return r.plan(a, group, true, false), nil
+		return r.plan(a, group, true, false, upstreamID), nil
 	}
 
 	// No conversation, or the round-robin strategy: the next account
@@ -405,7 +439,7 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 		return Plan{}, err
 	}
 	r.markUsed(a.ID)
-	return r.plan(a, group, false, false), nil
+	return r.plan(a, group, false, false, upstreamID), nil
 }
 
 // usableAccounts gives the accounts that can answer, and the group the
@@ -496,13 +530,14 @@ func (r *Rotator) isBusy(ctx context.Context, accountID string) bool {
 }
 
 // plan gives the plan of a request that goes to an account.
-func (r *Rotator) plan(a store.Account, group string, rebound, retried bool) Plan {
+func (r *Rotator) plan(a store.Account, group string, rebound, retried bool, upstreamID string) Plan {
 	return Plan{
-		AccountID: a.ID,
-		WindowKey: group,
-		GroupKey:  group,
-		Rebound:   rebound,
-		Retried:   retried,
+		AccountID:  a.ID,
+		WindowKey:  group,
+		GroupKey:   group,
+		Rebound:    rebound,
+		Retried:    retried,
+		UpstreamID: upstreamID,
 	}
 }
 

@@ -29,6 +29,9 @@ type harness struct {
 	srv   *httptest.Server
 	gw    *Server
 	store *store.Store
+	// counter counts the statements the store sends: the measuring tool
+	// (see internal/store/counting.go).
+	counter *store.Counter
 	// reader is the credits reader the gateway uses: a fake one, so a
 	// test never goes to the network to read the credits.
 	reader *fakeReader
@@ -63,7 +66,8 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	}))
 	t.Cleanup(h.srv.Close)
 
-	s, err := store.Open(t.TempDir() + "/t.db")
+	h.counter = store.NewCounter()
+	s, err := store.Open(t.TempDir()+"/t.db", store.WithConnector(h.counter.Connector()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1260,9 +1264,12 @@ func (p *plainPool) BindSession(_ context.Context, key, accountID string) error 
 	return nil
 }
 
-func (p *plainPool) SessionAccount(_ context.Context, key string) (string, bool, error) {
+func (p *plainPool) SessionState(_ context.Context, key string) (store.SessionState, error) {
 	id, ok := p.sessions[key]
-	return id, ok, nil
+	if !ok {
+		return store.SessionState{Known: true}, nil
+	}
+	return store.SessionState{Known: true, AccountID: id}, nil
 }
 
 func (p *plainPool) MarkExhausted(context.Context, string, string, time.Time, string) error {
@@ -1685,5 +1692,159 @@ func TestTheTotalConcurrencyIsCached(t *testing.T) {
 	h.gw.concTTL = 0
 	if got := h.gw.concurrencyLimit(ctx); got == first {
 		t.Errorf("the total concurrency = %d, want the new one", got)
+	}
+}
+
+// TestTheSessionRowIsReadOnce says a request reads the session's row once.
+//
+// 这一版要盯的就是这个数：那一行的两列（钉在哪个号上、上游的 id）是分开读
+// 的，所以每个请求读它两次。合成一条之后是一次。
+//
+// 数的是**这一行**，不是总数：总数里还有「有没有 key」和「总并发」那两条，
+// 它们什么时候问看缓存的状态 —— 拿总数当断言，测的是缓存。
+func TestTheSessionRowIsReadOnce(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`))
+	})
+	body := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`
+
+	// 第一趟：会话还没有 —— 冷的那一趟。
+	h.counter.Reset()
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if got := h.counter.CountOf("FROM sessions"); got != 1 {
+		t.Errorf("the reads of the session row = %d, want 1: %v", got, h.counter.Statements())
+	}
+
+	// 第二趟：会话有了，号也钉上了 —— 热的那一趟。
+	h.counter.Reset()
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if got := h.counter.CountOf("FROM sessions"); got != 1 {
+		t.Errorf("the reads of the session row = %d, want 1: %v", got, h.counter.Statements())
+	}
+	if got := h.counter.CountOf("INSERT INTO sessions"); got != 0 {
+		t.Errorf("the writes of the session row = %d, want none: %v", got, h.counter.Statements())
+	}
+}
+
+// TestTheStatementsOfARequest measures what one request costs the database.
+//
+// 这是这一版的账：热请求和冷请求各打了几条语句，会话那一行各读了几条写了
+// 几条。
+//
+// 总数只是记下来（t.Logf），不是断言的东西：里面还有「有没有 key」和「
+// 总并发」那两条 —— 「有没有 key」是事件失效的（谁改了 key 谁就通知），
+// 「总并发」那条带 TTL，什么时候问看缓存的状态。拿总数当断言，测的是缓
+// 存，不是这一行。
+//
+// 冷的那一趟是**换一个会话 key**：会话那一行是新的，而那两个缓存是热的
+// （第一趟已经问过它们了）。这样两趟量的才是同一件事。
+func TestTheStatementsOfARequest(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`))
+	})
+	body := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`
+
+	// 两个缓存的时限拉长：它们各带 TTL（默认一秒），机器慢一点就会在两趟
+	// 之间过期，总数就变了 —— 那样量的是 TTL，不是这一行。
+	h.gw.concTTL = time.Minute
+	h.gw.fallback.ttl = time.Minute
+
+	// 第一趟：会话还没有 —— 它把会话那一行建起来，也把两个缓存问过了。
+	h.counter.Reset()
+	chat(t, h, "hot-1", body)
+	firstTotal := h.counter.Count()
+	firstStmts := h.counter.Statements()
+
+	// 第二趟：热的 —— 会话有了，号也钉上了。
+	h.counter.Reset()
+	chat(t, h, "hot-1", body)
+	hotTotal := h.counter.Count()
+	hotReads := h.counter.CountOf("FROM sessions")
+	hotWrites := h.counter.CountOf("INSERT INTO sessions")
+	hotStmts := h.counter.Statements()
+	if hotReads != 1 {
+		t.Errorf("the reads of the session row = %d, want 1: %v", hotReads, hotStmts)
+	}
+	if hotWrites != 0 {
+		t.Errorf("the writes of the session row = %d, want none: %v", hotWrites, hotStmts)
+	}
+
+	// 第三趟：冷的 —— 换一个会话 key：会话那一行是新的，但两个缓存是热的。
+	h.counter.Reset()
+	chat(t, h, "cold-1", body)
+	coldTotal := h.counter.Count()
+	coldReads := h.counter.CountOf("FROM sessions")
+	coldWrites := h.counter.CountOf("INSERT INTO sessions")
+	coldStmts := h.counter.Statements()
+	if coldReads != 1 {
+		t.Errorf("the reads of the session row = %d, want 1: %v", coldReads, coldStmts)
+	}
+
+	t.Logf("the first request (nothing cached yet): %d statements in all: %v",
+		firstTotal, firstStmts)
+	t.Logf("the hot request: %d statements in all, the session row was read %d times and written %d times",
+		hotTotal, hotReads, hotWrites)
+	t.Logf("the cold request: %d statements in all, the session row was read %d times and written %d times",
+		coldTotal, coldReads, coldWrites)
+	t.Logf("the statements of the hot request: %v", hotStmts)
+	t.Logf("the statements of the cold request: %v", coldStmts)
+
+	// 后台那一趟（读额度）读了几条 —— 它是另一条路，不在请求上。
+	h.counter.Reset()
+	if _, err := h.gw.round().Targets(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the background round reads %d statements: %v", h.counter.Count(), h.counter.Statements())
+}
+
+// TestTheKeyMadeInThePanelIsSeenAtOnce says a key made in the panel is the
+// answer the next request gets.
+//
+// 这个缓存管的是「要不要鉴权」：它慢了半秒，就是半秒的窗口里不带 key 的
+// 请求被放行。所以它不能只靠 TTL 过期 —— 谁改了谁就通知。
+func TestTheKeyMadeInThePanelIsSeenAtOnce(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`))
+	})
+	body := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`
+
+	// 还没有 key：请求过去。
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// 后台申请了一把 key（后台页面走的就是 store 的这一个方法）。
+	if err := h.store.CreateAPIKey(context.Background(), store.APIKey{
+		ID: "key_01", Name: "k", KeyHash: "hash", Prefix: "mmx",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 立刻再发一个不带 key 的请求：它得进不来。
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if w.Code != 401 {
+		t.Fatalf("code = %d, want 401: a key was made and the request was let in", w.Code)
+	}
+
+	// 撤销了：又没有 key 了，请求过去。
+	if err := h.store.RevokeAPIKey(context.Background(), "key_01", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if w.Code != 200 {
+		t.Fatalf("code = %d, want 200: the key was taken away and the request was refused", w.Code)
 	}
 }

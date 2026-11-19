@@ -17,8 +17,8 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -79,6 +81,19 @@ type Store struct {
 	// It is there so that a test can say what time it is. A store
 	// with no clock uses the wall clock.
 	Clock func() time.Time
+
+	// apiKeys is the answer to "has anybody asked for a key yet".
+	//
+	// 它是「要不要鉴权」：缓一秒就有一秒的窗口 —— 那一秒里后台申请了一把
+	// key，不带 key 的请求被放行。所以它不能只靠 TTL 过期：谁改了谁就通
+	// 知（见 forgetAPIKeys）。
+	apiKeys atomic.Int32
+	// apiKeysMu guards the moment when the answer is put back.
+	//
+	// 查库和把答案写回去要锁在一起：不然一个正在查库的请求会在别人申请了
+	// key 之后，把「一把都没有」这个旧答案写回去 —— 那个旧答案就留在缓存
+	// 里不动了，门就一直开着（见 forgetAPIKeys）。
+	apiKeysMu sync.Mutex
 }
 
 // now gives the store's time.
@@ -209,7 +224,15 @@ type options struct {
 	// synchronous is how hard a write hits the disk. Empty leaves it to
 	// SQLite.
 	synchronous string
+	// connector opens the connections. Nil means SQLite's own.
+	connector Connector
 }
+
+// Connector opens the connections of the database.
+//
+// 平时是 SQLite 自己的（见 openConn）。量语句条数的时候是套了一层计数的
+// （见 counting.go）。
+type Connector func(dsn string) (driver.Connector, error)
 
 // WithCacheMB says how many MB of pages one connection may keep.
 //
@@ -238,6 +261,14 @@ func WithSynchronous(s string) Option {
 	return func(o *options) { o.synchronous = s }
 }
 
+// WithConnector gives the store the connections to use.
+//
+// 那是量具用的：套一层计数的连接，就知道一个请求打了几条语句。生产的那个
+// 连接不用它 —— 那时候还是 SQLite 自己的。
+func WithConnector(c Connector) Option {
+	return func(o *options) { o.connector = c }
+}
+
 // Open opens the database at path, creating it and its directory if
 // they are not there.
 //
@@ -262,7 +293,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 			return nil, fmt.Errorf("create data dir: %w", err)
 		}
 	}
-	db, err := sql.Open("sqlite", dsn(path, o))
+	db, err := openConn(path, o)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -311,7 +342,7 @@ func openDurable(path string, o options, db *sql.DB) (*sql.DB, error) {
 	}
 	d := o
 	d.synchronous = "full"
-	durable, err := sql.Open("sqlite", dsn(path, d))
+	durable, err := openConn(path, d)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -322,6 +353,24 @@ func openDurable(path string, o options, db *sql.DB) (*sql.DB, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	return durable, nil
+}
+
+// openConn opens the connections of the database.
+//
+// 没有量具的时候是 SQLite 自己的连接 —— 那条路一点没变。有量具的时候是量具
+// 给的那条（见 counting.go）。
+//
+// 出错的时候不包一层「open sqlite」：包了的是 Open 和 openDurable，它们是
+// 唯一会把这句话说出口的地方 —— 包两遍的话那句话就重复了。
+func openConn(path string, o options) (*sql.DB, error) {
+	if o.connector == nil {
+		return sql.Open("sqlite", dsn(path, o))
+	}
+	conn, err := o.connector(dsn(path, o))
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(conn), nil
 }
 
 // fsyncsEveryWrite says whether the connection fsyncs every commit.
@@ -1815,6 +1864,10 @@ func (s *Store) CreateAPIKey(ctx context.Context, k APIKey) error {
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
 	}
+	// 有人申请了 key：那个「有没有 key」的答案变了，扔掉它（见
+	// forgetAPIKeys）。不改这一句的话，下一个不带 key 的请求还会被放行
+	// —— 那是鉴权上的窟窿。
+	s.forgetAPIKeys()
 	return nil
 }
 
@@ -1868,6 +1921,10 @@ func (s *Store) RevokeAPIKey(ctx context.Context, id string, at time.Time) error
 	if n == 0 {
 		return fmt.Errorf("revoke api key %s: %w", id, ErrNotFound)
 	}
+	// 有人撤销了 key：那个「有没有 key」的答案变了，扔掉它（见
+	// forgetAPIKeys）。不改这一句的话，门还关着 —— 人已经撤销了，请求
+	// 却还进不来。
+	s.forgetAPIKeys()
 	return nil
 }
 
@@ -1896,17 +1953,70 @@ func (s *Store) APIKeyByHash(ctx context.Context, hash string) (APIKey, error) {
 	return k, nil
 }
 
-// HasAPIKeys says whether any key has been made.
+// keyState is what the store knows about the keys in the console.
+//
+// 三态：「没查过」/「一把都没有」/「有」。「一把都没有」跟「没查过」必须分开
+// —— 分不开的话缓存永远不命中（每次都当没查过）。
+type keyState int32
+
+const (
+	// keysUnknown says nobody has asked yet.
+	keysUnknown keyState = iota
+	// keysNone says there is no key.
+	keysNone
+	// keysSome says there is at least one key.
+	keysSome
+)
+
+// HasAPIKeys says whether any key has been made in the console.
 //
 // 一把都没有的时候网关不鉴权：那时候它只该听在本机。申请过就不一样
 // 了：那是有人打算从别的机器用它。
+//
+// 答案记在内存里：这个数每个请求都要问一次，而它变不变只有一种理由 —— 有
+// 人申请了或者撤销了 key。谁改了谁就把这个答案扔掉（见 forgetAPIKeys）。
 func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
+	switch keyState(s.apiKeys.Load()) {
+	case keysSome:
+		return true, nil
+	case keysNone:
+		return false, nil
+	}
+	// 没查过：去查库。查库和写答案锁在一起，不然一个正在查库的请求会在
+	// 别人申请了 key 之后，把「一把都没有」这个旧答案写回去 —— 那个答案
+	// 留在缓存里不动了，门就一直开着。
+	s.apiKeysMu.Lock()
+	defer s.apiKeysMu.Unlock()
+	// 等锁的这会儿，答案可能已经有人填上了。
+	switch keyState(s.apiKeys.Load()) {
+	case keysSome:
+		return true, nil
+	case keysNone:
+		return false, nil
+	}
 	var n int
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL`).Scan(&n); err != nil {
 		return false, fmt.Errorf("count api keys: %w", err)
 	}
+	state := keysNone
+	if n > 0 {
+		state = keysSome
+	}
+	s.apiKeys.Store(int32(state))
 	return n > 0, nil
+}
+
+// forgetAPIKeys throws the cached answer away.
+//
+// 谁改了 key 谁就通知：这个答案是「要不要鉴权」，它慢了半秒就是半秒的窗口
+// 里不带 key 的请求被放行。
+//
+// 它拿着那把锁：不然一个正在查库的请求会在这次通知之后把旧答案写回去。
+func (s *Store) forgetAPIKeys() {
+	s.apiKeysMu.Lock()
+	defer s.apiKeysMu.Unlock()
+	s.apiKeys.Store(int32(keysUnknown))
 }
 
 // SaveToken writes an account's token.
@@ -2411,143 +2521,6 @@ func (s *Store) PruneExpiredWindows(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("prune the expired windows: %w", err)
 	}
 	return nil
-}
-
-// BindSession points a session at an account.
-//
-// The session's upstream id is left alone: it belongs to the
-// conversation and not to the account it is bound to.
-func (s *Store) BindSession(ctx context.Context, sessionKey, accountID string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO sessions (session_key, account_id, updated_at) VALUES (?,?,?)
-		ON CONFLICT(session_key) DO UPDATE SET
-			account_id=excluded.account_id, updated_at=excluded.updated_at`,
-		sessionKey, accountID, ms(s.now()))
-	if err != nil {
-		return fmt.Errorf("bind session: %w", err)
-	}
-	return nil
-}
-
-// SessionAccount gives the account a session is bound to.
-//
-// A session that was never bound has no account and no error.
-func (s *Store) SessionAccount(ctx context.Context, sessionKey string) (string, bool, error) {
-	var id sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		"SELECT account_id FROM sessions WHERE session_key=?", sessionKey).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("session account: %w", err)
-	}
-	if !id.Valid || id.String == "" {
-		return "", false, nil
-	}
-	return id.String, true, nil
-}
-
-// UpstreamID gives the session's upstream id, making one if the
-// session has none.
-//
-// The id is random: it is not derived from the session key, so the
-// upstream never sees a hash of the words in the request. It is also
-// kept: the same session has the same upstream id every time it is
-// asked for.
-//
-// The key is what decides which id a conversation gets, and two
-// conversations that arrive under the same key are one conversation as
-// far as this store can tell. Telling them apart is the caller's job:
-// it has to give them different keys.
-//
-// The session does not have to be bound to an account yet: a
-// conversation has an upstream id before it has an account.
-func (s *Store) UpstreamID(ctx context.Context, key string) (string, error) {
-	id, ok, err := s.upstreamIDOf(ctx, key)
-	if err != nil {
-		return "", err
-	}
-	if ok {
-		if id != "" {
-			return id, nil
-		}
-		// The session is there but has no id yet: make one and write
-		// it down.
-		newID, err := randomID()
-		if err != nil {
-			return "", err
-		}
-		res, err := s.db.ExecContext(ctx, `
-			UPDATE sessions SET upstream_id=?
-			WHERE session_key=? AND (upstream_id IS NULL OR upstream_id='')`, newID, key)
-		if err != nil {
-			return "", fmt.Errorf("set the upstream id of the session %s: %w", key, err)
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			return newID, nil
-		}
-		// Somebody else wrote one first, and theirs is the one.
-		id, _, err := s.upstreamIDOf(ctx, key)
-		if err != nil {
-			return "", err
-		}
-		if id == "" {
-			return "", fmt.Errorf("the session %s has no upstream id", key)
-		}
-		return id, nil
-	}
-	// The session is not there yet: make it with an id of its own.
-	newID, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO sessions (session_key, account_id, upstream_id, updated_at)
-		VALUES (?, NULL, ?, ?)
-		ON CONFLICT(session_key) DO UPDATE SET
-			upstream_id=COALESCE(sessions.upstream_id, excluded.upstream_id)`,
-		key, newID, ms(s.now()))
-	if err != nil {
-		return "", fmt.Errorf("make the session %s: %w", key, err)
-	}
-	id, _, err = s.upstreamIDOf(ctx, key)
-	if err != nil {
-		return "", err
-	}
-	if id == "" {
-		return "", fmt.Errorf("the session %s has no upstream id", key)
-	}
-	return id, nil
-}
-
-// upstreamIDOf gives the upstream id of a session.
-//
-// The second value says whether the session is there at all.
-func (s *Store) upstreamIDOf(ctx context.Context, key string) (string, bool, error) {
-	var id sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		"SELECT upstream_id FROM sessions WHERE session_key=?", key).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("read the upstream id of the session %s: %w", key, err)
-	}
-	return id.String, true, nil
-}
-
-// randomID gives an id that is not like any other.
-//
-// The id is random and not made from the session's key: two
-// conversations that begin with the same words must not end up with
-// the same upstream id.
-func randomID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("make an id: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
 }
 
 // SetEgressHealth writes a proxy's last check.

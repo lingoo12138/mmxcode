@@ -277,7 +277,7 @@ type poolStore interface {
 	ListAccounts(ctx context.Context) ([]store.Account, error)
 	ListExhausted(ctx context.Context) ([]store.Exhausted, error)
 	BindSession(ctx context.Context, sessionKey, accountID string) error
-	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	SessionState(ctx context.Context, sessionKey string) (store.SessionState, error)
 	UpstreamID(ctx context.Context, sessionKey string) (string, error)
 	SetExhausted(ctx context.Context, accountID, windowKey string, until time.Time, reason string) error
 	LatestUsageSnapshots(ctx context.Context) ([]store.UsageSnapshot, error)
@@ -336,8 +336,8 @@ func (p poolAdapter) BindSession(ctx context.Context, key, accountID string) err
 	return p.s.BindSession(ctx, key, accountID)
 }
 
-func (p poolAdapter) SessionAccount(ctx context.Context, key string) (string, bool, error) {
-	return p.s.SessionAccount(ctx, key)
+func (p poolAdapter) SessionState(ctx context.Context, key string) (store.SessionState, error) {
+	return p.s.SessionState(ctx, key)
 }
 
 // UpstreamID gives the upstream id of a session.
@@ -565,11 +565,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	// 发给上游的会话 id 是数据库里存着的那个：不重算，也不把客户端
 	// 自己那串字符串发出去。取不到就是取不到，不能拿别的顶上：顶上来的
 	// 那个上游没见过，会把这段对话当成新的一段。
-	upstreamID, err := s.Rot.UpstreamID(ctx, sess)
-	if err != nil {
-		writeError(w, proto, http.StatusServiceUnavailable, err.Error())
-		return
-	}
+	//
+	// 它是跟着轮转的 plan 一起回来的：那一行每个请求都要读一次，读出来
+	// 的东西就跟着走，不用再问一遍。池子给不出 id 的时候（那种池子没有
+	// 上游 id 这个本事），用的是请求自己算出来的那个。
+	upstreamID := sess.UpstreamID
 
 	used := map[string]bool{}
 	var lastErr error
@@ -616,6 +616,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			}
 			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
 			return
+		}
+		// 上游的会话 id 跟着轮转的 plan 一起回来了：那一行每个请求都要读
+		// 一次，读出来的东西就跟着走，不用再问一遍。
+		//
+		// 池子给不出的时候（那种池子没有上游 id 这个本事），用的还是请求
+		// 自己算出来的那个。
+		if plan.UpstreamID != "" {
+			upstreamID = plan.UpstreamID
 		}
 		if !s.busy.take(plan.AccountID) {
 			// 刚挑中的那个账号在挑的时候还是闲的，现在被人抢了：等它

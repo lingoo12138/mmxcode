@@ -4,11 +4,15 @@
 
 **Goal:** 一个聊天请求打在库上的次数从 5 条（热）/ 9 条（冷）降到 3 条 / 5 条。
 
-**Architecture:** 四个改动 —— 量具（数一个请求打了几条语句）、后台那一趟的两条读合成一条、`HasAPIKeys` 的答案缓存在内存里（谁改了谁通知）、会话那一行读一次就够（顺带把冷路径的两次写合成一条）。缓存会话行、token、账号行**不做** —— 调查里实测它们会错。
+**Architecture:** 三个改动 —— 量具（数一个请求打了几条语句）、`HasAPIKeys` 的答案缓存在内存里（谁改了谁通知）、会话那一行读一次就够（`UpstreamID` 那条语句也顺带从三条变成一条）。缓存会话行、token、账号行**不做** —— 调查里实测它们会错。后台那一趟的两条读合成一条也**不做** —— 量过了，合成的那一条更慢（见 Task 3）。
 
 **Tech Stack:** Go 1.26、`modernc.org/sqlite`（纯 Go）、`database/sql`。
 
 **规格：** `docs/superpowers/specs/2026-11-19-mmxcode-request-db-round-trips-design.md`
+
+**做的顺序：** 1 → 4 → 5 → 2。Task 2 那个测量的测试要等 Task 5 修好了才
+会过（它数的就是 Task 5 改的那个数），所以它放在最后做 —— 中间每一步仓库都
+是绿的。
 
 ---
 
@@ -48,12 +52,12 @@
 | 文件 | 干什么 |
 |---|---|
 | `internal/store/counting.go`（新） | 量具：给 SQLite 套一层计数的连接，数一个请求打了几条语句 |
-| `internal/store/store.go` | `options` 多一个 `connector`（量具从这儿进来）、`HasAPIKeys` 的缓存、`ListAccounts` 带上耗尽标记 |
-| `internal/store/sessions.go`（新） | 会话那几个方法（`store.go` 已经 2500 多行了）：`SessionState`、合成一条的 INSERT |
-| `internal/rotator/rotator.go` | `Pool` 接口的 `SessionAccount` 换成 `SessionState`；`Pick` 用带着的那一份，不再自己读 |
-| `internal/gateway/gateway.go` | `poolAdapter` 跟着换；请求那一路把带着的状态递下去 |
-| `internal/webui/keys.go` | 不用改 —— 失效在 store 自己的写方法里（见 Task 3） |
-| `internal/usage/round.go` | `Targets` 里那两条读合成一条 |
+| `internal/store/store.go` | `options` 多一个 `connector`（量具从这儿进来）、`HasAPIKeys` 的缓存 |
+| `internal/store/sessions.go`（新） | 会话那几个方法（`store.go` 已经 2500 多行了）：`SessionState`、一条语句的 `UpstreamID` |
+| `internal/rotator/rotator.go` | `Pool` 接口的 `SessionAccount` 换成 `SessionState`；`Pick` 读那一行一次，上游的 id 跟着 `Plan` 走 |
+| `internal/gateway/gateway.go` | `poolAdapter` 跟着换；请求那一路用 `plan` 里的上游 id |
+| `internal/webui/keys.go` | 不用改 —— 失效在 store 自己的写方法里（见 Task 4） |
+| `internal/usage/round.go` | 不用改 —— 那两条读合成一条更慢（见 Task 3） |
 
 ---
 
@@ -109,7 +113,11 @@ func TestTheCounterCountsTheStatements(t *testing.T) {
 func TestTheCounterCountsEveryConnection(t *testing.T) {
 	ctx := context.Background()
 	counter := NewCounter()
-	s := openTestOpts(t, WithConnector(counter.Connector()))
+	// 要「normal」才有那两条连接：常用的那条不 fsync，丢不得的那条才另开
+	// 一条（synchronous=full）。默认的时候 SQLite 自己就是 full，两条是同
+	// 一条 —— 那样这条测试就只是在数同一条连接上的语句，没有测到「另一
+	// 条」这件事。
+	s := openTestOpts(t, WithConnector(counter.Connector()), WithSynchronous("normal"))
 	makeAccount(t, s, "one")
 
 	// 这一笔走的是那条 fsync 的连接。
@@ -197,6 +205,16 @@ func (c *Counter) CountOf(text string) int {
 	return n
 }
 
+// Reset throws the count away.
+//
+// 量一个请求之前要先把准备的开头扔掉：建号、存令牌那些语句不是这个请求
+// 打的，它们混在里面量出来的条数就是多的。
+func (c *Counter) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stmts = nil
+}
+
 // Connector gives the connector that counts into this counter.
 //
 // 把它交给 WithConnector，store 的每一条连接（常用的那条和丢不得的那条）都从
@@ -241,8 +259,7 @@ func (c *countingConnector) Driver() driver.Driver {
 // countingConn counts the statements that go through it.
 //
 // 它把 SQLite 那些「可选的」接口都转发下去：少转一个，database/sql 就退回那
-// 条不带 context 的老路子上（等锁的时候就不认 context 了，规格 §5.1 说的那个
-// 「锁要等得到」就破了）。
+// 条不带 context 的老路子上（等锁的时候就不认 context 了）。
 type countingConn struct {
 	driver.Conn
 	counter *Counter
@@ -317,7 +334,6 @@ func (c *countingConn) IsValid() bool {
 	}
 	return true
 }
-
 ```
 
 `internal/store/store.go` —— 那条缝：
@@ -353,13 +369,16 @@ func WithConnector(c Connector) Option {
 //
 // 没有量具的时候是 SQLite 自己的连接 —— 那条路一点没变。有量具的时候是量具
 // 给的那条（见 counting.go）。
+//
+// 出错的时候不包一层「open sqlite」：包了的是 Open 和 openDurable，它们是
+// 唯一会把这句话说出口的地方 —— 包两遍的话那句话就重复了。
 func openConn(path string, o options) (*sql.DB, error) {
 	if o.connector == nil {
 		return sql.Open("sqlite", dsn(path, o))
 	}
 	conn, err := o.connector(dsn(path, o))
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 	return sql.OpenDB(conn), nil
 }
@@ -426,7 +445,7 @@ go test ./internal/store/ -run TestTheCounter -v
 // 的，所以每个请求读它两次。合成一条之后是一次。
 //
 // 数的是**这一行**，不是总数：总数里还有「有没有 key」和「总并发」那两条，
-// 它们带 TTL，什么时候问看缓存到期没有 —— 拿总数当断言，测的是 TTL。
+// 它们什么时候问看缓存的状态 —— 拿总数当断言，测的是缓存。
 func TestTheSessionRowIsReadOnce(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`))
@@ -442,9 +461,6 @@ func TestTheSessionRowIsReadOnce(t *testing.T) {
 	}
 	if got := h.counter.CountOf("FROM sessions"); got != 1 {
 		t.Errorf("the reads of the session row = %d, want 1: %v", got, h.counter.Statements())
-	}
-	if got := h.counter.CountOf("INSERT INTO sessions"); got != 1 {
-		t.Errorf("the writes of the session row = %d, want 1: %v", got, h.counter.Statements())
 	}
 
 	// 第二趟：会话有了，号也钉上了 —— 热的那一趟。
@@ -483,7 +499,7 @@ go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v
 go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v
 ```
 
-它现在还**不过** —— 这是这一版要修的东西。Task 5 和 Task 6 修它。
+它现在还**不过** —— 这是这一版要修的东西。Task 5 修它。
 
 - [ ] **Step 5: 把改之前的数字记下来**
 
@@ -495,169 +511,55 @@ go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v 2>&1 | tee /tmp/
 
 ---
 
-### Task 3: 后台那一趟的两条读合成一条
+### Task 3: 后台那一趟的两条读合成一条 —— **不做**（量过了）
 
-**Files:**
-- Modify: `internal/store/store.go`（`AccountsWithWindows`）
-- Modify: `internal/usage/round.go`（`Targets`）
-- Test: `internal/usage/round_test.go`
+**这一条做过了，也量过了，然后撤回来了。** 下面是量出来的数 —— 留着是给下一个
+人看的，免得再想着「合成一条总该快点吧」。
 
-读额度那一趟（`usage.Round.Targets`）读四张表。`ListAccounts` 和 `ListExhausted`
-是其中两条 —— 1000 个号的时候，第一条是 2.8 ms。合成一条，那一趟就少一次往返。
+计划的原文是：把 `usage.Round.Targets` 里的 `ListAccounts` 和 `ListExhausted`
+合成一条（`accounts` 带上它的耗尽标记），说「1000 个号的时候是 2.8 ms」。
 
-**口径一个字都不动**：两条查询的「最新」判法（时刻优先、id 平局，规格 §3.4）、
-排序、过滤，全都在合成的那一条里照抄。
+**做出来的两种写法都比原来的两条读慢**（同一个夹具：1000 个号、30 天签到，
+每个量三遍）：
 
-- [ ] **Step 1: 写失败的测试**
+| | 一次 |
+|---|---|
+| 两条读（`ListAccounts` + `ListExhausted`） | **2.6 ms** |
+| 合成一条（`UNION ALL`：两条原句各自带着自己的 `ORDER BY`，各在一个子查询里，
+外面 `LIMIT -1` 挡住 SQLite 把子查询拍平） | **4.2 ms** |
+| 合成一条（`LEFT JOIN`） | **4.2 ms** |
 
-`internal/usage/round_test.go` —— 对拍：同一个库，新旧两条路都跑一遍，结果逐
-字段比对。故意造几条 `created_at` 完全相同的读数，让新旧结果不同的时候被抓到。
+**多出来的那 1.6 ms 是怎么来的：** 合成的那一条里，账号那一行**多带几列**
+（`UNION ALL` 补四列空的，`LEFT JOIN` 带上窗口的三列）—— Go 那边每读一行账号
+就多扫几个值、多分配几个（`sql.NullString` / `sql.NullInt64` 各一个）。1000 行
+就是几千个额外的分配。
 
-```go
-// TestTheTargetsAreTheSameWithTheMergedReads says the merged read gives
-// the same targets as the two reads.
-//
-// 合成一条只是把两次往返变成一次：算出来的东西必须一个字都不差。
-func TestTheTargetsAreTheSameWithTheMergedReads(t *testing.T) {
-	ctx := context.Background()
-	s := openTest(t)
-	now := time.Now()
-	for _, id := range []string{"a", "b", "c"} {
-		makeAccount(t, s, id)
-	}
-	// 一个号的标记还没到：它该被读一次。
-	if err := s.SetExhausted(ctx, "b", "general", now.Add(-time.Hour), "quota"); err != nil {
-		t.Fatal(err)
-	}
-	// 一个号的标记还在：它不用被读。
-	if err := s.SetExhausted(ctx, "c", "general", now.Add(time.Hour), "quota"); err != nil {
-		t.Fatal(err)
-	}
+**那 2.6 ms 本身是什么：** 不是 SQLite 的排序。只扫 id 的那一条只要 **0.47 ms**
+（带上排序 0.76 ms）—— 差的 1.8 ms 是 Go 那边把 1000 行读成 1000 个
+`Account` 结构体（八个字符串字段，八千个字符串分配）。给 `accounts(created_at)`
+加一条索引再量，一模一样（2.5~2.8 ms）：**排序不是瓶颈，那条索引治不了它。**
 
-	accounts, exhausted, err := s.AccountsWithWindows(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 账号跟 ListAccounts 一样：按 created_at 排，一行一个。
-	if len(accounts) != 3 {
-		t.Fatalf("the accounts = %+v, want three", accounts)
-	}
-	// 标记跟 ListExhausted 一样：按账号排，一行一个窗口。
-	if len(exhausted) != 2 {
-		t.Fatalf("the spent windows = %+v, want two", exhausted)
-	}
-	if exhausted[0].AccountID != "b" || exhausted[1].AccountID != "c" {
-		t.Errorf("the spent windows = %+v, want b then c", exhausted)
-	}
-}
+**省下来的是什么：** 一次往返（几十微秒）。**换来的是 1.6 ms 的亏。**
 
-```
+**而且这一趟每 30 秒才跑一次**：2.6 ms 是 0.009% 的一个核。
 
-- [ ] **Step 2: 跑测试，看它失败**
+**「口径一个字都不动」也做不到**：合成的那一条只有一种排序 —— 账号按
+`created_at` 排的时候，标记就排不成 `account_id` 了（`ListExhausted` 是按
+`account_id` 排的）。要一样就得在 Go 里再排一遍：那是把两条读换成一条读加一次
+排序，外加上面那 1.6 ms。
 
-```bash
-go test ./internal/usage/ -run TestTheTargetsAreTheSameWithTheMergedReads -v
-```
+→ **这一条不做。** 两条读留着（`internal/usage/round.go` 一个字没改）。
 
-失败：编译不过（`AccountsWithWindows` 还没有）。
-
-- [ ] **Step 3: 实现**
-
-`internal/store/store.go`：
-
-```go
-// AccountsWithWindows gives the accounts and the windows that are spent,
-// in one read.
-//
-// 账号和它的耗尽标记本来是两条读：合成一条，那一趟就少一次往返 —— 1000 个
-// 号的时候是 2.8 ms（规格 §3.4）。
-//
-// 一个号有几条标记就出来几行；没有标记的号出来一行，那三条是空的。账号按
-// created_at 排（跟 ListAccounts 一样），标记按账号排（跟 ListExhausted 一
-// 样）。
-func (s *Store) AccountsWithWindows(ctx context.Context) ([]Account, []Exhausted, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group,
-			a.proxy_url, a.last_error, a.created_at, a.updated_at,
-			e.window_key, e.until, e.reason
-		FROM accounts a
-		LEFT JOIN exhausted_windows e ON e.account_id=a.id
-		ORDER BY a.created_at, e.window_key`)
-	if err != nil {
-		return nil, nil, fmt.Errorf("list accounts: %w", err)
-	}
-	defer rows.Close()
-	var (
-		out      []Account
-		spent    []Exhausted
-		lastID   string
-		haveLast bool
-	)
-	for rows.Next() {
-		var (
-			windowKey sql.NullString
-			until     sql.NullInt64
-			reason    sql.NullString
-		)
-		a, err := scanAccount(rows, &windowKey, &until, &reason)
-		if err != nil {
-			return nil, nil, fmt.Errorf("list accounts: %w", err)
-		}
-		// 一个号有几条标记就出来几行：账号只算一次。
-		if !haveLast || a.ID != lastID {
-			out = append(out, a)
-			lastID = a.ID
-			haveLast = true
-		}
-		if windowKey.Valid {
-			spent = append(spent, Exhausted{
-				AccountID: a.ID,
-				WindowKey: windowKey.String,
-				Until:     fromMS(until.Int64),
-				Reason:    reason.String,
-			})
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("list accounts: %w", err)
-	}
-	return out, spent, nil
-}
-
-```
-
-`internal/usage/round.go` —— `Targets` 里那两条读换成一条：
-
-```go
-	accounts, exhausted, err := r.Store.AccountsWithWindows(ctx)
-	if err != nil {
-		return nil, err
-	}
-```
-
-（`ListAccounts` 和 `ListExhausted` 那两句删掉。）
-
-- [ ] **Step 4: 跑测试，看它过了**
-
-```bash
-go test ./internal/store/ ./internal/usage/ -count=1
-```
-
-- [ ] **Step 5: 量一下**
-
-```bash
-go test ./internal/store/ -run XXX -bench BenchmarkRoundTargets -benchtime 30x -count=3
-```
-
-（基准要另写，见最后一节。）
-
----
+**顺带记下来的一个数**（下一个碰到「读额度这一趟」的人会想知道）：那 2.6 ms
+里 1.8 ms 是 Go 那边把行读成结构体的分配。**真的要把这一趟变快，要动的是
+「读出来的行怎么进内存」，不是 SQL。**
 
 ### Task 4: `HasAPIKeys` 的缓存用事件失效
 
 **Files:**
 - Modify: `internal/store/store.go`（`Store` 多一个 `apiKeys`；`HasAPIKeys`；`CreateAPIKey` 和 `RevokeAPIKey` 之后把缓存置掉）
 - Test: `internal/gateway/gateway_test.go`
+- Test: `internal/store/apikeys_cache_test.go`（新 —— 缓存这一层自己的测试：它数库那一趟，问五次只查一次）
 
 **为什么不能只靠 TTL：** 这个缓存管的是「**要不要鉴权**」。TTL 窗口里有人在后台
 申请了一把 key，那窗口里不带 key 的请求会被放行。窗口很短，但性质是鉴权。
@@ -668,6 +570,11 @@ go test ./internal/store/ -run XXX -bench BenchmarkRoundTargets -benchtime 30x -
 
 **唯一的坑：「false」跟「没缓存过」必须分开。** 调查的原型第一版就踩了这个坑：
 缓存永远不命中（每次都当没缓存过）。所以缓存的值是三态的。
+
+**第二个坑（实现的时候发现的，计划里原来没有）：查库和写答案要锁在一起。**
+一个正在查库的请求会在别人申请了 key 之后，把「一把都没有」这个旧答案写回
+去 —— 那个答案留在缓存里不动了，门就一直开着。所以 `HasAPIKeys` 查库的那一
+段和 `forgetAPIKeys` 拿着**同一把锁**。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -745,7 +652,7 @@ const (
 	keysUnknown keyState = iota
 	// keysNone says there is no key.
 	keysNone
-	// keysSome says there at least one key.
+	// keysSome says there is at least one key.
 	keysSome
 )
 
@@ -760,6 +667,12 @@ const (
 	// key，不带 key 的请求被放行。所以它不能只靠 TTL 过期：谁改了谁就通
 	// 知（见 forgetAPIKeys）。
 	apiKeys atomic.Int32
+	// apiKeysMu guards the moment when the answer is put back.
+	//
+	// 查库和把答案写回去要锁在一起：不然一个正在查库的请求会在别人申请了
+	// key 之后，把「一把都没有」这个旧答案写回去 —— 那个旧答案就留在缓存
+	// 里不动了，门就一直开着（见 forgetAPIKeys）。
+	apiKeysMu sync.Mutex
 ```
 
 `internal/store/store.go` —— 那个答案：
@@ -767,9 +680,24 @@ const (
 ```go
 // HasAPIKeys says whether any key has been made in the console.
 //
+// 一把都没有的时候网关不鉴权：那时候它只该听在本机。申请过就不一样
+// 了：那是有人打算从别的机器用它。
+//
 // 答案记在内存里：这个数每个请求都要问一次，而它变不变只有一种理由 —— 有
 // 人申请了或者撤销了 key。谁改了谁就把这个答案扔掉（见 forgetAPIKeys）。
 func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
+	switch keyState(s.apiKeys.Load()) {
+	case keysSome:
+		return true, nil
+	case keysNone:
+		return false, nil
+	}
+	// 没查过：去查库。查库和写答案锁在一起，不然一个正在查库的请求会在
+	// 别人申请了 key 之后，把「一把都没有」这个旧答案写回去 —— 那个答案
+	// 留在缓存里不动了，门就一直开着。
+	s.apiKeysMu.Lock()
+	defer s.apiKeysMu.Unlock()
+	// 等锁的这会儿，答案可能已经有人填上了。
 	switch keyState(s.apiKeys.Load()) {
 	case keysSome:
 		return true, nil
@@ -793,7 +721,11 @@ func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
 //
 // 谁改了 key 谁就通知：这个答案是「要不要鉴权」，它慢了半秒就是半秒的窗口
 // 里不带 key 的请求被放行。
+//
+// 它拿着那把锁：不然一个正在查库的请求会在这次通知之后把旧答案写回去。
 func (s *Store) forgetAPIKeys() {
+	s.apiKeysMu.Lock()
+	defer s.apiKeysMu.Unlock()
 	s.apiKeys.Store(int32(keysUnknown))
 }
 
@@ -848,17 +780,15 @@ go test ./internal/store/ ./internal/webui/ -count=1
 `internal/rotator/rotator_test.go` —— 轮转读那一行的时候，两列要一起拿：
 
 ```go
-// TestTheSessionRowIsReadInOneGo says the rotator reads the session's row
-// in one read.
+// TestTheSessionRowIsReadInOneGo says the rotator reads the session's
+// row in one read.
 //
 // 那一行的两列是同一行：分开读就是两次往返，而每个请求都要问这一行。
 func TestTheSessionRowIsReadInOneGo(t *testing.T) {
-	ctx := context.Background()
-	p := &fakePool{}
+	p := newFakePool(acc("acc_01"))
 	r := newRotator(p, Options{Strategy: StrategySticky})
-	makeAccount(t, p, "acc_01")
 
-	if _, err := r.Pick(ctx, "sess-1", "MiniMax-M3", nil); err != nil {
+	if _, err := r.Pick(context.Background(), "sess-1", "MiniMax-M3", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.sessionReads; got != 1 {
@@ -884,8 +814,8 @@ go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v
 **第一步：store 那边。**
 
 `internal/store/sessions.go`（新）—— 把 `BindSession`、`SessionAccount`、
-`UpstreamID`、`upstreamIDOf`、`randomID` 从 `store.go` 挪过来（搬家，不改），
-再加一个新方法：
+`UpstreamID`、`randomID` 从 `store.go` 挪过来（搬家，`UpstreamID` 除外：它变成
+一条语句了，见下），再加一个新方法：
 
 ```go
 // SessionState is what the store knows about a session's row.
@@ -926,6 +856,54 @@ func (s *Store) SessionState(ctx context.Context, sessionKey string) (SessionSta
 		AccountID:  account.String,
 		UpstreamID: upstream.String,
 	}, nil
+}
+
+```
+
+**`UpstreamID` 变成一条语句**（它现在是三条：读、写、再读一遍）：
+
+```go
+// UpstreamID gives the session's upstream id, making one if the
+// session has none.
+//
+// 一条语句：写完把这一行最后的上游 id 拿回来（RETURNING）。从前是「读一
+// 遍、写一遍、再读一遍」—— 那最后一遍是为了知道别人有没有先写一个 id。
+// RETURNING 是同一件事，而且省掉两趟。
+//
+// 那一行已经有了 id 的时候：写的还是那一行，id 不换（先到先得）。
+//
+// The id is random: it is not derived from the session key, so the
+// upstream never sees a hash of the words in the request. It is also
+// kept: the same session has the same upstream id every time it is
+// asked for.
+//
+// The key is what decides which id a conversation gets, and two
+// conversations that arrive under the same key are one conversation as
+// far as this store can tell. Telling them apart is the caller's job:
+// it has to give them different keys.
+//
+// The session does not have to be bound to an account yet: a
+// conversation has an upstream id before it has an account.
+func (s *Store) UpstreamID(ctx context.Context, key string) (string, error) {
+	newID, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	var id string
+	err = s.db.QueryRowContext(ctx, `
+		INSERT INTO sessions (session_key, account_id, upstream_id, updated_at)
+		VALUES (?, NULL, ?, ?)
+		ON CONFLICT(session_key) DO UPDATE SET
+			upstream_id=CASE WHEN sessions.upstream_id IS NULL OR sessions.upstream_id=''
+			                  THEN excluded.upstream_id ELSE sessions.upstream_id END
+		RETURNING upstream_id`, key, newID, ms(s.now())).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("make the session %s: %w", key, err)
+	}
+	if id == "" {
+		return "", fmt.Errorf("the session %s has no upstream id", key)
+	}
+	return id, nil
 }
 
 ```
@@ -977,8 +955,12 @@ func (s *Store) SessionState(ctx context.Context, sessionKey string) (SessionSta
 	// 上游的 id：那一行里的那个。
 	//
 	// 那一行没有 id（新的对话）：问池子要一个 —— 它会编一个写下去。
+	//
+	// 只有「那一行还没有 id」的时候才问：问一次就是一次写，而热路径上那一
+	// 行已经有 id 了（那一行每个请求都要读一次，所以问出来的东西就跟着
+	// 走，不用再问一遍）。
 	upstreamID := state.UpstreamID
-	if upstreamID == "" {
+	if upstreamID == "" && sessionKey != "" {
 		if ids, ok := r.pool.(UpstreamIDs); ok {
 			upstreamID, err = ids.UpstreamID(ctx, sessionKey)
 			if err != nil {
@@ -988,8 +970,16 @@ func (s *Store) SessionState(ctx context.Context, sessionKey string) (SessionSta
 	}
 ```
 
+**`sessionKey != ""` 那个条件不能省：** 没有会话就没有对话要命名 —— 空的会话行
+不该有（`Rotator.UpstreamID` 里就是这么写的，注释也是那么说的）。
+
+**`upstreamID == ""` 那个条件更不能省：** 库里那个 `UpstreamID` 现在是**一条写**
+（`INSERT ... ON CONFLICT ... RETURNING`）：那一行已经有 id 的时候它照样写一遍
+（实测：这种 upsert ≈ 918 µs，一条普通的读 ≈ 32 µs）。热路径上那一行**已经有
+id 了**，所以不能每趟都去问池子要 id。
+
 （`Plan` 的每一处 `return r.plan(...)` 都要带上这个 id —— 最省事的做法是
-`r.plan` 多收一个参数。）
+`r.plan` 多收一个参数。`Pick` 里有**五处**。）
 
 **第三步：网关那边。**
 
@@ -1042,25 +1032,43 @@ go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v
 **同一台机器，同一条命令**（量具是 Task 1 做的那个）。
 
 ```bash
-go test ./internal/gateway/ -run TestTheSessionRowIsReadOnce -v
+go test ./internal/gateway/ -run "TestTheSessionRowIsReadOnce|TestTheStatementsOfARequest" -v
 ```
 
-| | 改之前 | 改之后 |
+| | 改之前 | 改之后（量出来的） |
 |---|---|---|
-| 热请求的语句数 | 5 | ? |
-| 冷请求的语句数 | 9 | ? |
-| 热请求：会话那一行读 | 2 | 1 |
-| 热请求：会话那一行写 | 0 | 0 |
-| 冷请求：会话那一行读 | 3 | ? |
-| 冷请求：会话那一行写 | 2 | ? |
-| 后台那一趟的读 | 4 | 3 |
+| 热请求的语句数 | 5 | **3** |
+| 冷请求的语句数 | 9 | **5** |
+| 热请求：会话那一行读 | 2 | **1** |
+| 热请求：会话那一行写 | 0 | **0** |
+| 冷请求：会话那一行读 | 3 | **1** |
+| 冷请求：会话那一行写 | 2 | **2** |
+| 后台那一趟的读 | 4 | **4**（合成更慢，不做 —— 见 Task 3） |
+
+**改之后的数是量出来的**（`TestTheStatementsOfARequest`，在仓库里留着）：
+
+- 热请求那 3 条：读会话那一行 + `FROM tokens` + `FROM accounts WHERE id=?`；
+- 冷请求那 5 条：上面那 3 条，加 `INSERT INTO sessions … RETURNING upstream_id`
+  （造上游 id）和 `INSERT INTO sessions (session_key, account_id, updated_at)`
+  （钉号）—— 会话那一行**读 1 次、写 2 次**；
+- 还有两个参考数：**第一趟**（什么都还没缓存）是 **10** 条（多出「有没有 key」
+  1 条、「总并发」1 条、fallback 那 3 条）；**后台那一趟**（读额度）是 **4** 条。
+
+**量具怎么数：** 它挂在驱动这一层，数的是 `PrepareContext` / `ExecContext` /
+`QueryContext` 三个口子。一条**只准备一次、跑很多遍**的语句只算 **1** 条
+（数在准备那一下）—— 像 `SaveCheckins` 那种批量写，N 行也只算 1 条，想看行数
+的话这个量具给不了。这次量到的 3 / 5 / 10 都是「一条语句跑一次」的一次性查
+询，走的是直接执行那条路，所以条数就是真的往返次数。
+
+（热请求的 3 和冷请求的 5 都是**缓存热了**的数：「有没有 key」那条问过一次就
+不问了（它是事件失效的，谁改了 key 谁就通知），「总并发」那条带 TTL，缓存过期
+的时候才问。）
 
 改之前的那些数是规格 §2 里量出来的（调查在 `E:\tmp\inv-req\repo` 的副本上做，
 `internal/store/counting.go` 给 SQLite 套了一层计数）。
 
-**总数不是断言的东西** —— 里面还有「有没有 key」和「总并发」那两条，它们带
-TTL，什么时候问看缓存到期没有。断言的是**会话那一行**的读和写：那才是这一
-版动的东西。
+**总数不是断言的东西** —— 里面还有「有没有 key」和「总并发」那两条，它们什么
+时候问看缓存的状态。断言的是**会话那一行**的读和写：那才是这一版动的东西。
 
 ## 下一个（不在这一版里）
 
