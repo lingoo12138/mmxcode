@@ -99,3 +99,14 @@ pool:
   read_on_admit: true
 
 db: "/data/mmxcode.db"
+
+# 库自己怎么干活。
+sqlite:
+  # 一条连接留多少 MB 的页在工作集里（0 = SQLite 自己的默认，2 MB；负数不许）
+  cache_mb: 8
+  # 写盘：normal = 交给操作系统（断电可能丢最近几笔），full = 每一笔都
+  # fsync（慢一点）
+  synchronous: normal
+  # 签到的历史留多少天（0 = 永远留；少于 7 天不许 —— 签到的积分七天就过期，
+  # 「签到待补」那一档要用的那几天的记录会被清掉）
+  checkin_retention_days: 30

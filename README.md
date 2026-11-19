@@ -344,6 +344,24 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 
 两个值写错了 `mmxcode serve` 会拒绝启动，而不是悄悄按别的来：`schedule.checkin_at` 不是 `HH:MM` 会报 `schedule.checkin_at = "..."; want HH:MM`，`upstream.site` 不是 `global` 会报 `upstream.site = "..."; only "global" is supported`。
 
+### 数据库
+
+库是 SQLite，用的是纯 Go 的那一份（`modernc.org/sqlite`）—— 不用 cgo，交叉编译出来的东西哪儿都能跑。路径是 `db`。
+
+| 键 | 默认值 | 作用 |
+|---|---|---|
+| `sqlite.cache_mb` | `8` | 一个连接留多少 MB 的页缓存。读过的页留在手边，工作集装得下就不用一遍遍去磁盘要页 |
+| `sqlite.synchronous` | `"normal"` | 写下去多硬。`normal`：交给操作系统，断电的时候最近这几笔可能丢（**库不会坏**）。`full`：每一笔都 fsync，慢一个数量级 |
+| `sqlite.checkin_retention_days` | `30` | 签到记录留几天。签到的积分七天就过期了，再往前的记录除了占地方没有别的用处。0 = 永远留。**少于 7 天会被拒** |
+
+**丢不得的那两笔走一条会 fsync 的连接。** 续好的 token 和清掉的「用完」标记走同一个库的另一条连接，那条连接每次提交都 fsync —— 断电不会丢这两笔。别的写入不 fsync：那一趟的账下一趟再对就是。
+
+> 早先这里是把写日志刷进库文件（`wal_checkpoint`）。那个做法会把整个日志抄回库文件，抄的时候占着写锁，别人要写就排队 —— 排队排满了就是 `database is locked`。现在改成 fsync：只等盘，不抄页，也不挡别人。
+
+**写错的 `sqlite:` 一节会让网关拒绝启动。** `synchronous` 只认 `normal` 和 `full`；`cache_mb` 不能是负数；`checkin_retention_days` 要么 0（永远留）要么 7 天以上（少于 7 天的话，「签到待补」那一档要用的那几天的记录会被清掉）。
+
+**签到的记录一批一批写。** 一趟签到几百个号，五十个一批写一个事务 —— 一个号一个事务要把签到表的那几页重写一遍。丢得起：最多五十个号今天的积分进不了池，下一趟补上。
+
 ### 读额度
 
 额度不是所有账号一起读的 —— 冷账号的数是旧的，读它也是把旧的数再读一遍。调度器每 `usage.refresh.scan_every` 扫一遍，只读**该读的账号**：

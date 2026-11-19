@@ -100,7 +100,9 @@ func newRoot() (*cobra.Command, *env) {
 			cfg.Server.APIKeys = append(cfg.Server.APIKeys, apiKeysFromEnv(v)...)
 		}
 		e.cfg = cfg
-		s, err := store.Open(cfg.DB)
+		s, err := store.Open(cfg.DB,
+			store.WithCacheMB(cfg.SQLite.CacheMB),
+			store.WithSynchronous(cfg.SQLite.Synchronous))
 		if err != nil {
 			return err
 		}

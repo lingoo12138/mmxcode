@@ -107,6 +107,16 @@ func NextCheckin(now time.Time, at time.Time, jitter time.Duration) time.Time {
 	return next.Add(d)
 }
 
+// checkinBatch is how many check-in records are written at once.
+//
+// 一趟签到有几百个号。一个号一个事务的话，每个号都要把签到表的那一页和
+// 它的几个索引页重写一遍 —— 一千个号是 17 MB 的日志，而五十个一批是
+// 1 MB（量出来的：每个号 1133 B，而不是 18004 B）。
+//
+// 五十个一批也是丢得起的：一批丢了的记录是「签到成了、可是记录没了」，
+// 最多五十个号今天的积分进不了池（规格 §5.3）。
+const checkinBatch = 50
+
 // CheckinAll claims every account's daily credits.
 //
 // 只签今天还没签的号（规格 §5.2）：签过的再签一次，站点只会答 done，白
@@ -123,9 +133,11 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 	}
 	out := make([]CheckinResult, 0, len(accounts))
 	checked := []string{}
+	// 记录攒起来一批一批写：一个号一个事务要把签到的那几页重写一遍。
+	records := make([]store.Checkin, 0, checkinBatch)
 	for _, a := range accounts {
 		r := CheckinResult{AccountID: a.ID}
-		res, err := s.Mgr.Checkin(ctx, a.ID)
+		res, rec, err := s.Mgr.CheckinRecord(ctx, a.ID)
 		if err != nil {
 			r.Error = err.Error()
 		} else {
@@ -133,9 +145,16 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 			r.Credit = res.Credit
 			r.Streak = res.Streak
 			checked = append(checked, a.ID)
+			records = append(records, rec)
+			if len(records) >= checkinBatch {
+				s.Mgr.RecordCheckins(ctx, records)
+				records = nil
+			}
 		}
 		out = append(out, r)
 	}
+	// 最后不满一批的也写下去。
+	s.Mgr.RecordCheckins(ctx, records)
 	// 签到给的积分是账本池里的：不读额度，卡上的余额还是签到前的旧
 	// 数。签到的账号凑成一批，一次有预算地读；读到的数说有额度就清
 	// 掉"用完"的标记。
@@ -363,6 +382,26 @@ func (s *Scheduler) checkinAll(ctx context.Context) {
 			continue
 		}
 		fmt.Printf("checkin %s: %s\n", r.AccountID, r.Outcome)
+	}
+	s.pruneCheckins(ctx)
+}
+
+// pruneCheckins throws away the check-in history that is not needed any
+// more.
+//
+// 签到的历史是唯一会长个没完的东西：一天一个号一行，1000 个号一年 36 万
+// 行、40 MB。签到的积分七天就过期了（规格 §5.3）—— 再往前的记录除了占
+// 地方没有别的用处。
+//
+// 签到那一趟跑完删一次：那是每天唯一一趟往签到表里写的事。
+func (s *Scheduler) pruneCheckins(ctx context.Context) {
+	days := s.Cfg.SQLite.CheckinRetentionDays
+	if days <= 0 {
+		return
+	}
+	cut := time.Now().AddDate(0, 0, -days)
+	if err := s.Mgr.Store.PruneCheckins(ctx, cut); err != nil {
+		fmt.Printf("checkin: the old check-ins could not be thrown away: %v\n", err)
 	}
 }
 

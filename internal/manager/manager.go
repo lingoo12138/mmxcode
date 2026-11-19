@@ -260,11 +260,18 @@ func tokenFromStore(stored store.Token) *oauth.Token {
 // the site hands out access tokens that live an hour, so the token of
 // the later renewal ends later. Two tokens that end at the same time
 // are the same step of the chain, and the one in the store is kept.
+//
+// 库里存的是毫秒（tokens.expires_at 是 UnixMilli），而续签那一刻拿到的是
+// 毫秒以下的精度。所以比的时候**两边都要砍到毫秒**：不砍的话，库里那个 =
+// fromMS(ms(手里那个))，永远比手里那个「旧」那么一点（除非它正好落在毫秒
+// 的边界上），于是 newerThanStored 永远为真 —— 每个被代理的请求都以为要
+// 重写一遍 token 行，每一遍都是一个写事务加一次 fsync，写锁排长队，排满
+// busy_timeout 就是 SQLITE_BUSY。
 func newerThanStored(tok *oauth.Token, stored store.Token) bool {
 	if tok == nil || tok.Expires.IsZero() {
 		return false
 	}
-	return stored.ExpiresAt.Before(tok.Expires)
+	return stored.ExpiresAt.Before(store.AtMillisecond(tok.Expires))
 }
 
 // tokenReadError says what it is that the token could not be read.
@@ -467,23 +474,35 @@ func (m *Manager) newerToken(cur *oauth.Token, refused string, held *oauth.Token
 // later. Two tokens that end at the same time are the same step of the
 // chain, and the one in the store is kept: writing the other one down
 // buys nothing and risks a refresh token that is spent already.
+//
+// 库里存的是毫秒，而续签那一刻拿到的是毫秒以下的精度。所以比的时候**两边
+// 都要砍到毫秒**：不砍的话，库里那个 = fromMS(ms(手里那个))，永远比手里
+// 那个「旧」那么一点，于是这个守卫永远是「库里那个旧，写吧」—— 每个请求
+// 都重写一遍 token 行，每一遍都是一个写事务加一次 fsync，写锁排长队，排满
+// busy_timeout 就是 SQLITE_BUSY。
 func (m *Manager) saveToken(ctx context.Context, accountID string, tok *oauth.Token) error {
 	stored, err := m.Store.GetToken(ctx, accountID)
-	if err == nil && !stored.ExpiresAt.Before(tok.Expires) {
+	if err == nil && !stored.ExpiresAt.Before(store.AtMillisecond(tok.Expires)) {
 		// The store already holds a token that is at least as new.
 		return nil
 	}
 	// A token that could not be read is written over: the store is
 	// the only place the token lives, and a renewal that is not
 	// written down is a renewal that is lost.
-	return m.Store.SaveToken(ctx, store.Token{
+	if err := m.Store.SaveToken(ctx, store.Token{
 		AccountID: accountID,
 		Access:    tok.Access,
 		Refresh:   tok.Refresh,
 		ExpiresAt: tok.Expires,
 		Subject:   tok.Subject,
 		UpdatedAt: time.Now(),
-	})
+	}); err != nil {
+		return err
+	}
+	// 写下去了，库里那份就追上了手里这份 —— 那条「写不下去」的记号不再
+	// 成立，把它擦掉。
+	m.clearTokenNote(ctx, accountID)
+	return nil
 }
 
 // ForceRenew renews an account's token without waiting for it to be
@@ -608,6 +627,36 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 	// not read back to be written again. A sign-out that happened
 	// while this was being written must not be undone by it.
 	_ = m.Store.SetAccountLastError(ctx, accountID, reason, time.Now())
+}
+
+// clearTokenNote takes away the note about a token that could not be
+// written down.
+//
+// 那条记号说的是「库里那份比手里那份旧」。token 写成功了，库里那份就追上
+// 了手里那份 —— 记号不成立了，可它还挂着：last_error 只有在改状态的时候
+// 才会被清掉，所以一次暂时的忙会在一个好好的账号上留一条「这个号有问题」，
+// 一直留到下一次改状态为止。
+//
+// 所以 token 写成功之后要把它擦掉。只擦这一条：别的理由（续签失败但手里
+// 那份还好之类）说的是别的事，擦了就是把真话也藏起来。
+//
+// 它是尽力而为的：擦不掉就算了，下一次写成功还会再擦一次。
+func (m *Manager) clearTokenNote(ctx context.Context, accountID string) {
+	a, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return
+	}
+	if a.Status == store.StatusSignedOut {
+		// The sign-out has its own reason, and that is the one that
+		// matters: it says why the site does not take this account
+		// any more.
+		return
+	}
+	if !strings.HasPrefix(a.LastError, tokenNotWrittenReason) {
+		// Some other reason is on the account, and it is still true.
+		return
+	}
+	_ = m.Store.SetAccountLastError(ctx, accountID, "", time.Now())
 }
 
 // ErrNotSignedOut says the account is not signed out.
@@ -1053,32 +1102,11 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 
 // Checkin claims an account's daily credits.
 func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcome, error) {
-	a, err := m.Store.GetAccount(ctx, accountID)
+	out, rec, err := m.CheckinRecord(ctx, accountID)
 	if err != nil {
 		return checkin.Outcome{}, err
 	}
-	tok, err := m.Token(ctx, accountID)
-	if err != nil {
-		return checkin.Outcome{}, err
-	}
-	acc, err := m.accFor(a)
-	if err != nil {
-		return checkin.Outcome{}, err
-	}
-	out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
-	if err != nil {
-		return checkin.Outcome{}, err
-	}
-	day := m.Store.Today()
-	if err := m.Store.SaveCheckin(ctx, store.Checkin{
-		AccountID: accountID,
-		Day:       day,
-		Outcome:   out.Outcome,
-		Credit:    out.Credit,
-		Streak:    out.Streak,
-		Message:   out.Message,
-		CreatedAt: time.Now(),
-	}); err != nil {
+	if err := m.Store.SaveCheckin(ctx, rec); err != nil {
 		// The check-in worked: the credits are claimed and the day
 		// cannot be claimed again. The record of it is lost, so the
 		// credit and the streak are recorded nowhere.
@@ -1086,9 +1114,59 @@ func (m *Manager) Checkin(ctx context.Context, accountID string) (checkin.Outcom
 		// The failure is written down on the account rather than
 		// returned: the caller would tell the user that the check-in
 		// failed, and it did not.
-		m.note(ctx, accountID, checkinNotWrittenReason+": "+err.Error())
+		m.note(ctx, rec.AccountID, checkinNotWrittenReason+": "+err.Error())
 	}
 	return out, nil
+}
+
+// CheckinRecord checks an account in and gives the record of it.
+//
+// 记录不在这里写：写是另一件事。一趟签到有几百个号，一个号一个事务的话，
+// 每个号都要把签到表的那一页和它的几个索引页重写一遍 —— 一千个号是 17 MB
+// 的日志，而合成一批写是 1 MB（量出来的：每个号 1133 B，而不是 18004 B）。
+//
+// 那一趟用 `RecordCheckins` 把记录一批一批写下去。
+func (m *Manager) CheckinRecord(ctx context.Context, accountID string) (checkin.Outcome, store.Checkin, error) {
+	a, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return checkin.Outcome{}, store.Checkin{}, err
+	}
+	tok, err := m.Token(ctx, accountID)
+	if err != nil {
+		return checkin.Outcome{}, store.Checkin{}, err
+	}
+	acc, err := m.accFor(a)
+	if err != nil {
+		return checkin.Outcome{}, store.Checkin{}, err
+	}
+	out, err := checkin.New(acc).Run(ctx, tok.Access, a.UserID)
+	if err != nil {
+		return checkin.Outcome{}, store.Checkin{}, err
+	}
+	return out, store.Checkin{
+		AccountID: accountID,
+		Day:       m.Store.Today(),
+		Outcome:   out.Outcome,
+		Credit:    out.Credit,
+		Streak:    out.Streak,
+		Message:   out.Message,
+		CreatedAt: time.Now(),
+	}, nil
+}
+
+// RecordCheckins writes the records of a batch of check-ins down.
+//
+// 记不住的那些号要记在账号上：签到成了，记录没了。而记在库里的那笔正是
+// 签到给的积分进池的那条路（规格 §5.3）。
+func (m *Manager) RecordCheckins(ctx context.Context, records []store.Checkin) {
+	if len(records) == 0 {
+		return
+	}
+	if err := m.Store.SaveCheckins(ctx, records); err != nil {
+		for _, r := range records {
+			m.note(ctx, r.AccountID, checkinNotWrittenReason+": "+err.Error())
+		}
+	}
 }
 
 // LatestWindows gives an account's saved windows.

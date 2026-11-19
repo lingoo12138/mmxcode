@@ -349,6 +349,39 @@ type Pool struct {
 	ReadOnAdmit bool `yaml:"read_on_admit" json:"read_on_admit"`
 }
 
+// SQLite is the database's own tuning.
+//
+// 它是「库怎么干活」的几件事：页缓存多大、写盘要不要每次都 fsync、签到
+// 的历史留多少天。
+type SQLite struct {
+	// CacheMB is how many MB of pages one connection may keep.
+	//
+	// 页缓存是「读过的页先留在手边」：工作集装得下的时候，同一批查询不
+	// 用一遍一遍地去磁盘要页（1000 个号、一年的签到：填池那条查询从
+	// 11.7 ms 到 5.9 ms）。0 是 SQLite 自己的默认（2 MB）。
+	//
+	// 负数是不许的：它会悄悄按 0 办（store 的 dsn 只在 cacheMB > 0 的时
+	// 候才加那条 pragma），写的人以为自己说了什么，其实什么也没说。
+	CacheMB int `yaml:"cache_mb" json:"cache_mb"`
+	// Synchronous is how hard a write hits the disk: "normal" or "full".
+	//
+	// "normal"：写下去就交给操作系统，断电的时候最近这几笔可能丢（库不
+	// 会坏）。"full"：每一笔都 fsync（同一笔写：normal 64µs 对 full
+	// 874µs —— full 那一笔要等盘）。空是 SQLite 自己的默认（"full"）。
+	Synchronous string `yaml:"synchronous" json:"synchronous"`
+	// CheckinRetentionDays is how many days of check-ins are kept.
+	//
+	// 签到的积分七天就过期了，网页上只摆最近 5 条 —— 再往前的记录除了
+	// 占地方没有别的用处（1000 个号一年 36 万行、40 MB）。0 是永远留。
+	//
+	// 少于 7 天是不许的（负数也不行）：「待补」那一档只看最近七天的签
+	// 到，而清理是按站点的那个日子删的，站点时区跟 UTC 差着几个钟头。
+	// 留 6 天的话，被删掉的那一段里可能有七天窗口还要用的行 —— 那些号
+	// 就永远等不到「签到待补」那一读，卡上摆的数就一直旧着。7 天是刚够
+	// 的。
+	CheckinRetentionDays int `yaml:"checkin_retention_days" json:"checkin_retention_days"`
+}
+
 // Config is the whole configuration.
 type Config struct {
 	Server   Server   `yaml:"server" json:"server"`
@@ -365,6 +398,8 @@ type Config struct {
 	Concurrency Concurrency `yaml:"concurrency" json:"concurrency"`
 	// Pool holds how many accounts the gateway keeps in memory.
 	Pool Pool `yaml:"pool" json:"pool"`
+	// SQLite holds how the database itself works.
+	SQLite SQLite `yaml:"sqlite" json:"sqlite"`
 }
 
 // Default is the configuration a file starts from.
@@ -411,6 +446,11 @@ func Default() Config {
 			MemoryBudgetMB: 32,
 			SessionWindow:  Duration(time.Hour),
 			ReadOnAdmit:    true,
+		},
+		SQLite: SQLite{
+			CacheMB:              8,
+			Synchronous:          "normal",
+			CheckinRetentionDays: 30,
 		},
 		DB: "/data/mmxcode.db",
 	}
@@ -465,7 +505,53 @@ func Load(path string) (Config, error) {
 	if err := c.checkAPIKeys(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	if err := c.checkSQLite(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	return c, nil
+}
+
+// checkSQLite refuses the tuning the database does not know, and the
+// numbers that would quietly mean something else.
+//
+// 写盘的狠劲只有两档：normal 和 full。别的词 SQLite 不认，库打开的时候
+// 才说，那时已经晚了一步 —— 宁可在这里报错。
+//
+// 另外两个键写错的时候没有人会报错：它们会悄悄按别的意思来。负的页缓存
+// 按 0 办（store 的 dsn 只在 cacheMB > 0 的时候才加那条 pragma），负的
+// 保留天数按"永远留"办（pruneCheckins 见到 days <= 0 就不删）。写 -1
+// 的人以为自己说了什么，其实什么也没说 —— 宁可在这里报错。
+//
+// 保留天数还有一条更细的：1 到 6 天不许。签到的积分七天就过期，所以
+// 「待补」那一档只看最近七天的签到（usage/round.go 的 checkinWindow =
+// 7 * 24 * time.Hour，它问 Store.CheckinTimes(ctx, now.Add(-checkinWindow))）。
+// 而清理是按**站点的那个日子**删的（Store.PruneCheckins 删的是
+// day < DayKey(cut)，day 是站点时区的那一天），站点时区跟 UTC 差着几个
+// 钟头。留 6 天的话，被删掉的那一段里可能有七天窗口还要用的行 —— 那些
+// 号就永远等不到「签到待补」那一读，卡上摆的数就一直旧着。留 7 天是刚
+// 够的：DayKey 对时刻是单调的，一条 created_at >= now-7天 的行，它的
+// 站点那天一定 >= DayKey(now-7天)，所以删 day < DayKey(now-7天) 删不到
+// 它。
+func (c *Config) checkSQLite() error {
+	switch strings.ToLower(c.SQLite.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("sqlite.synchronous is %q: it is \"normal\" or \"full\"",
+			c.SQLite.Synchronous)
+	}
+	if c.SQLite.CacheMB < 0 {
+		return fmt.Errorf("sqlite.cache_mb is %d: it is 0 (SQLite's own default, 2 MB) or more",
+			c.SQLite.CacheMB)
+	}
+	if c.SQLite.CheckinRetentionDays < 0 {
+		return fmt.Errorf("sqlite.checkin_retention_days is %d: it is 0 (keep every check-in) or 7 or more",
+			c.SQLite.CheckinRetentionDays)
+	}
+	if c.SQLite.CheckinRetentionDays > 0 && c.SQLite.CheckinRetentionDays < 7 {
+		return fmt.Errorf("sqlite.checkin_retention_days is %d: it is 0 (keep every check-in) or 7 or more, because the check-in window is seven days",
+			c.SQLite.CheckinRetentionDays)
+	}
+	return nil
 }
 
 // checkAPIKeys refuses the api keys that are not keys.

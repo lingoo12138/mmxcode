@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -347,6 +349,209 @@ func TestCheckinAll(t *testing.T) {
 	if results[0].Outcome != "claimed" {
 		t.Fatalf("outcome = %q", results[0].Outcome)
 	}
+}
+
+// TestTheCheckinRoundRecordsEveryCheckin says every check-in of a round
+// is written down.
+//
+// 记录是签到给的积分进池的那条路（规格 §5.3）：签到了可是记录没了，那个
+// 号今天的积分就进不了池。
+//
+// 一趟签到把记录攒起来一批一批写下去（一个号一个事务要把签到的那几页重
+// 写一遍），所以这一条守的是「攒起来的那些也都被写下去了」。
+func TestTheCheckinRoundRecordsEveryCheckin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	// 三个号：签到那一趟的记录是攒起来写的，攒不满一批也要写下去。
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	sc.CheckinAll(ctx)
+
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		rows, err := s.ListCheckins(ctx, id, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("the check-ins of %s = %+v, want one", id, rows)
+		}
+		if rows[0].Credit != 25 {
+			t.Fatalf("the credit of %s = %v, want 25", id, rows[0].Credit)
+		}
+	}
+}
+
+// TestTheCheckinRecordsAreWrittenInBatches says the check-in records are
+// written fifty at a time.
+//
+// 一趟签到几百个号。一个号一个事务要把签到的几页重写一遍（1000 个号是
+// 17 MB 的日志，五十个一批是 1 MB）。而且一批中间要是有一条坏了，那一批
+// 整批都不落 —— 所以「攒够五十写一次」这件事要验。
+//
+// 怎么验「攒够五十」：让最后一个号的那条记录写不进去（一个触发器拒绝它）。
+// 全是一批（51 个一个事务）的话，那一批整个不落 —— 一个记录都没有；攒成
+// 五十加一的话，前五十个落了，最后那个没落。
+func TestTheCheckinRecordsAreWrittenInBatches(t *testing.T) {
+	ctx := context.Background()
+	s := checkinRound(t, 51, "acc_50")
+
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		rows, err := s.ListCheckins(ctx, id, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("the check-ins of %s = %+v, want one", id, rows)
+		}
+	}
+	rows, err := s.ListCheckins(ctx, "acc_50", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("the check-ins of acc_50 = %+v, want none", rows)
+	}
+}
+
+// TestAFullBatchOfCheckinRecordsIsAllWritten says a round of exactly
+// fifty accounts writes all fifty records.
+//
+// 攒够五十就写出去，写出去之后最后那一趟是空的 —— 空的也得写（不然最后
+// 几个号的记录就攒着，等下一趟才落）。凑巧五十个的时候最容易错，所以
+// 单独验一遍。
+func TestAFullBatchOfCheckinRecordsIsAllWritten(t *testing.T) {
+	ctx := context.Background()
+	s := checkinRound(t, 50, "")
+
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		rows, err := s.ListCheckins(ctx, id, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("the check-ins of %s = %+v, want one", id, rows)
+		}
+	}
+}
+
+// checkinRound runs a check-in round over n accounts.
+//
+// refuse 是那个「记录写不进去」的号（空就是没有）。它靠一个触发器 stands
+// in for 满盘或者只读的库文件 —— 写被拒了，读照常。
+func checkinRound(t *testing.T, n int, refuse string) *store.Store {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "t.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("acc_%02d", i)
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if refuse != "" {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		q := `CREATE TRIGGER refuse_one BEFORE INSERT ON checkins WHEN NEW.account_id = '` +
+			refuse + `' BEGIN SELECT RAISE(ABORT, 'the disk is full'); END`
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	// The account API is pointed at the test server. Without this the
+	// test asks MiniMax for the numbers and waits for an answer that
+	// never comes.
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	sc.CheckinAll(ctx)
+	return s
 }
 
 // TestCheckEgressWritesTheHealth says the result of the outlet check

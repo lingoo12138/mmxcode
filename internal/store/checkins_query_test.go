@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,14 +87,14 @@ func TestTheAccountsWithoutACheckinAreTheOnesThatHaveNotSignedInToday(t *testing
 // TestTheCheckinIndexReachesAnOldFile says a file that is already at the
 // old version gets the index on the day.
 //
-// 老库停在版本 5，走不到 migrateConform 里那几条索引（那一步只把版本 1
+// 老库停在版本 6，走不到 migrateConform 里那几条索引（那一步只把版本 1
 // 的库带到版本 2）。索引是新的那一步建的：没有它，「今天谁签到了」就是
 // 全表扫 —— 一天一个号一行，1000 个号一年 36 万行（规格 §5.3）。
 func TestTheCheckinIndexReachesAnOldFile(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
 	// 把它退回到老版本：索引没有。
-	if _, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_checkins_day"); err != nil {
+	if _, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_checkins_day_account"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx,
@@ -116,7 +117,7 @@ func TestTheCheckinIndexReachesAnOldFile(t *testing.T) {
 		if err := rows.Scan(&name); err != nil {
 			t.Fatal(err)
 		}
-		if name == "idx_checkins_day" {
+		if name == "idx_checkins_day_account" {
 			found = true
 		}
 	}
@@ -149,6 +150,9 @@ func TestTheCheckinZoneIsTheSitesZone(t *testing.T) {
 //
 // 签到一天一行，一个号一天一行：1000 个号一年就是 36 万行。查「今天谁
 // 签到」要的是索引，不是全表扫（规格 §5.3）。
+//
+// 那条索引盖住的不止日子：号、时刻、积分都在里面 —— 「今天签到的号和它
+// 们给的积分」那一条查询因此不用回表（1000 次回表就是 1000 次随机读）。
 func TestTheCheckinsHaveAnIndexOnTheDay(t *testing.T) {
 	s := openTest(t)
 	rows, err := s.db.QueryContext(context.Background(),
@@ -163,7 +167,7 @@ func TestTheCheckinsHaveAnIndexOnTheDay(t *testing.T) {
 		if err := rows.Scan(&name); err != nil {
 			t.Fatal(err)
 		}
-		if name == "idx_checkins_day" {
+		if name == "idx_checkins_day_account" {
 			found = true
 		}
 	}
@@ -172,5 +176,25 @@ func TestTheCheckinsHaveAnIndexOnTheDay(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the check-ins have no index on the day")
+	}
+}
+
+// TestTheAccountsWithoutACheckinAskTheDayAtOnce says the day's list is
+// asked for in one go.
+//
+// 一个号一次问一次签到没有，1000 个号就是 1000 次对签到表的随机探测
+// （签到的表越大越贵：一年 36 万行的库上是 4.05 ms）。同一天签到的那些号
+// 是可以一次拿全的：签到表按日子排，那一天就是连着的一千行。
+//
+// 断言抓的是**我们自己的**名字（索引名），不是 SQLite 的措辞 ——
+// 「LIST SUBQUERY」那些词是 SQLite 的话，升级一下就可能换一句，而它要防
+// 的那件事（那一天的签到一次拿全）没变。
+func TestTheAccountsWithoutACheckinAskTheDayAtOnce(t *testing.T) {
+	s := openTest(t)
+	makeAccount(t, s, "waiting")
+
+	plan := queryPlan(t, s, accountsWithoutCheckinSQL, StatusActive, "2026-11-18")
+	if !strings.Contains(plan, "idx_checkins_day_account") {
+		t.Fatalf("the plan does not use the index on the day: %s", plan)
 	}
 }

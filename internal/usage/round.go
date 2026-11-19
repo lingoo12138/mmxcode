@@ -83,6 +83,16 @@ const (
 // 它是一个常数，不是一个配置项：配置的键是规格定死了的。
 const retryWindow = 10 * time.Minute
 
+// checkinWindow is how far back a check-in can still matter.
+//
+// 签到给的积分七天有效（规格 §5.3），而「签到待补」问的是「这个号签到
+// 给了积分，可是卡上还摆着旧数」—— 那种情况只有刚签到的号才有：积分过
+// 期了，补读它读回来的也是过期数。
+//
+// 所以问「最近七天的签到」跟问「全部签到」是一回事，而后者在有历史的库
+// 上慢得没法看（一年 36 万行：138 秒，而这一档每 30 秒问一次）。
+const checkinWindow = 7 * 24 * time.Hour
+
 // target is one account to read, and where it stands in the order.
 type target struct {
 	// id is the account.
@@ -110,7 +120,8 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	checkins, err := r.Store.LatestCheckins(ctx)
+	now := time.Now()
+	checkins, err := r.Store.CheckinTimes(ctx, now.Add(-checkinWindow))
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +129,6 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
 
 	snapAt := map[string]time.Time{}
 	snapHas := map[string]bool{}
@@ -128,7 +138,7 @@ func (r *Round) Targets(ctx context.Context) ([]string, error) {
 	}
 	checkAt := map[string]time.Time{}
 	for _, c := range checkins {
-		checkAt[c.AccountID] = c.CreatedAt
+		checkAt[c.AccountID] = c.At
 	}
 	// 标记到期：标记过了时刻，账号该回轮转里读一次了。
 	//

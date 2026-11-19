@@ -256,15 +256,41 @@ var tables = []table{
 
 // The indexes.
 //
-// 签到的行要按日子找：「今天谁签到了」是签到那一趟的名单，也是积分进
-// 池的那条路（规格 §5.3）。一天一个号一行，1000 个号一年就是 36 万行
-// —— 没有索引就是全表扫。
+// 索引是照着「怎么问」建的，不是照着「表长什么样」建的：每一条都对应
+// 一条被量出来的热查询。
 //
-// 那条按天的索引不在这里：它由 migrateCheckinIndex 建（版本 6 的那一步），
-// 因为老库停在版本 5，走不到这里 —— 这里只把版本 1 的库带到版本 2。
+//   - checkins(day, account_id, created_at, credit)：今天谁签到、给了多
+//     少积分（DayCheckins）、今天谁还没签（AccountsWithoutCheckin）。
+//     旧的那条 idx_checkins_day 只盖住 day 一列，每一行都要回表。
+//   - checkins(account_id, created_at DESC, id DESC)：这个号最近签到的
+//     时候（CheckinTimes）。旧的 UNIQUE(account_id, day) 按日子排，不按
+//     时刻排。
+//   - usage_snapshots(account_id, created_at DESC, id DESC)：每个号最新
+//     的一条读数（LatestUsageSnapshots）。旧的 idx_usage_account 少了
+//     id，排到最后一条的时候还要再排一次。
+//   - sessions(account_id)：这个号绑着哪些对话（PoolCandidates 的排序）。
+//
+// 别的都试过，没有好处（1000 个号 / 36 万行签到的库上量的，每条量三遍
+// 取最快的那一遍）：
+//
+//   - accounts(status, created_at, id)：填池那条查询 6.15 ms 到 6.79 ms
+//     （顺序扫变成了按索引随机取行）。
+//   - sessions(account_id, updated_at)：写会话（一批 100 个 key）0.77 ms 到
+//     0.82 ms —— 请求的路上一分都不能慢。
+//   - sessions(updated_at)：数活跃会话 0.196 ms 到 0.247 ms，而它省下的
+//     那点时间在一条每 20 秒才跑一次的路上。
+//
+// 每一条都要在每次写的时候多维护一份，所以每一条索引都对应一条具体的、
+// 被量出来的查询。
+//
+// 被新索引完全盖住的旧索引在这里删掉：留着就是每次写都多维护一份。
 var indexStatements = []string{
-	"CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_snapshots(account_id, created_at DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_checkins_day_account ON checkins(day, account_id, created_at, credit)",
+	"CREATE INDEX IF NOT EXISTS idx_checkins_account_created ON checkins(account_id, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_usage_account_created ON usage_snapshots(account_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
+	"DROP INDEX IF EXISTS idx_checkins_day",
+	"DROP INDEX IF EXISTS idx_usage_account",
 	"DROP INDEX IF EXISTS idx_checkins_account",
 }
 

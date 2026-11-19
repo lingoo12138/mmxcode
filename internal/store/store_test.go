@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +21,16 @@ import (
 
 func openTest(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	return openTestOpts(t)
+}
+
+// openTestOpts opens a store for a test, with the options it is given.
+//
+// 有些测试要看的是「库是照什么开的」：那条会 fsync 的连接在不在，主连接是
+// 不是 normal —— 这些都是打开的时候定下来的。
+func openTestOpts(t *testing.T, opts ...Option) *Store {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1596,7 +1606,7 @@ func TestThePathWithAQuestionMarkIsThePath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a?b&c#d%e.db")
 
-	d := dsn(path)
+	d := dsn(path, options{})
 	if !strings.HasPrefix(d, "file:") {
 		t.Fatalf("dsn = %q, want a file: URI", d)
 	}
@@ -2598,5 +2608,413 @@ func TestThePruningKeepsTheNewestReading(t *testing.T) {
 	}
 	if got[0].Remaining != 100 {
 		t.Fatalf("got %+v, want the reading that was made last", got[0])
+	}
+}
+
+// queryPlan says what SQLite is going to do with a statement.
+//
+// 它是量「问法」的工具：同一条查询，问法不同，SQLite 做的事就不同 ——
+// 而做的事不同，快慢差着十倍（一年 36 万行的签到表上，「一个号一次问一
+// 次签到没有」是 4.05 ms，「一天签到的号一次拿全」是 1.52 ms）。
+func queryPlan(t *testing.T, s *Store, q string, args ...any) string {
+	t.Helper()
+	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+q, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var b strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		b.WriteString(detail)
+		b.WriteString("\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// TestTheLatestUsageSnapshotsAreAskedPerAccount says the newest reading
+// of every account is asked for account by account.
+//
+// 这条查询在卡片那条路上（用户点一次卡片问一次「每个号最新的一条读数是多
+// 少」）。从读数表里扫、每读一行问一次「这个号最新的是哪一行」，在只有
+// account_id 的索引上要把这个号的读数排一遍 —— 而读数表比账号多得多（一个
+// 号一刻钟一条的话，一天就是几千行）。从账号那边走是一千次查找。
+//
+// 断言抓的是**我们自己的**名字（索引名、表的别名），不是 SQLite 的措辞
+// ——「SCAN」「SEARCH」「LIST SUBQUERY」那些词是 SQLite 的话，升级一下
+// 就可能换一句，而它要防的那件事（读数表不被扫）没变。
+func TestTheLatestUsageSnapshotsAreAskedPerAccount(t *testing.T) {
+	s := openTest(t)
+	makeAccount(t, s, "one")
+
+	plan := queryPlan(t, s, latestUsageSnapshotsSQL)
+	// 读数表只被查，不被扫：那个别名是 u（和子查询里的 s2）。
+	for _, line := range strings.Split(plan, "\n") {
+		if strings.Contains(line, "SCAN u") || strings.Contains(line, "SCAN s2") {
+			t.Fatalf("the plan scans the readings: %s", plan)
+		}
+	}
+	// 找最新那一条走的是那条索引（account_id, created_at）。
+	if !strings.Contains(plan, "idx_usage_account_created") {
+		t.Fatalf("the plan does not use the index on the readings: %s", plan)
+	}
+}
+
+// TestTheDurableConnectionSyncsAndTheEverydayOneDoesNot says the writes
+// that must not be lost go on a connection that fsyncs, and the everyday
+// writes go on one that does not.
+//
+// 「丢不起」的两笔（续签后的 token、清掉的「用完了」标记）走同一个文件的另
+// 一条连接，那条是 full 的：提交的时候它把 WAL fsync 掉，写完了的东西就
+// 真的在盘上。常用的那条连接还是 normal —— 别的写丢了都能自己好起来。
+//
+// 配了 full 的时候不必再开第二条：主连接自己就在 fsync。
+func TestTheDurableConnectionSyncsAndTheEverydayOneDoesNot(t *testing.T) {
+	ctx := context.Background()
+
+	s := openTestOpts(t, WithSynchronous("normal"))
+	var sync int
+	if err := s.durable.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&sync); err != nil {
+		t.Fatal(err)
+	}
+	if sync != 2 {
+		t.Errorf("the durable connection's synchronous = %d, want 2 (full)", sync)
+	}
+	if err := s.db.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&sync); err != nil {
+		t.Fatal(err)
+	}
+	if sync != 1 {
+		t.Errorf("the everyday connection's synchronous = %d, want 1 (normal)", sync)
+	}
+
+	// 配了 full 就没有第二条连接了：主连接自己就在 fsync。
+	full := openTestOpts(t, WithSynchronous("full"))
+	if full.durable != full.db {
+		t.Error("there is a second connection although the everyday one fsyncs")
+	}
+}
+
+// TestTheTokenIsWrittenOnTheDurableConnection says the token is written
+// on the connection that fsyncs.
+//
+// 把那条连接关掉，token 就写不进去了 —— 而别的写照常写得进去。这一条守的
+// 是「走哪条连接」：token 走错了连接，断电就能把它带走。
+func TestTheTokenIsWrittenOnTheDurableConnection(t *testing.T) {
+	ctx := context.Background()
+	s := openTestOpts(t, WithSynchronous("normal"))
+	makeAccount(t, s, "one")
+
+	if err := s.durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveToken(ctx, Token{
+		AccountID: "one", Access: "a", Refresh: "r",
+		ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now(),
+	}); err == nil {
+		t.Fatal("the token was written without the connection that fsyncs")
+	}
+
+	// 别的写还在那条连接上：它们照常写得进去。
+	if err := s.SaveCheckin(ctx, Checkin{
+		AccountID: "one", Day: "2026-11-19", Outcome: "claimed", Credit: 25,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("the everyday write failed too: %v", err)
+	}
+}
+
+// TestTheClearedSpentMarkIsWrittenOnTheDurableConnection says the "used
+// up" mark is taken off on the connection that fsyncs.
+//
+// 把那条连接关掉，标记就清不掉 —— 而别的写照常写得进去。
+func TestTheClearedSpentMarkIsWrittenOnTheDurableConnection(t *testing.T) {
+	ctx := context.Background()
+	s := openTestOpts(t, WithSynchronous("normal"))
+	makeAccount(t, s, "one")
+	if err := s.SetExhausted(ctx, "one", "general", time.Now().Add(time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearExhausted(ctx, "one", "general"); err == nil {
+		t.Fatal("the spent mark was cleared without the connection that fsyncs")
+	}
+}
+
+// TestTheClearedSpentMarkIsReallyGone says clearing the "used up" mark
+// really clears it, and says nothing is wrong.
+//
+// 删掉了就是删掉了：不报假错。以前那个 flush 失败是「删掉了但没落盘」这种
+// 半个状态 —— 现在写不进去就是没删掉，写进去了就是在盘上的。
+func TestTheClearedSpentMarkIsReallyGone(t *testing.T) {
+	ctx := context.Background()
+	s := openTestOpts(t, WithSynchronous("normal"))
+	makeAccount(t, s, "one")
+	if err := s.SetExhausted(ctx, "one", "general", time.Now().Add(time.Hour), "quota"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearExhausted(ctx, "one", "general"); err != nil {
+		t.Fatalf("clear exhausted: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM exhausted_windows WHERE account_id=?", "one").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d spent marks are left", n)
+	}
+}
+
+// TestTheCheckinsInABatchAreWrittenDown says a batch of check-ins is
+// written down and can be read back.
+//
+// 一批签到写进去能读出来 —— 这一条是「写进去了」的意思。
+func TestTheCheckinsInABatchAreWrittenDown(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "one")
+	makeAccount(t, s, "two")
+
+	if err := s.SaveCheckins(ctx, []Checkin{
+		{AccountID: "one", Day: "2026-11-19", Outcome: "claimed", Credit: 25, Streak: 3},
+		{AccountID: "two", Day: "2026-11-19", Outcome: "claimed", Credit: 10, Streak: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListCheckins(ctx, "one", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d check-ins for the account, want one", len(got))
+	}
+	if got[0].Day != "2026-11-19" || got[0].Credit != 25 {
+		t.Fatalf("got %+v, want the check-in that was written", got[0])
+	}
+}
+
+// TestTheSameBatchOfCheckinsWrittenTwiceIsAnOverwrite says writing the
+// same batch again replaces the rows instead of making more of them.
+//
+// 签到那一趟会重跑：一个号一天只有一行（account_id + day 上有唯一约束），
+// 写第二次是覆盖，不是多出一行来。
+func TestTheSameBatchOfCheckinsWrittenTwiceIsAnOverwrite(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "one")
+
+	first := []Checkin{{AccountID: "one", Day: "2026-11-19", Outcome: "claimed", Credit: 25}}
+	if err := s.SaveCheckins(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := []Checkin{{AccountID: "one", Day: "2026-11-19", Outcome: "claimed", Credit: 40}}
+	if err := s.SaveCheckins(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM checkins WHERE account_id=?", "one").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("got %d rows for the account and the day, want one", n)
+	}
+	var credit float64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT credit FROM checkins WHERE account_id=?", "one").Scan(&credit); err != nil {
+		t.Fatal(err)
+	}
+	if credit != 40 {
+		t.Fatalf("the credit = %v, want the one that was written last", credit)
+	}
+}
+
+// TestAnEmptyBatchOfCheckinsWritesNothing says an empty batch is not an
+// error, and writes nothing.
+//
+// 没有要签到的号：那是「今天不用签」，不是「签到坏了」。
+func TestAnEmptyBatchOfCheckinsWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if err := s.SaveCheckins(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM checkins").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("got %d rows, want none", n)
+	}
+}
+
+// TestABatchOfCheckinsWithABadRowIsNotWrittenAtAll says one bad row
+// stops the whole batch.
+//
+// 整批是一个事务：一个写不下去，一整批都回去 —— 半批写下去比全批写下去
+// 更贵，而丢掉的最多是这一批里那些号今天的积分进不了池。
+func TestABatchOfCheckinsWithABadRowIsNotWrittenAtAll(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "one")
+
+	err := s.SaveCheckins(ctx, []Checkin{
+		{AccountID: "one", Day: "2026-11-19", Outcome: "claimed", Credit: 25},
+		// 这个号不在库里：外键不答应，这一批就都回去。
+		{AccountID: "nope", Day: "2026-11-19", Outcome: "claimed", Credit: 25},
+	})
+	if err == nil {
+		t.Fatal("the batch with the bad row was written down")
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM checkins").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("got %d rows, want none: the batch is one transaction", n)
+	}
+}
+
+// TestAtMillisecondSaysTheTimeAsTheStoreWritesItDown says the time is
+// cut to the millisecond, the way the store writes it down.
+//
+// 库里存的时间是毫秒 —— 比毫秒细的那部分存下去就没有了。所以拿一个时刻跟
+// 库里的比，要先把它也砍到毫秒：不砍的话，库里那个（毫秒）永远比手里那个
+// （毫秒以下）旧那么一点，于是每一次比较都说「要重写」。
+func TestAtMillisecondSaysTheTimeAsTheStoreWritesItDown(t *testing.T) {
+	t.Run("the finer than a millisecond is cut", func(t *testing.T) {
+		got := AtMillisecond(time.Date(2026, 11, 19, 10, 30, 0, 123456789, time.UTC))
+		want := time.Date(2026, 11, 19, 10, 30, 0, 123000000, time.UTC)
+		if !got.Equal(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("the zero time is still the zero time", func(t *testing.T) {
+		if got := AtMillisecond(time.Time{}); !got.IsZero() {
+			t.Fatalf("got %v, want the zero time", got)
+		}
+	})
+	t.Run("the result is in UTC", func(t *testing.T) {
+		got := AtMillisecond(time.Date(2026, 11, 19, 10, 30, 0, 0, time.FixedZone("CST", 8*3600)))
+		if got.Location() != time.UTC {
+			t.Fatalf("got the zone %v, want UTC", got.Location())
+		}
+	})
+}
+
+// TestTheCheckinsInABatchAreWrittenInOneGo says a batch of check-ins is
+// written in one transaction.
+//
+// 一趟签到有几百个号：一个号一个事务的话，每个号都要把签到表的那一页和
+// 它的几个索引页重写一遍 —— 一千个号是 17 MB 的日志。合成一个事务写是
+// 1 MB（量出来的：每个号 1133 B，而不是 18004 B）。
+//
+// 「一个事务」是看得见的：日志涨了多少。
+func TestTheCheckinsInABatchAreWrittenInOneGo(t *testing.T) {
+	const rows = 100
+	oneByOne := logGrowth(t, rows, false)
+	inABatch := logGrowth(t, rows, true)
+	if inABatch >= oneByOne/2 {
+		t.Fatalf("the batch wrote %d bytes, the single writes %d", inABatch, oneByOne)
+	}
+}
+
+// logGrowth says how many bytes the log grew when check-ins were written.
+//
+// batch says whether they are written in one transaction or one by one.
+func logGrowth(t *testing.T, rows int, batch bool) int64 {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < rows; i++ {
+		makeAccount(t, s, fmt.Sprintf("acc_%03d", i))
+	}
+	before := logSize(t, path)
+	cs := make([]Checkin, 0, rows)
+	for i := 0; i < rows; i++ {
+		cs = append(cs, Checkin{
+			AccountID: fmt.Sprintf("acc_%03d", i), Day: "2026-11-19",
+			Outcome: "claimed", Credit: 25, Streak: 3, CreatedAt: time.Now(),
+		})
+	}
+	if batch {
+		if err := s.SaveCheckins(ctx, cs); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		for _, c := range cs {
+			if err := s.SaveCheckin(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return logSize(t, path) - before
+}
+
+// logSize says how big the write-ahead log is.
+func logSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path + "-wal")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+// TestTheStoreIsOpenedWithItsTuning says the store is opened with the
+// pragmas it was asked for.
+//
+// pragma 是每条连接自己的（DSN 里给），所以它们得在打开的时候给。
+func TestTheStoreIsOpenedWithItsTuning(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(t.TempDir()+"/t.db", WithCacheMB(8), WithSynchronous("normal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var cache, sync string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA cache_size").Scan(&cache); err != nil {
+		t.Fatal(err)
+	}
+	// The size is in KB and SQLite rounds it to a power of two: 8 MB is
+	// 8192 KB.
+	kb, err := strconv.Atoi(cache)
+	if err != nil {
+		t.Fatalf("the cache size = %q, want a number of KB", cache)
+	}
+	if kb > -8000 {
+		t.Errorf("the cache size = %d KB, want at least 8000 KB", kb)
+	}
+	if err := s.db.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&sync); err != nil {
+		t.Fatal(err)
+	}
+	if sync != "1" {
+		t.Errorf("synchronous = %s, want 1 (normal)", sync)
 	}
 }

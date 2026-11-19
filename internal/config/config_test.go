@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -764,5 +765,189 @@ func TestTheShippedConfigsCheckInAtTheSitesMidnight(t *testing.T) {
 			t.Errorf("%s: checkin_jitter = %s, want %s",
 				name, c.Schedule.CheckinJitter, Default().Schedule.CheckinJitter)
 		}
+	}
+}
+
+// TestTheSQLiteDefaults says the database's own tuning has its defaults.
+//
+// 页缓存 8 MB：工作集（1000 个号 + 30 天签到 + 读数）大约 5 MB —— 装得
+// 下就一页也不用再去磁盘要。写盘 normal：WAL 下 SQLite 自己的推荐（断电
+// 可能丢最近几笔，库不会坏）。签到的历史留 30 天：积分七天过期，网页上
+// 只摆最近 5 条。
+func TestTheSQLiteDefaults(t *testing.T) {
+	c := Default()
+	if c.SQLite.CacheMB != 8 {
+		t.Errorf("cache_mb = %d, want 8", c.SQLite.CacheMB)
+	}
+	if c.SQLite.Synchronous != "normal" {
+		t.Errorf("synchronous = %q, want normal", c.SQLite.Synchronous)
+	}
+	if c.SQLite.CheckinRetentionDays != 30 {
+		t.Errorf("checkin_retention_days = %d, want 30", c.SQLite.CheckinRetentionDays)
+	}
+}
+
+// TestTheShippedConfigsHaveTheSQLiteDefaults says the configs that ship
+// with the program agree with the default.
+//
+// 发出去的配置跟说好的不一样，照着配置文件跑的人拿到的就不是那个配置。
+func TestTheShippedConfigsHaveTheSQLiteDefaults(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		c, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.SQLite != Default().SQLite {
+			t.Errorf("%s: sqlite = %+v, want %+v", name, c.SQLite, Default().SQLite)
+		}
+	}
+}
+
+// TestTheSynchronousTheDatabaseDoesNotKnowIsRefused says a word SQLite
+// does not know is an error, not a shrug.
+//
+// 它是拼进 pragma 里去的：库打开的时候才说，那时候已经晚了一步。
+func TestTheSynchronousTheDatabaseDoesNotKnowIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, []byte("sqlite:\n  synchronous: hard\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("the word SQLite does not know was accepted")
+	}
+}
+
+// loadSQLite writes a config file with the given sqlite section and
+// reads it back.
+func loadSQLite(t *testing.T, body string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+// TestTheSynchronousTheDatabaseKnowsIsAccepted says the two words SQLite
+// knows are taken, and so is an empty one.
+//
+// 空是 SQLite 自己的默认（"full"），所以空也要写得进去。
+func TestTheSynchronousTheDatabaseKnowsIsAccepted(t *testing.T) {
+	for _, word := range []string{"normal", "full", ""} {
+		body := "sqlite:\n  synchronous: \"" + word + "\"\n"
+		if _, err := loadSQLite(t, body); err != nil {
+			t.Errorf("synchronous %q was refused: %v", word, err)
+		}
+	}
+}
+
+// TestTheCacheMBRefusesANegative says a negative page cache is an error.
+//
+// 负的页缓存是"悄悄按 0 办"：store 的 dsn 只在 cacheMB > 0 的时候才加那
+// 条 pragma，所以 -1 跟 0 是一回事。写 -1 的人以为自己说了什么，其实
+// 什么也没说 —— 宁可在这里报错。
+func TestTheCacheMBRefusesANegative(t *testing.T) {
+	_, err := loadSQLite(t, "sqlite:\n  cache_mb: -1\n")
+	if err == nil {
+		t.Fatal("the negative page cache was taken")
+	}
+	if !strings.Contains(err.Error(), "cache_mb") {
+		t.Fatalf("error %q does not name the key", err)
+	}
+}
+
+// TestTheCacheMBAcceptsZero says a zero page cache is SQLite's own
+// default.
+//
+// 0 是文档写着的东西（2 MB），所以它得能写进去。
+func TestTheCacheMBAcceptsZero(t *testing.T) {
+	c, err := loadSQLite(t, "sqlite:\n  cache_mb: 0\n")
+	if err != nil {
+		t.Fatalf("the zero page cache was refused: %v", err)
+	}
+	if c.SQLite.CacheMB != 0 {
+		t.Fatalf("cache_mb = %d, want 0", c.SQLite.CacheMB)
+	}
+}
+
+// TestTheCacheMBAcceptsAPositiveNumber says a page cache in MB is taken.
+func TestTheCacheMBAcceptsAPositiveNumber(t *testing.T) {
+	c, err := loadSQLite(t, "sqlite:\n  cache_mb: 8\n")
+	if err != nil {
+		t.Fatalf("the page cache was refused: %v", err)
+	}
+	if c.SQLite.CacheMB != 8 {
+		t.Fatalf("cache_mb = %d, want 8", c.SQLite.CacheMB)
+	}
+}
+
+// TestTheCheckinRetentionRefusesANegative says a negative retention is an
+// error.
+//
+// 负的保留天数是"悄悄按永远留办"：pruneCheckins 见到 days <= 0 就不删。
+// 写 -1 的人以为自己说了什么，其实什么也没说。
+func TestTheCheckinRetentionRefusesANegative(t *testing.T) {
+	_, err := loadSQLite(t, "sqlite:\n  checkin_retention_days: -1\n")
+	if err == nil {
+		t.Fatal("the negative retention was taken")
+	}
+	if !strings.Contains(err.Error(), "checkin_retention_days") {
+		t.Fatalf("error %q does not name the key", err)
+	}
+}
+
+// TestTheCheckinRetentionAcceptsZero says a zero retention keeps every
+// check-in.
+//
+// 0 是永远留，文档上写着，所以它得能写进去。
+func TestTheCheckinRetentionAcceptsZero(t *testing.T) {
+	c, err := loadSQLite(t, "sqlite:\n  checkin_retention_days: 0\n")
+	if err != nil {
+		t.Fatalf("the zero retention was refused: %v", err)
+	}
+	if c.SQLite.CheckinRetentionDays != 0 {
+		t.Fatalf("checkin_retention_days = %d, want 0", c.SQLite.CheckinRetentionDays)
+	}
+}
+
+// TestTheCheckinRetentionRefusesSixDays says a retention shorter than the
+// check-in window is an error.
+//
+// 1 到 6 天不许：签到的积分七天就过期，所以「待补」那一档只看最近七天
+// 的签到；而清理是按站点的那个日子删的，站点时区跟 UTC 差着几个钟头。
+// 留 6 天的话，被删掉的那一段里可能有七天窗口还要用的行 —— 那些号就
+// 永远等不到「签到待补」那一读，卡上摆的数就一直旧着。7 天是刚够。
+func TestTheCheckinRetentionRefusesSixDays(t *testing.T) {
+	for _, days := range []int{1, 3, 6} {
+		body := fmt.Sprintf("sqlite:\n  checkin_retention_days: %d\n", days)
+		if _, err := loadSQLite(t, body); err == nil {
+			t.Errorf("the %d day retention was taken", days)
+		}
+	}
+}
+
+// TestTheCheckinRetentionAcceptsSevenDays says seven days is just enough.
+//
+// DayKey 对时刻是单调的：一条 created_at >= now-7天 的行，它的站点那天
+// 一定 >= DayKey(now-7天)，所以删 day < DayKey(now-7天) 删不到它。
+func TestTheCheckinRetentionAcceptsSevenDays(t *testing.T) {
+	c, err := loadSQLite(t, "sqlite:\n  checkin_retention_days: 7\n")
+	if err != nil {
+		t.Fatalf("the seven day retention was refused: %v", err)
+	}
+	if c.SQLite.CheckinRetentionDays != 7 {
+		t.Fatalf("checkin_retention_days = %d, want 7", c.SQLite.CheckinRetentionDays)
+	}
+}
+
+// TestTheCheckinRetentionAcceptsThirtyDays says the default retention is
+// taken.
+func TestTheCheckinRetentionAcceptsThirtyDays(t *testing.T) {
+	c, err := loadSQLite(t, "sqlite:\n  checkin_retention_days: 30\n")
+	if err != nil {
+		t.Fatalf("the thirty day retention was refused: %v", err)
+	}
+	if c.SQLite.CheckinRetentionDays != 30 {
+		t.Fatalf("checkin_retention_days = %d, want 30", c.SQLite.CheckinRetentionDays)
 	}
 }

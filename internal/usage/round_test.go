@@ -2,7 +2,10 @@ package usage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +13,8 @@ import (
 	"mmxcode/internal/config"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/store"
+
+	_ "modernc.org/sqlite"
 )
 
 // TestTheAccountsToReadAreTheOnesThatNeedIt says the read set is the
@@ -243,7 +248,19 @@ func TestTheAccountsToReadSkipTheSignedOut(t *testing.T) {
 // newStore gives a store with the schema in it.
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(t.TempDir() + "/mmxcode.db")
+	s, _ := newStoreWithPath(t)
+	return s
+}
+
+// newStoreWithPath gives a store with the schema in it, and says where
+// its database is.
+//
+// 一个想知道「那笔写到底在不在盘上」的测试要自己打开那些文件：库文件和
+// 它旁边的 WAL 一起拷走 —— 那两个文件加起来就是盘上的东西。
+func newStoreWithPath(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mmxcode.db")
+	s, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -251,7 +268,7 @@ func newStore(t *testing.T) *store.Store {
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return s
+	return s, path
 }
 
 // mk makes an account, with a reading of it or without one.
@@ -482,6 +499,63 @@ func TestTheReadingClearsTheSpentMark(t *testing.T) {
 	}
 }
 
+// TestTheClearedSpentMarkIsMadeDurable says the "used up" mark that is
+// taken off an account is not in the database when it is taken off.
+//
+// 签到给的积分能救活一个用完的号，而「用完了」的那个标记是被清掉的。清掉
+// 的那笔要落盘：断了电丢了它，这个号会被关在外面最多七天（签到的积分有效
+// 期）。
+//
+// 「真的在盘上」没法在测试里造一次断电来验，但**盘上有什么是能验的**：把
+// 库文件和它旁边的 WAL 一起拷一份（那两个文件加起来就是盘上的东西），那个
+// 标记得不在里面了。
+//
+// WAL 也要跟着走 —— 那笔清除是走一条会 fsync 的连接写的：提交把 WAL
+// fsync 掉，页没有抄回主库，所以主库里还是清除之前的样子，账在 WAL 上。
+// 两个文件一起拷才是盘上的全部。
+func TestTheClearedSpentMarkIsMadeDurable(t *testing.T) {
+	ctx := context.Background()
+	s, path := newStoreWithPath(t)
+	now := time.Now()
+	mk(t, s, "acc_1", now)
+	if err := s.SetExhausted(ctx, "acc_1", "general", now.Add(time.Hour), "quota"); err != nil {
+		t.Fatalf("set exhausted: %v", err)
+	}
+	r := NewRound(s, &fakeReader{fail: map[string]bool{}}, nil, config.Default())
+	if _, err := r.Settle(ctx, "acc_1"); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+
+	// 库文件和 WAL 一起拷一份。
+	copyDir := t.TempDir()
+	copyPath := filepath.Join(copyDir, "copy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(copyPath+suffix, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM exhausted_windows").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("the mark is still on the disk: %d rows in the copy", n)
+	}
+}
+
 // TestAFailedReadingKeepsTheSpentMark says a reading that failed does
 // not take the "used up" mark off.
 //
@@ -622,5 +696,34 @@ func TestAReaderWithoutTheGuardIsUnaffected(t *testing.T) {
 	}
 	if res.Refreshed != 1 {
 		t.Fatalf("the readings = %d, want one", res.Refreshed)
+	}
+}
+
+// TestTheCheckInFromLongAgoIsNotPending says a check-in from more than a
+// week ago does not make an account pending.
+//
+// 签到给的积分七天就过期了：七天以前的那一次签到，补读它读回来的也是过
+// 期数，而卡上摆的旧数跟一个过期的积分没关系。所以这一档只问最近七天
+// 的签到（规格 §5.3）。
+//
+// 这一条是这次改动的行为变化：从前问的是「全部签到」，那样一个八天前
+// 签到、之后没读过的号会被一直当成「待补」（规格 §5.3 的规矩）。
+func TestTheCheckInFromLongAgoIsNotPending(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	mk(t, s, "acc_old", now.AddDate(0, 0, -9))
+	if err := s.SaveCheckin(context.Background(), store.Checkin{
+		AccountID: "acc_old", Day: "2026-11-10", Outcome: "claimed",
+		Credit: 10, CreatedAt: now.AddDate(0, 0, -8),
+	}); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	r := NewRound(s, nil, func() []string { return nil }, config.Default())
+	got, err := r.Targets(context.Background())
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the accounts to read = %v, want none", got)
 	}
 }

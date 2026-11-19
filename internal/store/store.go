@@ -52,9 +52,27 @@ var ErrNotFound = errors.New("store: not found")
 // journal is for.
 const maxConns = 4
 
+// durableConns is how many connections the durable pool has.
+//
+// 丢不得的那两笔很少写（一次续签、一次签到救活了一个用完的号），一条连接
+// 就够 —— 而且写锁也只有一把：两笔抢一把锁，等的功夫比写的功夫长得多。
+const durableConns = 1
+
 // Store is the database.
 type Store struct {
 	db *sql.DB
+
+	// durable is the connection the writes that must not be lost go on.
+	//
+	// It is the same file as db, opened with synchronous=full: the
+	// commit fsyncs the write-ahead log, so the write is on the disk
+	// when the commit is done. It is db itself when db already fsyncs
+	// every commit, and then there is no second connection.
+	//
+	// 丢不得的那两笔（续签后的 token、清掉的「用完了」标记）走它。常用的
+	// 那些写还是走 db，按配的速度写（normal）—— 那些写丢了都能自己好起来
+	// （额度快照旧一点、标记没写上撞一次空换号重试）。
+	durable *sql.DB
 
 	// Clock is the store's clock.
 	//
@@ -180,6 +198,46 @@ type ImportRun struct {
 	Results    string
 }
 
+// Option is one thing about how the database is opened.
+type Option func(*options)
+
+// options is what the options add up to.
+type options struct {
+	// cacheMB is the page cache of one connection, in MB. Zero leaves it
+	// to SQLite.
+	cacheMB int
+	// synchronous is how hard a write hits the disk. Empty leaves it to
+	// SQLite.
+	synchronous string
+}
+
+// WithCacheMB says how many MB of pages one connection may keep.
+//
+// 页缓存是「读过的页先留在手边」：工作集装得下的时候，同一批查询不用一
+// 遍一遍地去磁盘要页。1000 个号、一年的签到：填池那条查询从 11.7 ms 到
+// 5.9 ms。
+//
+// 0 是 SQLite 自己的默认（2 MB）。缓存是用多少占多少：库小的时候它占不
+// 到那么多。
+func WithCacheMB(n int) Option {
+	return func(o *options) { o.cacheMB = n }
+}
+
+// WithSynchronous says how hard a write hits the disk.
+//
+// "normal"：写下去就交给操作系统，断电的时候最近这几笔可能丢（库不会
+// 坏 —— SQLite 对 WAL 的推荐就是这个）。"full"：每一笔都 fsync，慢一点
+// （同一笔写：normal 64µs 对 full 874µs —— full 那一笔要等盘）。
+//
+// 它管的是**常用的那些写**。丢不起的那两笔（续签后的 token、清掉的「用完
+// 了」标记）走另一条连接，那条永远是 full：断了电它们不会丢。配了 "normal"
+// 也是那样 —— full 不是全局的，只有那两笔等得起盘。
+//
+// 空是 SQLite 自己的默认（"full"）。
+func WithSynchronous(s string) Option {
+	return func(o *options) { o.synchronous = s }
+}
+
 // Open opens the database at path, creating it and its directory if
 // they are not there.
 //
@@ -190,13 +248,21 @@ type ImportRun struct {
 // A directory that is already there is left as it is: the store does
 // not tighten the permissions of a directory the user picked. The file
 // itself is always tightened, whoever made it.
-func Open(path string) (*Store, error) {
+//
+// The file is opened twice when the everyday writes do not fsync: once
+// for them, and once with synchronous=full for the writes that must
+// not be lost. See the durable field.
+func Open(path string, opts ...Option) (*Store, error) {
+	o := options{}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create data dir: %w", err)
 		}
 	}
-	db, err := sql.Open("sqlite", dsn(path))
+	db, err := sql.Open("sqlite", dsn(path, o))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -213,11 +279,75 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, Clock: time.Now}, nil
+	durable, err := openDurable(path, o, db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, durable: durable, Clock: time.Now}, nil
+}
+
+// openDurable opens the connection the writes that must not be lost go
+// on.
+//
+// It is the same file, opened with synchronous=full: the commit fsyncs
+// the write-ahead log, so the write is on the disk when the commit is
+// done. The everyday connection keeps the speed it was given (normal):
+// most writes can be lost and recover by themselves.
+//
+// If the everyday connection fsyncs every write already, it is the
+// durable one and there is no second connection.
+//
+// 丢不得的那两笔（续签后的 token、清掉的「用完了」标记）走这条连接。它们的
+// 提交是一次 fsync：几毫秒。它们很少发生 —— 一次续签，和一次签到救活了
+// 一个用完的号 —— 所以等得起。
+func openDurable(path string, o options, db *sql.DB) (*sql.DB, error) {
+	fsyncs, err := fsyncsEveryWrite(db)
+	if err != nil {
+		return nil, err
+	}
+	if fsyncs {
+		return db, nil
+	}
+	d := o
+	d.synchronous = "full"
+	durable, err := sql.Open("sqlite", dsn(path, d))
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	durable.SetMaxOpenConns(durableConns)
+	durable.SetMaxIdleConns(durableConns)
+	if err := durable.PingContext(context.Background()); err != nil {
+		durable.Close()
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	return durable, nil
+}
+
+// fsyncsEveryWrite says whether the connection fsyncs every commit.
+//
+// The pragma is asked of the database, not of the options: SQLite's own
+// default (no synchronous in the data source name) is full, and a build
+// that says otherwise is the build's business, not ours.
+func fsyncsEveryWrite(db *sql.DB) (bool, error) {
+	var sync int
+	if err := db.QueryRowContext(context.Background(), "PRAGMA synchronous").Scan(&sync); err != nil {
+		return false, fmt.Errorf("read the synchronous setting: %w", err)
+	}
+	// 2 is full, 3 is extra: both of them fsync every commit.
+	return sync >= 2, nil
 }
 
 // Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.durable != nil && s.durable != s.db {
+		if e := s.durable.Close(); err == nil {
+			err = e
+		}
+	}
+	return err
+}
 
 // dsn gives the data source name of a database file.
 //
@@ -229,7 +359,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // The write lock is taken when a transaction starts and not in the
 // middle of it. A transaction that finds the lock taken fails at once
 // instead of failing at the end, after it has done its work.
-func dsn(path string) string {
+func dsn(path string, o options) string {
 	p := filepath.ToSlash(path)
 	prefix := "file:"
 	if strings.HasPrefix(p, "//") {
@@ -238,9 +368,18 @@ func dsn(path string) string {
 		// says so.
 		prefix = "file://"
 	}
-	return prefix + escapePath(p) +
+	q := prefix + escapePath(p) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
 		"&_pragma=foreign_keys(1)&_txlock=immediate"
+	if o.cacheMB > 0 {
+		// The page cache is in KB, and a negative number means "that many
+		// KB" (a positive one would mean "that many pages").
+		q += fmt.Sprintf("&_pragma=cache_size(%d)", -o.cacheMB*1024)
+	}
+	if o.synchronous != "" {
+		q += "&_pragma=synchronous(" + o.synchronous + ")"
+	}
+	return q
 }
 
 // escapePath makes a path safe to put in a file: URI.
@@ -355,7 +494,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 6
+const schemaVersion = 7
 
 // migrations are the steps, in order.
 //
@@ -367,6 +506,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateBatchImport,
 	migrateAPIKeys,
 	migrateCheckinIndex,
+	migrateIndexes,
 }
 
 // migrateMake makes the tables that are not there.
@@ -534,10 +674,33 @@ func migrateAPIKeys(ctx context.Context, conn *sql.Conn) error {
 //
 // 这一步是单独的：索引那几条在 migrateConform 里，而老库停在版本 5 ——
 // 走不到那一步（那一步只把版本 1 的库带到版本 2）。
+//
+// 建的是新那一条（盖住日子、号、时刻、积分）：旧的 idx_checkins_day 只盖
+// 住日子一列，每一行都要回表（规格 §5.3 的那趟就是 1000 次回表）。旧的
+// 那一条由版本 7 的那一步删掉 —— 走不到这一步的老库停在版本 6，那一条还
+// 在它身上。
 func migrateCheckinIndex(ctx context.Context, conn *sql.Conn) error {
 	return runStep(ctx, conn, 6, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day)"); err != nil {
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_checkins_day_account ON checkins(day, account_id, created_at, credit)"); err != nil {
 			return fmt.Errorf("migrate: the index on the check-in day: %w", err)
+		}
+		return nil
+	})
+}
+
+// migrateIndexes gives the tables the indexes the queries ask for.
+//
+// 它们是第 7 步建的：老库停在版本 6，走不到 migrateConform 里那几条索引
+// （那一步只把版本 1 的库带到版本 2）。
+//
+// 每建一条索引都要重写一遍表，所以这一步在一个事务里：失败就回滚，老
+// 库原样不动。
+func migrateIndexes(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 7, func(tx *sql.Tx) error {
+		for _, q := range indexStatements {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
 		}
 		return nil
 	})
@@ -730,6 +893,15 @@ func fromMS(v int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(v).UTC()
+}
+
+// AtMillisecond gives the time as the store writes it down.
+//
+// 库里存的时间是毫秒 —— 比毫秒细的那部分存下去就没有了。所以拿一个时刻跟
+// 库里的比，要先把它也砍到毫秒：不砍的话，库里那个（毫秒）永远比手里那个
+// （毫秒以下）旧那么一点，于是每一次比较都说「要重写」。
+func AtMillisecond(t time.Time) time.Time {
+	return fromMS(ms(t))
 }
 
 // CreateAccount inserts an account.
@@ -1738,8 +1910,12 @@ func (s *Store) HasAPIKeys(ctx context.Context) (bool, error) {
 }
 
 // SaveToken writes an account's token.
+//
+// 这笔丢不得：库里那笔 token 丢了，下一次续签拿的就是一个已经被站点用过
+// 一次的 refresh token，站点会拒，账号就被记成签入失效。所以它走那条
+// fsync 的连接：写完了就在盘上。
 func (s *Store) SaveToken(ctx context.Context, t Token) error {
-	return s.saveToken(ctx, s.db, t)
+	return s.saveToken(ctx, s.durable, t)
 }
 
 func (s *Store) saveToken(ctx context.Context, db execer, t Token) error {
@@ -1799,6 +1975,54 @@ func (s *Store) SaveCheckin(ctx context.Context, c Checkin) error {
 	return nil
 }
 
+// SaveCheckins writes several check-ins down in one transaction.
+//
+// 一趟签到有几百个号：一个号一个事务的话，每个号都要把签到表的那一页和
+// 它的几个索引页重写一遍 —— 一千个号是 17 MB 的日志，而合成一个事务写
+// 是 1 MB（量出来的：每个号 1133 B，而不是 18004 B）。
+//
+// 一整批是一个事务：一个写不下去，一整批都回去。
+//
+// 全批一起回是划得来的：签到的记录是彼此独立的，可是它们写的是同一张表的
+// 同一批页 —— 半批写下去比全批写下去更贵，而丢掉的最多是这一批里那些号
+// 今天的积分进不了池（规格 §5.3）。丢得起。
+func (s *Store) SaveCheckins(ctx context.Context, cs []Checkin) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("save checkins: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO checkins (account_id, day, outcome, credit, streak, message, created_at)
+		VALUES (?,?,?,?,?,?,?)
+		ON CONFLICT(account_id, day) DO UPDATE SET
+			outcome=excluded.outcome, credit=excluded.credit, streak=excluded.streak,
+			message=excluded.message, created_at=excluded.created_at`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("save checkins: %w", err)
+	}
+	for _, c := range cs {
+		if _, err := stmt.ExecContext(ctx,
+			c.AccountID, c.Day, c.Outcome, c.Credit, c.Streak, c.Message, ms(s.stamp(c.CreatedAt))); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("save checkin: %w", err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("save checkins: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("save checkins: %w", err)
+	}
+	return nil
+}
+
 // ListCheckins gives an account's check-ins, newest first.
 //
 // A limit of zero or less means every check-in: a limit is a limit,
@@ -1841,49 +2065,67 @@ func (s *Store) ListCheckins(ctx context.Context, accountID string, limit int) (
 	return out, nil
 }
 
-// LatestCheckins gives each account's newest check-in.
+// CheckinTime is when an account was checked in.
+type CheckinTime struct {
+	// AccountID is the account.
+	AccountID string
+	// At is when it was checked in.
+	At time.Time
+}
+
+// CheckinTimes gives, for every account checked in since a moment, the
+// time of that check-in.
 //
-// The newest is the one written last: a day is unique for an account,
-// but the same day's row is updated in place — its id stays the one it
-// was given and only its time moves. So the id does not say which
-// check-in is the latest; the time does. Ties go to the greater id.
-func (s *Store) LatestCheckins(ctx context.Context) ([]Checkin, error) {
+// 它是「签到待补」那一档要的东西：这个号最后一次签到是什么时候（规格
+// §5.3）。签到给了积分，卡上还摆着签到之前的旧数 —— 那种号要补读一次
+// 额度。
+//
+// 问的是「最近」，不是「全部」：签到的积分七天就过期了（规格 §5.3），七
+// 天以前的签到既不会让一个号变成「待补」，也不会在十分钟的重试窗口里。
+// 而问「全部」的那条查询在有历史的库上慢得没法看：一年 36 万行，138 秒
+// —— 而这一档每 30 秒问一次。
+//
+// 每个号一条：它在这段时间里最后一次签到。时刻说了算（MAX 出来的就是
+// 最大的时刻），平局的时候是哪一个不影响 —— 这里的时刻就是全部。
+func (s *Store) CheckinTimes(ctx context.Context, since time.Time) ([]CheckinTime, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.account_id, c.day, c.outcome, c.credit, c.streak, c.message, c.created_at
-		FROM checkins c
-		WHERE c.id = (
-			SELECT c2.id FROM checkins c2
-			WHERE c2.account_id = c.account_id
-			ORDER BY c2.created_at DESC, c2.id DESC
-			LIMIT 1
-		)
-		ORDER BY c.account_id`)
+		SELECT account_id, MAX(created_at) FROM checkins
+		WHERE created_at >= ? GROUP BY account_id`, ms(since))
 	if err != nil {
-		return nil, fmt.Errorf("latest checkins: %w", err)
+		return nil, fmt.Errorf("the check-in times: %w", err)
 	}
 	defer rows.Close()
-	var out []Checkin
+	var out []CheckinTime
 	for rows.Next() {
 		var (
-			c         Checkin
-			credit    sql.NullFloat64
-			streak    sql.NullInt64
-			message   sql.NullString
-			createdAt int64
+			t  CheckinTime
+			at int64
 		)
-		if err := rows.Scan(&c.ID, &c.AccountID, &c.Day, &c.Outcome, &credit, &streak, &message, &createdAt); err != nil {
-			return nil, fmt.Errorf("latest checkins: %w", err)
+		if err := rows.Scan(&t.AccountID, &at); err != nil {
+			return nil, fmt.Errorf("the check-in times: %w", err)
 		}
-		c.Credit = credit.Float64
-		c.Streak = int(streak.Int64)
-		c.Message = message.String
-		c.CreatedAt = fromMS(createdAt)
-		out = append(out, c)
+		t.At = fromMS(at)
+		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("latest checkins: %w", err)
+		return nil, fmt.Errorf("the check-in times: %w", err)
 	}
 	return out, nil
+}
+
+// PruneCheckins throws away the check-ins of the days before a day.
+//
+// 签到的历史是唯一会长个没完的东西：一天一个号一行，1000 个号一年 36 万
+// 行、40 MB。签到的积分七天就过期了（规格 §5.3），网页上每个号只摆最近
+// 5 条 —— 再往前的记录除了占地方没有别的用处。
+//
+// 留多少天是外面说了算（sqlite.checkin_retention_days）。
+func (s *Store) PruneCheckins(ctx context.Context, olderThan time.Time) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM checkins WHERE day < ?", DayKey(olderThan))
+	if err != nil {
+		return fmt.Errorf("prune the check-ins: %w", err)
+	}
+	return nil
 }
 
 // SaveUsageSnapshot writes a usage reading.
@@ -1946,6 +2188,29 @@ func usageSnapshotColumns(prefix string) string {
 	return strings.Join(cols, ", ")
 }
 
+// latestUsageSnapshotsSQL is the query that gives every account's newest
+// usage reading.
+//
+// 它是从账号那边走的，不是从读数那边走的：读数表比账号多得多（一个号一
+// 刻钟一条的话，一天就是几千行），从读数那边走就是「每读一行问一次这个
+// 号最新的是哪一行」—— 110 万行的时候是 1.5 秒，而这条路在卡片的路上
+// （用户点一次卡片就等 1.5 秒）。从账号那边走是一千次查找：12 毫秒。
+//
+// 没有读过的号不在里面：它是 JOIN，不是 LEFT JOIN（规格 §3.4：卡上摆的
+// 是每个号最新的一条读数，没有读过的号没有那条）。
+//
+// 排的是 a.id 而不是 u.account_id：这两个是同一个号（u 就是 a 那个号的
+// 最新一条），而账号的主键索引本来就是按 id 排的 —— 排 u.account_id 要让
+// SQLite 临时排一遍（USE TEMP B-TREE FOR ORDER BY）。
+var latestUsageSnapshotsSQL = `
+	SELECT ` + usageSnapshotColumns("u") + `
+	FROM accounts a JOIN usage_snapshots u ON u.id = (
+		SELECT s2.id FROM usage_snapshots s2
+		WHERE s2.account_id = a.id
+		ORDER BY s2.created_at DESC, s2.id DESC
+		LIMIT 1)
+	ORDER BY a.id`
+
 // LatestUsageSnapshots gives each account's newest usage reading.
 //
 // The newest is the one that was read last: the time says when the
@@ -1958,16 +2223,7 @@ func usageSnapshotColumns(prefix string) string {
 // would then show the older numbers. The check-ins have the same shape
 // and the same rule.
 func (s *Store) LatestUsageSnapshots(ctx context.Context) ([]UsageSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+usageSnapshotColumns("s")+`
-		FROM usage_snapshots s
-		WHERE s.id = (
-			SELECT s2.id FROM usage_snapshots s2
-			WHERE s2.account_id = s.account_id
-			ORDER BY s2.created_at DESC, s2.id DESC
-			LIMIT 1
-		)
-		ORDER BY s.account_id`)
+	rows, err := s.db.QueryContext(ctx, latestUsageSnapshotsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("latest usage snapshots: %w", err)
 	}
@@ -2090,8 +2346,15 @@ func (s *Store) SetExhausted(ctx context.Context, accountID, windowKey string, u
 }
 
 // ClearExhausted clears an account's window.
+//
+// 清除的那笔要落盘：这个标记是「这个号的额度用完了」，而签到给的积分能
+// 救活它 —— 标记没了它才回到轮转里。断了电把这一笔丢了，它就还被关在
+// 外面，最多关到签到的积分过期（七天）。
+//
+// 它走那条 fsync 的连接：写不进去就是没删掉，写进去了就是在盘上的 ——
+// 没有「删掉了但没落盘」这种半个状态，所以只有 DELETE 本身失败才报错。
 func (s *Store) ClearExhausted(ctx context.Context, accountID, windowKey string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.durable.ExecContext(ctx,
 		"DELETE FROM exhausted_windows WHERE account_id=? AND window_key=?", accountID, windowKey)
 	if err != nil {
 		return fmt.Errorf("clear exhausted: %w", err)

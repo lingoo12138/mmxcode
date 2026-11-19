@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -192,6 +193,281 @@ func TestTokenRefreshOnlyOnceUnderConcurrency(t *testing.T) {
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("the refresh token was spent %d times, want 1", n)
 	}
+}
+
+// TestTheRenewedTokenIsOnTheDisk says the token of a renewal is on the
+// disk when the renewal is over.
+//
+// 库里写下的东西在 WAL 模式下是「写进 WAL 交给操作系统」：断电可能把最
+// 后这几笔丢掉。而 token 丢了就是下一次续签拿一个已经被站点用过的 refresh
+// token（站点会拒，账号就被记成签入失效）。所以 token 走的那条连接每次
+// 提交都 fsync。
+//
+// 「真的在盘上」没法在测试里造一次断电来验，但**盘上有什么**是能验的：把
+// 库文件和它旁边的 WAL 一起拷一份（那两个文件加起来就是盘上的东西），那个
+// token 得在里面。
+//
+// WAL 也要跟着走 —— 那一笔是写进 WAL 的，页还没有抄回主库，所以主库里还是
+// 续签之前的样子。两个文件一起拷才是盘上的全部。
+func TestTheRenewedTokenIsOnTheDisk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old", Refresh: "ref",
+		// 两分钟后过期，落在续期窗口内
+		ExpiresAt: now.Add(2 * time.Minute), UpdatedAt: now,
+	})
+	if _, err := m.Token(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+
+	db := rawDB(t, copyOfTheDatabase(t, path))
+	var access, refresh string
+	if err := db.QueryRowContext(ctx,
+		"SELECT access, refresh FROM tokens WHERE account_id=?", "acc_01").
+		Scan(&access, &refresh); err != nil {
+		t.Fatal(err)
+	}
+	if access != "new" || refresh != "newref" {
+		t.Fatalf("the token on the disk = %q / %q", access, refresh)
+	}
+}
+
+// TestARenewedAccountIsNotWrittenOnEveryRequest says the token of a
+// renewed account is written once.
+//
+// 库里存的时间是毫秒，续签那一刻拿到的是毫秒以下的精度。不把两边砍到同
+// 一个精度，库里那个就永远比手里那个「旧」那么一点 —— 于是每个被代理的
+// 请求都重写一遍 token 行：写锁排长队，排满了（busy_timeout 5 秒）就是
+// SQLITE_BUSY。
+//
+// 怎么知道写没写：另一个连接看着 `PRAGMA data_version` —— 别的连接提交了
+// 它就变。
+func TestARenewedAccountIsNotWrittenOnEveryRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"new","refresh_token":"newref","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, srv)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old", Refresh: "ref",
+		ExpiresAt: now.Add(2 * time.Minute), UpdatedAt: now,
+	})
+	// 续签一次，写下去一次。
+	if _, err := m.Token(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+
+	watch := rawDB(t, path)
+	before := dataVersion(t, watch)
+	// 再来一个请求：不该再写了。
+	if _, err := m.Token(ctx, "acc_01"); err != nil {
+		t.Fatal(err)
+	}
+	if after := dataVersion(t, watch); after != before {
+		t.Error("the token was written again")
+	}
+}
+
+// TestTheTokenIsWrittenWhileSomethingElseIsReading says writing the token
+// does not wait for a reader.
+//
+// WAL 的 checkpoint（把 WAL 里的页抄回主库）要拿着写锁，抄不完就一直等
+// —— 等到 busy_timeout 就是 SQLITE_BUSY。而从前那个 checkpoint 就放在写
+// token 的路上。fsync 只等盘，不抄页，也不挡别人写。
+func TestTheTokenIsWrittenWhileSomethingElseIsReading(t *testing.T) {
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+
+	// 一个读者开着读事务不放。
+	reader := rawDB(t, path)
+	tx, err := reader.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	// 读一次，读者才拿住快照。
+	var n int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := m.saveToken(ctx, "acc_01", &oauth.Token{
+		Access: "a", Refresh: "r", Expires: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("writing the token took %v: it waited for the reader", d)
+	}
+}
+
+// TestTheTokenNoteGoesAwayWhenTheStoreCatchesUp says the note about a
+// token that could not be written down goes away when the store catches
+// up.
+//
+// 那条记号说的是「库里那份比手里那份旧」。token 写成功了，库里那份就追上
+// 了 —— 记号不成立了，可它还挂着：last_error 只有在改状态的时候才会被
+// 清掉，所以一次暂时的忙会在一个好好的账号上留一条「这个号有问题」。
+func TestTheTokenNoteGoesAwayWhenTheStoreCatchesUp(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	// 写不下去的那一次留下的记号。
+	m.note(ctx, "acc_01", tokenNotWrittenReason+": the disk is full")
+	// 写进去了，库里那份追上了手里那份。
+	if err := m.saveToken(ctx, "acc_01", &oauth.Token{
+		Access: "a", Refresh: "r", Expires: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.LastError != "" {
+		t.Errorf("the note is still on the account: %q", a.LastError)
+	}
+}
+
+// TestTheNoteOfAnotherReasonStays says a note that is not about the token
+// is left alone.
+//
+// 记号上写的是别的理由（续签失败但手里那份还好），那件事还是真的 —— 擦掉
+// 它就是把真话也藏起来。
+func TestTheNoteOfAnotherReasonStays(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.note(ctx, "acc_01", renewalFailedReason+": the site is having a bad moment")
+	if err := m.saveToken(ctx, "acc_01", &oauth.Token{
+		Access: "a", Refresh: "r", Expires: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(a.LastError, renewalFailedReason) {
+		t.Errorf("the note on the account = %q, want the one that was there", a.LastError)
+	}
+}
+
+// TestTheCheckinRecordsAreWrittenDown says the records of a check-in are
+// written down.
+//
+// 记录是签到给的积分进池的那条路（规格 §5.3）：签到了可是记录没了，那个
+// 号今天的积分就进不了池。
+func TestTheCheckinRecordsAreWrittenDown(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	m.RecordCheckins(ctx, []store.Checkin{{
+		AccountID: "acc_01", Day: "2026-11-19", Outcome: "claimed", Credit: 25,
+		Streak: 3, CreatedAt: now,
+	}})
+	rows, err := m.Store.ListCheckins(ctx, "acc_01", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the check-ins = %+v, want one", rows)
+	}
+}
+
+// TestAFailedCheckinIsNotedOnEveryAccount says a batch that could not be
+// written is noted on every account of the batch.
+//
+// 写不进去的记录，网页上要看得见是哪个号 —— 不然签到了可是积分没进池，
+// 而没有人知道是哪个号。
+func TestAFailedCheckinIsNotedOnEveryAccount(t *testing.T) {
+	ctx := context.Background()
+	m, path := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	refuseWrites(t, path, "checkins", "INSERT")
+	m.RecordCheckins(ctx, []store.Checkin{
+		{AccountID: "acc_01", Day: "2026-11-19", Outcome: "claimed", Credit: 25, CreatedAt: now},
+		{AccountID: "acc_02", Day: "2026-11-19", Outcome: "claimed", Credit: 25, CreatedAt: now},
+	})
+	for _, id := range []string{"acc_01", "acc_02"} {
+		a, err := m.Store.GetAccount(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(a.LastError, checkinNotWrittenReason) {
+			t.Errorf("the note on %s = %q", id, a.LastError)
+		}
+	}
+}
+
+// dataVersion says what the database file is at, seen from another
+// connection.
+//
+// 它变的是「别的连接提交了没有」：一个连接自己提交不改自己的数。
+func dataVersion(t *testing.T, db *sql.DB) int64 {
+	t.Helper()
+	var v int64
+	if err := db.QueryRowContext(context.Background(), "PRAGMA data_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// copyOfTheDatabase copies the database file and the log beside it.
+//
+// WAL 也要跟着走：那一笔是写进 WAL 的，页还没有抄回主库 —— 主库里是写它
+// 之前的样子。两个文件加起来才是盘上的全部。
+func copyOfTheDatabase(t *testing.T, path string) string {
+	t.Helper()
+	copyPath := filepath.Join(t.TempDir(), "copy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(copyPath+suffix, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return copyPath
 }
 
 func TestTokenMarksAccountSignedOut(t *testing.T) {

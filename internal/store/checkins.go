@@ -87,22 +87,32 @@ func (s *Store) DayCheckins(ctx context.Context, day string) ([]CheckinCredit, e
 	return out, nil
 }
 
-// AccountsWithoutCheckin gives the accounts that were not checked in on a
-// day.
+// accountsWithoutCheckinSQL is the query that gives the accounts that
+// were not checked in on a day.
 //
 // 它是签到那一趟的名单：只签今天还没签的号（规格 §5.2）。
 //
-// 只有 active 的号：签不上的号签不了（signed_out 是 token 掉了，要的是
-// 重登，不是签到）。
-func (s *Store) AccountsWithoutCheckin(ctx context.Context, day string) ([]Account, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// 问法是「今天签到过的号有哪些」一次拿全，再去掉它们（NOT IN），不是一
+// 个号一次问一次签到没有：后者是 1000 次对签到表的随机探测，签到的表越
+// 大越贵（一年 36 万行的库上：4.05 ms 对 1.52 ms）。
+//
+// NOT IN 遇到 NULL 会一个都不返回。签到的 account_id 是 NOT NULL 的
+// （schema.go），迁移的时候老行补的也是空串不是 NULL，所以不会。
+const accountsWithoutCheckinSQL = `
 		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group, a.proxy_url,
 			a.last_error, a.created_at, a.updated_at
 		FROM accounts a
 		WHERE a.status = ?
-		  AND NOT EXISTS (
-			SELECT 1 FROM checkins c WHERE c.account_id = a.id AND c.day = ?)
-		ORDER BY a.created_at, a.id`, StatusActive, day)
+		  AND a.id NOT IN (SELECT c.account_id FROM checkins c WHERE c.day = ?)
+		ORDER BY a.created_at, a.id`
+
+// AccountsWithoutCheckin gives the accounts that were not checked in on a
+// day.
+//
+// 只有 active 的号：签不上的号签不了（signed_out 是 token 掉了，要的是
+// 重登，不是签到）。
+func (s *Store) AccountsWithoutCheckin(ctx context.Context, day string) ([]Account, error) {
+	rows, err := s.db.QueryContext(ctx, accountsWithoutCheckinSQL, StatusActive, day)
 	if err != nil {
 		return nil, fmt.Errorf("the accounts without a check-in: %w", err)
 	}
