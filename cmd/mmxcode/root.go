@@ -100,6 +100,9 @@ func newRoot() (*cobra.Command, *env) {
 			cfg.Server.APIKeys = append(cfg.Server.APIKeys, apiKeysFromEnv(v)...)
 		}
 		e.cfg = cfg
+		// 回包能有多大：整个进程一个数（读额度、模型名单、签到、续签、聊
+		// 天的回答读的都是它）。开机定一次。
+		upstream.SetMaxBody(int64(cfg.Upstream.MaxBodyMB) << 20)
 		s, err := store.Open(cfg.DB,
 			store.WithCacheMB(cfg.SQLite.CacheMB),
 			store.WithSynchronous(cfg.SQLite.Synchronous))

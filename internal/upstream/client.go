@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -100,9 +101,6 @@ func defaultTransport() *http.Transport {
 
 // redirectStatuses are the statuses a redirect can have.
 var redirectStatuses = map[int]bool{301: true, 302: true, 303: true, 307: true, 308: true}
-
-// maxBody is the most a response body may be.
-const maxBody = 32 << 20
 
 // sameHost says whether two URLs are on the same host.
 //
@@ -358,6 +356,41 @@ func (c *Client) PostJSON(ctx context.Context, rawURL string, body []byte) (*htt
 	return c.Do(req)
 }
 
+// DefaultMaxBody is the most an upstream response body may be when the
+// configuration does not say otherwise.
+//
+// 8 MiB：站点自己那个输出上限（524288 个 token）折成字节是 2 MB 上下，它
+// 的输入上限（1048576 个 token）是 4 MB 上下 —— 8 MiB 是它上面的一个整数。
+const DefaultMaxBody int64 = 8 << 20
+
+// maxBody is the most an upstream response body may be.
+//
+// 它是整个进程一个数：读上游回包的地方读的都是它 —— 读额度、模型名单、签
+// 到、续签、聊天的回答。
+//
+// 开机的时候从配置里定一次（upstream.max_body_mb），之后只读。读的时候用
+// atomic：它是开机定、之后读的东西，可定它的那一行和读它的那一行不在同一
+// 时候，撞上了就是数据竞争。
+var maxBody atomic.Int64
+
+// SetMaxBody sets the most an upstream response body may be.
+//
+// 定一次就好（开机的时候）。不是正数就还是原来那个 —— 「没有上限」不是一
+// 个选项。
+func SetMaxBody(n int64) {
+	if n > 0 {
+		maxBody.Store(n)
+	}
+}
+
+// MaxBody is the most an upstream response body may be.
+func MaxBody() int64 {
+	if n := maxBody.Load(); n > 0 {
+		return n
+	}
+	return DefaultMaxBody
+}
+
 // ReadBody reads a response's body and closes it.
 //
 // The body is read through a limit: an upstream that streams without
@@ -368,12 +401,20 @@ func ReadBody(resp *http.Response) ([]byte, error) {
 		return nil, fmt.Errorf("read body: no body")
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	return ReadBodyLimit(resp.Body, MaxBody())
+}
+
+// ReadBodyLimit reads a body through a limit.
+//
+// 读满上限就报错，不是截断：截断的回答是半个回答，客户端拿着它当完整的用，
+// 比报错糟得多。
+func ReadBodyLimit(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
-	if len(b) > maxBody {
-		return nil, fmt.Errorf("read body: the body is larger than %d bytes", maxBody)
+	if int64(len(b)) > limit {
+		return nil, &TooLargeError{Limit: limit}
 	}
 	return b, nil
 }

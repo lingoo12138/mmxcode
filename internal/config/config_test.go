@@ -951,3 +951,77 @@ func TestTheCheckinRetentionAcceptsThirtyDays(t *testing.T) {
 		t.Fatalf("checkin_retention_days = %d, want 30", c.SQLite.CheckinRetentionDays)
 	}
 }
+
+// TestTheMaxBodyDefaults says the default is 8 MiB.
+//
+// 站点自己那个输出上限（524288 个 token）折成字节是 2 MB 上下，8 MiB 是它上
+// 面的三倍多。
+func TestTheMaxBodyDefaults(t *testing.T) {
+	c := Default()
+	if c.Upstream.MaxBodyMB != 8 {
+		t.Errorf("max_body_mb = %d, want 8", c.Upstream.MaxBodyMB)
+	}
+}
+
+// TestTheMaxBodyRefusesZero says a zero body limit is refused.
+//
+// 0 会被读成「没有上限」—— 那正是要修的那个洞（聊天的回答从前就完全没有
+// 闸），所以宁可在这里报错。
+func TestTheMaxBodyRefusesZero(t *testing.T) {
+	_, err := loadUpstream(t, "upstream:\n  max_body_mb: 0\n")
+	if err == nil {
+		t.Fatal("the zero body limit was taken")
+	}
+	if !strings.Contains(err.Error(), "max_body_mb") {
+		t.Fatalf("error %q does not name the key", err)
+	}
+}
+
+// TestTheMaxBodyRefusesANegative says a negative body limit is refused.
+func TestTheMaxBodyRefusesANegative(t *testing.T) {
+	_, err := loadUpstream(t, "upstream:\n  max_body_mb: -1\n")
+	if err == nil {
+		t.Fatal("the negative body limit was taken")
+	}
+	if !strings.Contains(err.Error(), "max_body_mb") {
+		t.Fatalf("error %q does not name the key", err)
+	}
+}
+
+// TestTheMaxBodyIsTaken says a body limit in MB is taken.
+func TestTheMaxBodyIsTaken(t *testing.T) {
+	c, err := loadUpstream(t, "upstream:\n  max_body_mb: 16\n")
+	if err != nil {
+		t.Fatalf("the body limit was refused: %v", err)
+	}
+	if c.Upstream.MaxBodyMB != 16 {
+		t.Fatalf("max_body_mb = %d, want 16", c.Upstream.MaxBodyMB)
+	}
+}
+
+// loadUpstream reads a configuration that says one thing about the
+// upstream.
+func loadUpstream(t *testing.T, body string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+// TestTheShippedConfigsHaveTheUpstreamDefaults says the configs that
+// ship with the program agree with the default.
+//
+// 发出去的配置跟说好的不一样，照着配置文件跑的人拿到的就不是那个配置。
+func TestTheShippedConfigsHaveTheUpstreamDefaults(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		c, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.Upstream != Default().Upstream {
+			t.Errorf("%s: upstream = %+v, want %+v", name, c.Upstream, Default().Upstream)
+		}
+	}
+}

@@ -1848,3 +1848,32 @@ func TestTheKeyMadeInThePanelIsSeenAtOnce(t *testing.T) {
 		t.Fatalf("code = %d, want 200: the key was taken away and the request was refused", w.Code)
 	}
 }
+
+// TestAnAnswerThatIsTooBigIsRefused says an answer that is bigger than
+// the limit is refused, and the upstream is not asked again.
+//
+// 超限的回答是「上游发的不是回答」：再问同一个账号也是这么大的回答（回答
+// 的大小是模型和请求的事，不是账号的事），所以当场就答，不重试。
+func TestAnAnswerThatIsTooBigIsRefused(t *testing.T) {
+	upstream.SetMaxBody(1024)
+	t.Cleanup(func() { upstream.SetMaxBody(upstream.DefaultMaxBody) })
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(strings.Repeat("x", 4096)))
+	})
+	body := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "larger than") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	h.mu.Lock()
+	hits := h.hits
+	h.mu.Unlock()
+	if hits != 1 {
+		t.Errorf("the upstream was asked %d times, want 1", hits)
+	}
+}

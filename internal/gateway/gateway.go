@@ -697,6 +697,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 						writeError(w, proto, http.StatusBadGateway, oe.Error())
 						return true
 					}
+					var tooBig *upstream.TooLargeError
+					if errors.As(err, &tooBig) {
+						// 上游发的不是回答：再问同一个账号也是这么大的回答
+						// （回答的大小是模型和请求的事，不是账号的事）。当场
+						// 答 502，不重试。
+						writeError(w, proto, http.StatusBadGateway, err.Error())
+						return true
+					}
 					// 网络没通：还是这个账号，等一等再来。上游没有给出
 					// 状态：这是网关自己的问题。
 					lastErr = err
@@ -724,6 +732,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 							var oe *upstream.OtherSiteError
 							if errors.As(err, &oe) {
 								writeError(w, proto, http.StatusBadGateway, oe.Error())
+								return true
+							}
+							var tooBig *upstream.TooLargeError
+							if errors.As(err, &tooBig) {
+								writeError(w, proto, http.StatusBadGateway, err.Error())
 								return true
 							}
 							lastErr = err
@@ -975,13 +988,11 @@ func (s *Server) attempt(ctx context.Context, req upstream.ChatRequest, transpor
 		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		raw, _ := upstream.ReadBody(resp)
 		return resp, raw, nil
 	}
 	if !wantStream {
-		raw, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		raw, err := upstream.ReadBody(resp)
 		if err != nil {
 			return resp, nil, err
 		}
@@ -991,7 +1002,7 @@ func (s *Server) attempt(ctx context.Context, req upstream.ChatRequest, transpor
 	head, _ := peekEvent(br)
 	if sseHasError(head) {
 		// 200 里装着错误：整条读完，当成失败处理
-		rest, _ := io.ReadAll(br)
+		rest, _ := upstream.ReadBodyLimit(br, upstream.MaxBody())
 		resp.Body.Close()
 		return resp, append(head, rest...), nil
 	}

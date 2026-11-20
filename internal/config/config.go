@@ -189,6 +189,14 @@ type Proxy struct {
 type Upstream struct {
 	Timeout Duration `yaml:"timeout" json:"timeout"`
 	Site    string   `yaml:"site" json:"site"`
+	// MaxBodyMB is the most an upstream response body may be, in MiB.
+	//
+	// 它是**回包**的大小，不是请求的。回包的大小是上游的事：站点答一个正经
+	// 问题的回答最多是它那个输出上限（524288 个 token，约 2 MB），所以 8
+	// MiB 有三倍多的余量。
+	//
+	// 0 和负数不许（那是「没有上限」，正是要修的那个洞）。
+	MaxBodyMB int `yaml:"max_body_mb" json:"max_body_mb"`
 }
 
 // Rotation holds how accounts are picked and when one is given up on.
@@ -407,7 +415,7 @@ func Default() Config {
 	return Config{
 		Server:   Server{Listen: ":8080"},
 		Proxy:    Proxy{Default: "", Groups: map[string]string{}},
-		Upstream: Upstream{Timeout: Duration(120 * time.Second), Site: "global"},
+		Upstream: Upstream{Timeout: Duration(120 * time.Second), Site: "global", MaxBodyMB: 8},
 		Rotation: Rotation{Strategy: "sticky", MaxAttempts: 3, ExhaustedCooldown: Duration(5 * time.Minute)},
 		Schedule: Schedule{
 			CheckinAt:     "00:00",
@@ -505,10 +513,24 @@ func Load(path string) (Config, error) {
 	if err := c.checkAPIKeys(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	if err := c.checkUpstream(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	if err := c.checkSQLite(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
 	return c, nil
+}
+
+// checkUpstream refuses the settings that would mean something else.
+//
+// 回包能有多大：8 MiB 是站点自己那个输出上限的三倍多。0 和负数不许 —— 「没
+// 有上限」不是一个选项：那正是要修的那个洞（聊天的回答从前完全没有闸）。
+func (c *Config) checkUpstream() error {
+	if c.Upstream.MaxBodyMB < 1 {
+		return fmt.Errorf("upstream.max_body_mb is %d: it is 1 or more", c.Upstream.MaxBodyMB)
+	}
+	return nil
 }
 
 // checkSQLite refuses the tuning the database does not know, and the

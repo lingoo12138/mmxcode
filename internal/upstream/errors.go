@@ -73,6 +73,21 @@ func (e *StaleSignatureError) Error() string {
 	return fmt.Sprintf("%s sent the request on to %s (HTTP %d), which changes the path or the query. The signature is made over the path and the query, so it cannot be replayed; the redirect is refused.", e.From, e.To, e.Status)
 }
 
+// TooLargeError says a body was larger than it may be.
+//
+// 它是「上游发的不是回答」的一种：回包的大小是上游的事，站点答一个正经问
+// 题不会超过它自己那个输出上限（524288 个 token，约 2 MB）。所以超了就是
+// 有什么不对，不是「这个答案太长」。
+type TooLargeError struct {
+	// Limit is how many bytes the body may be.
+	Limit int64
+}
+
+// Error is the error's text.
+func (e *TooLargeError) Error() string {
+	return fmt.Sprintf("the upstream's answer is larger than %d bytes", e.Limit)
+}
+
 // signInRefusedCode is the business code MiniMax answers with when it
 // refuses the sign-in.
 const signInRefusedCode = 1000048

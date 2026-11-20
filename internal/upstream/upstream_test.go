@@ -342,7 +342,7 @@ func TestReadBodyWithNoResponse(t *testing.T) {
 
 func TestReadBodyRefusesAVeryLongBody(t *testing.T) {
 	// 一个不停往里写的上游不能把内存吃光。
-	body := io.NopCloser(io.LimitReader(filler{}, maxBody+1024))
+	body := io.NopCloser(io.LimitReader(filler{}, MaxBody()+1024))
 	resp := &http.Response{Body: body}
 	if _, err := ReadBody(resp); err == nil {
 		t.Fatal("expected an error")
@@ -469,5 +469,40 @@ func TestQuotaRefusalDetection(t *testing.T) {
 		if got := IsQuotaRefusal([]byte(body)); got != want {
 			t.Errorf("IsQuotaRefusal(%s) = %v, want %v", body, got, want)
 		}
+	}
+}
+
+// TestTheBodyIsRefusedWhenItIsTooBig says a body over the limit is an
+// error, not a truncated body.
+//
+// 截断的回答是半个回答：客户端拿着它当完整的用，比报错糟得多。
+func TestTheBodyIsRefusedWhenItIsTooBig(t *testing.T) {
+	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 100)))
+	_, err := ReadBodyLimit(body, 10)
+	if err == nil {
+		t.Fatal("the too big body was taken")
+	}
+	var tooBig *TooLargeError
+	if !errors.As(err, &tooBig) {
+		t.Fatalf("the error = %v, want the one that says the body is too big", err)
+	}
+	if tooBig.Limit != 10 {
+		t.Errorf("the limit in the error = %d, want 10", tooBig.Limit)
+	}
+}
+
+// TestTheLimitIsOneForTheWholeProcess says the limit is one number for
+// the whole process, and that a zero does not take it away.
+//
+// 「没有上限」不是一个选项：那个洞正是这么来的。
+func TestTheLimitIsOneForTheWholeProcess(t *testing.T) {
+	t.Cleanup(func() { SetMaxBody(DefaultMaxBody) })
+	SetMaxBody(1234)
+	if MaxBody() != 1234 {
+		t.Errorf("the limit = %d, want 1234", MaxBody())
+	}
+	SetMaxBody(0)
+	if MaxBody() != 1234 {
+		t.Errorf("the limit = %d after a zero, want 1234", MaxBody())
 	}
 }

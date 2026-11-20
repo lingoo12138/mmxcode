@@ -14,6 +14,9 @@ proxy:
 upstream:
   timeout: 120s
   site: global
+  # 上游回包最多多大（MiB）。站点自己那个回答上限（524288 个 token）折成
+  # 字节是 2 MB 上下，8 MiB 是它上面的三倍多。超了就是上游发的不是回答。
+  max_body_mb: 8
 
 rotation:
   strategy: sticky

@@ -321,6 +321,7 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `db` | `"/data/mmxcode.db"` | SQLite 数据库路径 |
 | `upstream.timeout` | `120s` | 上游请求时限。流式对话也吃这份预算，想聊更久就调大 |
 | `upstream.site` | `"global"` | 上游站点，只支持 `global` |
+| `upstream.max_body_mb` | `8` | 上游回包最多多大（MiB）。站点自己那个回答上限折成字节是 2 MB 上下，8 MiB 是三倍多。超了就是上游发的不是回答，客户端拿到 502 |
 | `rotation.max_attempts` | `3` | 一个请求最多换几个账号 |
 | `rotation.strategy` | `"sticky"` | `sticky`（会话粘账号）或 `round-robin`（每次都转）。写错的值当 `sticky` 处理 |
 | `rotation.exhausted_cooldown` | `5m` | 配额耗尽后暂时不用这个账号的时间。读不到窗口重置时间时按它算 |
