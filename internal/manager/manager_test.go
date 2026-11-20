@@ -54,7 +54,7 @@ func newTestManagerWithPath(t *testing.T, srv *httptest.Server) (*Manager, strin
 	t.Cleanup(func() { s.Close() })
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
-	m := New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	m := New(s, up, acc, egress.New(""), oauth.NewRenewer())
 	if srv != nil {
 		// The token endpoint and the account API are pointed at the
 		// test server. Without this the test talks to MiniMax itself,
@@ -1893,7 +1893,7 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	// 另一个写者改了出口
-	if err := m.Store.SetAccountProxy(ctx, "acc_01", "grp", "http://127.0.0.1:7890", time.Now()); err != nil {
+	if err := m.Store.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:7890", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	a, err := m.Store.GetAccount(ctx, "acc_01")
@@ -1903,7 +1903,7 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 	if a.Status != store.StatusSignedOut {
 		t.Fatalf("status = %q, want %q", a.Status, store.StatusSignedOut)
 	}
-	if a.ProxyGroup != "grp" || a.ProxyURL != "http://127.0.0.1:7890" {
+	if a.ProxyURL != "http://127.0.0.1:7890" {
 		t.Fatalf("the account = %+v, want the outlet the other writer set", a)
 	}
 }

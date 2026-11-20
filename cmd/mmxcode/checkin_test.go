@@ -71,7 +71,7 @@ func testEnvWithServer(t *testing.T, srv *httptest.Server) *env {
 	acc.SetBase(srv.URL, srv.URL)
 	e.up = up
 	e.acc = acc
-	e.egr = egress.New(nil, "")
+	e.egr = egress.New("")
 	e.mgr = manager.New(e.store, up, acc, e.egr, oauth.NewRenewer())
 	e.mgr.TokenURL = srv.URL + "/oauth2/token"
 	return e

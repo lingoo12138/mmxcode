@@ -51,7 +51,6 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
 	})
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	groups := map[string]string{"warp": "socks5h://warp:4000"}
 	// The account API is pointed at a stand-in server: the check-in
 	// route reaches the account API, and a test must never talk to
 	// MiniMax itself.
@@ -61,13 +60,7 @@ func newTestWebUIWithConfig(t *testing.T, cfg config.Config) (*WebUI, *store.Sto
 	t.Cleanup(srv.Close)
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(groups, ""), oauth.NewRenewer())
-	// The outlet groups are the configuration's; the resolver is built
-	// from the same map, so the page and the resolver agree on which
-	// groups there are.
-	if len(cfg.Proxy.Groups) == 0 {
-		cfg.Proxy.Groups = groups
-	}
+	mgr := manager.New(s, up, acc, egress.New(cfg.Proxy.Default), oauth.NewRenewer())
 	w := New(mgr, cfg, s)
 	// The import and the relogin talk to the site, and a test must
 	// never talk to MiniMax itself: they are fields so that the test
@@ -350,22 +343,27 @@ func TestAPICheckin(t *testing.T) {
 	}
 }
 
+// 出口页列的是在用的那些：全局默认，加上账号自己写的地址。
 func TestAPIEgress(t *testing.T) {
-	w, _ := newTestWebUI(t)
+	w, s := newTestWebUI(t)
+	if err := s.SetAccountProxy(context.Background(), "acc_01",
+		"http://10.0.0.5:1080", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "/api/egress", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "warp") {
+	if !strings.Contains(rec.Body.String(), "http://10.0.0.5:1080") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
 
 func TestAPIPatchAccount(t *testing.T) {
 	w, s := newTestWebUI(t)
-	body := strings.NewReader(`{"proxy_group":"warp","name":"新名字"}`)
+	body := strings.NewReader(`{"proxy_url":"http://10.0.0.5:1080","name":"新名字"}`)
 	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01", body)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
@@ -376,7 +374,7 @@ func TestAPIPatchAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ProxyGroup != "warp" || a.Name != "新名字" {
+	if a.ProxyURL != "http://10.0.0.5:1080" || a.Name != "新名字" {
 		t.Fatalf("account = %+v", a)
 	}
 }
@@ -611,7 +609,7 @@ func TestAPIPatchDoesNotUndoASignOut(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPatch, "/api/accounts/acc_01",
-		strings.NewReader(`{"name":"新名字","proxy_group":"warp"}`))
+		strings.NewReader(`{"name":"新名字","proxy_url":"http://10.0.0.5:1080"}`))
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -629,7 +627,7 @@ func TestAPIPatchDoesNotUndoASignOut(t *testing.T) {
 		t.Errorf("the last error is %q", a.LastError)
 	}
 	// 改的还是要改。
-	if a.Name != "新名字" || a.ProxyGroup != "warp" {
+	if a.Name != "新名字" || a.ProxyURL != "http://10.0.0.5:1080" {
 		t.Errorf("account = %+v", a)
 	}
 }

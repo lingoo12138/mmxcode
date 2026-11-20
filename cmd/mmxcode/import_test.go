@@ -16,13 +16,14 @@ import (
 	"mmxcode/internal/config"
 	"mmxcode/internal/egress"
 	"mmxcode/internal/provision"
+	"mmxcode/internal/store"
 )
 
 // aFakeEnv is an env whose batch does not touch the network.
 func aFakeEnv(t *testing.T) *env {
 	t.Helper()
 	e := &env{}
-	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+	e.makeRunner = func(interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
 		return &provision.Runner{
 			Importer: &provision.Importer{
 				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
@@ -62,7 +63,7 @@ func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
 	defer srv.Close()
 	e := testEnvWithServer(t, srv)
 	seedAccount(t, e, time.Now().Add(time.Hour))
-	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+	e.makeRunner = func(interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
 		return &provision.Runner{
 			Importer: &provision.Importer{
 				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
@@ -80,7 +81,7 @@ func TestTheImportReadsTheCreditsOfTheNewAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runImport(context.Background(), e, &out, path, "", time.Millisecond, false); err != nil {
+	if err := runImport(context.Background(), e, &out, path, time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	if reads.Load() == 0 {
@@ -95,7 +96,7 @@ func TestImportReadsTheFileAndSaysWhatHappened(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runImport(context.Background(), aFakeEnv(t), &out, path, "", time.Millisecond, false); err != nil {
+	if err := runImport(context.Background(), aFakeEnv(t), &out, path, time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	text := out.String()
@@ -115,7 +116,7 @@ func TestImportSaysALineItCouldNotRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runImport(context.Background(), aFakeEnv(t), &out, path, "", time.Millisecond, false); err != nil {
+	if err := runImport(context.Background(), aFakeEnv(t), &out, path, time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "第 1 行") {
@@ -130,7 +131,7 @@ func TestImportSaysWhyAnAccountDidNotMakeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runImport(context.Background(), aFakeEnv(t), &out, path, "", time.Millisecond, false); err != nil {
+	if err := runImport(context.Background(), aFakeEnv(t), &out, path, time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "密码") {
@@ -146,7 +147,7 @@ func TestImportStopsAtItsTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := aFakeEnv(t)
-	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+	e.makeRunner = func(interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
 		return &provision.Runner{
 			Importer: &provision.Importer{
 				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
@@ -179,7 +180,7 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 	e := testEnv(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	e.makeRunner = func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
+	e.makeRunner = func(interval time.Duration, keeper func(string) (string, error)) *provision.Runner {
 		return &provision.Runner{
 			Importer: &provision.Importer{
 				Import: func(ctx context.Context, email, password string) (provision.Result, error) {
@@ -196,7 +197,7 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
-	if err := runImport(ctx, e, &out, path, "", time.Millisecond, false); err == nil {
+	if err := runImport(ctx, e, &out, path, time.Millisecond, false); err == nil {
 		t.Fatal("the import ran past its deadline")
 	}
 	// 已经进来的那个账号要说出来，也要说清楚这趟是被掐断的。
@@ -224,15 +225,14 @@ func TestAnImportThatIsCutShortKeepsWhatItGot(t *testing.T) {
 	}
 }
 
-func TestTheImportGivesTheAccountTheGroupItUsed(t *testing.T) {
-	// --group 只管登录是不够的：账号自己的活也得从那个口出去，不然站点
-	// 看到的是同一个账号从两个地方来。
+// 导入走全局默认出口：新账号身上没有自己的地址，它跟着全局默认走。
+func TestTheImportGoesOutOfTheGlobalDefault(t *testing.T) {
 	e := &env{
 		cfg: config.Default(),
-		egr: egress.New(map[string]string{"hk": egress.Direct}, ""),
+		egr: egress.New("direct"),
 	}
-	c := e.chain("hk", nil)
-	if c.ProxyGroup != "hk" {
-		t.Fatalf("group = %q, want hk", c.ProxyGroup)
+	c := e.chain(e.egr.Resolve(store.Account{}), nil)
+	if c == nil {
+		t.Fatal("the chain is not there")
 	}
 }

@@ -75,17 +75,18 @@ func TestAccountsListKeepsTheDefaultProxySecret(t *testing.T) {
 	}
 }
 
-// TestAccountsListShowsTheGroupName says a group's name is printed as
-// it is: a name is not a secret.
+// TestAccountsListShowsTheAddress says the account's own address is
+// printed, with the credentials taken out.
 //
-// 组名不是秘密，照原样打印，才看得出这个账号走的是哪一组。
-func TestAccountsListShowsTheGroupName(t *testing.T) {
+// 地址里的账号和密码是秘密，而这份输出会进到终端的回滚里，也会进到 CI
+// 的日志里。
+func TestAccountsListShowsTheAddress(t *testing.T) {
 	e := testEnv(t)
-	e.cfg.Proxy.Groups = map[string]string{"hk": "socks5h://bob:hunter2@127.0.0.1:1080"}
 	now := time.Now()
 	if err := e.store.CreateAccount(context.Background(), store.Account{
 		ID: "acc_1", Name: "一号", Status: store.StatusActive,
-		ProxyGroup: "hk", CreatedAt: now, UpdatedAt: now,
+		ProxyURL:  "socks5h://bob:hunter2@127.0.0.1:1080",
+		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("create account: %v", err)
 	}
@@ -99,9 +100,9 @@ func TestAccountsListShowsTheGroupName(t *testing.T) {
 		}
 	})
 	if strings.Contains(out, "hunter2") {
-		t.Errorf("the group's password is in the output:\n%s", out)
+		t.Errorf("the address's password is in the output:\n%s", out)
 	}
-	if !strings.Contains(out, "hk") {
-		t.Errorf("the group is not in the output:\n%s", out)
+	if !strings.Contains(out, "127.0.0.1:1080") {
+		t.Errorf("the address is not in the output:\n%s", out)
 	}
 }

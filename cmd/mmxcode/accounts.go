@@ -39,20 +39,17 @@ func newAccountsListCmd(e *env) *cobra.Command {
 				return nil
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t出口组\t代理")
+			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t代理")
 			for _, a := range list {
 				// 代理地址里的账号和密码是秘密，而这份输出会进到终端的
 				// 回滚里，也会进到 CI 的日志里。egress.Redacted 就是
-				// 为了这个。组名不是秘密，照原样打印。
+				// 为了这个。账号没有自己的地址就写全局默认那个。
 				proxy := egress.Redacted(a.ProxyURL)
-				if proxy == "" {
-					proxy = a.ProxyGroup
-				}
 				if proxy == "" {
 					proxy = egress.Redacted(e.cfg.Proxy.Default)
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-					a.ID, a.Name, a.Email, a.Status, a.ProxyGroup, proxy)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+					a.ID, a.Name, a.Email, a.Status, proxy)
 			}
 			return w.Flush()
 		},
@@ -77,13 +74,10 @@ func newAccountsRemoveCmd(e *env) *cobra.Command {
 }
 
 func newAccountsProxyCmd(e *env) *cobra.Command {
-	var (
-		group string
-		url   string
-	)
+	var url string
 	cmd := &cobra.Command{
 		Use:   "proxy <id>",
-		Short: "给账号指定出口组或单独的代理地址",
+		Short: "给账号指定单独的代理地址",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
@@ -94,22 +88,14 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 				}
 				return err
 			}
-			if group != "" {
-				// 组名写错会让账号悄悄改走全局默认。挡在这里。
-				if _, ok := e.cfg.Proxy.Groups[group]; !ok {
-					return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
-				}
-				a.ProxyGroup = group
-			}
 			if url != "" {
 				a.ProxyURL = url
 			}
-			// 只写出口那两列。整行写回去会把别的写者在这中间改的东西抹掉：
+			// 只写出口那一列。整行写回去会把别的写者在这中间改的东西抹掉：
 			// 登出刚写下的状态，会被这一次改代理抹回 active。
-			return e.store.SetAccountProxy(ctx, a.ID, a.ProxyGroup, a.ProxyURL, nowUTC())
+			return e.store.SetAccountProxy(ctx, a.ID, a.ProxyURL, nowUTC())
 		},
 	}
-	cmd.Flags().StringVar(&group, "group", "", "出口组名")
 	cmd.Flags().StringVar(&url, "url", "", "单独的代理地址")
 	return cmd
 }

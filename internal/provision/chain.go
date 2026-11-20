@@ -33,7 +33,7 @@ type Store interface {
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
 	// SetAccountProxy writes the account's outlet.
-	SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error
+	SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error
 }
 
 // Web is the part of the account site the chain talks to.
@@ -78,11 +78,6 @@ type Chain struct {
 	// Keeper encrypts the password so that it can be kept. A nil one
 	// means the password is not kept: it is used once and thrown away.
 	Keeper func(password string) (string, error)
-	// ProxyGroup is the outlet group the accounts go out through.
-	//
-	// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的是同一个
-	// 账号从同一个地方来。空的是全局默认出口。
-	ProxyGroup string
 	// Now is the clock.
 	Now func() time.Time
 	// NewID makes an account id.
@@ -374,14 +369,13 @@ func (c *Chain) Import(ctx context.Context, email, password string) (Result, err
 				})
 			}
 			acc := store.Account{
-				ID:         c.newID(),
-				Name:       mail,
-				UserID:     wantUserID,
-				Email:      wantMail,
-				Status:     store.StatusActive,
-				ProxyGroup: c.ProxyGroup,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:        c.newID(),
+				Name:      mail,
+				UserID:    wantUserID,
+				Email:     wantMail,
+				Status:    store.StatusActive,
+				CreatedAt: now,
+				UpdatedAt: now,
 			}
 			if err := tx.CreateAccount(ctx, acc); err != nil {
 				return err
@@ -450,23 +444,9 @@ func (c *Chain) refresh(ctx context.Context, acc store.Account,
 			notes = append(notes, "名字没能更新："+err.Error())
 		}
 	}
-	// 出口组：导入是从哪个口登的，账号以后就走哪个口。没带组的导入不动
-	// 原来那一行的组和地址——那是人自己设的，不能因为一次没带组的导入就没了。
-	//
-	// 带了组的时候，账号自己那个地址要让位：出口是按「先看地址、再看组」
-	// 找的（internal/egress），地址留着就还是从那个地方出去，组写着是 hk
-	// 也没用。导入是人明确做的一件事，它带的组说了算，所以那个地址清掉，
-	// 而且要说出来——地址没了是件人该知道的事。
-	if c.ProxyGroup != "" && (c.ProxyGroup != acc.ProxyGroup || acc.ProxyURL != "") {
-		if err := c.Store.SetAccountProxy(ctx, acc.ID, c.ProxyGroup, "", now); err != nil {
-			notes = append(notes, "出口组没能更新："+err.Error())
-		} else if acc.ProxyURL != "" {
-			// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，
-			// 没了就得能照着填回去。
-			notes = append(notes, "账号自己那个出口地址（"+acc.ProxyURL+
-				"）清掉了，改走导入带的出口组 "+c.ProxyGroup)
-		}
-	}
+	// 出口：导入不动账号自己那个地址 —— 那是人自己设的，不能因为一次导
+	// 入就没了。账号没有地址的时候，它跟着全局默认走；全局默认改了，
+	// 它也跟着改。
 	return notes
 }
 

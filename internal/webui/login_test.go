@@ -140,7 +140,7 @@ func newFakeSiteWebUI(t *testing.T, f *fakeSite) (*WebUI, *store.Store) {
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(map[string]string{}, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 	return New(mgr, config.Default(), s), s
 }
 

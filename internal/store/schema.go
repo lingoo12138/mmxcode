@@ -50,6 +50,10 @@ func nullable(name string) copyColumn {
 // The tables, in the order they are made.
 //
 // The accounts come first: the other tables point at them.
+//
+// accounts.proxy_group 是退役的出口组：那一列留着（删列要重建整张表，而
+// 那张表上有触发器、有一百多个号在用），但代码不再写它、也不再读它，只有
+// 开机收拾旧账号的时候读一次（store.LegacyProxyGroups）。
 var tables = []table{
 	{
 		name: "accounts",

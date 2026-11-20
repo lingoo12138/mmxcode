@@ -30,34 +30,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # WARP 作为额外的出口，默认不启动。
-  # 开启：.env 里写 COMPOSE_PROFILES=warp
-  warp:
-    image: cloudflare/warp:latest
-    profiles: ["warp"]
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.conf.all.src_valid_mark: "1"
-    volumes:
-      - warp-state:/var/lib/cloudflare-warp
-    command:
-      - /bin/sh
-      - -c
-      - |
-        warp-cli --accept-tos registration new || true
-        warp-cli mode proxy
-        warp-cli proxy port 4000
-        warp-cli proxy bind 0.0.0.0
-        warp-cli connect
-        tail -f /dev/null
-    expose:
-      - "4000"
-
 volumes:
   # 数据库数据目录（见上面 MMXCODE_DATA_DIR 的说明）。
   mmxcode-data:
-  warp-state:

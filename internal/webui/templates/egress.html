@@ -7,7 +7,7 @@
   <td>{{.Name}}</td>
   <td class="muted">{{.URL}}</td>
   <td>{{if .OK}}<span class="good">可用</span>{{else if .Checked}}<span class="bad">不可用：{{.Error}}</span>{{else}}<span class="muted">未检查</span>{{end}}</td>
-  <td><button data-egress="{{.Name}}">测试</button></td>
+  <td><button data-egress="{{.URL}}">测试</button></td>
 </tr>
 {{end}}
 </table>

@@ -67,7 +67,7 @@ func (s *Store) PoolCandidates(ctx context.Context, limit int, exclude map[strin
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group, a.proxy_url,
+		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_url,
 			a.last_error, a.created_at, a.updated_at,
 			u.remaining, u.created_at
 		FROM accounts a

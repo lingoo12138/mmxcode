@@ -67,8 +67,8 @@ batch:
 	if cfg.Batch.Interval.Duration() != 5*time.Second {
 		t.Errorf("interval = %v", cfg.Batch.Interval)
 	}
-	if cfg.Batch.Group != "clash" {
-		t.Errorf("group = %q", cfg.Batch.Group)
+	if cfg.Batch.LegacyGroup != "clash" {
+		t.Errorf("group = %q", cfg.Batch.LegacyGroup)
 	}
 	if !cfg.Batch.Relogin.Enabled {
 		t.Error("the relogin is not on")
@@ -118,11 +118,11 @@ db: "./local.db"
 	if c.Proxy.Default != "socks5h://warp:4000" {
 		t.Fatalf("proxy default = %q", c.Proxy.Default)
 	}
-	if c.Proxy.Groups["warp"] != "socks5h://warp:4000" {
-		t.Fatalf("groups = %v", c.Proxy.Groups)
+	if c.Proxy.LegacyGroups["warp"] != "socks5h://warp:4000" {
+		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
 	}
-	if c.Proxy.Groups["direct"] != "direct" {
-		t.Fatalf("groups = %v", c.Proxy.Groups)
+	if c.Proxy.LegacyGroups["direct"] != "direct" {
+		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
 	}
 	if c.Upstream.Timeout.Duration() != 45*time.Second {
 		t.Fatalf("timeout = %v", c.Upstream.Timeout)
@@ -350,8 +350,9 @@ func TestLoadAllowsTrailingSeparator(t *testing.T) {
 	}
 }
 
-func TestLoadNullGroupsBecomesEmptyMap(t *testing.T) {
-	// WebUI 要遍历出口组，nil map 会让它炸。
+func TestLoadNullLegacyGroupsBecomesEmptyMap(t *testing.T) {
+	// 老部署的配置文件里有 proxy.groups：nil map 遍历起来没事，但写回
+	// 文件的时候是 null，读回来还是 nil。
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := writeFile(path, "proxy:\n  groups:\n"); err != nil {
 		t.Fatal(err)
@@ -360,18 +361,47 @@ func TestLoadNullGroupsBecomesEmptyMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Proxy.Groups == nil {
+	if c.Proxy.LegacyGroups == nil {
 		t.Fatal("groups is nil")
 	}
-	if len(c.Proxy.Groups) != 0 {
-		t.Fatalf("groups = %v", c.Proxy.Groups)
+	if len(c.Proxy.LegacyGroups) != 0 {
+		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	}
+}
+
+// 老部署的配置文件里有两个退役的键。加载器认不出的键是错字，直接报错
+// —— 那台机器就起不来了，而起不来的机器上的号就全废了。所以它们还得
+// 认，只是没有人再拿它们做事。
+func TestTheRetiredKeysAreStillRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `
+proxy:
+  default: "http://127.0.0.1:7890"
+  groups:
+    clash: "http://127.0.0.1:7890"
+batch:
+  interval: 3s
+  group: "clash"
+`
+	if err := writeFile(path, body); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Proxy.LegacyGroups["clash"] != "http://127.0.0.1:7890" {
+		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	}
+	if c.Batch.LegacyGroup != "clash" {
+		t.Fatalf("batch group = %q", c.Batch.LegacyGroup)
 	}
 }
 
 func TestConfigYAMLRoundTrip(t *testing.T) {
 	// CLI 与 WebUI 都要把配置写回文件，写出来要能读回来。
 	c := Default()
-	c.Proxy.Groups["warp"] = "socks5h://warp:4000"
+	c.Proxy.LegacyGroups["warp"] = "socks5h://warp:4000"
 	c.Server.APIKeys = []string{"sk-a"}
 	b, err := yaml.Marshal(c)
 	if err != nil {
@@ -388,8 +418,8 @@ func TestConfigYAMLRoundTrip(t *testing.T) {
 	if back.Upstream.Timeout.Duration() != c.Upstream.Timeout.Duration() {
 		t.Fatalf("timeout = %v, want %v", back.Upstream.Timeout.Duration(), c.Upstream.Timeout.Duration())
 	}
-	if back.Proxy.Groups["warp"] != c.Proxy.Groups["warp"] {
-		t.Fatalf("groups = %v", back.Proxy.Groups)
+	if back.Proxy.LegacyGroups["warp"] != c.Proxy.LegacyGroups["warp"] {
+		t.Fatalf("groups = %v", back.Proxy.LegacyGroups)
 	}
 	if back.Schedule.CheckinAt != c.Schedule.CheckinAt || back.DB != c.DB {
 		t.Fatalf("round trip lost data: %+v", back)

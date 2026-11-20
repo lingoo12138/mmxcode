@@ -173,11 +173,12 @@ document.addEventListener('click', async (ev) => {
 
   const egress = ev.target.closest('[data-egress]');
   if (egress) {
-    const name = egress.dataset.egress;
+    // 页面上显示的是去掉凭据的地址，服务器拿它去对上真的那个地址。
+    const url = egress.dataset.egress;
     egress.disabled = true;
     egress.textContent = '测试中……';
     try {
-      const out = await post('/api/egress/test', { name });
+      const out = await post('/api/egress/test', { url });
       egress.textContent = out.ok ? '可用' : '不可用';
       egress.className = out.ok ? 'good' : 'bad';
     } catch (e) {

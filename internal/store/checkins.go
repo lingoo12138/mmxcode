@@ -99,7 +99,7 @@ func (s *Store) DayCheckins(ctx context.Context, day string) ([]CheckinCredit, e
 // NOT IN 遇到 NULL 会一个都不返回。签到的 account_id 是 NOT NULL 的
 // （schema.go），迁移的时候老行补的也是空串不是 NULL，所以不会。
 const accountsWithoutCheckinSQL = `
-		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_group, a.proxy_url,
+		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_url,
 			a.last_error, a.created_at, a.updated_at
 		FROM accounts a
 		WHERE a.status = ?

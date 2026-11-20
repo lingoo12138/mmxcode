@@ -176,7 +176,7 @@ func serveEnv(t *testing.T, cfg config.Config) *env {
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	egr := egress.New(cfg.Proxy.Groups, cfg.Proxy.Default)
+	egr := egress.New(cfg.Proxy.Default)
 	tr, err := egr.Transport(egr.Resolve(store.Account{}))
 	if err != nil {
 		t.Fatalf("transport: %v", err)

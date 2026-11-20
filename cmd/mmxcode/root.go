@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -65,7 +64,7 @@ type env struct {
 
 	// makeRunner makes the batch driver. It is a field so that a test
 	// can run a batch without a network.
-	makeRunner func(group string, interval time.Duration, keeper func(string) (string, error)) *provision.Runner
+	makeRunner func(interval time.Duration, keeper func(string) (string, error)) *provision.Runner
 }
 
 func newRoot() (*cobra.Command, *env) {
@@ -113,7 +112,7 @@ func newRoot() (*cobra.Command, *env) {
 			return err
 		}
 		e.store = s
-		e.egr = egress.New(cfg.Proxy.Groups, cfg.Proxy.Default)
+		e.egr = egress.New(cfg.Proxy.Default)
 		// 登录和账户 API 也走代理。配了不用等于没配：国内的网络
 		// 连不上国际站，登录就停在第一步。
 		tr, err := e.egr.Transport(e.egr.Resolve(store.Account{}))
@@ -130,6 +129,23 @@ func newRoot() (*cobra.Command, *env) {
 		if err := e.mgr.ClearRetiredNotes(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: the notes of an older version could not be cleared: %v\n", err)
 		}
+		// 出口组退役了：账号身上那个组名变成账号自己的地址。收拾失败的
+		// 话，网关照样起 —— 那是一次收拾，不是网关的命。
+		res, err := e.mgr.MaterializeProxyGroups(ctx, cfg.Proxy.LegacyGroups)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: the outlet groups of the accounts could not be moved: %v\n", err)
+		} else {
+			if res.Moved > 0 {
+				fmt.Fprintf(os.Stderr, "%d account(s) took the address of their outlet group as an address of their own.\n", res.Moved)
+			}
+			if res.Dropped > 0 {
+				fmt.Fprintf(os.Stderr, "warning: %d account(s) pointed at an outlet group that is not in the configuration (%s): they follow the global default now.\n",
+					res.Dropped, strings.Join(res.DroppedIDs, ", "))
+			}
+		}
+		if len(cfg.Proxy.LegacyGroups) > 0 {
+			fmt.Fprintf(os.Stderr, "warning: proxy.groups is retired: the outlet groups of the accounts have become addresses of their own. That part can be taken out of the configuration file.\n")
+		}
 		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
 		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
 			e.mgr.Key = key
@@ -137,7 +153,7 @@ func newRoot() (*cobra.Command, *env) {
 			// 密钥设了但是不对：说一声，别让人以为密码存下了。
 			fmt.Fprintf(os.Stderr, "warning: %s is set but unusable: %v\n", PasswordKeyEnv, err)
 		}
-		e.mgr.ReloginFn = e.reloginFn("")
+		e.mgr.ReloginFn = e.reloginFn()
 		return nil
 	}
 	root.PersistentPostRun = func(cmd *cobra.Command, args []string) {
@@ -158,13 +174,3 @@ func newRoot() (*cobra.Command, *env) {
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
-
-// groupNames lists the outlet groups, for an error message.
-func groupNames(groups map[string]string) string {
-	names := make([]string, 0, len(groups))
-	for n := range groups {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return strings.Join(names, ", ")
-}

@@ -256,7 +256,6 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 	for _, s := range snaps {
 		byAccount[s.AccountID] = s
 	}
-	groups := w.groupNames()
 	out := make([]map[string]any, 0, len(accounts))
 	for _, a := range accounts {
 		snap := byAccount[a.ID]
@@ -266,9 +265,7 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"Name":          a.Name,
 			"Email":         a.Email,
 			"Status":        a.Status,
-			"ProxyGroup":    a.ProxyGroup,
 			"ProxyURL":      egress.Redacted(a.ProxyURL),
-			"Current":       a.ProxyGroup,
 			"HasAmounts":    snap.HasAmounts,
 			"Granted":       snap.Granted,
 			"Remaining":     snap.Remaining,
@@ -282,17 +279,7 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"LastError": a.LastError,
 		})
 	}
-	return map[string]any{"Accounts": out, "Groups": groups}, nil
-}
-
-// groupNames gives the outlet groups for the drop-down.
-func (w *WebUI) groupNames() []map[string]any {
-	var out []map[string]any
-	for name := range w.Cfg.Proxy.Groups {
-		out = append(out, map[string]any{"Name": name})
-	}
-	out = append(out, map[string]any{"Name": "direct"})
-	return out
+	return map[string]any{"Accounts": out}, nil
 }
 
 // windowSummary gives a one-line summary of the account's windows.
@@ -328,6 +315,9 @@ func (w *WebUI) todayCheckin(ctx context.Context, accountID string) (bool, int) 
 }
 
 // egressData is the outlets page's data.
+//
+// 列的是在用的那些：全局默认，加上账号自己写的地址。列那些没人走的地址
+// 没有意义 —— 「可用」什么也不说明。
 func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	health, err := w.Store.EgressHealth(ctx)
 	if err != nil {
@@ -337,11 +327,15 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	for _, h := range health {
 		byURL[h.URL] = h
 	}
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out []map[string]any
-	for name, url := range w.Cfg.Proxy.Groups {
-		h, ok := byURL[url]
+	for _, o := range egress.Outlets(accounts, w.Cfg.Proxy.Default) {
+		h, ok := byURL[o.URL]
 		out = append(out, map[string]any{
-			"Name": name, "URL": egress.Redacted(url),
+			"Name": o.Name, "URL": egress.Redacted(o.URL),
 			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
 		})
 	}
@@ -616,10 +610,10 @@ func (w *WebUI) apiEgress(rw http.ResponseWriter, r *http.Request) {
 // apiEgressTest tests one outlet now.
 func (w *WebUI) apiEgressTest(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		URL string `json:"url"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-	url, ok := w.Cfg.Proxy.Groups[body.Name]
+	url, ok := w.outletURL(r.Context(), body.URL)
 	if !ok {
 		http.Error(rw, "no such outlet", http.StatusNotFound)
 		return
@@ -634,6 +628,23 @@ func (w *WebUI) apiEgressTest(rw http.ResponseWriter, r *http.Request) {
 	}
 	_ = w.Store.SetEgressHealth(r.Context(), url, ok2, msg)
 	writeJSON(rw, map[string]any{"ok": ok2, "error": msg})
+}
+
+// outletURL finds the address behind the one the page shows.
+//
+// 页面显示的是去掉凭据的地址（凭据是秘密，不能露在页面上），那个地址发
+// 回来的时候也是去了凭据的。它得对上真的那个地址才测得动。
+func (w *WebUI) outletURL(ctx context.Context, shown string) (string, bool) {
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, o := range egress.Outlets(accounts, w.Cfg.Proxy.Default) {
+		if egress.Redacted(o.URL) == shown {
+			return o.URL, true
+		}
+	}
+	return "", false
 }
 
 // apiAccount handles one account: patch, delete, usage, check-in.
@@ -660,9 +671,8 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPatch:
 		var body struct {
-			Name       *string `json:"name"`
-			ProxyGroup *string `json:"proxy_group"`
-			ProxyURL   *string `json:"proxy_url"`
+			Name     *string `json:"name"`
+			ProxyURL *string `json:"proxy_url"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		a, err := w.Store.GetAccount(r.Context(), id)
@@ -673,16 +683,6 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			}
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
-		}
-		if body.ProxyGroup != nil {
-			// 组名写错会让账号悄悄改走全局默认。挡在这里。
-			if *body.ProxyGroup != "" {
-				if _, ok := w.Cfg.Proxy.Groups[*body.ProxyGroup]; !ok {
-					http.Error(rw, "no such outlet group: "+*body.ProxyGroup, http.StatusBadRequest)
-					return
-				}
-			}
-			a.ProxyGroup = *body.ProxyGroup
 		}
 		if body.ProxyURL != nil {
 			// The page shows the address without its credentials, so
@@ -702,8 +702,8 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if body.ProxyGroup != nil || body.ProxyURL != nil {
-			if err := w.Store.SetAccountProxy(r.Context(), a.ID, a.ProxyGroup, a.ProxyURL, time.Now()); err != nil {
+		if body.ProxyURL != nil {
+			if err := w.Store.SetAccountProxy(r.Context(), a.ID, a.ProxyURL, time.Now()); err != nil {
 				http.Error(rw, err.Error(), http.StatusInternalServerError)
 				return
 			}

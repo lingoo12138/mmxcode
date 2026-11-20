@@ -87,7 +87,7 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 	})
 
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
-	mgr := manager.New(s, up, account.New(up), egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, account.New(up), egress.New(""), oauth.NewRenewer())
 	// 续签的地址指到假服务器：一个测试碰到续签的时候，也不该去
 	// MiniMax 自己那里。
 	mgr.TokenURL = h.srv.URL + site.TokenPath

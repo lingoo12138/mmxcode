@@ -11,6 +11,7 @@ import (
 
 	"mmxcode/internal/checkin"
 	"mmxcode/internal/config"
+	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/store"
 	"mmxcode/internal/usage"
@@ -271,7 +272,10 @@ func (s *Scheduler) Relogin(ctx context.Context) {
 	}
 }
 
-// CheckEgress tests every outlet and records the result.
+// CheckEgress tests every outlet that is in use and records the result.
+//
+// 查的是在用的那些：全局默认，加上账号自己写的地址。查那些没人走的地
+// 址没有意义 —— 「可用」什么也不说明。
 //
 // The probe and the write have a context each. The probe's timeout is
 // over when the answer is in, and a write under that context would be
@@ -282,7 +286,12 @@ func (s *Scheduler) CheckEgress(ctx context.Context) {
 	if target == "" {
 		target = egressTarget
 	}
-	for name, url := range s.Cfg.Proxy.Groups {
+	accounts, err := s.Mgr.Store.ListAccounts(ctx)
+	if err != nil {
+		fmt.Printf("egress: %v\n", err)
+		return
+	}
+	for _, url := range egress.OutletURLs(accounts, s.Cfg.Proxy.Default) {
 		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		err := s.Mgr.Egress.Check(probeCtx, url, target)
 		cancel()
@@ -296,7 +305,6 @@ func (s *Scheduler) CheckEgress(ctx context.Context) {
 		writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), egressWriteTimeout)
 		_ = s.Mgr.Store.SetEgressHealth(writeCtx, url, err == nil, msg)
 		writeCancel()
-		_ = name
 	}
 }
 

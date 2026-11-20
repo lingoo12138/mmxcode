@@ -176,13 +176,20 @@ type Server struct {
 	APIKeys []string `yaml:"api_keys" json:"api_keys"`
 }
 
-// Proxy holds the global proxy and the named egress groups.
+// Proxy holds the global outlet.
 //
-// The groups are the names an account can be pointed at; the addresses
-// live here, so moving a group moves every account that uses it.
+// 出口只有两级：账号自己的地址（写在库里，页面上每一行都能改），然后是
+// 全局默认（写在这里）。两个都没有就是直连 —— 直连是最后一级，不是错。
 type Proxy struct {
-	Default string            `yaml:"default" json:"default"`
-	Groups  map[string]string `yaml:"groups" json:"groups"`
+	Default string `yaml:"default" json:"default"`
+	// LegacyGroups is the outlet groups of an older version.
+	//
+	// 退役了：组这个概念没有了。它只被读一次 —— 开机的时候，账号身上那个
+	// 组名变成账号自己的地址。
+	//
+	// 老部署的配置文件里还有这个键，加载器得认它：认不出的键是错字，直
+	// 接报错，那台机器就起不来了，而起不来的机器上的号就全废了。
+	LegacyGroups map[string]string `yaml:"groups" json:"groups"`
 }
 
 // Upstream holds the upstream site's settings.
@@ -227,15 +234,13 @@ type Schedule struct {
 type Batch struct {
 	// Interval is the wait between two accounts.
 	Interval Duration `yaml:"interval" json:"interval"`
-	// Group is the egress group the logins go through. An empty one
-	// is the default proxy.
+	// LegacyGroup is the outlet group the logins went through, of an
+	// older version.
 	//
-	// 它是常驻的：网页上传和命令行没有另外指定的时候，导入都走这个组。
-	// 导入带了组的时候，账号自己那个出口地址要让位——出口是按「先看地
-	// 址、再看组」找的，地址留着就还是从那个地方出去。所以配了这个组
-	// 之后，清单里那些账号自己手填的地址会被清掉，导入结果里会写明
-	// 清掉的是哪个地址。
-	Group string `yaml:"group" json:"group"`
+	// 退役了：导入不再有「走哪个组」这件事，它走全局默认出口。这个键只
+	// 是还认着 —— 老配置里有它，认不出的键是错字，直接报错，那台机器就
+	// 起不来了。
+	LegacyGroup string `yaml:"group" json:"group"`
 	// Relogin is the automatic signing-in again.
 	Relogin Relogin `yaml:"relogin" json:"relogin"`
 }
@@ -414,7 +419,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Server:   Server{Listen: ":8080"},
-		Proxy:    Proxy{Default: "", Groups: map[string]string{}},
+		Proxy:    Proxy{Default: "", LegacyGroups: map[string]string{}},
 		Upstream: Upstream{Timeout: Duration(120 * time.Second), Site: "global", MaxBodyMB: 8},
 		Rotation: Rotation{Strategy: "sticky", MaxAttempts: 3, ExhaustedCooldown: Duration(5 * time.Minute)},
 		Schedule: Schedule{
@@ -491,9 +496,9 @@ func Load(path string) (Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// 认不出的键是错字，不是新功能。直接报错，别让人以为配上了。
 	//
-	// 注意这只管结构体的字段。map 的键名管不了：出口组的名字是配置
-	// 自己定的，加载器没有一份已知的名单可比。组名写错由设置出口组的
-	// 地方挡（CLI 与 WebUI 都查配置里有没有这个组）。
+	// 注意这只管结构体的字段。map 的键名管不了：退役的 proxy.groups 的
+	// 组名是配置自己定的，加载器没有一份已知的名单可比。那个键只被读一
+	// 次（开机的时候收拾账号身上的组名），读完了就不管了。
 	dec.KnownFields(true)
 	// 空文件（或只有注释）没有文档可解，这不是错误：用默认值就好。
 	if err := dec.Decode(&c); err != nil {
@@ -507,8 +512,8 @@ func Load(path string) (Config, error) {
 	if err := oneDocument(dec); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	if c.Proxy.Groups == nil {
-		c.Proxy.Groups = map[string]string{}
+	if c.Proxy.LegacyGroups == nil {
+		c.Proxy.LegacyGroups = map[string]string{}
 	}
 	if err := c.checkAPIKeys(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)

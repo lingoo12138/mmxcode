@@ -688,15 +688,14 @@ func TestAccountRoundTrip(t *testing.T) {
 	s := openTest(t)
 
 	a := Account{
-		ID:         "acc_01",
-		Name:       "主号",
-		UserID:     "1234567890",
-		Email:      "a@example.com",
-		Status:     StatusActive,
-		ProxyGroup: "warp",
-		ProxyURL:   "",
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:        "acc_01",
+		Name:      "主号",
+		UserID:    "1234567890",
+		Email:     "a@example.com",
+		Status:    StatusActive,
+		ProxyURL:  "",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 	if err := s.CreateAccount(ctx, a); err != nil {
 		t.Fatal(err)
@@ -705,7 +704,7 @@ func TestAccountRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Email != "a@example.com" || got.ProxyGroup != "warp" || got.Status != StatusActive {
+	if got.Email != "a@example.com" || got.Status != StatusActive {
 		t.Fatalf("got %+v", got)
 	}
 
@@ -1488,21 +1487,21 @@ func TestTheNarrowSetters(t *testing.T) {
 	if got.Status != StatusSignedOut || got.LastError != "the sign-in was refused" {
 		t.Fatalf("got %+v", got)
 	}
-	if err := s.SetAccountProxy(ctx, "acc_01", "warp", "http://127.0.0.1:1080", time.Now()); err != nil {
+	if err := s.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:1080", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	got, err = s.GetAccount(ctx, "acc_01")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ProxyGroup != "warp" || got.ProxyURL != "http://127.0.0.1:1080" {
+	if got.ProxyURL != "http://127.0.0.1:1080" {
 		t.Fatalf("got %+v", got)
 	}
 	// 没有的账号还是找不到
 	if err := s.UpdateAccountStatus(ctx, "nope", StatusActive, "", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("update the status: %v, want ErrNotFound", err)
 	}
-	if err := s.SetAccountProxy(ctx, "nope", "warp", "", time.Now()); !errors.Is(err, ErrNotFound) {
+	if err := s.SetAccountProxy(ctx, "nope", "", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("set the outlet: %v, want ErrNotFound", err)
 	}
 }
@@ -1693,6 +1692,54 @@ func TestTheFileIsOnlyForItsOwner(t *testing.T) {
 	}
 }
 
+// 出口组退役了，但那一列还在老账号的行上。收拾之前要先能找到它们。
+func TestTheRetiredGroupsAreFound(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	for _, a := range []Account{
+		{ID: "acc_01", Name: "有组的", Email: "a@example.com", Status: StatusActive},
+		{ID: "acc_02", Name: "没有组的", Email: "b@example.com", Status: StatusActive},
+	} {
+		if err := s.CreateAccount(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 老账号的行上还留着组名。
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE accounts SET proxy_group='clash' WHERE id='acc_01'`); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.LegacyProxyGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("list = %+v, want one account", list)
+	}
+	if list[0].ID != "acc_01" || list[0].Group != "clash" {
+		t.Fatalf("list = %+v", list[0])
+	}
+	// 写出口的时候，那一列顺手就清了。
+	if err := s.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:1080", now); err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.LegacyProxyGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("list = %+v, want none", list)
+	}
+	got, err := s.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyURL != "http://127.0.0.1:1080" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 // oldSchema is the schema of a file that was made before the
 // versions were kept.
 const oldSchema = `
@@ -1830,7 +1877,7 @@ func TestTheOldFileIsBroughtForward(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Name != "old" || a.ProxyGroup != "warp" {
+	if a.Name != "old" {
 		t.Fatalf("got %+v", a)
 	}
 	tok, err := s.GetToken(ctx, "acc_01")

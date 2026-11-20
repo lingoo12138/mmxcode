@@ -25,7 +25,7 @@ func aReloginEnv(t *testing.T) (*env, secret.Key) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	e.up = up
 	e.acc = account.New(up)
-	e.egr = egress.New(nil, "")
+	e.egr = egress.New("")
 	e.mgr = manager.New(e.store, up, e.acc, e.egr, oauth.NewRenewer())
 	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
 	e.mgr.Key = key
@@ -63,7 +63,7 @@ func seedSignedOut(t *testing.T, e *env, key secret.Key, id string) {
 func TestReloginWantsAllOrAnAccount(t *testing.T) {
 	// 什么都不说就重登，是一个惊喜等着人：说清楚要哪一个。
 	var out bytes.Buffer
-	err := runRelogin(context.Background(), &env{}, &out, "", "", false)
+	err := runRelogin(context.Background(), &env{}, &out, "", false)
 	if err == nil {
 		t.Fatal("relogin without --all and without --account said nothing")
 	}
@@ -76,7 +76,7 @@ func TestReloginSignsOneAccountInAgain(t *testing.T) {
 	e, key := aReloginEnv(t)
 	seedSignedOut(t, e, key, "acc_1")
 	var out bytes.Buffer
-	if err := runRelogin(context.Background(), e, &out, "acc_1", "", false); err != nil {
+	if err := runRelogin(context.Background(), e, &out, "acc_1", false); err != nil {
 		t.Fatal(err)
 	}
 	a, err := e.store.GetAccount(context.Background(), "acc_1")
@@ -96,7 +96,7 @@ func TestReloginAllSignsThemAllInAgain(t *testing.T) {
 	seedSignedOut(t, e, key, "acc_1")
 	seedSignedOut(t, e, key, "acc_2")
 	var out bytes.Buffer
-	if err := runRelogin(context.Background(), e, &out, "", "", true); err != nil {
+	if err := runRelogin(context.Background(), e, &out, "", true); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "成功 2") {
@@ -120,7 +120,7 @@ func TestReloginSaysWhenAnAccountCouldNotBeSignedIn(t *testing.T) {
 		return errors.New("the site refused the password")
 	}
 	var out bytes.Buffer
-	err := runRelogin(context.Background(), e, &out, "", "", true)
+	err := runRelogin(context.Background(), e, &out, "", true)
 	if err == nil {
 		t.Fatal("relogin said nothing about the account that could not be signed in")
 	}
@@ -145,17 +145,12 @@ func TestImportHasATimeoutFlag(t *testing.T) {
 	}
 }
 
-func TestReloginRefusesAnUnknownGroup(t *testing.T) {
-	// 组名写错而默默走全局默认出口，是最坏的一种错：看着跑通了，
-	// 其实请求根本没走要去的那条路。
+// 重登走账号自己的出口：它自己写的地址，没有就全局默认。
+func TestReloginGoesOutOfTheAccountsOwnAddress(t *testing.T) {
 	e := testEnv(t)
-	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
-	err := e.reloginFn("nope")(context.Background(), store.Account{ID: "acc_1"}, "pw")
-	if err == nil {
-		t.Fatal("relogin took an outlet group that is not there")
-	}
-	if !strings.Contains(err.Error(), "nope") {
-		t.Errorf("the error does not name the group: %v", err)
+	fn := e.reloginFn()
+	if fn == nil {
+		t.Fatal("the relogin function is not there")
 	}
 }
 

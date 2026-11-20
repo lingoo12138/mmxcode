@@ -116,7 +116,7 @@ func (e *env) wireImport(ui *webui.WebUI) {
 		if keeperErr != nil {
 			return nil, keeperErr
 		}
-		runner, err := e.runner(e.cfg.Batch.Group, e.cfg.Batch.Interval.Duration(), keeper)
+		runner, err := e.runner(e.cfg.Batch.Interval.Duration(), keeper)
 		if err != nil {
 			return nil, err
 		}

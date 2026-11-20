@@ -8,7 +8,7 @@ MiniMax Code 国际站的多账号网关。
 - **多账号**：每个账号一份凭据，各自独立。
 - **签到**：每个账号每天签到一次，签到得到的积分进各自的账本。
 - **轮转**：会话粘在一个账号上，配额耗尽时自动换号。
-- **代理**：按账号、按出口组或全局指定出口，Cloudflare WARP 可作额外出口。
+- **代理**：按账号或全局指定出口。地址自己在网页上填，或者写在配置文件里。
 
 ## 快速开始
 
@@ -58,7 +58,7 @@ curl -s http://127.0.0.1:8080/v1/messages \
 mmxcode serve                     # 起 HTTP 服务、WebUI 与定时任务
 mmxcode login                    # 登录一个账号
 mmxcode accounts list            # 列出账号
-mmxcode accounts proxy <id> --group warp
+mmxcode accounts proxy <id> --url http://127.0.0.1:7890
 mmxcode import --file accounts.txt  # 批量导入账号
 mmxcode relogin --all             # 把签出的账号登回去
 mmxcode checkin                  # 给所有账号签到
@@ -73,7 +73,7 @@ mmxcode models                   # 模型列表
 
 `serve` 自己没有别的开关：监听地址、key、轮转参数都在配置文件里。
 
-其余子命令的开关：`login --name`（账号标签）、`accounts proxy --group/--url`（出口组名 / 单独的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）、`usage --refresh`（现读一遍账本，不看上次读数）。
+其余子命令的开关：`login --name`（账号标签）、`accounts proxy --url`（这个账号自己的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）、`usage --refresh`（现读一遍账本，不看上次读数）。
 
 ### 积分什么时候读
 
@@ -93,8 +93,8 @@ mmxcode models                   # 模型列表
 # 清单每行一个账号：邮箱|密码，# 开头是注释
 mmxcode import --file accounts.txt
 
-# 每个账号走哪个出口组，每个账号之间隔多久
-mmxcode import --file accounts.txt --group clash --interval 5s
+# 每个账号之间隔多久
+mmxcode import --file accounts.txt --interval 5s
 
 # 整趟导入最多跑多久
 mmxcode import --file accounts.txt --timeout 30m
@@ -140,10 +140,9 @@ mmxcode relogin --account acc_123  # 只登这一个
 那一行上的邮箱写的是站点自己认的那个地址（清单上写的那个地址在导入的结果
 里还留着）。
 
-**出口组说了算。** 导入带了出口组（命令行 `--group`，或者配置里的
-`batch.group`）的时候，账号自己手填的出口地址会被清掉 —— 出口是按「先看
-地址、再看组」找的，地址留着就还是从那个地方出去。导入结果里会写明清掉的
-是哪个地址。网页上传用的也是配置里的 `batch.group`。
+**导入走全局默认出口。** 新账号身上没有自己的出口地址，它跟着全局默认走 ——
+全局默认改了，它也跟着改。已经在库里的账号，导入不动它自己手填的出口地址：
+那是人自己设的，一次导入不能把它抹掉。
 
 **页面上也能导。** WebUI 里有一页「导入」，清单有两种交法：
 
@@ -163,7 +162,6 @@ mmxcode relogin --account acc_123  # 只登这一个
 | 键 | 默认值 | 作用 |
 |---|---|---|
 | `batch.interval` | `3s` | 批量导入时两个账号之间的间隔 |
-| `batch.group` | 空 | 批量导入走哪个出口组。空 = 全局默认出口。配了它，清单里那些账号自己手填的出口地址会被清掉 |
 | `batch.relogin.enabled` | `false` | 账号掉线了自动用存着的密码登回去 |
 | `batch.relogin.cooldown` | `1h` | 调度器两趟重登之间隔多久 |
 | `batch.relogin.max_accounts` | `20` | 一趟重登最多处理多少个账号 |
@@ -186,13 +184,13 @@ mmxcode relogin --account acc_123  # 只登这一个
 |---|---|---|
 | `/api/accounts` | GET / POST | 列出账号 / 发起一次登录 |
 | `/api/accounts/poll` | POST | 查登录进度 |
-| `/api/accounts/{id}` | PATCH / DELETE | 改账号（名字、出口组、代理地址）/ 删除账号 |
+| `/api/accounts/{id}` | PATCH / DELETE | 改账号（名字、代理地址）/ 删除账号 |
 | `/api/accounts/{id}/checkin` | POST | 给这个账号签到 |
 | `/api/accounts/{id}/usage` | GET | 读这个账号的积分 |
 | `/api/usage` | GET | 所有账号的积分汇总 |
 | `/api/usage/refresh` | POST | 立刻把所有账号的账本读一遍 |
-| `/api/egress` | GET | 出口组和它们的状态 |
-| `/api/egress/test` | POST | 立刻测一个出口组 |
+| `/api/egress` | GET | 在用的出口和它们的状态 |
+| `/api/egress/test` | POST | 立刻测一个出口 |
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
 | `/api/events` | GET | SSE，每 30 秒一个心跳 |
 | `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
@@ -326,7 +324,6 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `rotation.strategy` | `"sticky"` | `sticky`（会话粘账号）或 `round-robin`（每次都转）。写错的值当 `sticky` 处理 |
 | `rotation.exhausted_cooldown` | `5m` | 配额耗尽后暂时不用这个账号的时间。读不到窗口重置时间时按它算 |
 | `proxy.default` | 空 | 全局默认出口 |
-| `proxy.groups` | 空 | 出口组：组名 → 地址。账号可以指向其中一组，一组共用一个出口 |
 | `schedule.checkin_at` | `"00:00"` | 每天签到的时间，**大陆时间**，`HH:MM`。站点按大陆时间算一天，签到要落在那一天里 |
 | `schedule.checkin_jitter` | `"0"` | 签到最多往后推多久。几个实例一起跑的时候抖一下就散开了 |
 | `schedule.usage_refresh` | `15m` | 积分刷新间隔。只在 `usage.refresh.scan_every` 写成 0 时才用它；两个都写的时候新键赢 |
@@ -445,11 +442,14 @@ magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refres
 
 出口按这个顺序挑：
 
-1. 账号自己的代理地址：`mmxcode accounts proxy <id> --url <地址>`；
-2. 账号指向的出口组：`mmxcode accounts proxy <id> --group <组名>`，取组里的地址；
-3. 全局 `proxy.default`。
+1. 账号自己的代理地址：`mmxcode accounts proxy <id> --url <地址>`，或者在网页上
+   那一行里填（空 = 跟着全局）；
+2. 全局 `proxy.default`。
 
-组的地址写成空字符串时不算出口：它会落到全局默认，而不是变成直连。全局默认也是空（或明确写 `direct`）时才是直连。
+两个都没有的时候是直连。全局默认写 `direct` 也是直连。
+
+出口组这个概念没有了（老的配置里那个 `proxy.groups` 键还认，只是没人再拿它
+做事）：开机的时候，账号身上那个组名会变成账号自己的地址，然后就没有组了。
 
 - 支持的 scheme：`http`、`https`、`socks5`、`socks5h`。没有 scheme 的地址会报错，不会默默直连。
 - `socks5://` 和 `socks5h://` 都把域名交给代理去解析（远端 DNS），跟 curl 的 `socks5://`（本地解析）不一样。
@@ -480,14 +480,6 @@ compose 做的事：
   ```bash
   mkdir -p data && chown 10001:10001 data
   ```
-
-### Cloudflare WARP
-
-WARP 是额外的出口选项，跟按账号单独指定的代理并列。
-
-- 默认是关的：`.env.example` 里 `COMPOSE_PROFILES=warp` 那行是注释掉的，所以普通的 `docker compose up` 不会起 WARP。
-- 打开：把 `.env` 里那行的注释去掉。宿主机的 `/dev/net/tun` 要可用，容器需要 `NET_ADMIN` 权限（compose 里已经写好）。
-- 起了以后，出口组 `warp` 指向 `socks5h://warp:4000`，账号用 `mmxcode accounts proxy <id> --group warp` 就走 WARP。
 
 ## magpie 插件
 

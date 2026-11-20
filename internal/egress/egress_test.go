@@ -15,21 +15,17 @@ import (
 )
 
 func TestResolveOrder(t *testing.T) {
-	r := New(map[string]string{
-		"warp":   "socks5h://warp:4000",
-		"direct": "direct",
-	}, "http://127.0.0.1:7890")
+	r := New("http://127.0.0.1:7890")
 
 	cases := []struct {
 		name string
 		acc  store.Account
 		want string
 	}{
-		{"账号级优先", store.Account{ProxyGroup: "warp", ProxyURL: "http://1.2.3.4:8080"}, "http://1.2.3.4:8080"},
-		{"其次出口组", store.Account{ProxyGroup: "warp"}, "socks5h://warp:4000"},
+		{"账号级优先", store.Account{ProxyURL: "http://1.2.3.4:8080"}, "http://1.2.3.4:8080"},
 		{"再次全局", store.Account{}, "http://127.0.0.1:7890"},
-		{"组名为 direct", store.Account{ProxyGroup: "direct"}, "direct"},
-		{"未知组落到全局", store.Account{ProxyGroup: "nope"}, "http://127.0.0.1:7890"},
+		{"账号级是 direct", store.Account{ProxyURL: "direct"}, "direct"},
+		{"账号级是空白", store.Account{ProxyURL: "   "}, "http://127.0.0.1:7890"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -41,70 +37,66 @@ func TestResolveOrder(t *testing.T) {
 }
 
 func TestResolveEmptyMeansDirect(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	if got := r.Resolve(store.Account{}); got != Direct {
 		t.Fatalf("Resolve = %q, want %q", got, Direct)
 	}
 }
 
-func TestResolveAnEmptyGroupFallsBackToTheDefault(t *testing.T) {
-	// 一个空的组值不是一条出路。空地址会被当成直连，请求就悄悄
-	// 走掉了代理——这正是代理支持最不能犯的错。
-	r := New(map[string]string{"g": "", "blank": "   "}, "http://127.0.0.1:7890")
-	cases := []struct {
-		name string
-		acc  store.Account
-		want string
-	}{
-		{"空组落到全局", store.Account{ProxyGroup: "g"}, "http://127.0.0.1:7890"},
-		{"空白组落到全局", store.Account{ProxyGroup: "blank"}, "http://127.0.0.1:7890"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := r.Resolve(c.acc)
-			if got != c.want {
-				t.Fatalf("Resolve = %q, want %q", got, c.want)
-			}
-			if got == Direct {
-				t.Fatalf("Resolve = %q: the traffic would go out direct", got)
-			}
-		})
-	}
-}
-
 func TestResolveNeverReturnsAnEmptyAddress(t *testing.T) {
 	resolvers := []*Resolver{
-		New(nil, ""),
-		New(map[string]string{"g": ""}, ""),
-		New(map[string]string{"g": " "}, "  "),
-		New(nil, "direct"),
+		New(""),
+		New(" "),
+		New("direct"),
+		New("http://127.0.0.1:7890"),
 	}
 	for _, r := range resolvers {
-		got := r.Resolve(store.Account{ProxyGroup: "g"})
+		got := r.Resolve(store.Account{})
 		if strings.TrimSpace(got) == "" {
 			t.Fatalf("Resolve = %q: an empty address would go out direct", got)
 		}
 	}
 }
 
-func TestAnEmptyGroupDoesNotResolveToAProxyLessTransport(t *testing.T) {
-	r := New(map[string]string{"g": ""}, "http://127.0.0.1:7890")
-	addr := r.Resolve(store.Account{ProxyGroup: "g"})
-	c, err := r.Client(addr)
-	if err != nil {
-		t.Fatal(err)
+// 在用的出口就那些：全局默认，加上账号自己写的那些。列那些没人走的地址
+// 没有意义 —— 查出来的「可用」什么也不说明。
+func TestTheOutletsAreTheOnesInUse(t *testing.T) {
+	accounts := []store.Account{
+		{ProxyURL: "http://10.0.0.5:1080"},
+		{ProxyURL: "http://10.0.0.5:1080"},
+		{ProxyURL: "socks5h://10.0.0.6:1080"},
+		{},
 	}
-	tr, ok := c.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("transport = %T", c.Transport)
+	outs := Outlets(accounts, "http://127.0.0.1:7890")
+	want := []Outlet{
+		{Name: DefaultOutlet, URL: "http://127.0.0.1:7890"},
+		{Name: OwnOutlet, URL: "http://10.0.0.5:1080"},
+		{Name: OwnOutlet, URL: "socks5h://10.0.0.6:1080"},
 	}
-	if tr.Proxy == nil {
-		t.Fatal("the transport has no proxy: the traffic would go out direct")
+	if len(outs) != len(want) {
+		t.Fatalf("outlets = %+v, want %+v", outs, want)
+	}
+	for i, o := range outs {
+		if o != want[i] {
+			t.Fatalf("outlet %d = %+v, want %+v", i, o, want[i])
+		}
+	}
+	urls := OutletURLs(accounts, "http://127.0.0.1:7890")
+	if len(urls) != 3 || urls[0] != "http://127.0.0.1:7890" {
+		t.Fatalf("urls = %v", urls)
+	}
+}
+
+// 没有全局默认的时候，在用的就只有账号自己那些地址。
+func TestTheOutletsWithoutAGlobalDefault(t *testing.T) {
+	outs := Outlets([]store.Account{{ProxyURL: "http://10.0.0.5:1080"}}, "")
+	if len(outs) != 1 || outs[0].URL != "http://10.0.0.5:1080" {
+		t.Fatalf("outlets = %+v", outs)
 	}
 }
 
 func TestClientIsCachedPerURL(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	c1, err := r.Client("http://127.0.0.1:7890")
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +118,7 @@ func TestClientIsCachedPerURL(t *testing.T) {
 }
 
 func TestTheSameAddressWrittenTwoWaysIsOneClient(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	c1, err := r.Client("http://127.0.0.1:7890")
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +144,7 @@ func TestTheSameAddressWrittenTwoWaysIsOneClient(t *testing.T) {
 }
 
 func TestInvalidateDropsTheClient(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	c1, err := r.Client("http://127.0.0.1:7890")
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +176,7 @@ func TestInvalidateClosesTheIdleConnections(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	r := New(nil, "")
+	r := New("")
 	proxyURL := "http://" + srv.Listener.Addr().String()
 	c, err := r.Client(proxyURL)
 	if err != nil {
@@ -211,7 +203,7 @@ func TestInvalidateClosesTheIdleConnections(t *testing.T) {
 
 func TestDirectClientDoesNotUseEnvProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://should-not-be-used:9999")
-	r := New(nil, "")
+	r := New("")
 	c, err := r.Client(Direct)
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +218,7 @@ func TestDirectClientDoesNotUseEnvProxy(t *testing.T) {
 }
 
 func TestDirectIsComparedWithoutTheCase(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	for _, v := range []string{"direct", "Direct", "DIRECT", " direct "} {
 		c, err := r.Client(v)
 		if err != nil {
@@ -243,7 +235,7 @@ func TestDirectIsComparedWithoutTheCase(t *testing.T) {
 }
 
 func TestHTTPProxyIsUsed(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	c, err := r.Client("http://127.0.0.1:7890")
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +247,7 @@ func TestHTTPProxyIsUsed(t *testing.T) {
 }
 
 func TestTheTransportIsTunedForManyAccounts(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	c, err := r.Client("http://127.0.0.1:7890")
 	if err != nil {
 		t.Fatal(err)
@@ -275,7 +267,7 @@ func TestSocks5ClientDialsThroughProxy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 
-	r := New(nil, "")
+	r := New("")
 	c, err := r.Client("socks5://127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +281,7 @@ func TestSocks5ClientDialsThroughProxy(t *testing.T) {
 }
 
 func TestLoopbackNeverProxied(t *testing.T) {
-	r := New(nil, "http://127.0.0.1:7890")
+	r := New("http://127.0.0.1:7890")
 	if got := r.ResolveForHost(store.Account{}, "127.0.0.1:8080"); got != Direct {
 		t.Fatalf("got %q, want direct", got)
 	}
@@ -299,7 +291,7 @@ func TestLoopbackNeverProxied(t *testing.T) {
 }
 
 func TestAnAddressWithoutAHostIsRefused(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	if _, err := r.Client("http://"); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -309,7 +301,7 @@ func TestAnAddressWithoutAHostIsRefused(t *testing.T) {
 }
 
 func TestASocks5AddressWithoutAPortIsRefused(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	if _, err := r.Client("socks5://host"); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -319,7 +311,7 @@ func TestASocks5AddressWithoutAPortIsRefused(t *testing.T) {
 }
 
 func TestTheCredentialsAreNotInTheErrorText(t *testing.T) {
-	r := New(nil, "")
+	r := New("")
 	_, err := r.Client("http://user:secret@")
 	if err == nil {
 		t.Fatal("expected an error")
@@ -370,7 +362,7 @@ func TestCheckTreatsA407AsAFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := New(nil, "")
+	r := New("")
 	proxyURL := "http://user:secret@" + srv.Listener.Addr().String()
 	err := r.Check(context.Background(), proxyURL, "http://127.0.0.1:1/")
 	if err == nil {
@@ -397,7 +389,7 @@ func TestCheckDoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := New(nil, "")
+	r := New("")
 	err := r.Check(context.Background(), Direct, srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -428,7 +420,7 @@ func TestCheckHasADeadline(t *testing.T) {
 		}
 	}()
 
-	r := New(nil, "")
+	r := New("")
 	start := time.Now()
 	err = r.Check(context.Background(), Direct, "http://"+ln.Addr().String()+"/")
 	if err == nil {
@@ -445,7 +437,7 @@ func TestCheckPassesWhenTheTargetAnswers(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := New(nil, "")
+	r := New("")
 	if err := r.Check(context.Background(), Direct, srv.URL); err != nil {
 		t.Fatal(err)
 	}

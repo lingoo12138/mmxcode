@@ -128,7 +128,7 @@ func TestUsageRefresh(t *testing.T) {
 	// test asks MiniMax for the numbers and waits for an answer that
 	// never comes.
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	sc.RefreshUsage(ctx)
@@ -177,7 +177,7 @@ func TestTheScanEveryCanBeZero(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	// 新键是 0：间隔交回 schedule.usage_refresh。
 	cfg := config.Default()
@@ -273,7 +273,7 @@ func TestTheUsageRoundReadsTheAccountsThatNeedIt(t *testing.T) {
 	// test asks MiniMax for the numbers and waits for an answer that
 	// never comes.
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	cfg := config.Default()
 	// 一趟只读一个：读谁由排在前面的说了算。
@@ -339,7 +339,7 @@ func TestCheckinAll(t *testing.T) {
 	// test asks MiniMax for the numbers and waits for an answer that
 	// never comes.
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	results := sc.CheckinAll(ctx)
@@ -402,7 +402,7 @@ func TestTheCheckinRoundRecordsEveryCheckin(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	sc.CheckinAll(ctx)
@@ -547,7 +547,7 @@ func checkinRound(t *testing.T, n int, refuse string) *store.Store {
 	// test asks MiniMax for the numbers and waits for an answer that
 	// never comes.
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	sc.CheckinAll(ctx)
@@ -575,11 +575,11 @@ func TestCheckEgressWritesTheHealth(t *testing.T) {
 
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	cfg := config.Default()
 	// "direct" 不走代理，请求直接到那台假服务器上。
-	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	cfg.Proxy.Default = "direct"
 	sc := New(mgr, cfg)
 	sc.target = srv.URL
 
@@ -623,10 +623,10 @@ func TestCheckEgressWritesAFailedHealth(t *testing.T) {
 
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	cfg := config.Default()
-	cfg.Proxy.Groups = map[string]string{"local": "direct"}
+	cfg.Proxy.Default = "direct"
 	sc := New(mgr, cfg)
 	sc.target = srv.URL
 
@@ -674,7 +674,7 @@ func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {
 	}
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 	mgr.Key = key
 	mgr.ReloginFn = func(ctx context.Context, a store.Account, password string) error {
 		return s.SaveToken(ctx, store.Token{
@@ -765,7 +765,7 @@ func TestTheUsageRoundThrowsAwayTheOldReadings(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 	// 它刚被用过：它是热的，这一趟要读它。
 	mgr.MarkUsed("acc_01")
 
@@ -795,7 +795,7 @@ func TestTheSchedulerCanBeWaitedFor(t *testing.T) {
 	defer s.Close()
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 	sc := New(mgr, config.Default())
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -878,7 +878,7 @@ func TestTheCheckinSkipsTheAccountsThatSignedInToday(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	results := sc.CheckinAll(ctx)
@@ -937,7 +937,7 @@ func TestTheCheckinIsMadeUpOnStartup(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	runCtx, cancel := context.WithCancel(ctx)
@@ -1047,7 +1047,7 @@ func TestTheCheckinPassesDoNotOverlap(t *testing.T) {
 	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
 	acc := account.New(up)
 	acc.SetBase(srv.URL, srv.URL)
-	mgr := manager.New(s, up, acc, egress.New(nil, ""), oauth.NewRenewer())
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
 
 	sc := New(mgr, config.Default())
 	// 前一趟还在跑（这里就是拿着锁的那一趟）。

@@ -1,9 +1,9 @@
 // Package egress resolves which proxy a request goes out through and
 // keeps the HTTP clients that use them.
 //
-// The resolution follows magpie's model: an account's own address wins,
-// then the group it is pointed at, then the global default. "direct"
-// means no proxy, and a loopback address never goes through one.
+// The resolution has two steps: an account's own address wins, then
+// the global default. Nothing configured means direct, and a loopback
+// address never goes through a proxy.
 //
 // Both "socks5://" and "socks5h://" resolve the name at the proxy,
 // not here: the address is sent to the proxy as it is written, and the
@@ -39,11 +39,8 @@ var checkTimeout = 10 * time.Second
 // Resolver resolves an account's egress and hands out clients for it.
 type Resolver struct {
 	mu sync.Mutex
-	// groups are the named ways out. They are set when the resolver is
-	// made and are not written to afterwards.
-	groups map[string]string
-	// def is the global way out. Like the groups, it is set when the
-	// resolver is made and is not written to afterwards.
+	// def is the global way out. It is set when the resolver is made
+	// and is not written to afterwards.
 	def string
 	// clients are the HTTP clients, by way out.
 	clients map[string]*http.Client
@@ -51,15 +48,9 @@ type Resolver struct {
 	transports map[string]http.RoundTripper
 }
 
-// New makes a resolver over the configured groups and the global
-// default.
-func New(groups map[string]string, def string) *Resolver {
-	g := make(map[string]string, len(groups))
-	for k, v := range groups {
-		g[k] = v
-	}
+// New makes a resolver over the global default.
+func New(def string) *Resolver {
 	return &Resolver{
-		groups:     g,
 		def:        def,
 		clients:    map[string]*http.Client{},
 		transports: map[string]http.RoundTripper{},
@@ -69,12 +60,7 @@ func New(groups map[string]string, def string) *Resolver {
 // Resolve gives the proxy URL an account's requests go through.
 //
 // Nothing configured means direct: the account has no proxy of its
-// own, no group, and there is no global default either.
-//
-// A group whose value is empty is not a way out: it falls through to
-// the global default. An empty value that resolved to nothing would
-// send the traffic out direct, which is the one mistake a proxy
-// support must not make.
+// own, and there is no global default either.
 //
 // The lock is taken, so that the maps are read the same way the caches
 // are.
@@ -83,13 +69,6 @@ func (r *Resolver) Resolve(a store.Account) string {
 	defer r.mu.Unlock()
 	if u := strings.TrimSpace(a.ProxyURL); u != "" {
 		return u
-	}
-	if g := strings.TrimSpace(a.ProxyGroup); g != "" {
-		if u, ok := r.groups[g]; ok {
-			if v := strings.TrimSpace(u); v != "" {
-				return v
-			}
-		}
 	}
 	v := strings.TrimSpace(r.def)
 	if v == "" {
@@ -191,18 +170,56 @@ func (r *Resolver) Invalidate(proxyURL string) {
 	}
 }
 
-// Groups gives the configured groups.
+// Outlet is one address that traffic goes out through.
+type Outlet struct {
+	// Name is what the page calls it.
+	Name string
+	// URL is the address.
+	URL string
+}
+
+// The names the outlets page gives the two kinds of outlet.
+const (
+	// DefaultOutlet is the global default.
+	DefaultOutlet = "全局默认"
+	// OwnOutlet is an address an account carries itself.
+	OwnOutlet = "账号自带"
+)
+
+// Outlets gives the addresses that are in use.
 //
-// The lock is taken, so that the maps are read the same way the caches
-// are.
-func (r *Resolver) Groups() map[string]string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[string]string, len(r.groups))
-	for k, v := range r.groups {
-		out[k] = v
+// The global default comes first (if there is one), then the addresses
+// the accounts carry themselves — each of them once.
+//
+// 在用的出口就这些：全局默认一个，加上账号自己写的那些。健康检查查的就
+// 是它们，页面列的也是它们 —— 列那些没人走的地址，查出来的「可用」什么
+// 也不说明。
+func Outlets(accounts []store.Account, def string) []Outlet {
+	var out []Outlet
+	seen := map[string]bool{}
+	add := func(name, url string) {
+		u := strings.TrimSpace(url)
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, Outlet{Name: name, URL: u})
+	}
+	add(DefaultOutlet, def)
+	for _, a := range accounts {
+		add(OwnOutlet, a.ProxyURL)
 	}
 	return out
+}
+
+// OutletURLs gives the addresses of the outlets, in order.
+func OutletURLs(accounts []store.Account, def string) []string {
+	outs := Outlets(accounts, def)
+	urls := make([]string, 0, len(outs))
+	for _, o := range outs {
+		urls = append(urls, o.URL)
+	}
+	return urls
 }
 
 // cacheKey is the key a proxy URL is cached under.

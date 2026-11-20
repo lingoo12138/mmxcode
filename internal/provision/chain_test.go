@@ -212,8 +212,8 @@ func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt t
 	return t.s.setAccountName(id, name)
 }
 
-func (t fakeTx) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
-	return t.s.setAccountProxy(id, group, url)
+func (t fakeTx) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
+	return t.s.setAccountProxy(id, url)
 }
 
 func (t fakeTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
@@ -272,11 +272,10 @@ func (s *fakeStore) setAccountName(id, name string) error {
 }
 
 // setAccountProxy writes an outlet.
-func (s *fakeStore) setAccountProxy(id, group, url string) error {
-	s.groups = append(s.groups, id+":"+group)
+func (s *fakeStore) setAccountProxy(id, url string) error {
+	s.groups = append(s.groups, id+":"+url)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
-			s.rows[i].ProxyGroup = group
 			s.rows[i].ProxyURL = url
 		}
 	}
@@ -365,10 +364,10 @@ func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastErr
 }
 
 // SetAccountProxy writes the account's outlet.
-func (s *fakeStore) SetAccountProxy(ctx context.Context, id, group, url string, updatedAt time.Time) error {
+func (s *fakeStore) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.setAccountProxy(id, group, url)
+	return s.setAccountProxy(id, url)
 }
 
 func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
@@ -1167,12 +1166,10 @@ func TestTwoConcurrentImportsOfOneEmailAreOneRow(t *testing.T) {
 	}
 }
 
-func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
-	// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的应该是
-	// 同一个账号从同一个地方来，而不是两个地方。
+// 导入不给新账号写地址：它跟着全局默认走，全局默认改了它也跟着改。
+func TestTheImportedAccountHasNoAddressOfItsOwn(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
-	c.ProxyGroup = "hk"
 
 	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
@@ -1180,80 +1177,8 @@ func TestTheAccountGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
 	if len(st.rows) != 1 {
 		t.Fatalf("rows = %v", st.rows)
 	}
-	if st.rows[0].ProxyGroup != "hk" {
-		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
-	}
-}
-
-// TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith
-// says the group the import carries wins over the address on the
-// account.
-//
-// 出口是按「先看地址、再看组」找的：地址留着，账号还是从那个地方出去，
-// 组写着是 hk 也没用。导入是人明确做的一件事，它带的组说了算，所以那个
-// 地址清掉，而且要说出来——地址没了，人得知道。
-func TestAnAccountWithItsOwnAddressGoesOutOfTheGroupItWasImportedWith(t *testing.T) {
-	st := &fakeStore{}
-	c := aChain(st)
-	c.ProxyGroup = "hk"
-
-	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 人给这个账号手设了一个地址。
-	if err := st.SetAccountProxy(context.Background(), res.AccountID, "hk",
-		"socks5h://127.0.0.1:1080", time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if st.rows[0].ProxyURL == "" {
-		t.Fatalf("the address was not set: %+v", st.rows[0])
-	}
-
-	res, err = c.Import(context.Background(), "a@example.com", "hunter2")
-	if err != nil {
-		t.Fatal(err)
-	}
 	if st.rows[0].ProxyURL != "" {
-		t.Fatalf("the address is still there: %+v", st.rows[0])
-	}
-	if st.rows[0].ProxyGroup != "hk" {
-		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
-	}
-	if !strings.Contains(res.Message, "地址") {
-		t.Fatalf("message = %q, want it to say the address was cleared", res.Message)
-	}
-	// 被清掉的是哪个地址，得写出来：那是一个人自己设的地址，没了就得能
-	// 照着填回去。
-	if !strings.Contains(res.Message, "socks5h://127.0.0.1:1080") {
-		t.Fatalf("message = %q, want it to name the address that was cleared", res.Message)
-	}
-}
-
-// TestAnImportWithoutAGroupKeepsTheGroupThatIsThere says an import
-// without a group does not wipe the group the account has.
-//
-// 组是人自己设的：一次没带组的导入不能把它抹掉——抹掉了账号的出口就变
-// 了，而导入的人根本没有说要变。
-func TestAnImportWithoutAGroupKeepsTheGroupThatIsThere(t *testing.T) {
-	st := &fakeStore{}
-	c := aChain(st)
-	c.ProxyGroup = "hk"
-
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
-		t.Fatal(err)
-	}
-	if st.rows[0].ProxyGroup != "hk" {
-		t.Fatalf("group = %q, want hk", st.rows[0].ProxyGroup)
-	}
-	// 第二趟没带组。
-	c.ProxyGroup = ""
-	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
-		t.Fatal(err)
-	}
-	if st.rows[0].ProxyGroup != "hk" {
-		t.Fatalf("group = %q, want hk: an import without a group must not wipe it",
-			st.rows[0].ProxyGroup)
+		t.Fatalf("address = %q, want none", st.rows[0].ProxyURL)
 	}
 	// 而且出口那一行根本没动过。
 	if len(st.groups) != 0 {
@@ -1261,15 +1186,32 @@ func TestAnImportWithoutAGroupKeepsTheGroupThatIsThere(t *testing.T) {
 	}
 }
 
-func TestAnAccountWithoutAGroupGoesOutOfTheDefault(t *testing.T) {
+// 导入不动账号自己那个地址 —— 那是人自己设的。
+//
+// 组退役之前，导入带的组说了算，账号自己那个地址会被清掉。现在导入根本
+// 不带出口：地址是人自己设的，一次导入不能把它抹掉。
+func TestAnImportKeepsTheAddressThatIsThere(t *testing.T) {
 	st := &fakeStore{}
 	c := aChain(st)
 
+	res, err := c.Import(context.Background(), "a@example.com", "hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 人给这个账号手设了一个地址。
+	if err := st.SetAccountProxy(context.Background(), res.AccountID,
+		"socks5h://127.0.0.1:1080", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if st.rows[0].ProxyURL == "" {
+		t.Fatalf("the address was not set: %+v", st.rows[0])
+	}
+	// 再导一次。
 	if _, err := c.Import(context.Background(), "a@example.com", "hunter2"); err != nil {
 		t.Fatal(err)
 	}
-	if st.rows[0].ProxyGroup != "" {
-		t.Fatalf("group = %q, want the default one", st.rows[0].ProxyGroup)
+	if st.rows[0].ProxyURL != "socks5h://127.0.0.1:1080" {
+		t.Fatalf("address = %q, want it to stay", st.rows[0].ProxyURL)
 	}
 }
 

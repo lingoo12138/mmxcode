@@ -43,7 +43,6 @@ const webTimeout = 30 * time.Second
 
 func newImportCmd(e *env) *cobra.Command {
 	var file string
-	var group string
 	var interval time.Duration
 	var noStore bool
 	var timeout time.Duration
@@ -62,11 +61,10 @@ func newImportCmd(e *env) *cobra.Command {
 				ctx, cancel = context.WithTimeout(ctx, timeout)
 				defer cancel()
 			}
-			return runImport(ctx, e, cmd.OutOrStdout(), file, group, interval, noStore)
+			return runImport(ctx, e, cmd.OutOrStdout(), file, interval, noStore)
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "账号清单（每行 邮箱|密码）")
-	cmd.Flags().StringVar(&group, "group", "", "每个账号走哪个出口组；账号自己那个出口地址会被这个组换掉")
 	cmd.Flags().DurationVar(&interval, "interval", 3*time.Second, "每个账号之间的间隔")
 	cmd.Flags().BoolVar(&noStore, "no-store-password", false, "登录成功就丢密码，不入库")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "整趟导入的时限（0 = 不限）")
@@ -75,7 +73,7 @@ func newImportCmd(e *env) *cobra.Command {
 }
 
 // runImport brings in the accounts of a list.
-func runImport(ctx context.Context, e *env, out io.Writer, file, group string, interval time.Duration, noStore bool) error {
+func runImport(ctx context.Context, e *env, out io.Writer, file string, interval time.Duration, noStore bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -98,7 +96,7 @@ func runImport(ctx context.Context, e *env, out io.Writer, file, group string, i
 	if err != nil {
 		return err
 	}
-	runner, err := e.runner(group, interval, keeper)
+	runner, err := e.runner(interval, keeper)
 	if err != nil {
 		return err
 	}
@@ -203,23 +201,12 @@ func passwordKeeper(noStore bool) (func(string) (string, error), error) {
 // reloginFn makes the function that signs an account in again.
 //
 // The account is already in the database: only the token is new. The
-// way out is the account's own proxy group, so that the sign-in comes
-// from where the account usually comes from — unless the person
-// asked for another group.
-func (e *env) reloginFn(group string) manager.ReloginFunc {
+// way out is the account's own: the address it carries, or the global
+// default when it carries none. The sign-in comes from where the
+// account usually comes from.
+func (e *env) reloginFn() manager.ReloginFunc {
 	return func(ctx context.Context, acc store.Account, password string) error {
-		if group != "" {
-			// 人指名的组得是真的：组名写错而默默走全局默认出口，
-			// 看着跑通了，其实请求根本没走要去的那条路。
-			if _, ok := e.cfg.Proxy.Groups[group]; !ok {
-				return fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
-			}
-		}
-		g := group
-		if g == "" {
-			g = acc.ProxyGroup
-		}
-		chain := e.chain(g, nil)
+		chain := e.chain(e.egr.Resolve(acc), nil)
 		tok, err := chain.SignIn(ctx, acc.Email, password)
 		if err != nil {
 			return err
@@ -240,24 +227,20 @@ func (e *env) reloginFn(group string) manager.ReloginFunc {
 // The way out is settled once, here, and not once per account: an
 // address that does not work is a mistake in the configuration, and it
 // is said once rather than once per account.
-func (e *env) runner(group string, interval time.Duration, keeper func(string) (string, error)) (*provision.Runner, error) {
+//
+// 导入走全局默认出口：新账号身上没有自己的地址，它跟着全局默认走，全
+// 局默认改了它也跟着改。
+func (e *env) runner(interval time.Duration, keeper func(string) (string, error)) (*provision.Runner, error) {
 	if e.makeRunner != nil {
-		return e.makeRunner(group, interval, keeper), nil
+		return e.makeRunner(interval, keeper), nil
 	}
-	// 出口组先查一遍：组名写错而默默走全局默认出口，是最坏的一种
-	// 错——看着跑通了，其实请求根本没走要去的那条路。
-	if group != "" {
-		if _, ok := e.cfg.Proxy.Groups[group]; !ok {
-			return nil, fmt.Errorf("no such outlet group %q; known: %s", group, groupNames(e.cfg.Proxy.Groups))
-		}
-	}
-	if _, err := e.egress(group); err != nil {
+	if _, err := e.egress(e.egr.Resolve(store.Account{})); err != nil {
 		return nil, err
 	}
 	return &provision.Runner{
 		Importer: &provision.Importer{
 			Import: func(ctx context.Context, email, password string) (provision.Result, error) {
-				chain := e.chain(group, keeper)
+				chain := e.chain(e.egr.Resolve(store.Account{}), keeper)
 				return chain.Import(ctx, email, password)
 			},
 		},
@@ -265,12 +248,10 @@ func (e *env) runner(group string, interval time.Duration, keeper func(string) (
 	}, nil
 }
 
-// egress settles the way out of a group.
+// egress settles the way out of an address.
 //
-// The group says which way the traffic goes: an empty group is the
-// global default.
-func (e *env) egress(group string) (http.RoundTripper, error) {
-	proxyURL := e.egr.Resolve(store.Account{ProxyGroup: group})
+// The address says which way the traffic goes: "direct" means no proxy.
+func (e *env) egress(proxyURL string) (http.RoundTripper, error) {
 	return e.egr.Transport(proxyURL)
 }
 
@@ -282,8 +263,8 @@ func (e *env) egress(group string) (http.RoundTripper, error) {
 // Every call makes a new chain, and a new chain has a new web client:
 // the site keeps the session in a cookie, and two accounts sharing one
 // session would be signing in as each other.
-func (e *env) chain(group string, keeper func(string) (string, error)) *provision.Chain {
-	tr, trErr := e.egress(group)
+func (e *env) chain(proxyURL string, keeper func(string) (string, error)) *provision.Chain {
+	tr, trErr := e.egress(proxyURL)
 	up := e.up
 	hc := &http.Client{Timeout: webTimeout}
 	if trErr == nil {
@@ -312,16 +293,13 @@ func (e *env) chain(group string, keeper func(string) (string, error)) *provisio
 			return d.Poll(ctx, up, site.AccountURL(site.TokenPath))
 		},
 		Identity: func(ctx context.Context, access, subject string) (account.Identity, error) {
-			// 账户信息也从这条路走：换了出口组却用旧出口读账户，
-			// 站点看到的是两个地方来的同一个号。
+			// 账户信息也从这条路走：换了出口却用旧出口读账户，站点
+			// 看到的是两个地方来的同一个号。
 			return e.acc.With(up).Identity(ctx, access, subject)
 		},
 		Keeper: keeper,
-		// 账号从哪个口登进去的，以后它的活就从哪个口出：站点看到的
-		// 是同一个账号从同一个地方来，而不是两个地方。
-		ProxyGroup: group,
-		Now:        time.Now,
-		NewID:      newBatchAccountID,
+		Now:    time.Now,
+		NewID:  newBatchAccountID,
 	}
 	if e.store != nil {
 		c.Store = e.store

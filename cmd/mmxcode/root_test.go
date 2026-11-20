@@ -119,31 +119,23 @@ func TestAccountsListShowsTheAccount(t *testing.T) {
 	}
 }
 
-func TestAccountsProxyRefusesAnUnknownGroup(t *testing.T) {
+func TestAccountsProxyRefusesAnUnknownAccount(t *testing.T) {
 	e := testEnv(t)
-	now := time.Now()
-	if err := e.store.CreateAccount(context.Background(), store.Account{
-		ID: "acc_1", Name: "一号", Status: store.StatusActive,
-		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create account: %v", err)
-	}
 	cmd := newAccountsProxyCmd(e)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"acc_1", "--group", "nope"})
+	cmd.SetArgs([]string{"acc_nope", "--url", "http://127.0.0.1:8080"})
 	err := cmd.Execute()
 	if err == nil {
-		t.Fatal("accounts proxy took an unknown group")
+		t.Fatal("accounts proxy took an account that is not there")
 	}
-	if !strings.Contains(err.Error(), "nope") {
-		t.Errorf("the error does not name the group: %v", err)
+	if !strings.Contains(err.Error(), "acc_nope") {
+		t.Errorf("the error does not name the account: %v", err)
 	}
 }
 
-func TestAccountsProxySetsTheGroup(t *testing.T) {
+func TestAccountsProxySetsTheAddress(t *testing.T) {
 	e := testEnv(t)
-	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
 	now := time.Now()
 	if err := e.store.CreateAccount(context.Background(), store.Account{
 		ID: "acc_1", Name: "一号", Status: store.StatusActive,
@@ -154,7 +146,7 @@ func TestAccountsProxySetsTheGroup(t *testing.T) {
 	cmd := newAccountsProxyCmd(e)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	cmd.SetArgs([]string{"acc_1", "--url", "http://127.0.0.1:8080"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("accounts proxy: %v", err)
 	}
@@ -162,8 +154,8 @@ func TestAccountsProxySetsTheGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get account: %v", err)
 	}
-	if a.ProxyGroup != "hk" {
-		t.Errorf("the account's group is %q, want %q", a.ProxyGroup, "hk")
+	if a.ProxyURL != "http://127.0.0.1:8080" {
+		t.Errorf("the account's address is %q, want %q", a.ProxyURL, "http://127.0.0.1:8080")
 	}
 }
 
@@ -250,13 +242,6 @@ func TestFirstNonEmpty(t *testing.T) {
 	}
 }
 
-func TestGroupNames(t *testing.T) {
-	got := groupNames(map[string]string{"b": "", "a": ""})
-	if got != "a, b" {
-		t.Errorf("groupNames gave %q, want %q", got, "a, b")
-	}
-}
-
 // testEnv gives an environment with a store in a temporary file.
 func testEnv(t *testing.T) *env {
 	t.Helper()
@@ -298,9 +283,12 @@ func TestAccountsRemoveSaysThereIsNoSuchAccount(t *testing.T) {
 // the address alone, and the other way round.
 //
 // 改组不动地址，改地址不动组。
+// TestAccountsProxyKeepsTheOtherField says changing the outlet does
+// not put a signed-out account back to active.
+//
+// 改出口不能把登出的账号改回 active。
 func TestAccountsProxyKeepsTheOtherField(t *testing.T) {
 	e := testEnv(t)
-	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
 	now := time.Now()
 	if err := e.store.CreateAccount(context.Background(), store.Account{
 		ID: "acc_1", Name: "一号", Status: store.StatusActive,
@@ -317,20 +305,9 @@ func TestAccountsProxyKeepsTheOtherField(t *testing.T) {
 		t.Fatalf("accounts proxy --url: %v", err)
 	}
 
-	cmd = newAccountsProxyCmd(e)
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("accounts proxy --group: %v", err)
-	}
-
 	a, err := e.store.GetAccount(context.Background(), "acc_1")
 	if err != nil {
 		t.Fatalf("get account: %v", err)
-	}
-	if a.ProxyGroup != "hk" {
-		t.Errorf("the group is %q, want %q", a.ProxyGroup, "hk")
 	}
 	if a.ProxyURL != "http://127.0.0.1:2:8080" {
 		t.Errorf("the address is %q, want it kept", a.ProxyURL)
@@ -343,7 +320,6 @@ func TestAccountsProxyKeepsTheOtherField(t *testing.T) {
 // 改出口不能把登出的账号改回 active。
 func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
 	e := testEnv(t)
-	e.cfg.Proxy.Groups = map[string]string{"hk": "http://127.0.0.1:1:8080"}
 	now := time.Now()
 	if err := e.store.CreateAccount(context.Background(), store.Account{
 		ID: "acc_1", Name: "一号", Status: store.StatusActive,
@@ -359,7 +335,7 @@ func TestAccountsProxyDoesNotUndoASignOut(t *testing.T) {
 	cmd := newAccountsProxyCmd(e)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"acc_1", "--group", "hk"})
+	cmd.SetArgs([]string{"acc_1", "--url", "http://127.0.0.1:8080"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("accounts proxy: %v", err)
 	}

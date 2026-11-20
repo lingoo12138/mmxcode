@@ -11,7 +11,6 @@ import (
 func newReloginCmd(e *env) *cobra.Command {
 	var all bool
 	var accountID string
-	var group string
 	cmd := &cobra.Command{
 		Use:   "relogin",
 		Short: "把签出的账号登回去",
@@ -21,12 +20,11 @@ func newReloginCmd(e *env) *cobra.Command {
 			"一个正在跑着的 mmxcode serve 用同一个库的时候，两个进程可能同时登\n" +
 			"同一个账号。要是不想撞上，就别一边开着 serve 一边跑这一条。",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, group, all)
+			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, all)
 		},
 	}
 	cmd.Flags().BoolVar(&all, "all", false, "重登所有签出且有密码的账号")
 	cmd.Flags().StringVar(&accountID, "account", "", "只重登这一个账号")
-	cmd.Flags().StringVar(&group, "group", "", "走哪个出口组（空 = 各账号自己的组）")
 	return cmd
 }
 
@@ -35,13 +33,9 @@ func newReloginCmd(e *env) *cobra.Command {
 // Either one account or all of them: "all of them" without saying so
 // is a surprise waiting to happen, and a named account is not a
 // surprise at all.
-func runRelogin(ctx context.Context, e *env, out io.Writer, accountID, group string, all bool) error {
+func runRelogin(ctx context.Context, e *env, out io.Writer, accountID string, all bool) error {
 	if accountID == "" && !all {
 		return fmt.Errorf("要么说 --all，要么给一个 --account")
-	}
-	if group != "" {
-		// 人说了走哪个出口组，就走那个：账号自己的组这时不算数。
-		e.mgr.ReloginFn = e.reloginFn(group)
 	}
 	if accountID != "" {
 		if err := e.mgr.Relogin(ctx, accountID); err != nil {

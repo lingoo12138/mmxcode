@@ -5,11 +5,9 @@ server:
   # 或者在部署的时候把它写进挂进去的配置文件。
 
 proxy:
+  # 全局默认出口。出口只有两级：账号自己的地址（在网页上每一行都能
+  # 填），然后是这里。两个都没有就是直连。
   default: "http://host.docker.internal:7890"
-  groups:
-    clash:  "http://host.docker.internal:7890"
-    warp:   "socks5h://warp:4000"
-    direct: "direct"
 
 upstream:
   timeout: 120s
@@ -35,10 +33,6 @@ schedule:
 batch:
   # 批量导入时每个账号之间的间隔
   interval: 3s
-  # 批量导入走哪个出口组（空 = 全局默认出口）
-  # 配了这个组，导入的账号就都走这个组：账号自己手填的出口地址会被清掉，
-  # 导入结果里会写明清掉的是哪个地址。网页上传也用这个组。
-  group: ""
   relogin:
     # 账号掉线了自动用存着的密码登回去（默认关）
     enabled: false
