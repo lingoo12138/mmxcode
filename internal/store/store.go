@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -56,9 +57,37 @@ const maxConns = 4
 
 // durableConns is how many connections the durable pool has.
 //
-// 丢不得的那两笔很少写（一次续签、一次签到救活了一个用完的号），一条连接
-// 就够 —— 而且写锁也只有一把：两笔抢一把锁，等的功夫比写的功夫长得多。
-const durableConns = 1
+// 丢不得的那两笔很少写（一次续签、一次签到救活了一个用完的号），写的工夫
+// 比等的工夫长得多。
+//
+// 两条连接不是为了写得多快，是为了**不排队**：写锁只有一把，可是等着的人
+// 不用在 Go 这边排。一条连接的时候，第二个写等的是一条空连接 —— 等第一条
+// 放弃了（等满了 busy_timeout）它才拿到连接，然后自己再等一遍：量出来是
+// 5 秒和 7.8 秒。两条连接的时候，两个写一起在库的忙处理器里等，一起结束。
+const durableConns = 2
+
+// The waits for the file's write lock.
+//
+// 写锁多半只被人占着几毫秒（一次写、一个事务），等一下就拿到了。占得久
+// 的是导入和迁移 —— 那不是等得久就能等到的，所以等的工夫有个顶。
+const (
+	// defaultWait is how long the everyday writes wait for the write
+	// lock.
+	//
+	// 平时那些写丢了都能自己好起来（额度快照旧一点、标记没写上撞一次空
+	// 换号重试），所以它们等得久一点没关系。
+	defaultWait = 5 * time.Second
+	// durableWait is the longest the writes that must not be lost wait
+	// for the write lock.
+	//
+	// 那两笔等得短一点，是为了让「再来一遍」有意义：库的忙处理器越等越
+	// 粗（一开始 1 毫秒，后来 100 毫秒），占着锁的那件事中间让出来的空
+	// 当（导入的时候，一笔账一个事务）它就错过了。再来一遍是新的忙处理
+	// 器，它又从 1 毫秒开始等。
+	//
+	// 等的工夫短了，再来的遍数就多：几遍加起来还是那个顶（busyBudget）。
+	durableWait = time.Second
+)
 
 // Store is the database.
 type Store struct {
@@ -75,6 +104,13 @@ type Store struct {
 	// 那些写还是走 db，按配的速度写（normal）—— 那些写丢了都能自己好起来
 	// （额度快照旧一点、标记没写上撞一次空换号重试）。
 	durable *sql.DB
+
+	// busyWait is how long one try waits for the file's write lock.
+	//
+	// 它是丢不得的那两笔走的那条连接上的那个数（那边等一秒，平时那些写
+	// 等五秒）。一遍等多久，决定了能试几遍：几遍加起来是那个顶
+	// （busyBudget）。
+	busyWait time.Duration
 
 	// Clock is the store's clock.
 	//
@@ -224,6 +260,9 @@ type options struct {
 	// synchronous is how hard a write hits the disk. Empty leaves it to
 	// SQLite.
 	synchronous string
+	// busyTimeout is how long one write waits for the file's write lock.
+	// Zero leaves it at defaultWait.
+	busyTimeout time.Duration
 	// connector opens the connections. Nil means SQLite's own.
 	connector Connector
 }
@@ -315,7 +354,14 @@ func Open(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, durable: durable, Clock: time.Now}, nil
+	// 丢不得的那两笔等锁等多久，是它们走的那条连接上的那个数：平时那条
+	// 连接自己就 fsync 的时候（配了 full），没有第二条连接，那两笔走的就是
+	// 它。
+	wait := busyWaitOf(o)
+	if durable != db {
+		wait = durableWaitOf(o)
+	}
+	return &Store{db: db, durable: durable, Clock: time.Now, busyWait: wait}, nil
 }
 
 // openDurable opens the connection the writes that must not be lost go
@@ -342,6 +388,7 @@ func openDurable(path string, o options, db *sql.DB) (*sql.DB, error) {
 	}
 	d := o
 	d.synchronous = "full"
+	d.busyTimeout = durableWaitOf(o)
 	durable, err := openConn(path, d)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -398,6 +445,27 @@ func (s *Store) Close() error {
 	return err
 }
 
+// busyWaitOf is how long one write waits for the file's write lock.
+//
+// 平时那些写等得久一点没关系：它们丢了都能自己好起来。
+func busyWaitOf(o options) time.Duration {
+	if o.busyTimeout > 0 {
+		return o.busyTimeout
+	}
+	return defaultWait
+}
+
+// durableWaitOf is how long the writes that must not be lost wait for the
+// write lock.
+//
+// 那两笔等得短一点，是为了让「再来一遍」有意义（见 durableWait）。
+func durableWaitOf(o options) time.Duration {
+	if w := busyWaitOf(o); w < durableWait {
+		return w
+	}
+	return durableWait
+}
+
 // dsn gives the data source name of a database file.
 //
 // The path is made a file: URI, so that a path with a question mark
@@ -418,8 +486,8 @@ func dsn(path string, o options) string {
 		prefix = "file://"
 	}
 	q := prefix + escapePath(p) +
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
-		"&_pragma=foreign_keys(1)&_txlock=immediate"
+		"?_pragma=busy_timeout(" + fmt.Sprint(int(busyWaitOf(o)/time.Millisecond)) + ")" +
+		"&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
 	if o.cacheMB > 0 {
 		// The page cache is in KB, and a negative number means "that many
 		// KB" (a positive one would mean "that many pages").
@@ -1344,6 +1412,27 @@ func (s *Store) SetAccountLastError(ctx context.Context, id, lastError string, u
 	return nil
 }
 
+// ClearAccountNotes takes away the notes that start with prefix, and says
+// how many it took away.
+//
+// 它是给「旧版本写的记号」用的：那些记号说的是一句今天已经不存在的话，挂
+// 着它是骗人的 —— 页面上显示着「这个号有问题」，而那个号其实好得很。
+//
+// 只擦前缀一样的：别的理由说的是别的事，擦了就是把真话也藏起来。
+//
+// 前缀是拿 substr 比的，不是 LIKE —— LIKE 里的 "%" 和 "_" 是通配符，一
+// 个记号的前缀里要是有它们，擦掉的就是别的记号。
+func (s *Store) ClearAccountNotes(ctx context.Context, prefix string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE accounts SET last_error='', updated_at=? WHERE substr(last_error,1,?)=?",
+		ms(s.now()), utf8.RuneCountInString(prefix), prefix)
+	if err != nil {
+		return 0, fmt.Errorf("clear the notes: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // SetPassword writes an account's encrypted password.
 //
 // The cipher text is written on its own, so that the other setters --
@@ -1562,10 +1651,16 @@ func (s *Store) Tx(ctx context.Context, fn func(Tx) error) error {
 //
 // It is what Tx hands out, and what the store's own two-step writes use
 // when the two steps have to land together.
+//
+// 事务走那条会 fsync 的连接：签入和导入都是走事务写令牌的（见 SignIn 和
+// internal/provision 的链），那一笔也是丢不得的 —— 库里留着的是一个已经被
+// 站点用掉一次的 refresh token，下一次续签站点会拒，账号就被记成签入失效。
+// 走那条连接的时候，账号行和令牌行是一起落盘的：读者不会看见一行没有
+// 令牌的账号。
 func (s *Store) tx(ctx context.Context, fn func(*sqlTx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin a transaction: %w", err)
+		return err
 	}
 	if err := fn(&sqlTx{s: s, tx: tx}); err != nil {
 		_ = tx.Rollback()
@@ -1576,6 +1671,31 @@ func (s *Store) tx(ctx context.Context, fn func(*sqlTx) error) error {
 		return fmt.Errorf("commit the transaction: %w", err)
 	}
 	return nil
+}
+
+// begin starts a write transaction, and starts it again when the library
+// says the file was busy.
+//
+// 事务里的写是拿不到写锁才起不来的：起来了，锁就是它的了，里面的语句再也
+// 不会碰到「忙」（数据源名里写着 _txlock=immediate）。所以要再试的只有开
+// 头那一件事 —— 而它没起来的话，里面那个函数一次也没有跑过，再来一遍是
+// 安全的。
+func (s *Store) begin(ctx context.Context) (*sql.Tx, error) {
+	var err error
+	for i := 0; i < s.busyTries(); i++ {
+		if i > 0 && !sleepCtx(ctx, busyPause) {
+			break
+		}
+		var tx *sql.Tx
+		tx, err = s.durable.BeginTx(ctx, nil)
+		if err == nil {
+			return tx, nil
+		}
+		if ctx.Err() != nil || !Busy(err) {
+			return nil, fmt.Errorf("begin a transaction: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("begin a transaction: %w", err)
 }
 
 // sqlTx is one transaction of the store.
@@ -2029,19 +2149,25 @@ func (s *Store) SaveToken(ctx context.Context, t Token) error {
 }
 
 func (s *Store) saveToken(ctx context.Context, db execer, t Token) error {
-	_, err := db.ExecContext(ctx, `
-		INSERT INTO tokens (account_id, access, refresh, expires_at, subject, updated_at)
-		VALUES (?,?,?,?,?,?)
-		ON CONFLICT(account_id) DO UPDATE SET
-			access=excluded.access, refresh=excluded.refresh,
-			expires_at=excluded.expires_at, subject=excluded.subject,
-			updated_at=excluded.updated_at`,
+	err := s.writeBusy(ctx, db, tokenInsert,
 		t.AccountID, t.Access, t.Refresh, ms(t.ExpiresAt), t.Subject, ms(s.stamp(t.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("save token: %w", err)
 	}
 	return nil
 }
+
+// tokenInsert is the statement that writes a token.
+//
+// 写进去的是哪一个令牌，由库里那份说了算：saveToken 只在手里那份更新的
+// 时候才写（见 internal/manager 的 saveToken）。
+const tokenInsert = `
+	INSERT INTO tokens (account_id, access, refresh, expires_at, subject, updated_at)
+	VALUES (?,?,?,?,?,?)
+	ON CONFLICT(account_id) DO UPDATE SET
+		access=excluded.access, refresh=excluded.refresh,
+		expires_at=excluded.expires_at, subject=excluded.subject,
+		updated_at=excluded.updated_at`
 
 // GetToken gives an account's token.
 //
@@ -2464,8 +2590,9 @@ func (s *Store) SetExhausted(ctx context.Context, accountID, windowKey string, u
 // 它走那条 fsync 的连接：写不进去就是没删掉，写进去了就是在盘上的 ——
 // 没有「删掉了但没落盘」这种半个状态，所以只有 DELETE 本身失败才报错。
 func (s *Store) ClearExhausted(ctx context.Context, accountID, windowKey string) error {
-	_, err := s.durable.ExecContext(ctx,
-		"DELETE FROM exhausted_windows WHERE account_id=? AND window_key=?", accountID, windowKey)
+	err := s.writeBusy(ctx, s.durable,
+		"DELETE FROM exhausted_windows WHERE account_id=? AND window_key=?",
+		accountID, windowKey)
 	if err != nil {
 		return fmt.Errorf("clear exhausted: %w", err)
 	}

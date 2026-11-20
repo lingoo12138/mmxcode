@@ -2730,6 +2730,34 @@ func TestTheTokenIsWrittenOnTheDurableConnection(t *testing.T) {
 	}
 }
 
+// TestTheTokenWrittenInATransactionIsOnTheDurableConnection says the
+// token written inside a transaction is written on the connection that
+// fsyncs.
+//
+// 签入和导入都是走事务写令牌的（internal/store 的 SignIn 和
+// internal/provision 的链）。那一笔也是丢不得的：库里留着的是一个已经被
+// 站点用掉一次的 refresh token，下一次续签站点会拒，账号就被记成签入失效。
+//
+// 把那条连接关掉，事务就起不来了 —— 这一条守的是「走哪条连接」。
+func TestTheTokenWrittenInATransactionIsOnTheDurableConnection(t *testing.T) {
+	ctx := context.Background()
+	s := openTestOpts(t, WithSynchronous("normal"))
+	makeAccount(t, s, "one")
+
+	if err := s.durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Tx(ctx, func(tx Tx) error {
+		return tx.SaveToken(ctx, Token{
+			AccountID: "one", Access: "a", Refresh: "r",
+			ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now(),
+		})
+	})
+	if err == nil {
+		t.Fatal("the token was written in a transaction without the connection that fsyncs")
+	}
+}
+
 // TestTheClearedSpentMarkIsWrittenOnTheDurableConnection says the "used
 // up" mark is taken off on the connection that fsyncs.
 //

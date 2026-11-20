@@ -135,9 +135,12 @@ func (s *fakeStore) Tx(ctx context.Context, fn func(store.Tx) error) error {
 	}
 	// 库忙：真库上两个写碰上了就是这样（SQLITE_BUSY）。这一趟没写进去
 	// 任何东西，等一下再来一趟就行。
+	//
+	// 那句话是照着驱动说的写的：库说忙，是它的结果码（store.Busy 认的
+	// 就是那个），不是句子里有没有「locked」两个字。
 	if s.lockFailures > 0 {
 		s.lockFailures--
-		return errors.New("database is locked")
+		return errors.New("database is locked (5) (SQLITE_BUSY)")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

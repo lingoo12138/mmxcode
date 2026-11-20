@@ -353,6 +353,87 @@ func TestTheTokenNoteGoesAwayWhenTheStoreCatchesUp(t *testing.T) {
 	}
 }
 
+// TestTheTokenNoteGoesAwayWhenTheStoreHasCaughtUp says the note about a
+// token that could not be written down goes away when the store catches
+// up — even when nothing was written this time.
+//
+// 那条记号说的是「库里那份比手里那份旧」。库里那份追上了，那句话就不成立
+// 了 —— 记号该擦。写下去的那条路从前就擦（saveToken 的最后一行），跳过
+// 写入的那条路（库里那份已经不比手里那份旧）从前不擦：记号就一直挂着，一
+// 直挂到下一次改状态为止。
+func TestTheTokenNoteGoesAwayWhenTheStoreHasCaughtUp(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	})
+	// 库里那份已经是新的了（别的路写进去的）。
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "a", Refresh: "r",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 写不下去的那一次留下的记号。
+	m.note(ctx, "acc_01", tokenNotWrittenReason+": the disk is full")
+	// 手里那份不比库里那份旧：不写，可是记号该擦。
+	if err := m.saveToken(ctx, "acc_01", &oauth.Token{
+		Access: "a", Refresh: "r", Expires: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.LastError != "" {
+		t.Errorf("the note is still on the account: %q", a.LastError)
+	}
+}
+
+// TestTheNoteOfAnOlderVersionIsCleared says the note an older version
+// wrote is cleared, and the note of another reason is left alone.
+//
+// 旧版本写的记号说的是一句今天已经不存在的话（那一版有一个 Flush，去把预
+// 写日志搬回主库，搬不动的时候就把那句话记在账号上）。现在那两笔丢不得的
+// 写走的是会 fsync 的连接 —— 落盘了 —— 所以那句话已经不成立了，挂着它是
+// 骗人的。
+//
+// 别的理由（续签失败但手里那份还好）说的是别的事，那件事还是真的：擦了就
+// 是把真话也藏起来。
+func TestTheNoteOfAnOlderVersionIsCleared(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newTestManagerWithPath(t, nil)
+	now := time.Now()
+	for _, id := range []string{"acc_01", "acc_02"} {
+		m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	m.note(ctx, "acc_01", retiredDurableReason+": flush the database: it is busy")
+	m.note(ctx, "acc_02", renewalFailedReason+": the site is having a bad moment")
+
+	if err := m.ClearRetiredNotes(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	old, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.LastError != "" {
+		t.Errorf("the note of the older version is still on the account: %q", old.LastError)
+	}
+	other, err := m.Store.GetAccount(ctx, "acc_02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(other.LastError, renewalFailedReason) {
+		t.Errorf("the note on the account = %q, want the one that was there", other.LastError)
+	}
+}
+
 // TestTheNoteOfAnotherReasonStays says a note that is not about the token
 // is left alone.
 //

@@ -120,6 +120,13 @@ func newRoot() (*cobra.Command, *env) {
 		e.up = upstream.New(upstream.Options{Timeout: 30 * time.Second, Transport: tr})
 		e.acc = account.New(e.up)
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
+		// 旧版本写在账号上的记号擦掉：那句话说的事今天已经不存在了，挂
+		// 着它是骗人的（页面上显示着「这个号有问题」，而那个号其实得好
+		// 得很）。擦不掉不是说一声就好 —— 网关照样起：那是一次收拾，不
+		// 是网关的命。
+		if err := e.mgr.ClearRetiredNotes(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: the notes of an older version could not be cleared: %v\n", err)
+		}
 		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
 		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
 			e.mgr.Key = key

@@ -74,7 +74,30 @@ const (
 	// renewalFailedReason says a renewal failed but the token in hand
 	// is still good.
 	renewalFailedReason = "the renewal failed but the token in hand is still good"
+	// retiredDurableReason is a note an older version wrote.
+	//
+	// 那一版有一个 Flush：它去把预写日志搬回主库，搬不动的时候就把这句
+	// 话记在账号上。那个 Flush 早就不在了 —— 现在那两笔丢不得的写走的是
+	// 会 fsync 的连接，落盘了 —— 所以这句话已经不成立了。
+	//
+	// 可是它写在账号上的记号还在，而擦记号的那段代码只认自己写的那一条
+	// 前缀：从前**永远擦不掉**。
+	retiredDurableReason = "the token was written down but it was not made durable: a power cut could lose it"
 )
+
+// The notes that are about a token that could not be written down.
+//
+// 前一个是现在写的那一条。后一个是旧版本写的那一条 —— 旧的那一条说的
+// 是另一句话，可是说的是同一件事（库里那份比手里那份旧），所以擦的时候
+// 要认得它。
+var tokenNotePrefixes = []string{tokenNotWrittenReason, retiredDurableReason}
+
+// retiredNotePrefixes are the notes that the current version cannot write
+// any more.
+//
+// 旧版本写的那些记号说的是一句今天已经不存在的话，挂着它是骗人的。开机
+// 的时候擦一遍（见 ClearRetiredNotes）。
+var retiredNotePrefixes = []string{retiredDurableReason}
 
 // Manager holds the gateway's accounts.
 type Manager struct {
@@ -484,6 +507,11 @@ func (m *Manager) saveToken(ctx context.Context, accountID string, tok *oauth.To
 	stored, err := m.Store.GetToken(ctx, accountID)
 	if err == nil && !stored.ExpiresAt.Before(store.AtMillisecond(tok.Expires)) {
 		// The store already holds a token that is at least as new.
+		//
+		// 库里那份不比手里那份旧 —— 那条「库里那份比手里那份旧」就不成立
+		// 了，记号该擦。这一遍没有写下去（写下去的那条路本来就在擦），
+		// 可是记号说的不是「这一遍写了没有」，说的是「库里那份旧不旧」。
+		m.clearTokenNote(ctx, accountID)
 		return nil
 	}
 	// A token that could not be read is written over: the store is
@@ -637,8 +665,9 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 // 才会被清掉，所以一次暂时的忙会在一个好好的账号上留一条「这个号有问题」，
 // 一直留到下一次改状态为止。
 //
-// 所以 token 写成功之后要把它擦掉。只擦这一条：别的理由（续签失败但手里
-// 那份还好之类）说的是别的事，擦了就是把真话也藏起来。
+// 所以 token 写成功之后要把它擦掉。只擦关于令牌的那一条（现在写的那条，
+// 和旧版本写的那条）：别的理由（续签失败但手里那份还好之类）说的是别的事，
+// 擦了就是把真话也藏起来。
 //
 // 它是尽力而为的：擦不掉就算了，下一次写成功还会再擦一次。
 func (m *Manager) clearTokenNote(ctx context.Context, accountID string) {
@@ -652,11 +681,42 @@ func (m *Manager) clearTokenNote(ctx context.Context, accountID string) {
 		// any more.
 		return
 	}
-	if !strings.HasPrefix(a.LastError, tokenNotWrittenReason) {
+	if !isTokenNote(a.LastError) {
 		// Some other reason is on the account, and it is still true.
 		return
 	}
 	_ = m.Store.SetAccountLastError(ctx, accountID, "", time.Now())
+}
+
+// isTokenNote says the note is about a token that could not be written down.
+//
+// 两条前缀都认：现在写的那一条，和旧版本写的那一条 —— 旧的那一条说的是
+// 另一句话，可是说的是同一件事，擦它的时候得认得它。
+func isTokenNote(note string) bool {
+	for _, p := range tokenNotePrefixes {
+		if strings.HasPrefix(note, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClearRetiredNotes takes away the notes that an older version wrote.
+//
+// 旧版本写的那些记号说的是一句今天已经不存在的话 —— 那一版有一个 Flush，
+// 去把预写日志搬回主库，搬不动的时候就把那句话记在账号上。现在那两笔丢
+// 不得的写走的是会 fsync 的连接（落盘了），所以那句话已经不成立了，挂着
+// 它是骗人的：页面上显示着「这个号有问题」，而那个号其实好得很。
+//
+// 它是开机时做一次的事。擦的是自己认得的那一条前缀：别的理由说的是别的
+// 事，擦了就是把真话也藏起来。
+func (m *Manager) ClearRetiredNotes(ctx context.Context) error {
+	for _, p := range retiredNotePrefixes {
+		if _, err := m.Store.ClearAccountNotes(ctx, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ErrNotSignedOut says the account is not signed out.

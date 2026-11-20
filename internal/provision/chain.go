@@ -589,7 +589,7 @@ func (c *Chain) storeError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return &Error{Stage: StageStore, Message: err.Error()}
 	}
-	return &Error{Stage: StageStore, Message: err.Error(), Retry: busyLibrary(err)}
+	return &Error{Stage: StageStore, Message: err.Error(), Retry: store.Busy(err)}
 }
 
 // transient says whether a failure is worth another go at the same step.
@@ -613,12 +613,6 @@ func transient(err error) bool {
 	}
 	// 传输上的问题：连接断了、读超时了。
 	return true
-}
-
-// busyLibrary says whether the library was busy.
-func busyLibrary(err error) bool {
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "locked") || strings.Contains(s, "busy")
 }
 
 // webError turns what the site said into what the runner needs to
