@@ -346,8 +346,8 @@ func TestAPICheckin(t *testing.T) {
 // 出口页列的是在用的那些：全局默认，加上账号自己写的地址。
 func TestAPIEgress(t *testing.T) {
 	w, s := newTestWebUI(t)
-	if err := s.SetAccountProxy(context.Background(), "acc_01",
-		"http://10.0.0.5:1080", time.Now()); err != nil {
+	if err := s.SetAccountOutlet(context.Background(), "acc_01",
+		"http://10.0.0.5:1080", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/egress", nil)
@@ -1452,5 +1452,114 @@ func TestTheImportResultsScriptSurvivesAResultsThatIsNotAnArray(t *testing.T) {
 	p := exec.Command(node, filepath.Join("testdata", "import_results_guard.js"))
 	if out, err := p.CombinedOutput(); err != nil {
 		t.Fatalf("the script guard failed: %v\n%s", err, out)
+	}
+}
+
+// do asks the web UI a question and gives back the answer.
+//
+// 组的那几个接口要问的种类多：一个请求走一遍 recorder，比抄一遍四行强。
+func (w *WebUI) do(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, path, nil)
+	} else {
+		r = httptest.NewRequest(method, path, strings.NewReader(body))
+	}
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, r)
+	return rec
+}
+
+// TestTheGroupIsMadeAndChanged says a group can be made and changed
+// through the API.
+//
+// 组在库里，页面上能改 —— 这是这一版跟上一版最不一样的地方。
+func TestTheGroupIsMadeAndChanged(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	body := `{"name":"clash","urls":["http://a:8080","http://b:8080"]}`
+	rec := w.do(t, http.MethodPost, "/api/proxy-groups", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	g, err := w.Store.GetProxyGroup(context.Background(), "clash")
+	if err != nil {
+		t.Fatalf("get the group: %v", err)
+	}
+	if len(g.URLs) != 2 {
+		t.Errorf("the group's addresses are %v", g.URLs)
+	}
+	// 改组：地址换掉。
+	rec = w.do(t, http.MethodPost, "/api/proxy-groups", `{"name":"clash","urls":["http://c:8080"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	g, err = w.Store.GetProxyGroup(context.Background(), "clash")
+	if err != nil {
+		t.Fatalf("get the group: %v", err)
+	}
+	if len(g.URLs) != 1 || g.URLs[0] != "http://c:8080" {
+		t.Errorf("the group's addresses are %v", g.URLs)
+	}
+}
+
+// TestTheGroupIsTakenAway says a group can be taken away, and that the
+// accounts that pointed at it go back to the global group.
+func TestTheGroupIsTakenAway(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := w.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "one", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create the account: %v", err)
+	}
+	if err := w.Store.SetAccountOutlet(ctx, "acc_1", "", "clash", now); err != nil {
+		t.Fatalf("set the outlet: %v", err)
+	}
+	rec := w.do(t, http.MethodPost, "/api/proxy-groups", `{"name":"clash","urls":["http://a:8080"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = w.do(t, http.MethodDelete, "/api/proxy-groups?name=clash", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	a, err := w.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatalf("get the account: %v", err)
+	}
+	if a.ProxyGroup != "" {
+		t.Errorf("the account still points at the group %q", a.ProxyGroup)
+	}
+}
+
+// TestTheAccountPointsAtAGroup says an account can be pointed at a group
+// through the API, and that the address and the group are one thing.
+func TestTheAccountPointsAtAGroup(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := w.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "one", Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create the account: %v", err)
+	}
+	rec := w.do(t, http.MethodPatch, "/api/accounts/acc_1", `{"proxy_group":"clash"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	a, err := w.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatalf("get the account: %v", err)
+	}
+	if a.ProxyGroup != "clash" {
+		t.Errorf("the account's group is %q", a.ProxyGroup)
+	}
+	// 两个一起给是不行的：账号只有一条出口。
+	rec = w.do(t, http.MethodPatch, "/api/accounts/acc_1",
+		`{"proxy_group":"clash","proxy_url":"http://a:8080"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("the answer is %d: %s", rec.Code, rec.Body.String())
 	}
 }

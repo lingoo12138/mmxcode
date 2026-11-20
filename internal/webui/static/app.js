@@ -188,6 +188,27 @@ document.addEventListener('click', async (ev) => {
     return;
   }
 
+  const groupEdit = ev.target.closest('[data-group-edit]');
+  if (groupEdit) {
+    editGroup(groupEdit.dataset.groupEdit, groupEdit.dataset.groupUrls || '');
+    return;
+  }
+
+  const groupRm = ev.target.closest('[data-group-rm]');
+  if (groupRm) {
+    const name = groupRm.dataset.groupRm;
+    if (!confirm(`删掉组 ${name}？指着它的账号回到全局组。`)) return;
+    groupRm.disabled = true;
+    try {
+      await del(`/api/proxy-groups?name=${encodeURIComponent(name)}`);
+      location.reload();
+    } catch (e) {
+      document.getElementById('status').textContent = '删除失败：' + e.message;
+      groupRm.disabled = false;
+    }
+    return;
+  }
+
   if (ev.target.id === 'start-login') {
     const box = document.getElementById('login-result');
     box.textContent = '请稍候……';
@@ -217,6 +238,15 @@ document.addEventListener('change', async (ev) => {
   if (!sel) return;
   const body = {};
   body[sel.dataset.field] = sel.value;
+  // 地址和组是二选一：选了组，地址框就清掉；填了地址，下拉框就回到空。
+  if (sel.dataset.field === 'proxy_group' && sel.value) {
+    const input = document.querySelector(`input[data-account="${sel.dataset.account}"][data-field="proxy_url"]`);
+    if (input) input.value = '';
+  }
+  if (sel.dataset.field === 'proxy_url' && sel.value) {
+    const pick = document.querySelector(`select[data-account="${sel.dataset.account}"][data-field="proxy_group"]`);
+    if (pick) pick.value = '';
+  }
   try {
     await patch(`/api/accounts/${sel.dataset.account}`, body);
     document.getElementById('status').textContent = '已保存';
@@ -555,4 +585,35 @@ async function renderKeys() {
     tr.appendChild(last);
     body.appendChild(tr);
   }
+}
+
+// editGroup 改一个组。
+//
+// 组里的地址一行一个，顺序就是故障转移的顺序：第一个是主路，后面的都是
+// 备路。
+function editGroup(name, urls) {
+  const box = document.createElement('div');
+  box.className = 'card';
+  const label = document.createElement('p');
+  label.textContent = `组 ${name} 的地址（一行一个，第一个是主路）`;
+  const input = document.createElement('textarea');
+  input.rows = 6;
+  input.cols = 48;
+  input.value = urls;
+  const button = document.createElement('button');
+  button.textContent = '存回去';
+  const msg = document.createElement('p');
+  box.append(label, input, button, msg);
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const list = input.value.split('\n').map((s) => s.trim()).filter(Boolean);
+      await post('/api/proxy-groups', { name, urls: list });
+      location.reload();
+    } catch (e) {
+      msg.textContent = e.message;
+      button.disabled = false;
+    }
+  });
+  document.body.appendChild(box);
 }

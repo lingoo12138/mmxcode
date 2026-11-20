@@ -113,6 +113,35 @@ func newRoot() (*cobra.Command, *env) {
 		}
 		e.store = s
 		e.egr = egress.New(cfg.Proxy.Default)
+		// 组：库是老家，配置里的组只是种子。库里没有的组用配置里的地址
+		// 建出来 —— 老库里那些指着组名的号，靠这一步还指着原来的那条路。
+		res, err := e.store.SeedProxyGroups(ctx, cfg.Proxy.Default, cfg.Proxy.Groups)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: the outlet groups could not be made: %v\n", err)
+		} else {
+			if res.GlobalSeeded {
+				fmt.Fprintf(os.Stderr, "warning: the global group was made from proxy.default in the configuration. The configuration's proxy.default does not count any more - change the global group on the page.\n")
+			}
+			if res.GlobalShadowed {
+				fmt.Fprintf(os.Stderr, "warning: proxy.default in the configuration does not count any more: the global group is in the database. Change the global group on the page.\n")
+			}
+			for _, n := range res.Created {
+				fmt.Fprintf(os.Stderr, "the outlet group %q was made from the configuration.\n", n)
+			}
+			for _, n := range res.Shadowed {
+				fmt.Fprintf(os.Stderr, "warning: the outlet group %q in the configuration is already in the database. The one in the database counts. That part can be taken out of the configuration file.\n", n)
+			}
+			if res.UnknownAccounts > 0 {
+				fmt.Fprintf(os.Stderr, "warning: %d account(s) point at an outlet group that is not in the database (%s). They follow the global group for now.\n",
+					res.UnknownAccounts, strings.Join(res.Unknown, ", "))
+			}
+		}
+		// 解析器得知道组：登录、导入、网关都按组挑地址。
+		groups, err := e.store.ListProxyGroups(ctx)
+		if err != nil {
+			return err
+		}
+		e.egr.SetGroups(egress.GroupMap(groups))
 		// 登录和账户 API 也走代理。配了不用等于没配：国内的网络
 		// 连不上国际站，登录就停在第一步。
 		tr, err := e.egr.Transport(e.egr.Resolve(store.Account{}))
@@ -124,27 +153,14 @@ func newRoot() (*cobra.Command, *env) {
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
 		// 旧版本写在账号上的记号擦掉：那句话说的事今天已经不存在了，挂
 		// 着它是骗人的（页面上显示着「这个号有问题」，而那个号其实得好
-		// 得很）。擦不掉不是说一声就好 —— 网关照样起：那是一次收拾，不
+		// 得很）。擦不掉不是说一声就好 —— 网关照样起：那一次收拾，不
 		// 是网关的命。
 		if err := e.mgr.ClearRetiredNotes(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: the notes of an older version could not be cleared: %v\n", err)
 		}
-		// 出口组退役了：账号身上那个组名变成账号自己的地址。收拾失败的
-		// 话，网关照样起 —— 那是一次收拾，不是网关的命。
-		res, err := e.mgr.MaterializeProxyGroups(ctx, cfg.Proxy.LegacyGroups)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: the outlet groups of the accounts could not be moved: %v\n", err)
-		} else {
-			if res.Moved > 0 {
-				fmt.Fprintf(os.Stderr, "%d account(s) took the address of their outlet group as an address of their own.\n", res.Moved)
-			}
-			if res.Dropped > 0 {
-				fmt.Fprintf(os.Stderr, "warning: %d account(s) pointed at an outlet group that is not in the configuration (%s): they follow the global default now.\n",
-					res.Dropped, strings.Join(res.DroppedIDs, ", "))
-			}
-		}
-		if len(cfg.Proxy.LegacyGroups) > 0 {
-			fmt.Fprintf(os.Stderr, "warning: proxy.groups is retired: the outlet groups of the accounts have become addresses of their own. That part can be taken out of the configuration file.\n")
+		// 组和它们的健康灌进解析器：网关下一次挑地址就该按库里那份来。
+		if err := e.mgr.RefreshOutlets(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: the outlet groups could not be read: %v\n", err)
 		}
 		// 重登用的密钥：没有它，账号掉线了就只能自己再登一次。
 		if key, err := secret.FromEnv(PasswordKeyEnv); err == nil {
@@ -166,6 +182,7 @@ func newRoot() (*cobra.Command, *env) {
 	root.AddCommand(newImportCmd(e))
 	root.AddCommand(newReloginCmd(e))
 	root.AddCommand(newAccountsCmd(e))
+	root.AddCommand(newGroupsCmd(e))
 	root.AddCommand(newCheckinCmd(e))
 	root.AddCommand(newUsageCmd(e))
 	root.AddCommand(newModelsCmd(e))

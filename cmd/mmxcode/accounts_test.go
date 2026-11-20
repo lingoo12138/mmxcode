@@ -106,3 +106,71 @@ func TestAccountsListShowsTheAddress(t *testing.T) {
 		t.Errorf("the address is not in the output:\n%s", out)
 	}
 }
+
+// TestTheAccountCanPointAtAGroup says an account's outlet can be a
+// group, and that the address and the group are one thing.
+//
+// 地址和组是二选一：账号只有一条出口。给了组，账号自己的地址就不算了。
+func TestTheAccountCanPointAtAGroup(t *testing.T) {
+	e := testEnv(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := e.store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		ProxyURL:  "http://old:8080",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	cmd := newAccountsProxyCmd(e)
+	cmd.SetArgs([]string{"acc_1", "--group", "clash"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("accounts proxy: %v", err)
+	}
+	a, err := e.store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ProxyGroup != "clash" {
+		t.Errorf("the account's group is %q, want %q", a.ProxyGroup, "clash")
+	}
+	// 给了组，账号自己的地址就不算了。
+	if a.ProxyURL != "" {
+		t.Errorf("the account still has an address of its own: %q", a.ProxyURL)
+	}
+
+	// 两个一起给是不行的。
+	cmd = newAccountsProxyCmd(e)
+	cmd.SetArgs([]string{"acc_1", "--url", "http://a:8080", "--group", "clash"})
+	if err := cmd.Execute(); err == nil {
+		t.Error("the address and the group were both taken")
+	}
+}
+
+// TestTheAccountListSaysTheGroup says the list says which group an
+// account is on.
+//
+// 一列「出口组」：人不用去猜这个号走的是哪条路。
+func TestTheAccountListSaysTheGroup(t *testing.T) {
+	e := testEnv(t)
+	now := time.Now()
+	if err := e.store.CreateAccount(context.Background(), store.Account{
+		ID: "acc_1", Name: "一号", Status: store.StatusActive,
+		ProxyGroup: "clash", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		cmd := newAccountsListCmd(e)
+		cmd.SetOut(nil)
+		cmd.SetErr(nil)
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("accounts list: %v", err)
+		}
+	})
+	if !strings.Contains(out, "clash") {
+		t.Errorf("the group is not in the output:\n%s", out)
+	}
+}

@@ -133,6 +133,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/egress":
 		w.apiEgress(rw, r)
 		return
+	case "/api/proxy-groups":
+		w.apiProxyGroups(rw, r)
+		return
 	case "/api/egress/test":
 		w.apiEgressTest(rw, r)
 		return
@@ -248,6 +251,10 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	groups, err := w.Store.ListProxyGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
 	snaps, err := w.Store.LatestUsageSnapshots(ctx)
 	if err != nil {
 		return nil, err
@@ -266,6 +273,7 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"Email":         a.Email,
 			"Status":        a.Status,
 			"ProxyURL":      egress.Redacted(a.ProxyURL),
+			"ProxyGroup":    a.ProxyGroup,
 			"HasAmounts":    snap.HasAmounts,
 			"Granted":       snap.Granted,
 			"Remaining":     snap.Remaining,
@@ -279,7 +287,21 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"LastError": a.LastError,
 		})
 	}
-	return map[string]any{"Accounts": out}, nil
+	return map[string]any{"Accounts": out, "Groups": groupList(groups)}, nil
+}
+
+// groupList gives the groups for the page: the name and how many
+// addresses it has.
+func groupList(groups []store.ProxyGroup) []map[string]any {
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, map[string]any{
+			"Name":   g.Name,
+			"Global": g.Name == store.GlobalGroup,
+			"Count":  len(g.URLs),
+		})
+	}
+	return out
 }
 
 // windowSummary gives a one-line summary of the account's windows.
@@ -331,15 +353,36 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	groups, err := w.Store.ListProxyGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// 组：一个组一行 —— 名字、几条地址、那些地址（去掉凭据的）。
+	var groupRows []map[string]any
+	for _, g := range groups {
+		text := make([]string, 0, len(g.URLs))
+		for _, u := range g.URLs {
+			text = append(text, egress.Redacted(u))
+		}
+		groupRows = append(groupRows, map[string]any{
+			"Name":   g.Name,
+			"Global": g.Name == store.GlobalGroup,
+			"Count":  len(g.URLs),
+			"Text":   strings.Join(text, "\n"),
+		})
+	}
+	// 在用的地址：从哪来、地址本身、健不健康。
+	// 库里还没有全局组的时候，配置里那个全局默认就是全局组。
+	gm := egress.GroupsWithDefault(egress.GroupMap(groups), w.Cfg.Proxy.Default)
 	var out []map[string]any
-	for _, o := range egress.Outlets(accounts, w.Cfg.Proxy.Default) {
+	for _, o := range egress.Outlets(accounts, gm) {
 		h, ok := byURL[o.URL]
 		out = append(out, map[string]any{
 			"Name": o.Name, "URL": egress.Redacted(o.URL),
 			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
 		})
 	}
-	return map[string]any{"Egress": out}, nil
+	return map[string]any{"Groups": groupRows, "Egress": out}, nil
 }
 
 // usageData is the usage page's data.
@@ -607,6 +650,139 @@ func (w *WebUI) apiEgress(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, d)
 }
 
+// apiProxyGroups reads and writes the outlet groups.
+//
+// 组在库里，页面上能改：建一个、改一个、删一个。删掉的组，指着它的账号
+// 回到全局组去。
+func (w *WebUI) apiProxyGroups(rw http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.apiProxyGroupsList(rw, r)
+	case http.MethodPost:
+		w.apiProxyGroupsSave(rw, r)
+	case http.MethodDelete:
+		w.apiProxyGroupsDelete(rw, r)
+	default:
+		rw.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// apiProxyGroupsList gives the groups.
+func (w *WebUI) apiProxyGroupsList(rw http.ResponseWriter, r *http.Request) {
+	groups, err := w.Store.ListProxyGroups(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	counts, err := w.Store.AccountGroups(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, map[string]any{
+			"Name":     g.Name,
+			"Global":   g.Name == store.GlobalGroup,
+			"URLs":     g.URLs,
+			"Accounts": counts[g.Name],
+		})
+	}
+	writeJSON(rw, map[string]any{"Groups": out})
+}
+
+// apiProxyGroupsSave makes a group or changes it.
+//
+// 名字是组的身份：这个名字已经有了，就是改它的地址。
+func (w *WebUI) apiProxyGroupsSave(rw http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string   `json:"name"`
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		http.Error(rw, "the group has no name", http.StatusBadRequest)
+		return
+	}
+	// 页面显示的是去掉凭据的地址，送回来的也是去了凭据的：没改过的那
+	// 几条，存回去的是带凭据的那一个。
+	var stored []string
+	if old, err := w.Store.GetProxyGroup(r.Context(), name); err == nil {
+		stored = old.URLs
+	}
+	urls := mergeAddresses(body.URLs, stored)
+	now := time.Now()
+	if err := w.Store.SaveProxyGroup(r.Context(), store.ProxyGroup{
+		Name: name, URLs: urls, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// 解析器得马上知道：网关下一次挑地址就该按新的来。
+	if err := w.Mgr.RefreshOutlets(r.Context()); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{"ok": true})
+}
+
+// apiProxyGroupsDelete takes a group away.
+func (w *WebUI) apiProxyGroupsDelete(rw http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		http.Error(rw, "the group has no name", http.StatusBadRequest)
+		return
+	}
+	back, err := w.Store.DeleteProxyGroup(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(rw, "no such group: "+name, http.StatusNotFound)
+			return
+		}
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = w.Mgr.RefreshOutlets(r.Context())
+	writeJSON(rw, map[string]any{"ok": true, "back": back})
+}
+
+// mergeAddresses puts the credentials back into the addresses that were
+// not really changed.
+//
+// 页面显示的是去掉凭据的地址（凭据是秘密），送回来的也是去了凭据的。
+// 没改过的那几条，存回去的是带凭据的那一个 —— 否则改一下别的地址就把凭
+// 据抹了。
+func mergeAddresses(shown, stored []string) []string {
+	used := make([]bool, len(stored))
+	out := make([]string, 0, len(shown))
+	for _, s := range shown {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		matched := false
+		for i, old := range stored {
+			if used[i] {
+				continue
+			}
+			if s == egress.Redacted(old) {
+				out = append(out, old)
+				used[i] = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // apiEgressTest tests one outlet now.
 func (w *WebUI) apiEgressTest(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -639,7 +815,12 @@ func (w *WebUI) outletURL(ctx context.Context, shown string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	for _, o := range egress.Outlets(accounts, w.Cfg.Proxy.Default) {
+	groups, err := w.Store.ListProxyGroups(ctx)
+	if err != nil {
+		return "", false
+	}
+	gm := egress.GroupsWithDefault(egress.GroupMap(groups), w.Cfg.Proxy.Default)
+	for _, o := range egress.Outlets(accounts, gm) {
 		if egress.Redacted(o.URL) == shown {
 			return o.URL, true
 		}
@@ -671,8 +852,9 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPatch:
 		var body struct {
-			Name     *string `json:"name"`
-			ProxyURL *string `json:"proxy_url"`
+			Name       *string `json:"name"`
+			ProxyURL   *string `json:"proxy_url"`
+			ProxyGroup *string `json:"proxy_group"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		a, err := w.Store.GetAccount(r.Context(), id)
@@ -684,6 +866,11 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if body.ProxyURL != nil && body.ProxyGroup != nil {
+			// 地址和组是二选一：账号只有一条出口。
+			http.Error(rw, "the outlet is an address or a group, not both", http.StatusBadRequest)
+			return
+		}
 		if body.ProxyURL != nil {
 			// The page shows the address without its credentials, so
 			// the address that comes back unchanged is the one that
@@ -693,6 +880,12 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 			if *body.ProxyURL != shown || shown == a.ProxyURL {
 				a.ProxyURL = *body.ProxyURL
 			}
+			// 给了地址，组就清掉：账号只有一条出口。
+			a.ProxyGroup = ""
+		}
+		if body.ProxyGroup != nil {
+			a.ProxyGroup = strings.TrimSpace(*body.ProxyGroup)
+			a.ProxyURL = ""
 		}
 		// 名字和出口分开写。整行写回去会把别的写者在这中间改的东西抹掉：
 		// 管理器刚写下的登出，会被这一次改名字抹回 active。
@@ -702,8 +895,8 @@ func (w *WebUI) apiAccount(rw http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if body.ProxyURL != nil {
-			if err := w.Store.SetAccountProxy(r.Context(), a.ID, a.ProxyURL, time.Now()); err != nil {
+		if body.ProxyURL != nil || body.ProxyGroup != nil {
+			if err := w.Store.SetAccountOutlet(r.Context(), a.ID, a.ProxyURL, a.ProxyGroup, time.Now()); err != nil {
 				http.Error(rw, err.Error(), http.StatusInternalServerError)
 				return
 			}

@@ -1,7 +1,23 @@
 {{define "content"}}
 <h2>出口</h2>
+<h3>组</h3>
 <table>
-<tr><th>名字</th><th>地址</th><th>健康</th><th></th></tr>
+<tr><th>名字</th><th>地址</th><th></th></tr>
+{{range .Groups}}
+<tr>
+  <td>{{.Name}}{{if .Global}} <span class="muted">全局默认</span>{{end}}</td>
+  <td class="muted">{{.Count}} 条</td>
+  <td>
+    <button data-group-edit="{{.Name}}" data-group-urls="{{.Text}}">改</button>
+    {{if not .Global}}<button data-group-rm="{{.Name}}">删</button>{{end}}
+  </td>
+</tr>
+{{end}}
+</table>
+{{if not .Groups}}<p class="muted">还没有组。<code>mmxcode groups set --name X --url 地址</code> 建一个。</p>{{end}}
+<h3>在用的地址</h3>
+<table>
+<tr><th>从哪来</th><th>地址</th><th>健康</th><th></th></tr>
 {{range .Egress}}
 <tr>
   <td>{{.Name}}</td>

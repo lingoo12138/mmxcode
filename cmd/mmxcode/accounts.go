@@ -39,7 +39,7 @@ func newAccountsListCmd(e *env) *cobra.Command {
 				return nil
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t代理")
+			fmt.Fprintln(w, "ID\t标签\t邮箱\t状态\t出口组\t代理")
 			for _, a := range list {
 				// 代理地址里的账号和密码是秘密，而这份输出会进到终端的
 				// 回滚里，也会进到 CI 的日志里。egress.Redacted 就是
@@ -48,8 +48,8 @@ func newAccountsListCmd(e *env) *cobra.Command {
 				if proxy == "" {
 					proxy = egress.Redacted(e.cfg.Proxy.Default)
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-					a.ID, a.Name, a.Email, a.Status, proxy)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+					a.ID, a.Name, a.Email, a.Status, a.ProxyGroup, proxy)
 			}
 			return w.Flush()
 		},
@@ -74,10 +74,10 @@ func newAccountsRemoveCmd(e *env) *cobra.Command {
 }
 
 func newAccountsProxyCmd(e *env) *cobra.Command {
-	var url string
+	var url, group string
 	cmd := &cobra.Command{
 		Use:   "proxy <id>",
-		Short: "给账号指定单独的代理地址",
+		Short: "给账号指定单独的代理地址或者出口组",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
@@ -88,14 +88,24 @@ func newAccountsProxyCmd(e *env) *cobra.Command {
 				}
 				return err
 			}
-			if url != "" {
-				a.ProxyURL = url
+			// 地址和组是二选一：账号只有一条出口。
+			if cmd.Flags().Changed("url") && cmd.Flags().Changed("group") {
+				return fmt.Errorf("the outlet is an address or a group, not both")
 			}
-			// 只写出口那一列。整行写回去会把别的写者在这中间改的东西抹掉：
+			if cmd.Flags().Changed("url") {
+				a.ProxyURL = url
+				a.ProxyGroup = ""
+			}
+			if cmd.Flags().Changed("group") {
+				a.ProxyGroup = group
+				a.ProxyURL = ""
+			}
+			// 只写出口那两列。整行写回去会把别的写者在这中间改的东西抹掉：
 			// 登出刚写下的状态，会被这一次改代理抹回 active。
-			return e.store.SetAccountProxy(ctx, a.ID, a.ProxyURL, nowUTC())
+			return e.store.SetAccountOutlet(ctx, a.ID, a.ProxyURL, a.ProxyGroup, nowUTC())
 		},
 	}
 	cmd.Flags().StringVar(&url, "url", "", "单独的代理地址")
+	cmd.Flags().StringVar(&group, "group", "", "出口组的名字")
 	return cmd
 }
