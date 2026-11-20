@@ -53,9 +53,12 @@ WHOLE = [
     "internal/provision/chain_test.go",
     "cmd/mmxcode/import.go",
     "cmd/mmxcode/import_test.go",
-    "internal/store/legacy_proxy.go",
-    "internal/manager/proxy_groups.go",
-    "internal/manager/proxy_groups_test.go",
+    "internal/store/proxy_groups.go",
+    "internal/store/proxy_groups_test.go",
+    "internal/egress/groups.go",
+    "internal/egress/groups_test.go",
+    "cmd/mmxcode/groups.go",
+    "cmd/mmxcode/groups_test.go",
 ]
 
 

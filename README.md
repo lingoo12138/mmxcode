@@ -59,6 +59,8 @@ mmxcode serve                     # 起 HTTP 服务、WebUI 与定时任务
 mmxcode login                    # 登录一个账号
 mmxcode accounts list            # 列出账号
 mmxcode accounts proxy <id> --url http://127.0.0.1:7890
+mmxcode accounts proxy <id> --group clash
+mmxcode groups list                # 列出出口组
 mmxcode import --file accounts.txt  # 批量导入账号
 mmxcode relogin --all             # 把签出的账号登回去
 mmxcode checkin                  # 给所有账号签到
@@ -73,7 +75,7 @@ mmxcode models                   # 模型列表
 
 `serve` 自己没有别的开关：监听地址、key、轮转参数都在配置文件里。
 
-其余子命令的开关：`login --name`（账号标签）、`accounts proxy --url`（这个账号自己的代理地址）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）、`usage --refresh`（现读一遍账本，不看上次读数）。
+其余子命令的开关：`login --name`（账号标签）、`accounts proxy --url`（这个账号自己的代理地址）、`accounts proxy --group <组名>`（这个账号走哪个组）、`groups list|set|rm`（出口组）、`checkin --account`（只签这一个账号）、`usage --json`（输出 JSON）、`usage --refresh`（现读一遍账本，不看上次读数）。
 
 ### 积分什么时候读
 
@@ -191,6 +193,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `/api/usage/refresh` | POST | 立刻把所有账号的账本读一遍 |
 | `/api/egress` | GET | 在用的出口和它们的状态 |
 | `/api/egress/test` | POST | 立刻测一个出口 |
+| `/api/proxy-groups` | GET / POST / DELETE | 出口组（列出、建或改、删） |
 | `/api/sessions` | GET | 会话绑定（目前是空列表） |
 | `/api/events` | GET | SSE，每 30 秒一个心跳 |
 | `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
@@ -443,13 +446,22 @@ magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refres
 出口按这个顺序挑：
 
 1. 账号自己的代理地址：`mmxcode accounts proxy <id> --url <地址>`，或者在网页上
-   那一行里填（空 = 跟着全局）；
-2. 全局 `proxy.default`。
+   每一行里填。
+2. 账号指着的出口组：`mmxcode accounts proxy <id> --group <组名>`，或者网页上那
+   个下拉框。
+3. 全局组（名字是 `default`）：网页上「出口」那一页里改。
+4. 直连。
 
-两个都没有的时候是直连。全局默认写 `direct` 也是直连。
+一个组里有多条地址（一条也行）：组里的地址按顺序试，第一个通就用它，不通换下一
+个 —— 故障转移，不是轮询。哪个地址活着由健康检查说了算（`schedule.egress_health`
+那个间隔，默认两分钟）。
 
-出口组这个概念没有了（老的配置里那个 `proxy.groups` 键还认，只是没人再拿它
-做事）：开机的时候，账号身上那个组名会变成账号自己的地址，然后就没有组了。
+组在数据库里：`mmxcode groups set --name X --url A --url B` 建一个或者改它，
+`mmxcode groups list` 看有哪些组，`mmxcode groups rm --name X` 删掉（指着它的账号回
+到全局组）。网页上「出口」那一页也能建、改、删。
+
+配置里的 `proxy.default` 只是全局组的种子：`proxy.groups` 是老部署的组，也是种子
+—— 库里没有的组开机的时候用它们建出来，库里已经有了的就是库里的算数。
 
 - 支持的 scheme：`http`、`https`、`socks5`、`socks5h`。没有 scheme 的地址会报错，不会默默直连。
 - `socks5://` 和 `socks5h://` 都把域名交给代理去解析（远端 DNS），跟 curl 的 `socks5://`（本地解析）不一样。
