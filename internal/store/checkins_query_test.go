@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -97,8 +96,9 @@ func TestTheCheckinIndexReachesAnOldFile(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_checkins_day_account"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx,
-		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion-1)); err != nil {
+	// 退回到 6：那是索引那一步（版本 7）之前的版本 —— 从那里再走一遍，
+	// 索引那一步就会跑。
+	if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {

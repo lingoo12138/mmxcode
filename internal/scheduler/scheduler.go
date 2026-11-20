@@ -291,7 +291,15 @@ func (s *Scheduler) CheckEgress(ctx context.Context) {
 		fmt.Printf("egress: %v\n", err)
 		return
 	}
-	for _, url := range egress.OutletURLs(accounts, s.Cfg.Proxy.Default) {
+	gs, err := s.Mgr.Store.ListProxyGroups(ctx)
+	if err != nil {
+		fmt.Printf("egress: %v\n", err)
+		return
+	}
+	// 库里还没有全局组的时候，配置里那个全局默认就是全局组：解析器也是
+	// 这么挑的地址，查的得是同一个。
+	groups := egress.GroupsWithDefault(egress.GroupMap(gs), s.Cfg.Proxy.Default)
+	for _, url := range egress.OutletURLs(accounts, groups) {
 		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		err := s.Mgr.Egress.Check(probeCtx, url, target)
 		cancel()
@@ -299,6 +307,8 @@ func (s *Scheduler) CheckEgress(ctx context.Context) {
 		if err != nil {
 			msg = err.Error()
 		}
+		// 内存里的那份也更新：下一个请求不该从一个刚探到不通的地址开始。
+		s.Mgr.Egress.SetHealth(url, err == nil)
 		// The write runs under a context of its own: the caller's may
 		// be over already, and the health of the outlet has to be
 		// written down all the same.

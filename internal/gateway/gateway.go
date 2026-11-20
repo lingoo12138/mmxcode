@@ -39,6 +39,7 @@ import (
 
 	"mmxcode/internal/config"
 	"mmxcode/internal/convert"
+	"mmxcode/internal/egress"
 	"mmxcode/internal/manager"
 	"mmxcode/internal/pool"
 	"mmxcode/internal/rotator"
@@ -658,10 +659,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 				s.dropDeadAccount(ctx, plan.AccountID)
 				return false
 			}
-			client, _, err := s.Mgr.Client(ctx, plan.AccountID)
+			// 候选地址：账号自己的地址 → 它的组 → 全局组。路不通的时候还
+			// 有下一条。
+			cands, err := s.Mgr.Candidates(ctx, plan.AccountID)
 			if err != nil {
 				lastErr = err
 				return false
+			}
+			ci := 0
+			var transport http.RoundTripper
+			if len(cands) > 0 {
+				transport, err = s.Mgr.Egress.Transport(cands[0])
+				if err != nil {
+					lastErr = err
+					return false
+				}
 			}
 
 			upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
@@ -689,7 +701,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 			// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
 			// 再来一次就好。
 			for try := 0; try < attempts; try++ {
-				resp, raw, err := s.attempt(ctx, chatReq, client.Transport, stream)
+				resp, raw, err := s.attempt(ctx, chatReq, transport, stream)
 				if err != nil {
 					var oe *upstream.OtherSiteError
 					if errors.As(err, &oe) {
@@ -704,6 +716,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 						// 答 502，不重试。
 						writeError(w, proto, http.StatusBadGateway, err.Error())
 						return true
+					}
+					// 路不通：还有下一条路就立刻换。不是上游慢，是这条路
+					// 不通，等没有用。
+					if ci+1 < len(cands) {
+						failed := cands[ci]
+						ci++
+						tr, terr := s.Mgr.Egress.Transport(cands[ci])
+						if terr != nil {
+							lastErr = terr
+							return false
+						}
+						transport = tr
+						// 换掉的那条路记一笔坏的：下一个请求不该从它开始。
+						_ = s.Mgr.MarkEgressBad(ctx, failed, err)
+						// 换地址这件事要说一声：看着是「那个号走了 A 路」，其
+						// 实走了 B 路。
+						fmt.Printf("egress: the account %s moved from %s to %s\n",
+							plan.AccountID, egress.Redacted(failed), egress.Redacted(cands[ci]))
+						// 新的一条路还没有预算：try 归零（循环末尾会加一，
+						// 所以是 -1）。换的是路，不是重试。
+						try = -1
+						continue
 					}
 					// 网络没通：还是这个账号，等一等再来。上游没有给出
 					// 状态：这是网关自己的问题。
@@ -727,7 +761,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 						upBody, upPath, convertBack = fb, fp, fback
 						chatReq.Body = upBody
 						chatReq.Path = upPath
-						resp, raw, err = s.attempt(ctx, chatReq, client.Transport, stream)
+						resp, raw, err = s.attempt(ctx, chatReq, transport, stream)
 						if err != nil {
 							var oe *upstream.OtherSiteError
 							if errors.As(err, &oe) {

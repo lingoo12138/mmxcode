@@ -32,8 +32,8 @@ type Store interface {
 	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
-	// SetAccountProxy writes the account's outlet.
-	SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error
+	// SetAccountOutlet writes the account's outlet.
+	SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error
 }
 
 // Web is the part of the account site the chain talks to.

@@ -178,18 +178,23 @@ type Server struct {
 
 // Proxy holds the global outlet.
 //
-// 出口只有两级：账号自己的地址（写在库里，页面上每一行都能改），然后是
-// 全局默认（写在这里）。两个都没有就是直连 —— 直连是最后一级，不是错。
+// 出口是四级的：账号自己的地址（写在库里，页面上每一行都能改），账号指
+// 着的组，然后是全局组（也是一个组，名字是保留的 default）。两个都没有
+// 就是直连 —— 直连是最后一级，不是错。
 type Proxy struct {
-	Default string `yaml:"default" json:"default"`
-	// LegacyGroups is the outlet groups of an older version.
+	// Default is the address the global group is made from.
 	//
-	// 退役了：组这个概念没有了。它只被读一次 —— 开机的时候，账号身上那个
-	// 组名变成账号自己的地址。
+	// 它只是种子：开机的时候全局组不在库里，就用它建一个。组在库里之
+	// 后，页面上改的是库里那份，配置里这个就不再管事了。
+	Default string `yaml:"default" json:"default"`
+	// Groups are the outlet groups of an older version.
+	//
+	// 也是种子：库里没有的组用它们建出来 —— 老库里那些指着组名的号，靠
+	// 这一步还指着原来的那条路。库里已经有了的就是库里的算数。
 	//
 	// 老部署的配置文件里还有这个键，加载器得认它：认不出的键是错字，直
 	// 接报错，那台机器就起不来了，而起不来的机器上的号就全废了。
-	LegacyGroups map[string]string `yaml:"groups" json:"groups"`
+	Groups map[string]string `yaml:"groups" json:"groups"`
 }
 
 // Upstream holds the upstream site's settings.
@@ -419,7 +424,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Server:   Server{Listen: ":8080"},
-		Proxy:    Proxy{Default: "", LegacyGroups: map[string]string{}},
+		Proxy:    Proxy{Default: "", Groups: map[string]string{}},
 		Upstream: Upstream{Timeout: Duration(120 * time.Second), Site: "global", MaxBodyMB: 8},
 		Rotation: Rotation{Strategy: "sticky", MaxAttempts: 3, ExhaustedCooldown: Duration(5 * time.Minute)},
 		Schedule: Schedule{
@@ -512,8 +517,8 @@ func Load(path string) (Config, error) {
 	if err := oneDocument(dec); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	if c.Proxy.LegacyGroups == nil {
-		c.Proxy.LegacyGroups = map[string]string{}
+	if c.Proxy.Groups == nil {
+		c.Proxy.Groups = map[string]string{}
 	}
 	if err := c.checkAPIKeys(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)

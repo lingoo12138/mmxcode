@@ -1893,7 +1893,7 @@ func TestTheSignOutSurvivesAnotherWriter(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	// 另一个写者改了出口
-	if err := m.Store.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:7890", time.Now()); err != nil {
+	if err := m.Store.SetAccountOutlet(ctx, "acc_01", "http://127.0.0.1:7890", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	a, err := m.Store.GetAccount(ctx, "acc_01")

@@ -51,9 +51,9 @@ func nullable(name string) copyColumn {
 //
 // The accounts come first: the other tables point at them.
 //
-// accounts.proxy_group 是退役的出口组：那一列留着（删列要重建整张表，而
-// 那张表上有触发器、有一百多个号在用），但代码不再写它、也不再读它，只有
-// 开机收拾旧账号的时候读一次（store.LegacyProxyGroups）。
+// accounts.proxy_group 是账号指着的出口组：组名（空 = 跟着全局组走）。
+// 这一列一直都在库里 —— 删列要重建整张表，而那张表上有触发器、有一百多
+// 个号在用。
 var tables = []table{
 	{
 		name: "accounts",
@@ -229,6 +229,25 @@ var tables = []table{
 			notNull("ok", "0"),
 			nullable("error"),
 			notNull("checked_at", "0"),
+		},
+	},
+	{
+		// The outlet groups: a name and the addresses it holds.
+		//
+		// 组的名字是它的身份，地址是一个有序的数组（JSON）—— 顺序就是故
+		// 障转移的顺序。
+		name: "proxy_groups",
+		body: `(
+  name       TEXT PRIMARY KEY,
+  urls       TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		copy: []copyColumn{
+			notNull("name", "''"),
+			notNull("urls", "'[]'"),
+			notNull("created_at", "0"),
+			notNull("updated_at", "0"),
 		},
 	},
 	{

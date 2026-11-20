@@ -67,7 +67,9 @@ func TestTheOutletsAreTheOnesInUse(t *testing.T) {
 		{ProxyURL: "socks5h://10.0.0.6:1080"},
 		{},
 	}
-	outs := Outlets(accounts, "http://127.0.0.1:7890")
+	outs := Outlets(accounts, map[string][]string{
+		store.GlobalGroup: {"http://127.0.0.1:7890"},
+	})
 	want := []Outlet{
 		{Name: DefaultOutlet, URL: "http://127.0.0.1:7890"},
 		{Name: OwnOutlet, URL: "http://10.0.0.5:1080"},
@@ -81,7 +83,9 @@ func TestTheOutletsAreTheOnesInUse(t *testing.T) {
 			t.Fatalf("outlet %d = %+v, want %+v", i, o, want[i])
 		}
 	}
-	urls := OutletURLs(accounts, "http://127.0.0.1:7890")
+	urls := OutletURLs(accounts, map[string][]string{
+		store.GlobalGroup: {"http://127.0.0.1:7890"},
+	})
 	if len(urls) != 3 || urls[0] != "http://127.0.0.1:7890" {
 		t.Fatalf("urls = %v", urls)
 	}
@@ -89,7 +93,7 @@ func TestTheOutletsAreTheOnesInUse(t *testing.T) {
 
 // 没有全局默认的时候，在用的就只有账号自己那些地址。
 func TestTheOutletsWithoutAGlobalDefault(t *testing.T) {
-	outs := Outlets([]store.Account{{ProxyURL: "http://10.0.0.5:1080"}}, "")
+	outs := Outlets([]store.Account{{ProxyURL: "http://10.0.0.5:1080"}}, map[string][]string{})
 	if len(outs) != 1 || outs[0].URL != "http://10.0.0.5:1080" {
 		t.Fatalf("outlets = %+v", outs)
 	}

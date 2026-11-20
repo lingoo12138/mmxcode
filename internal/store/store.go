@@ -154,15 +154,20 @@ func (s *Store) stamp(t time.Time) time.Time {
 
 // Account is one MiniMax account.
 type Account struct {
-	ID        string
-	Name      string
-	UserID    string
-	Email     string
-	Status    string
-	ProxyURL  string
-	LastError string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID       string
+	Name     string
+	UserID   string
+	Email    string
+	Status   string
+	ProxyURL string
+	// ProxyGroup is the outlet group the account is pointed at.
+	//
+	// 组名是空的：这个账号没有指着一个组，它跟着全局组走（或者自己写了
+	// 地址，或者直连）。
+	ProxyGroup string
+	LastError  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // Token is an account's sign-in.
@@ -610,7 +615,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 7
+const schemaVersion = 8
 
 // migrations are the steps, in order.
 //
@@ -623,6 +628,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateAPIKeys,
 	migrateCheckinIndex,
 	migrateIndexes,
+	migrateProxyGroups,
 }
 
 // migrateMake makes the tables that are not there.
@@ -816,6 +822,31 @@ func migrateIndexes(ctx context.Context, conn *sql.Conn) error {
 		for _, q := range indexStatements {
 			if _, err := tx.ExecContext(ctx, q); err != nil {
 				return fmt.Errorf("migrate: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+// migrateProxyGroups gives the file its table of outlet groups.
+//
+// 这一张表是后来才有的：一个文件在它之前做出来的时候没有它。表不在就
+// 造出来，在就不动它 —— 已经有了的组不该为了一个迁移被抄一遍。
+func migrateProxyGroups(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 8, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			if t.name != "proxy_groups" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got != "" {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
 			}
 		}
 		return nil
@@ -1035,11 +1066,11 @@ func (s *Store) createAccount(ctx context.Context, db execer, a Account) error {
 		return err
 	}
 	_, err := db.ExecContext(ctx, `
-		INSERT INTO accounts (id, name, user_id, email, status, proxy_url,
+		INSERT INTO accounts (id, name, user_id, email, status, proxy_url, proxy_group,
 			last_error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.UserID, strings.TrimSpace(a.Email), a.Status, a.ProxyURL,
-		a.LastError, ms(s.stamp(a.CreatedAt)), ms(s.stamp(a.UpdatedAt)))
+		a.ProxyGroup, a.LastError, ms(s.stamp(a.CreatedAt)), ms(s.stamp(a.UpdatedAt)))
 	if err != nil {
 		return fmt.Errorf("create account: %w", err)
 	}
@@ -1059,10 +1090,10 @@ func (s *Store) UpdateAccount(ctx context.Context, a Account) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE accounts SET name=?, user_id=?, email=?, status=?, proxy_url=?,
+		UPDATE accounts SET name=?, user_id=?, email=?, status=?, proxy_url=?, proxy_group=?,
 			last_error=?, updated_at=?
 		WHERE id=?`,
-		a.Name, a.UserID, a.Email, a.Status, a.ProxyURL,
+		a.Name, a.UserID, a.Email, a.Status, a.ProxyURL, a.ProxyGroup,
 		a.LastError, ms(s.stamp(a.UpdatedAt)), a.ID)
 	if err != nil {
 		return fmt.Errorf("update account: %w", err)
@@ -1098,22 +1129,22 @@ func (s *Store) updateAccountStatus(ctx context.Context, db execer, id, status, 
 	return nil
 }
 
-// SetAccountProxy writes an account's outlet.
+// SetAccountOutlet writes an account's outlet.
 //
-// It is narrow like UpdateAccountStatus: the address is the only thing
+// It is narrow like UpdateAccountStatus: the outlet is the only thing
 // it writes, so a caller that changes the outlet does not have to read
 // the account first.
 //
-// 出口组退役了：那一列还留着（删列要重建整张表，那张表上有触发器、有
-// 一百多个号），但它从此永远是空的。写出口的时候顺手把它清掉。
-func (s *Store) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
-	return s.setAccountProxy(ctx, s.db, id, url, updatedAt)
+// 地址和组是二选一：账号只有一条出口。给了地址，组就清掉；给了组，地址
+// 就清掉。空着的那个就是「没有」—— 账号跟着全局组走。
+func (s *Store) SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error {
+	return s.setAccountOutlet(ctx, s.db, id, url, group, updatedAt)
 }
 
-func (s *Store) setAccountProxy(ctx context.Context, db execer, id, url string, updatedAt time.Time) error {
+func (s *Store) setAccountOutlet(ctx context.Context, db execer, id, url, group string, updatedAt time.Time) error {
 	res, err := db.ExecContext(ctx, `
-		UPDATE accounts SET proxy_url=?, proxy_group='', updated_at=? WHERE id=?`,
-		url, ms(s.stamp(updatedAt)), id)
+		UPDATE accounts SET proxy_url=?, proxy_group=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(url), strings.TrimSpace(group), ms(s.stamp(updatedAt)), id)
 	if err != nil {
 		return fmt.Errorf("set the outlet of the account %s: %w", id, err)
 	}
@@ -1125,7 +1156,7 @@ func (s *Store) setAccountProxy(ctx context.Context, db execer, id, url string, 
 
 // SetAccountName writes the account's name.
 //
-// It is narrow like SetAccountProxy: the name is the only thing it
+// It is narrow like SetAccountOutlet: the name is the only thing it
 // writes, so a caller that renames an account does not have to read
 // the account first, and cannot lose a change another writer made.
 func (s *Store) SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error {
@@ -1622,8 +1653,8 @@ type Tx interface {
 	SetAccountIdentity(ctx context.Context, id, email, userID string, updatedAt time.Time) error
 	// SetAccountName writes the account's name.
 	SetAccountName(ctx context.Context, id, name string, updatedAt time.Time) error
-	// SetAccountProxy writes the account's outlet.
-	SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error
+	// SetAccountOutlet writes the account's outlet.
+	SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error
 	// UpdateAccountStatus writes the account's state and its last
 	// error.
 	UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error
@@ -1737,8 +1768,8 @@ func (t *sqlTx) SetAccountName(ctx context.Context, id, name string, updatedAt t
 	return t.s.setAccountName(ctx, t.tx, id, name, updatedAt)
 }
 
-func (t *sqlTx) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
-	return t.s.setAccountProxy(ctx, t.tx, id, url, updatedAt)
+func (t *sqlTx) SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error {
+	return t.s.setAccountOutlet(ctx, t.tx, id, url, group, updatedAt)
 }
 
 func (t *sqlTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
@@ -1776,7 +1807,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 // ListAccounts gives every account, oldest first.
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, user_id, email, status, proxy_url,
+		SELECT id, name, user_id, email, status, proxy_url, proxy_group,
 			last_error, created_at, updated_at
 		FROM accounts ORDER BY created_at`)
 	if err != nil {
@@ -1802,7 +1833,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 // An account that is not there is ErrNotFound.
 func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, user_id, email, status, proxy_url,
+		SELECT id, name, user_id, email, status, proxy_url, proxy_group,
 			last_error, created_at, updated_at
 		FROM accounts WHERE id=?`, id)
 	a, err := scanAccount(row)
@@ -1836,7 +1867,7 @@ func (s *Store) accountByEmail(ctx context.Context, db execer, email string) (Ac
 		return Account{}, fmt.Errorf("get the account by email: %w", ErrNotFound)
 	}
 	row := db.QueryRowContext(ctx, `
-		SELECT id, name, user_id, email, status, proxy_url,
+		SELECT id, name, user_id, email, status, proxy_url, proxy_group,
 			last_error, created_at, updated_at
 		FROM accounts WHERE lower(trim(email)) = lower(trim(?))
 		ORDER BY created_at, id LIMIT 1`, email)
@@ -1869,7 +1900,7 @@ func (s *Store) accountByUserID(ctx context.Context, db execer, userID string) (
 		return Account{}, fmt.Errorf("get the account by user id: %w", ErrNotFound)
 	}
 	row := db.QueryRowContext(ctx, `
-		SELECT id, name, user_id, email, status, proxy_url,
+		SELECT id, name, user_id, email, status, proxy_url, proxy_group,
 			last_error, created_at, updated_at
 		FROM accounts WHERE user_id = ?
 		ORDER BY created_at, id LIMIT 1`, userID)
@@ -1903,7 +1934,7 @@ func (s *Store) accountBySubject(ctx context.Context, db execer, subject string)
 		return Account{}, fmt.Errorf("get the account by subject: %w", ErrNotFound)
 	}
 	row := db.QueryRowContext(ctx, `
-		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_url,
+		SELECT a.id, a.name, a.user_id, a.email, a.status, a.proxy_url, a.proxy_group,
 			a.last_error, a.created_at, a.updated_at
 		FROM accounts a JOIN tokens t ON t.account_id = a.id
 		WHERE t.subject = ?
@@ -1929,10 +1960,11 @@ func scanAccount(sc scanner, extra ...any) (Account, error) {
 	var (
 		a                    Account
 		userID, email, pu    sql.NullString
+		pg                   sql.NullString
 		lastErr              sql.NullString
 		createdAt, updatedAt int64
 	)
-	dest := []any{&a.ID, &a.Name, &userID, &email, &a.Status, &pu,
+	dest := []any{&a.ID, &a.Name, &userID, &email, &a.Status, &pu, &pg,
 		&lastErr, &createdAt, &updatedAt}
 	dest = append(dest, extra...)
 	if err := sc.Scan(dest...); err != nil {
@@ -1941,6 +1973,7 @@ func scanAccount(sc scanner, extra ...any) (Account, error) {
 	a.UserID = userID.String
 	a.Email = email.String
 	a.ProxyURL = pu.String
+	a.ProxyGroup = pg.String
 	a.LastError = lastErr.String
 	a.CreatedAt = fromMS(createdAt)
 	a.UpdatedAt = fromMS(updatedAt)

@@ -1074,3 +1074,52 @@ func TestTheCheckinPassesDoNotOverlap(t *testing.T) {
 	}
 	t.Fatal("the pass did not run after the other one was done")
 }
+
+// TestTheAddressesInTheGroupsAreChecked says the health check probes the
+// addresses that are in the groups.
+//
+// 组里的地址也是有人在走的路：没人探它，就没人知道它通了没有。
+func TestTheAddressesInTheGroupsAreChecked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`ok`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+
+	now := time.Now()
+	if err := s.SaveProxyGroup(ctx, store.ProxyGroup{
+		Name: "clash", URLs: []string{"http://clash:8080"},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
+	sc := New(mgr, config.Default())
+	sc.target = srv.URL
+
+	sc.CheckEgress(ctx)
+
+	rows, err := s.EgressHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.URL == "http://clash:8080" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the address in the group was not checked: %+v", rows)
+	}
+}

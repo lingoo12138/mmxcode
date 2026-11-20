@@ -212,8 +212,8 @@ func (t fakeTx) SetAccountName(ctx context.Context, id, name string, updatedAt t
 	return t.s.setAccountName(id, name)
 }
 
-func (t fakeTx) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
-	return t.s.setAccountProxy(id, url)
+func (t fakeTx) SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error {
+	return t.s.setAccountOutlet(id, url, group)
 }
 
 func (t fakeTx) UpdateAccountStatus(ctx context.Context, id, status, lastError string, updatedAt time.Time) error {
@@ -271,12 +271,13 @@ func (s *fakeStore) setAccountName(id, name string) error {
 	return nil
 }
 
-// setAccountProxy writes an outlet.
-func (s *fakeStore) setAccountProxy(id, url string) error {
+// setAccountOutlet writes an outlet.
+func (s *fakeStore) setAccountOutlet(id, url, group string) error {
 	s.groups = append(s.groups, id+":"+url)
 	for i := range s.rows {
 		if s.rows[i].ID == id {
 			s.rows[i].ProxyURL = url
+			s.rows[i].ProxyGroup = group
 		}
 	}
 	return nil
@@ -363,11 +364,11 @@ func (s *fakeStore) UpdateAccountStatus(ctx context.Context, id, status, lastErr
 	return s.updateAccountStatus(id, status)
 }
 
-// SetAccountProxy writes the account's outlet.
-func (s *fakeStore) SetAccountProxy(ctx context.Context, id, url string, updatedAt time.Time) error {
+// SetAccountOutlet writes the account's outlet.
+func (s *fakeStore) SetAccountOutlet(ctx context.Context, id, url, group string, updatedAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.setAccountProxy(id, url)
+	return s.setAccountOutlet(id, url, group)
 }
 
 func (s *fakeStore) SaveToken(ctx context.Context, t store.Token) error {
@@ -1199,8 +1200,8 @@ func TestAnImportKeepsTheAddressThatIsThere(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 人给这个账号手设了一个地址。
-	if err := st.SetAccountProxy(context.Background(), res.AccountID,
-		"socks5h://127.0.0.1:1080", time.Now()); err != nil {
+	if err := st.SetAccountOutlet(context.Background(), res.AccountID,
+		"socks5h://127.0.0.1:1080", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if st.rows[0].ProxyURL == "" {

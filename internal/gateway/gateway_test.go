@@ -1877,3 +1877,45 @@ func TestAnAnswerThatIsTooBigIsRefused(t *testing.T) {
 		t.Errorf("the upstream was asked %d times, want 1", hits)
 	}
 }
+
+// TestTheRequestGoesToTheNextAddress says a request whose address does
+// not answer is asked again through the next one.
+//
+// 路不通的时候还坐着不动，就是把预算全烧在一个死地址上 —— 而换的号多半
+// 还走同一个全局代理。
+func TestTheRequestGoesToTheNextAddress(t *testing.T) {
+	// 一个连不上的地址（127.0.0.1:1 上没有人在听），后面跟一个能答的。
+	dead := "http://127.0.0.1:1"
+	var hits int
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer alive.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the request did not go through the proxy: %s", r.URL)
+	})
+	ctx := context.Background()
+	if err := h.store.SetAccountOutlet(ctx, "acc_01", "", "pool", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.gw.Mgr.Egress.SetGroups(map[string][]string{
+		"pool": {dead, alive.URL},
+	})
+
+	body := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"text":"ok"`) {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if hits == 0 {
+		t.Fatal("the request did not go through the second address")
+	}
+}

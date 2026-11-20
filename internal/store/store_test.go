@@ -1487,7 +1487,7 @@ func TestTheNarrowSetters(t *testing.T) {
 	if got.Status != StatusSignedOut || got.LastError != "the sign-in was refused" {
 		t.Fatalf("got %+v", got)
 	}
-	if err := s.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:1080", time.Now()); err != nil {
+	if err := s.SetAccountOutlet(ctx, "acc_01", "http://127.0.0.1:1080", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	got, err = s.GetAccount(ctx, "acc_01")
@@ -1501,7 +1501,7 @@ func TestTheNarrowSetters(t *testing.T) {
 	if err := s.UpdateAccountStatus(ctx, "nope", StatusActive, "", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("update the status: %v, want ErrNotFound", err)
 	}
-	if err := s.SetAccountProxy(ctx, "nope", "", time.Now()); !errors.Is(err, ErrNotFound) {
+	if err := s.SetAccountOutlet(ctx, "nope", "", "", time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("set the outlet: %v, want ErrNotFound", err)
 	}
 }
@@ -1692,8 +1692,8 @@ func TestTheFileIsOnlyForItsOwner(t *testing.T) {
 	}
 }
 
-// 出口组退役了，但那一列还在老账号的行上。收拾之前要先能找到它们。
-func TestTheRetiredGroupsAreFound(t *testing.T) {
+// 组名在账号的行上。要说出来「哪些账号指着哪个组」，先得能找到它们。
+func TestTheGroupsOfTheAccountsAreFound(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	now := time.Now()
@@ -1710,26 +1710,23 @@ func TestTheRetiredGroupsAreFound(t *testing.T) {
 		`UPDATE accounts SET proxy_group='clash' WHERE id='acc_01'`); err != nil {
 		t.Fatal(err)
 	}
-	list, err := s.LegacyProxyGroups(ctx)
+	groups, err := s.AccountGroups(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 1 {
-		t.Fatalf("list = %+v, want one account", list)
-	}
-	if list[0].ID != "acc_01" || list[0].Group != "clash" {
-		t.Fatalf("list = %+v", list[0])
+	if groups["clash"] != 1 {
+		t.Fatalf("groups = %+v, want one account in clash", groups)
 	}
 	// 写出口的时候，那一列顺手就清了。
-	if err := s.SetAccountProxy(ctx, "acc_01", "http://127.0.0.1:1080", now); err != nil {
+	if err := s.SetAccountOutlet(ctx, "acc_01", "http://127.0.0.1:1080", "", now); err != nil {
 		t.Fatal(err)
 	}
-	list, err = s.LegacyProxyGroups(ctx)
+	groups, err = s.AccountGroups(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 0 {
-		t.Fatalf("list = %+v, want none", list)
+	if len(groups) != 0 {
+		t.Fatalf("groups = %+v, want none", groups)
 	}
 	got, err := s.GetAccount(ctx, "acc_01")
 	if err != nil {

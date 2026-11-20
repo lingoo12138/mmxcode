@@ -118,11 +118,11 @@ db: "./local.db"
 	if c.Proxy.Default != "socks5h://warp:4000" {
 		t.Fatalf("proxy default = %q", c.Proxy.Default)
 	}
-	if c.Proxy.LegacyGroups["warp"] != "socks5h://warp:4000" {
-		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	if c.Proxy.Groups["warp"] != "socks5h://warp:4000" {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
 	}
-	if c.Proxy.LegacyGroups["direct"] != "direct" {
-		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	if c.Proxy.Groups["direct"] != "direct" {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
 	}
 	if c.Upstream.Timeout.Duration() != 45*time.Second {
 		t.Fatalf("timeout = %v", c.Upstream.Timeout)
@@ -350,7 +350,7 @@ func TestLoadAllowsTrailingSeparator(t *testing.T) {
 	}
 }
 
-func TestLoadNullLegacyGroupsBecomesEmptyMap(t *testing.T) {
+func TestLoadNullGroupsBecomesEmptyMap(t *testing.T) {
 	// 老部署的配置文件里有 proxy.groups：nil map 遍历起来没事，但写回
 	// 文件的时候是 null，读回来还是 nil。
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -361,11 +361,11 @@ func TestLoadNullLegacyGroupsBecomesEmptyMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Proxy.LegacyGroups == nil {
+	if c.Proxy.Groups == nil {
 		t.Fatal("groups is nil")
 	}
-	if len(c.Proxy.LegacyGroups) != 0 {
-		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	if len(c.Proxy.Groups) != 0 {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
 	}
 }
 
@@ -390,8 +390,8 @@ batch:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Proxy.LegacyGroups["clash"] != "http://127.0.0.1:7890" {
-		t.Fatalf("groups = %v", c.Proxy.LegacyGroups)
+	if c.Proxy.Groups["clash"] != "http://127.0.0.1:7890" {
+		t.Fatalf("groups = %v", c.Proxy.Groups)
 	}
 	if c.Batch.LegacyGroup != "clash" {
 		t.Fatalf("batch group = %q", c.Batch.LegacyGroup)
@@ -401,7 +401,7 @@ batch:
 func TestConfigYAMLRoundTrip(t *testing.T) {
 	// CLI 与 WebUI 都要把配置写回文件，写出来要能读回来。
 	c := Default()
-	c.Proxy.LegacyGroups["warp"] = "socks5h://warp:4000"
+	c.Proxy.Groups["warp"] = "socks5h://warp:4000"
 	c.Server.APIKeys = []string{"sk-a"}
 	b, err := yaml.Marshal(c)
 	if err != nil {
@@ -418,8 +418,8 @@ func TestConfigYAMLRoundTrip(t *testing.T) {
 	if back.Upstream.Timeout.Duration() != c.Upstream.Timeout.Duration() {
 		t.Fatalf("timeout = %v, want %v", back.Upstream.Timeout.Duration(), c.Upstream.Timeout.Duration())
 	}
-	if back.Proxy.LegacyGroups["warp"] != c.Proxy.LegacyGroups["warp"] {
-		t.Fatalf("groups = %v", back.Proxy.LegacyGroups)
+	if back.Proxy.Groups["warp"] != c.Proxy.Groups["warp"] {
+		t.Fatalf("groups = %v", back.Proxy.Groups)
 	}
 	if back.Schedule.CheckinAt != c.Schedule.CheckinAt || back.DB != c.DB {
 		t.Fatalf("round trip lost data: %+v", back)

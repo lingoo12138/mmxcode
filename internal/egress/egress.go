@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,11 @@ type Resolver struct {
 	// def is the global way out. It is set when the resolver is made
 	// and is not written to afterwards.
 	def string
+	// groups are the outlet groups, by name: the addresses of each, in
+	// the order they are tried.
+	groups map[string][]string
+	// health says what the last probe of an address said.
+	health map[string]bool
 	// clients are the HTTP clients, by way out.
 	clients map[string]*http.Client
 	// transports are the transports, by way out.
@@ -52,6 +58,8 @@ type Resolver struct {
 func New(def string) *Resolver {
 	return &Resolver{
 		def:        def,
+		groups:     map[string][]string{},
+		health:     map[string]bool{},
 		clients:    map[string]*http.Client{},
 		transports: map[string]http.RoundTripper{},
 	}
@@ -65,16 +73,11 @@ func New(def string) *Resolver {
 // The lock is taken, so that the maps are read the same way the caches
 // are.
 func (r *Resolver) Resolve(a store.Account) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if u := strings.TrimSpace(a.ProxyURL); u != "" {
-		return u
-	}
-	v := strings.TrimSpace(r.def)
-	if v == "" {
+	c := r.Candidates(a)
+	if len(c) == 0 {
 		return Direct
 	}
-	return v
+	return c[0]
 }
 
 // ResolveForHost is Resolve for a host, except that a loopback address
@@ -188,13 +191,13 @@ const (
 
 // Outlets gives the addresses that are in use.
 //
-// The global default comes first (if there is one), then the addresses
-// the accounts carry themselves — each of them once.
+// The groups come first — the global one, then the others by name — and
+// then the addresses the accounts carry themselves, each of them once.
 //
-// 在用的出口就这些：全局默认一个，加上账号自己写的那些。健康检查查的就
+// 在用的出口就这些：全局组、每个组，加上账号自己写的那些。健康检查查的就
 // 是它们，页面列的也是它们 —— 列那些没人走的地址，查出来的「可用」什么
 // 也不说明。
-func Outlets(accounts []store.Account, def string) []Outlet {
+func Outlets(accounts []store.Account, groups map[string][]string) []Outlet {
 	var out []Outlet
 	seen := map[string]bool{}
 	add := func(name, url string) {
@@ -205,7 +208,23 @@ func Outlets(accounts []store.Account, def string) []Outlet {
 		seen[u] = true
 		out = append(out, Outlet{Name: name, URL: u})
 	}
-	add(DefaultOutlet, def)
+	// 全局组先来：它是所有人都跟着的那一个。
+	for _, u := range groups[store.GlobalGroup] {
+		add(DefaultOutlet, u)
+	}
+	names := make([]string, 0, len(groups))
+	for n := range groups {
+		if n == store.GlobalGroup {
+			continue
+		}
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		for _, u := range groups[n] {
+			add(n, u)
+		}
+	}
 	for _, a := range accounts {
 		add(OwnOutlet, a.ProxyURL)
 	}
@@ -213,8 +232,8 @@ func Outlets(accounts []store.Account, def string) []Outlet {
 }
 
 // OutletURLs gives the addresses of the outlets, in order.
-func OutletURLs(accounts []store.Account, def string) []string {
-	outs := Outlets(accounts, def)
+func OutletURLs(accounts []store.Account, groups map[string][]string) []string {
+	outs := Outlets(accounts, groups)
 	urls := make([]string, 0, len(outs))
 	for _, o := range outs {
 		urls = append(urls, o.URL)

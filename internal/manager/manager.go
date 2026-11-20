@@ -972,6 +972,56 @@ func (m *Manager) accFor(a store.Account) (*account.Client, error) {
 	return m.Acc.With(upstream.New(upstream.Options{Timeout: accountTimeout, Transport: tr})), nil
 }
 
+// Candidates gives the addresses an account's requests may go through, in
+// the order they are tried.
+//
+// 网关拿到的是一张表，不是一个地址：路不通的时候还有下一条。
+func (m *Manager) Candidates(ctx context.Context, accountID string) ([]string, error) {
+	a, err := m.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return m.Egress.Candidates(a), nil
+}
+
+// RefreshOutlets reads the groups and their health from the database and
+// gives them to the resolver.
+//
+// 组的地址是页面上改的，健康是探活探出来的 —— 两样都得进解析器，它挑地
+// 址的时候才用得上。
+func (m *Manager) RefreshOutlets(ctx context.Context) error {
+	groups, err := m.Store.ListProxyGroups(ctx)
+	if err != nil {
+		return err
+	}
+	m.Egress.SetGroups(egress.GroupMap(groups))
+	health, err := m.Store.EgressHealth(ctx)
+	if err != nil {
+		return err
+	}
+	for _, h := range health {
+		m.Egress.SetHealth(h.URL, h.OK)
+	}
+	return nil
+}
+
+// MarkEgressBad writes down that an address did not answer.
+//
+// 只有「根本没连上」才记（egress.Unreachable）：上游慢、超时不算代理的
+// 错 —— 记了就是踢掉一条好路。记了之后下一个请求不会从它开始，而健康检
+// 查下一轮探通了就把记号擦掉。
+//
+// 写不下去不要紧：内存里的那份已经改了，而健康检查本来就会再探一遍。
+func (m *Manager) MarkEgressBad(ctx context.Context, url string, cause error) error {
+	if !egress.Unreachable(cause) {
+		return nil
+	}
+	m.Egress.SetHealth(url, false)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return m.Store.SetEgressHealth(writeCtx, url, false, cause.Error())
+}
+
 // Client gives the HTTP client an account's requests go out with, and
 // the address of that way out.
 //
