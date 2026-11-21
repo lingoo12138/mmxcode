@@ -525,13 +525,35 @@ func protocolOf(path string) protocol {
 
 // maxBodyBytes is how large a request body may be.
 //
-// 一段对话的长上下文是几兆，32 MiB 已经很宽裕。再大的请求不是对话，
-// 是要把它这个网关的内存吃光的东西：没有上限的时候，一个请求就能
-// 让网关没有内存可用。
-const maxBodyBytes = 32 << 20
+// 64 MiB：用户是可能传图片的 —— 站点的模型收 text、image、video（参考插件
+// 的模型名单就是这么写的），而图片是 base64 写在身体里的，一张图几 MB 是常
+// 态，用户传几张就上三十兆。
+//
+// 1M token 的对话是 4 MB 上下（带上 JSON 外壳 4.5–5 MB），64 MiB 是它的十几
+// 倍，够宽裕。
+//
+// 再大的请求不是对话，是要把它这个网关的内存吃光的东西：没有上限的时候，一
+// 个请求就能让网关没有内存可用。
+const maxBodyBytes = 64 << 20
 
 // handleChat serves a chat request.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
+	ctx := r.Context()
+	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
+	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
+	// 着。
+	//
+	// 闸门在读请求体**之前**：闸门是网关对外面承诺的并发，在这个数里
+	// 面，请求才占着网关的内存。请求体最大 64 MiB —— 排在一百个请求
+	// 后面的那每一个都已经把身体读进内存了的话，那是 6.4 GB，跟承诺的
+	// 并发一点关系都没有。排队的时候身体还在客户端那边，网关没有替它
+	// 占内存。
+	if !s.gate.waitFor(ctx, s.concurrencyLimit(ctx), s.Cfg.Concurrency.Wait.Duration()) {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, proto, http.StatusTooManyRequests, "the gateway is busy: too many requests are in the air")
+		return
+	}
+	defer s.gate.give()
 	// 请求体有个上限：不然一个客户端发来一大块东西，网关就把它整个
 	// 读进内存里，然后就没有内存了。
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
@@ -547,16 +569,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	}
 	// 上游请求的时限就是配的那一个。流式对话也吃这份预算：想要更长的
 	// 就把 upstream.timeout 调大。
-	ctx := r.Context()
-	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
-	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
-	// 着。
-	if !s.gate.waitFor(ctx, s.concurrencyLimit(ctx), s.Cfg.Concurrency.Wait.Duration()) {
-		w.Header().Set("Retry-After", "5")
-		writeError(w, proto, http.StatusTooManyRequests, "the gateway is busy: too many requests are in the air")
-		return
-	}
-	defer s.gate.give()
 	if d := s.Cfg.Upstream.Timeout.Duration(); d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)

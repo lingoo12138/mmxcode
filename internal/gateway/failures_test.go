@@ -3,11 +3,14 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"mmxcode/internal/config"
 )
 
 // TestAnUpstreamThatIsDownIsNotARateLimit says a 503 from the upstream
@@ -112,6 +115,54 @@ func TestATransportErrorIsABadGateway(t *testing.T) {
 	}
 }
 
+// TestABodyIsNotReadWhileTheGatewayIsBusy says a request that is
+// waiting for a free slot has not read its body yet.
+//
+// 闸门是网关对外面承诺的并发：在这个数里面，请求才占着网关的内存。请求
+// 体最大 64 MiB —— 排在一百个请求后面的每一个都已经把身体读进内存了的
+// 话，那是 6.4 GB，跟承诺的并发一点关系都没有。排队的时候身体还在客
+// 户端那边，网关没有替它占内存。
+func TestABodyIsNotReadWhileTheGatewayIsBusy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	// 等不了多久：这道测试要的是「身体没被读」，不是「等到了」。
+	h.gw.Cfg.Concurrency.Wait = config.Duration(200 * time.Millisecond)
+	// 把闸门占满：承诺的那个名额没有了。
+	limit := h.gw.concurrencyLimit(context.Background())
+	for i := 0; i < limit; i++ {
+		if !h.gw.gate.take(limit) {
+			t.Fatalf("the gate gave out only %d of %d slots", i, limit)
+		}
+	}
+	body := &countedBody{Reader: strings.NewReader(`{"model":"m"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429, body = %s", w.Code, w.Body.String())
+	}
+	if body.read != 0 {
+		t.Fatalf("the body was read %d bytes while the gateway was busy, want 0", body.read)
+	}
+}
+
+// countedBody counts how many bytes were read out of it.
+//
+// 它是那道测试的眼睛：身体被读了多少，看得见。
+type countedBody struct {
+	*strings.Reader
+	read int
+}
+
+func (c *countedBody) Read(p []byte) (int, error) {
+	n, err := c.Reader.Read(p)
+	c.read += n
+	return n, err
+}
+
+func (c *countedBody) Close() error { return nil }
+
 // TestABodyOverTheLimitIsRefused says a body that is too big is turned
 // away instead of being read into memory.
 //
@@ -121,8 +172,8 @@ func TestABodyOverTheLimitIsRefused(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{}`))
 	})
-	big := strings.Repeat("x", maxBodyBytes+1)
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(big))
+	body := &manyBytes{left: maxBodyBytes + 1}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
 	w := httptest.NewRecorder()
 	h.gw.ServeHTTP(w, req)
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -130,6 +181,42 @@ func TestABodyOverTheLimitIsRefused(t *testing.T) {
 	}
 	if h.hits != 0 {
 		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	}
+}
+
+// manyBytes is a body of n bytes that does not hold them: it makes them
+// as they are read.
+//
+// 64 MiB 的身体用 strings.Repeat 造的话，那条测试自己就拿着 64 MiB，再加
+// 读身体时的那一份 —— 测试自己比它测的东西还胖。这个不占那份内存。
+type manyBytes struct {
+	left int
+}
+
+func (m *manyBytes) Read(p []byte) (int, error) {
+	if m.left <= 0 {
+		return 0, io.EOF
+	}
+	if len(p) > m.left {
+		p = p[:m.left]
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	m.left -= len(p)
+	return len(p), nil
+}
+
+func (m *manyBytes) Close() error { return nil }
+
+// TestTheRequestBodyLimitIs64MiB says how large a request body may be.
+//
+// 64 MiB：用户是可能传图片的 —— 站点的模型收 text、image、video（参考
+// 插件的模型名单就是这么写的），而图片是 base64 写在身体里的，一张图几
+// MB 是常态。而 1M token 的对话是 4 MB 上下 —— 64 MiB 是它的十几倍。
+func TestTheRequestBodyLimitIs64MiB(t *testing.T) {
+	if maxBodyBytes != 64<<20 {
+		t.Fatalf("maxBodyBytes = %d, want %d (64 MiB)", maxBodyBytes, 64<<20)
 	}
 }
 

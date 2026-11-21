@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -40,7 +41,7 @@ type ChatRequest struct {
 // account's exit is a property of the transport, so an account with
 // its own proxy passes its own client here.
 func (c *Client) Chat(ctx context.Context, req ChatRequest, transport http.RoundTripper) (*http.Response, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(req.BaseURL, "/")+req.Path, strings.NewReader(string(req.Body)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(req.BaseURL, "/")+req.Path, bytes.NewReader(req.Body))
 	if err != nil {
 		return nil, err
 	}

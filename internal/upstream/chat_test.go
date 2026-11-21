@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -112,6 +113,71 @@ func TestChatSendsTheBody(t *testing.T) {
 	resp.Body.Close()
 	if body != `{"model":"x"}` {
 		t.Fatalf("body = %q", body)
+	}
+}
+
+// TestChatSendsTheBodyAsItIs says the body arrives at the upstream byte
+// for byte, whatever is in it.
+//
+// 往上游发的时候身体是不该被抄一遍的（64 MiB 的身体抄一遍就是多 64 MiB
+// 的内存）。抄的那份跟原来那份在行为上是一模一样的 —— 所以这里守的不是
+// 「不抄」，守的是「抄了也别把身体改坏」。
+func TestChatSendsTheBodyAsItIs(t *testing.T) {
+	want := []byte{0x00, 0xff, 0xfe, '"', '\\', 0x00, 'a'}
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(Options{Timeout: 5 * time.Second})
+	resp, err := c.Chat(context.Background(), ChatRequest{
+		BaseURL: srv.URL, Path: "/p", Access: "a", Body: want,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("the body = %v, want %v", got, want)
+	}
+}
+
+// discardTransport answers every request without touching the network.
+//
+// 它是那个基准的地面：身体走的是它，不是真的网 —— 基准量的是网关自己
+// 那一份，不是网络快慢。
+type discardTransport struct{}
+
+func (discardTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	io.Copy(io.Discard, r.Body)
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+		Header:     make(http.Header),
+		Request:    r,
+	}, nil
+}
+
+// BenchmarkChatSendsABigBody says what a big body costs on the way to
+// the upstream.
+//
+// 身体是 4 MB（1M token 的对话）：往上游发的时候身体不该被抄一遍 ——
+// 抄一遍就是多一份 4 MB 的分配，也是多 4 MB 的内存（在飞的时候）。
+func BenchmarkChatSendsABigBody(b *testing.B) {
+	body := bytes.Repeat([]byte("x"), 4<<20)
+	c := New(Options{Timeout: 30 * time.Second})
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		resp, err := c.Chat(context.Background(), ChatRequest{
+			BaseURL: "http://upstream.invalid", Path: "/p", Access: "a", Body: body,
+		}, discardTransport{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		resp.Body.Close()
 	}
 }
 
