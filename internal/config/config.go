@@ -327,6 +327,22 @@ type Concurrency struct {
 	TotalMax int `yaml:"total_max" json:"total_max"`
 	// Wait is how long a request waits for a free place.
 	Wait Duration `yaml:"wait" json:"wait"`
+	// BodySmallMB is how large a request body may be and still count as
+	// small.
+	//
+	// 小的走普通并发，大的（几十兆 —— 图片就是那么大的）一次只让一个进
+	// 来。两个大的一起来那是一百多兆，三个就更多了。
+	//
+	// 配 0 的时候按 1 算：那样每个请求都是大身体，网关就成了一条道。
+	BodySmallMB int `yaml:"body_small_mb" json:"body_small_mb"`
+	// BodyBudgetMB is how many bytes of small request bodies may be in
+	// the air at once.
+	//
+	// 它是内存的天花板，跟有多少账号、承诺多少并发没关系：80 MiB 装得
+	// 下 19 个 4 MiB 的小请求。
+	//
+	// 0 = 不限（跟 total_max 一个规矩）：那时候只剩并发闸门管着。
+	BodyBudgetMB int `yaml:"body_budget_mb" json:"body_budget_mb"`
 }
 
 // Pool holds how many accounts the gateway keeps in memory.
@@ -452,11 +468,13 @@ func Default() Config {
 			CardBudget:  Duration(5 * time.Second),
 		}},
 		Concurrency: Concurrency{
-			PerAccount: 1,
-			TotalRatio: 5,
-			TotalMin:   3,
-			TotalMax:   0,
-			Wait:       Duration(10 * time.Second),
+			PerAccount:   1,
+			TotalRatio:   5,
+			TotalMin:     3,
+			TotalMax:     0,
+			Wait:         Duration(10 * time.Second),
+			BodySmallMB:  4,
+			BodyBudgetMB: 80,
 		},
 		Pool: Pool{
 			Factor:         2,

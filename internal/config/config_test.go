@@ -833,6 +833,27 @@ func TestTheShippedConfigsHaveTheSQLiteDefaults(t *testing.T) {
 	}
 }
 
+// TestTheShippedConfigsHaveTheBodyLimits says the configs that ship with
+// the program agree with the default on the two body limits.
+//
+// 发出去的配置跟说好的不一样，照着配置文件跑的人拿到的就不是那个配置。
+func TestTheShippedConfigsHaveTheBodyLimits(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		c, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.Concurrency.BodySmallMB != Default().Concurrency.BodySmallMB {
+			t.Errorf("%s: body_small_mb = %d, want %d",
+				name, c.Concurrency.BodySmallMB, Default().Concurrency.BodySmallMB)
+		}
+		if c.Concurrency.BodyBudgetMB != Default().Concurrency.BodyBudgetMB {
+			t.Errorf("%s: body_budget_mb = %d, want %d",
+				name, c.Concurrency.BodyBudgetMB, Default().Concurrency.BodyBudgetMB)
+		}
+	}
+}
+
 // TestTheSynchronousTheDatabaseDoesNotKnowIsRefused says a word SQLite
 // does not know is an error, not a shrug.
 //

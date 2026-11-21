@@ -333,6 +333,8 @@ curl -X POST http://127.0.0.1:8080/api/keys \
 | `schedule.token_refresh` | `5m` | token 续期检查间隔 |
 | `schedule.egress_health` | `2m` | 出口健康检查间隔 |
 | `concurrency.total_max` | `0` | 总并发的天花板。0 = 不限 |
+| `concurrency.body_small_mb` | `4` | 多大的请求体算大的。超过它一次只让一个进来（图片就那么大的） |
+| `concurrency.body_budget_mb` | `80` | 小请求体同时在飞的字节上限（80 MiB ≈ 19 × 4 MiB）。0 = 不限 |
 | `pool.factor` | `2` | 池装几个号 = max(总并发, 活跃会话数) × 它 |
 | `pool.max_size` | `0` | 池里最多几个号。0 = 不限 |
 | `pool.memory_budget_mb` | `32` | 池的内存预算（兜底）。一个号按 512 字节算 |
@@ -392,6 +394,15 @@ magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refres
 **额度用完的账号。** 上游说配额耗尽，网关立刻把这个账号的这个 plan 组标记成用完 —— 它暂时不进轮转。后台再读一次，把标记的时刻改准：读到几点的窗口回来，就到几点（标记只往后挪）；读不到就留着冷却时间（`rotation.exhausted_cooldown`，默认 5 分钟）。签到给了积分就读一次，读到的数说有额度就清掉标记。
 
 **并发。** 每个账号同时一个请求（`concurrency.per_account`，默认 1）；总并发是可用账号的五分之一（`concurrency.total_ratio`，默认 5），账号少的时候按 `concurrency.total_min`（默认 3）兜底。等一个空位最多等 `concurrency.wait`（默认 10s），等不到就 429。
+
+**身体分两条道。** 请求体是网关内存里最大的一块，而且是客户端说了算的：
+
+- **大道**：身体超过 `concurrency.body_small_mb`（默认 4 MiB）算大的 —— 一次只让**一个**进来。图片就是那么大的，两个一起来那是一百多兆。分块传的（客户端没说多大）也算大的。
+- **小道**：小的走普通并发，但它们的**总量**有个上限：`concurrency.body_budget_mb`（默认 80 MiB，约 19 × 4 MiB）。0 = 不限（那时候只剩并发闸门管着）。
+
+加起来 144 MiB 上下 —— 一个大的加十九个小的。OpenAI 和 Codex 的身体要转成 Anthropic 的形状，那是第二份拷贝，那一路是 208 MiB。
+
+大道的门排在并发闸门**前面**：不然 20 个大请求会把 20 个并发位全占住，小请求连闸门都进不去。拿不到位置的时候等 `concurrency.wait`，等不到就 429（消息里说的是哪一道忙：大身体、小身体、还是并发数）。
 
 ### 签到
 
@@ -492,6 +503,25 @@ compose 做的事：
   ```bash
   mkdir -p data && chown 10001:10001 data
   ```
+
+### 前面挡着 nginx 的话
+
+网关自己收请求体，收 64 MiB（用户传图片就那么大的）。**nginx 挡在前面的话，它自己也有个上限**：默认 `client_max_body_size` 是 **1m**，一个 4 MB 的对话（1M token 的上下文就 4 MB 上下）会被 nginx 自己挡下来，回一个 413 —— 那个 413 不是网关回的。
+
+```nginx
+server {
+    client_max_body_size 64m;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_request_buffering on;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+```
+
+- `client_max_body_size 64m`：跟网关自己的上限对齐。nginx 收整个身体，收齐了才转给网关 —— 所以请求体在 nginx 那里也占一份内存（`proxy_request_buffering on` 是默认的，别关：关了的话网关那边会变成流式的慢上传）。
+- `proxy_read_timeout` / `proxy_send_timeout`：流式的对话要传很久，默认 60s 不够。
 
 ## magpie 插件
 

@@ -104,6 +104,10 @@ go test ./internal/gateway/ -run TestABodyIsNotReadWhileTheGatewayIsBusy -v
 
 `internal/gateway/gateway.go` —— `handleChat` 开头：
 
+（这一段后来又长了两道门 —— 身体分大道和小道，
+`docs/superpowers/plans/2026-11-21-mmxcode-body-lanes.md` 那份计划干的。
+下面这一段是现在的 shipped 代码。）
+
 ```go
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
 	// 客户端说了身体有多大（Content-Length）的话，超限的那个请求连读都
@@ -116,6 +120,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		return
 	}
 	ctx := r.Context()
+	// 大身体和小身体走两条道（规格 §4）。
+	//
+	// 大的（几十兆 —— 图片就是那么大的）一次只让一个进来：两个一起来就
+	// 是一百多兆。小的是普通并发，但它们的总量有个上限：那个上限是运营
+	// 定的，跟有多少账号、承诺多少并发没关系。
+	//
+	// 分道看的是 Content-Length：客户端说了多大就是多大。分块传的（不
+	// 知道多大）按大的算 —— 宁可慢一点，不能让内存被撑破。
+	//
+	// 道的门在并发闸门**之前**：并发那 20 个位是共享的，排在它后面的
+	// 话，20 个大请求会把 20 个位全占住（它们在等大道那个位），小请求
+	// 连闸门都进不去 —— 那 19 个小请求就没了。
+	if r.ContentLength < 0 || r.ContentLength > s.bodySmallBytes() {
+		if !s.bigGate.waitFor(ctx, 1, s.Cfg.Concurrency.Wait.Duration()) {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, proto, http.StatusTooManyRequests,
+				"the gateway is busy: another big request body is in the air")
+			return
+		}
+		defer s.bigGate.give()
+	} else {
+		// 小身体占的字节：OpenAI 和 Codex 的身体要转成 Anthropic 的形状，
+		// 那是第二份 —— 转换的那一刻两份都在。
+		n := r.ContentLength
+		if proto != protocolAnthropic {
+			n *= 2
+		}
+		if !s.bodies.waitFor(ctx, n, s.bodyBudgetBytes(), s.Cfg.Concurrency.Wait.Duration()) {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, proto, http.StatusTooManyRequests,
+				"the gateway is busy: too many request bodies are in the air")
+			return
+		}
+		defer s.bodies.give(n)
+	}
 	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
 	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
 	// 着。
