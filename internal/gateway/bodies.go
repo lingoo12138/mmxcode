@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -89,4 +91,25 @@ func (s *Server) bodyBudgetBytes() int64 {
 		return 0
 	}
 	return mb << 20
+}
+
+// readBody reads the request body.
+//
+// 客户端说了多大（Content-Length）就照着那个数读，一次读完：ReadAll 是
+// 一路翻倍着长大的，16 MiB 的身体它要分配 32 MiB，翻倍的那一刻两份都在
+// —— 那 32 MiB 就是峰值，而身体本身只有 16 MiB。
+//
+// 不知道多大（分块传的）还是用 MaxBytesReader 挡着：那是唯一一种能超过
+// Content-Length 的。
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.ContentLength < 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		return io.ReadAll(r.Body)
+	}
+	// 客户端说了多大就是多大：服务器照着那个数读，多出来的没有。
+	buf := make([]byte, r.ContentLength)
+	if _, err := io.ReadFull(r.Body, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }

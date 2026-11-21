@@ -2,6 +2,7 @@ package convert
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,10 +33,10 @@ type chatRequest struct {
 
 // chatMessage is one message of an OpenAI request.
 type chatMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`
-	ToolCalls  []chatToolCall  `json:"tool_calls"`
-	ToolCallID string          `json:"tool_call_id"`
+	Role       string         `json:"role"`
+	Content    rawJSON        `json:"content"`
+	ToolCalls  []chatToolCall `json:"tool_calls"`
+	ToolCallID string         `json:"tool_call_id"`
 }
 
 // chatToolCall is one tool call of an assistant message.
@@ -151,7 +152,7 @@ func ToAnthropicOpenAI(body []byte) ([]byte, error) {
 	}
 	out.ToolChoice = openAIToolChoice(in.ToolChoice)
 	out.StopSequences = chatStop(in.Stop)
-	return json.Marshal(out)
+	return marshalTo(out, sizeOf(out))
 }
 
 // openAIToolChoice turns the OpenAI tool_choice into Anthropic's.
@@ -211,7 +212,7 @@ func chatStop(raw json.RawMessage) []string {
 }
 
 // chatText reads the text out of an OpenAI message's content.
-func chatText(raw json.RawMessage) string {
+func chatText(raw rawJSON) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -240,8 +241,8 @@ func chatText(raw json.RawMessage) string {
 // The parts that carry text come across; the pictures and the files do
 // not: their shapes differ, and a picture turned into a piece of text
 // would be a lie.
-func chatBlocks(raw json.RawMessage) []anthropicBlock {
-	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+func chatBlocks(raw rawJSON) []anthropicBlock {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), nullBytes) {
 		return nil
 	}
 	var s string
@@ -271,7 +272,7 @@ func chatBlocks(raw json.RawMessage) []anthropicBlock {
 //
 // Anthropic 的消息不能是空的：一条没有内容的消息不成立，所以这里
 // 补一个空的文字块。
-func chatTextBlocks(raw json.RawMessage) []anthropicBlock {
+func chatTextBlocks(raw rawJSON) []anthropicBlock {
 	blocks := chatBlocks(raw)
 	if len(blocks) == 0 {
 		return []anthropicBlock{{Type: "text", Text: ""}}

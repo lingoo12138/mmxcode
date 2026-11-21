@@ -30,7 +30,7 @@ import (
 // responsesRequest is the part of a Responses request that is read.
 type responsesRequest struct {
 	Model           string          `json:"model"`
-	Input           json.RawMessage `json:"input"`
+	Input           rawJSON         `json:"input"`
 	Instructions    string          `json:"instructions"`
 	MaxOutputTokens int             `json:"max_output_tokens"`
 	Stream          bool            `json:"stream"`
@@ -180,7 +180,7 @@ func ToAnthropic(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	out.Messages = msgs
-	return json.Marshal(out)
+	return marshalTo(out, sizeOf(out))
 }
 
 // toolChoice turns the Responses tool_choice into Anthropic's.
@@ -219,7 +219,7 @@ func toolChoice(raw json.RawMessage) *anthropicToolChoice {
 }
 
 // messages turns the Responses input into Anthropic messages.
-func messages(raw json.RawMessage) ([]anthropicMessage, error) {
+func messages(raw rawJSON) ([]anthropicMessage, error) {
 	if len(raw) == 0 {
 		return []anthropicMessage{}, nil
 	}
@@ -231,21 +231,27 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 			Content: []anthropicBlock{{Type: "text", Text: s}},
 		}}, nil
 	}
-	var items []map[string]json.RawMessage
+	var items []rawJSON
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, fmt.Errorf("responses: input is neither a string nor a list")
 	}
 	var out []anthropicMessage
 	for _, item := range items {
-		typ := stringField(item["type"])
-		switch typ {
+		// 每一样东西都是身体里原来那一段字节：抄一份是几十兆的白抄。
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(item, &head); err != nil {
+			continue
+		}
+		switch head.Type {
 		case "function_call":
 			var fc struct {
 				CallID    string          `json:"call_id"`
 				Name      string          `json:"name"`
 				Arguments json.RawMessage `json:"arguments"`
 			}
-			if err := json.Unmarshal(mustMarshal(item), &fc); err != nil {
+			if err := json.Unmarshal(item, &fc); err != nil {
 				return nil, err
 			}
 			input, err := toolInput(fc.Arguments)
@@ -263,7 +269,7 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 				CallID string `json:"call_id"`
 				Output string `json:"output"`
 			}
-			if err := json.Unmarshal(mustMarshal(item), &fo); err != nil {
+			if err := json.Unmarshal(item, &fo); err != nil {
 				return nil, err
 			}
 			out = append(out, anthropicMessage{
@@ -274,10 +280,10 @@ func messages(raw json.RawMessage) ([]anthropicMessage, error) {
 			})
 		case "message", "":
 			var mi struct {
-				Role    string          `json:"role"`
-				Content json.RawMessage `json:"content"`
+				Role    string  `json:"role"`
+				Content rawJSON `json:"content"`
 			}
-			if err := json.Unmarshal(mustMarshal(item), &mi); err != nil {
+			if err := json.Unmarshal(item, &mi); err != nil {
 				return nil, err
 			}
 			role := mi.Role
@@ -349,7 +355,7 @@ func jsonObject(raw []byte) (map[string]json.RawMessage, error) {
 }
 
 // blocks turns a Responses message's content into Anthropic blocks.
-func blocks(raw json.RawMessage) ([]anthropicBlock, error) {
+func blocks(raw rawJSON) ([]anthropicBlock, error) {
 	if len(raw) == 0 {
 		return []anthropicBlock{{Type: "text", Text: ""}}, nil
 	}
@@ -379,20 +385,4 @@ func blocks(raw json.RawMessage) ([]anthropicBlock, error) {
 		out = []anthropicBlock{{Type: "text", Text: ""}}
 	}
 	return out, nil
-}
-
-func stringField(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return ""
-	}
-	return s
-}
-
-func mustMarshal(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
 }

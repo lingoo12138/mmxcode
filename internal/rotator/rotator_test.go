@@ -1198,3 +1198,30 @@ func TestTheSameAccountsAlwaysGiveTheSameOne(t *testing.T) {
 		t.Fatalf("account = %s, want acc_01", plan.AccountID)
 	}
 }
+
+// TestTheBytesSessionIsTheStringSession says that the words and the
+// bytes of the same words are the same session.
+//
+// 网关给过来的字节是身体里原来那一段 —— 它算出来的会话得跟从前那个一样，
+// 不然存着的那些会话就都找不到了。
+func TestTheBytesSessionIsTheStringSession(t *testing.T) {
+	a := SessionOf(nil, "sys", "hello")
+	b := SessionOfBytes(nil, []byte("sys"), []byte("hello"))
+	if a.Key != b.Key || a.UpstreamID != b.UpstreamID {
+		t.Fatalf("the same words gave two sessions: %v and %v", a, b)
+	}
+	if SessionOf(nil, "sys", "other").Key == b.Key {
+		t.Fatal("two conversations gave the same key")
+	}
+}
+
+// TestTheBytesSessionIsEmptyWhenThereAreNoWords says that whitespace is
+// not a conversation.
+func TestTheBytesSessionIsEmptyWhenThereAreNoWords(t *testing.T) {
+	if s := SessionOfBytes(nil, []byte("  "), []byte("\n\t")); s.Key != "" {
+		t.Fatalf("blank words gave the key %q", s.Key)
+	}
+	if s := SessionOfBytes(nil, nil, nil); s.Key != "" {
+		t.Fatalf("no words gave the key %q", s.Key)
+	}
+}

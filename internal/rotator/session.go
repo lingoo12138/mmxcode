@@ -1,6 +1,7 @@
 package rotator
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -64,6 +65,14 @@ type Session struct {
 // own string and a hash of the request's words, and that the mapping
 // from the session to the upstream's conversation survives a restart.
 func SessionOf(headers map[string][]string, system, firstUser string) Session {
+	return SessionOfBytes(headers, []byte(system), []byte(firstUser))
+}
+
+// SessionOfBytes is SessionOf with the words as bytes.
+//
+// 字节是身体的原来那一段，指着就行：抄一份是几十兆的白抄 —— 一句几十兆
+// 的话，抄两份就是白涨一百多兆。
+func SessionOfBytes(headers map[string][]string, system, firstUser []byte) Session {
 	for _, h := range sessionHeaders {
 		for _, v := range headers[h] {
 			if s := strings.TrimSpace(v); s != "" {
@@ -71,10 +80,10 @@ func SessionOf(headers map[string][]string, system, firstUser string) Session {
 			}
 		}
 	}
-	if strings.TrimSpace(system) == "" && strings.TrimSpace(firstUser) == "" {
+	if len(bytes.TrimSpace(system)) == 0 && len(bytes.TrimSpace(firstUser)) == 0 {
 		return Session{}
 	}
-	d := digest(system + "\x00" + firstUser)
+	d := digestBytes(system, []byte{0}, firstUser)
 	return Session{Key: "m:" + d, UpstreamID: d}
 }
 
@@ -82,4 +91,26 @@ func SessionOf(headers map[string][]string, system, firstUser string) Session {
 func digest(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:32]
+}
+
+// digestBytes is the short hash of several pieces put together.
+//
+// 分开写进去，不先拼起来：拼起来是一份，转成字节又是一份 —— 一句几十兆
+// 的第一句话，光是这个哈希就白涨两倍。分块写进去，多的那点地方是固定
+// 的。
+//
+// 哈希出来的东西跟拼起来算的**一个字节都不差**：写进去的还是同样的那
+// 些字节，同样的顺序。
+func digestBytes(parts ...[]byte) string {
+	h := sha256.New()
+	buf := make([]byte, 32<<10)
+	for _, p := range parts {
+		for len(p) > 0 {
+			n := copy(buf, p)
+			h.Write(buf[:n])
+			p = p[n:]
+		}
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum)[:32]
 }

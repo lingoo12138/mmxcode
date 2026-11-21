@@ -624,8 +624,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	defer s.gate.give()
 	// 请求体有个上限：不然一个客户端发来一大块东西，网关就把它整个
 	// 读进内存里，然后就没有内存了。
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	//
+	// 照着客户端说的那个数读，一次读完：ReadAll 一路翻倍着长大，翻倍的
+	// 那一刻两份都在 —— 那就是峰值，而身体本身只有一半那么大。
+	body, err := readBody(w, r)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -642,9 +644,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
-	model := modelOf(body)
-	stream := isStream(body)
-	sess := rotator.SessionOf(r.Header, systemOf(body), firstUserOf(body))
+	// 身体只读一遍：模型、流式、会话这三样都要从身体里读出来，读四遍
+	// 就是四倍的 CPU。
+	peek := peekOf(body)
+	model := peek.Model
+	stream := peek.Stream
+	sess := rotator.SessionOfBytes(r.Header, peek.System.text, firstUserOfPeek(peek))
 	// 发给上游的会话 id 是数据库里存着的那个：不重算，也不把客户端
 	// 自己那串字符串发出去。取不到就是取不到，不能拿别的顶上：顶上来的
 	// 那个上游没见过，会把这段对话当成新的一段。
@@ -1560,84 +1565,120 @@ func clientHeaders(r *http.Request) map[string]string {
 	return out
 }
 
-// modelOf reads the model out of a request body.
-func modelOf(body []byte) string {
-	var b struct {
-		Model string `json:"model"`
-	}
-	json.Unmarshal(body, &b)
-	return b.Model
+// requestPeek is what the gateway reads out of a request body before it
+// sends it on.
+//
+// 读一遍就够了：读四遍就是四倍的 CPU —— 一个 63 MiB 的身体，读四遍要
+// 1.5 秒，读一遍要 0.4 秒。
+type requestPeek struct {
+	// Model is the model the client asked for.
+	Model string `json:"model"`
+	// Stream says the client wants the answer streamed.
+	Stream bool `json:"stream"`
+	// System is the system prompt.
+	System peekText `json:"system"`
+	// Messages are the conversation so far.
+	Messages []struct {
+		Role    string   `json:"role"`
+		Content peekText `json:"content"`
+	} `json:"messages"`
+	// Input is the Codex shape: the whole conversation in one field.
+	Input peekInput `json:"input"`
 }
 
-// isStream says the request wants a stream.
-func isStream(body []byte) bool {
-	var b struct {
-		Stream bool `json:"stream"`
-	}
-	json.Unmarshal(body, &b)
-	return b.Stream
+// peekOf reads what the gateway needs out of a request body.
+//
+// 读不出来就当没有：网关不能因为一个字段怪就把整个请求扔了。
+func peekOf(body []byte) requestPeek {
+	var p requestPeek
+	json.Unmarshal(body, &p)
+	return p
 }
 
-// systemOf reads the system prompt out of a request body.
-func systemOf(body []byte) string {
-	var b struct {
-		System json.RawMessage `json:"system"`
-	}
-	if json.Unmarshal(body, &b) != nil {
-		return ""
-	}
-	return textOf(b.System)
-}
-
-// firstUserOf reads the first user message out of a request body.
+// firstUserOfPeek reads the first user message out of what was read.
 //
 // The three protocols put it in different places, so all of them are
 // looked at.
-func firstUserOf(body []byte) string {
-	var b struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-		Input json.RawMessage `json:"input"`
-	}
-	if json.Unmarshal(body, &b) != nil {
-		return ""
-	}
-	for _, m := range b.Messages {
+func firstUserOfPeek(p requestPeek) []byte {
+	for _, m := range p.Messages {
 		if m.Role == "user" {
-			return textOf(m.Content)
+			return m.Content.text
 		}
 	}
-	if len(b.Input) > 0 {
-		var s string
-		if json.Unmarshal(b.Input, &s) == nil {
-			return s
-		}
-	}
-	return ""
+	return p.Input.text
 }
 
-// textOf reads the text out of a content field, which may be a string
-// or a list of parts.
-func textOf(raw json.RawMessage) string {
+// peekText is the text of a content field, as it stands in the body.
+//
+// 它记的是身体里原来的那一段字节，不是抄一份：抄一份就是几十兆的白抄。
+// 身体本身在请求的整个过程里都在，所以指着它的那一段，一个字节也不用多。
+//
+// 图片的 base64 在别的字段里（source、image_url），标准库看它不看就跳过
+// 去了 —— 几十兆的图片，一个字节也不抄。
+type peekText struct {
+	// text is the text of the field.
+	text []byte
+}
+
+// UnmarshalJSON reads the text out of a content field.
+func (c *peekText) UnmarshalJSON(raw []byte) error {
 	if len(raw) == 0 {
-		return ""
+		return nil
 	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+	if raw[0] == '"' {
+		c.text = textOfString(raw)
+		return nil
 	}
+	// 是一串部件？只有文字算数。
 	var parts []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
 	}
-	var b strings.Builder
+	var out []byte
 	for _, p := range parts {
-		b.WriteString(p.Text)
+		out = append(out, p.Text...)
 	}
-	return b.String()
+	c.text = out
+	return nil
+}
+
+// peekInput is the text of an input field, when it is a plain string.
+//
+// Codex 的 input 是一个数组（那边是 items）的时候，那里面没有文字可取 ——
+// 从前就是这样（只认字符串）。
+type peekInput struct {
+	// text is the input.
+	text []byte
+}
+
+// UnmarshalJSON reads the input when it is a plain string.
+func (c *peekInput) UnmarshalJSON(raw []byte) error {
+	if len(raw) == 0 || raw[0] != '"' {
+		return nil
+	}
+	c.text = textOfString(raw)
+	return nil
+}
+
+// textOfString reads the text out of a JSON string, without copying it
+// when it can.
+//
+// 没有转义的时候，字符串里那些字节就是文字本身 —— 指着就行。有转义的时
+// 候（\" 或者 \n），那里面是另一段字节了，抄一份。
+func textOfString(raw []byte) []byte {
+	if len(raw) < 2 {
+		return nil
+	}
+	inside := raw[1 : len(raw)-1]
+	if bytes.IndexByte(inside, '\\') < 0 {
+		return inside
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return nil
+	}
+	return []byte(s)
 }

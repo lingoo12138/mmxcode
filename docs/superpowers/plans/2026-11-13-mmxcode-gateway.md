@@ -8808,7 +8808,7 @@ func makeAKey(t *testing.T, s *store.Store) string {
 // says the usage in magpie's card shape.
 //
 // magpie 的 provider 插件有一个 usage() 钩子，卡片就是从那里来的。我们
-// ��自己端点，所以这个钩子得由网关自己顶上来：给 magpie 一个 magpie
+// 没有自己端点，所以这个钩子得由网关自己顶上来：给 magpie 一个 magpie
 // 认得的形状。
 func TestTheUsageCardIsMagpiesShape(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })

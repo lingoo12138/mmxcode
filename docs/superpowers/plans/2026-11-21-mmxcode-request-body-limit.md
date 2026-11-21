@@ -89,6 +89,7 @@ func (c *countedBody) Read(p []byte) (int, error) {
 }
 
 func (c *countedBody) Close() error { return nil }
+
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -109,6 +110,7 @@ go test ./internal/gateway/ -run TestABodyIsNotReadWhileTheGatewayIsBusy -v
 下面这一段是现在的 shipped 代码。）
 
 ```go
+// handleChat serves a chat request.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
 	// 客户端说了身体有多大（Content-Length）的话，超限的那个请求连读都
 	// 不用读就拒了：读进来是 64 MiB 的内存，而它马上就是一个 413。
@@ -172,8 +174,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	defer s.gate.give()
 	// 请求体有个上限：不然一个客户端发来一大块东西，网关就把它整个
 	// 读进内存里，然后就没有内存了。
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	//
+	// 照着客户端说的那个数读，一次读完：ReadAll 一路翻倍着长大，翻倍的
+	// 那一刻两份都在 —— 那就是峰值，而身体本身只有一半那么大。
+	body, err := readBody(w, r)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -190,6 +194,325 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
+	// 身体只读一遍：模型、流式、会话这三样都要从身体里读出来，读四遍
+	// 就是四倍的 CPU。
+	peek := peekOf(body)
+	model := peek.Model
+	stream := peek.Stream
+	sess := rotator.SessionOfBytes(r.Header, peek.System.text, firstUserOfPeek(peek))
+	// 发给上游的会话 id 是数据库里存着的那个：不重算，也不把客户端
+	// 自己那串字符串发出去。取不到就是取不到，不能拿别的顶上：顶上来的
+	// 那个上游没见过，会把这段对话当成新的一段。
+	//
+	// 它是跟着轮转的 plan 一起回来的：那一行每个请求都要读一次，读出来
+	// 的东西就跟着走，不用再问一遍。池子给不出 id 的时候（那种池子没有
+	// 上游 id 这个本事），用的是请求自己算出来的那个。
+	upstreamID := sess.UpstreamID
+
+	used := map[string]bool{}
+	var lastErr error
+	// quota 说最后一次失败是“额度用完了”，quotaMsg 是上游自己说的那句。
+	// 客户端最后看到的是上游的话，不是网关自己编的一句。
+	var quota bool
+	var quotaMsg string
+	// lastStatus 是上游最后一次给的状态，lastMsg 是它自己说的那句。
+	// 客户端最后看到的是上游的状态，不是网关编出来的一个 429：上游说
+	// 503 就是 503，客户端才知道是上游坏了，而不是自己被限流了。
+	var lastStatus int
+	var lastMsg string
+	attempts := s.Cfg.Rotation.MaxAttempts
+	if attempts <= 0 {
+		attempts = 3
+	}
+	// busyDeadline is when this request stops waiting for a free account.
+	// 它是整个请求的一份：等一个账号空出来，等不到就 429（规格 §6.2）。
+	var busyDeadline time.Time
+	// waitForFree waits for an account that can answer.
+	waitForFree := func() bool {
+		if busyDeadline.IsZero() {
+			busyDeadline = time.Now().Add(s.Cfg.Concurrency.Wait.Duration())
+		}
+		return s.waitForFree(ctx, busyDeadline, model, used)
+	}
+	for {
+		plan, err := s.Rot.Pick(ctx, sess.Key, model, used)
+		if err != nil {
+			if errors.Is(err, rotator.ErrAllBusy) {
+				// 能答的账号都在飞：等前面的请求结束，而不是报错
+				// （规格 §6.4）。等不到就是等不到：客户端自己超时了。
+				if !waitForFree() {
+					w.Header().Set("Retry-After", "5")
+					writeError(w, proto, http.StatusTooManyRequests,
+						"every account is busy right now: too many requests are in the air")
+					return
+				}
+				continue
+			}
+			if lastErr != nil {
+				s.writeFailure(w, proto, quota, quotaMsg, lastStatus, lastMsg, lastErr)
+				return
+			}
+			writeError(w, proto, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		// 上游的会话 id 跟着轮转的 plan 一起回来了：那一行每个请求都要读
+		// 一次，读出来的东西就跟着走，不用再问一遍。
+		//
+		// 池子给不出的时候（那种池子没有上游 id 这个本事），用的还是请求
+		// 自己算出来的那个。
+		if plan.UpstreamID != "" {
+			upstreamID = plan.UpstreamID
+		}
+		if !s.busy.take(plan.AccountID) {
+			// 刚挑中的那个账号在挑的时候还是闲的，现在被人抢了：等它
+			// 空出来。这一次不算一次失败：它没有坏，它只是忙。
+			if !waitForFree() {
+				w.Header().Set("Retry-After", "5")
+				writeError(w, proto, http.StatusTooManyRequests,
+					"every account is busy right now: too many requests are in the air")
+				return
+			}
+			continue
+		}
+		// 抢到了：这个账号归这个请求了。这一次算一次尝试：它真的被问
+		// 过上游了。
+		used[plan.AccountID] = true
+		// 这段对话用过：记下来，攒一批写回库（规格 §6.3）。它的
+		// updated_at 是「活跃会话数」的凭据 —— 池要靠它把这段对话绑
+		// 着的号留在池里。
+		s.touches.add(sess.Key)
+		// 这个账号的活干完就把账号还回去：它在飞的时候不能接第二个
+		// 请求。闭包是为了那个"还回去"一定发生 —— 无论这一圈是怎么
+		// 结束的。
+		answered := func() bool {
+			defer s.busy.give(plan.AccountID)
+
+			tok, err := s.Mgr.Token(ctx, plan.AccountID)
+			if err != nil {
+				lastErr = err
+				// 这个号签不上了：它出池，让位给一个冷的。
+				s.dropDeadAccount(ctx, plan.AccountID)
+				return false
+			}
+			// 候选地址：账号自己的地址 → 它的组 → 全局组。路不通的时候还
+			// 有下一条。
+			cands, err := s.Mgr.Candidates(ctx, plan.AccountID)
+			if err != nil {
+				lastErr = err
+				return false
+			}
+			ci := 0
+			var transport http.RoundTripper
+			if len(cands) > 0 {
+				transport, err = s.Mgr.Egress.Transport(cands[0])
+				if err != nil {
+					lastErr = err
+					return false
+				}
+			}
+
+			upBody, upPath, convertBack, err := s.upstreamShape(body, proto)
+			if err != nil {
+				writeError(w, proto, http.StatusBadRequest, err.Error())
+				return true
+			}
+			chatReq := upstream.ChatRequest{
+				BaseURL:   s.UpstreamBase,
+				Path:      upPath,
+				Access:    tok.Access,
+				SessionID: upstreamID,
+				// 秒，UTC 以东。参考实现发的是 getTimezoneOffset() * -60，
+				// 和 Zone() 给的偏移是同一个值。time.Time 没有 Offset()
+				// 方法，Zone() 的第二个返回值就是它。
+				TZOffset: nowOffset(),
+				Body:     upBody,
+				Stream:   stream,
+				Extra:    clientHeaders(r),
+			}
+
+			// renewed 说这个账号的令牌已经续过一次：MiniMax 的 refresh token
+			// 只能用一次，续第二次会把账号签死。
+			renewed := false
+			// 同一个账号可以再问几次：限流、5xx、续签之后，都是这个账号
+			// 再来一次就好。
+			for try := 0; try < attempts; try++ {
+				resp, raw, err := s.attempt(ctx, chatReq, transport, stream)
+				if err != nil {
+					var oe *upstream.OtherSiteError
+					if errors.As(err, &oe) {
+						// 跨站：不换号、不消耗 refresh token
+						writeError(w, proto, http.StatusBadGateway, oe.Error())
+						return true
+					}
+					var tooBig *upstream.TooLargeError
+					if errors.As(err, &tooBig) {
+						// 上游发的不是回答：再问同一个账号也是这么大的回答
+						// （回答的大小是模型和请求的事，不是账号的事）。当场
+						// 答 502，不重试。
+						writeError(w, proto, http.StatusBadGateway, err.Error())
+						return true
+					}
+					// 路不通：还有下一条路就立刻换。不是上游慢，是这条路
+					// 不通，等没有用。
+					if ci+1 < len(cands) {
+						failed := cands[ci]
+						ci++
+						tr, terr := s.Mgr.Egress.Transport(cands[ci])
+						if terr != nil {
+							lastErr = terr
+							return false
+						}
+						transport = tr
+						// 换掉的那条路记一笔坏的：下一个请求不该从它开始。
+						_ = s.Mgr.MarkEgressBad(ctx, failed, err)
+						// 换地址这件事要说一声：看着是「那个号走了 A 路」，其
+						// 实走了 B 路。
+						fmt.Printf("egress: the account %s moved from %s to %s\n",
+							plan.AccountID, egress.Redacted(failed), egress.Redacted(cands[ci]))
+						// 新的一条路还没有预算：try 归零（循环末尾会加一，
+						// 所以是 -1）。换的是路，不是重试。
+						try = -1
+						continue
+					}
+					// 网络没通：还是这个账号，等一等再来。上游没有给出
+					// 状态：这是网关自己的问题。
+					lastErr = err
+					lastStatus = 0
+					lastMsg = ""
+					if !sleepCtx(ctx, backoff(try)) {
+						return true
+					}
+					continue
+				}
+
+				// 上游没有这条路：改用本地转换，同一个账号再来一次。
+				//
+				// 开放平台对 MiniMax Code 的账号答的也是「没有这条路」：503
+				// 加一句 direct_route_not_configured。那不是站点坏了，是那条
+				// 路对这个账号不通 —— 该走 Anthropic 那条。
+				if resp.StatusCode == http.StatusNotFound || openPlatformNotConfigured(raw) {
+					fb, fp, fback, ok := s.fallbackShape(body, proto, upPath)
+					if ok {
+						upBody, upPath, convertBack = fb, fp, fback
+						chatReq.Body = upBody
+						chatReq.Path = upPath
+						resp, raw, err = s.attempt(ctx, chatReq, transport, stream)
+						if err != nil {
+							var oe *upstream.OtherSiteError
+							if errors.As(err, &oe) {
+								writeError(w, proto, http.StatusBadGateway, oe.Error())
+								return true
+							}
+							var tooBig *upstream.TooLargeError
+							if errors.As(err, &tooBig) {
+								writeError(w, proto, http.StatusBadGateway, err.Error())
+								return true
+							}
+							lastErr = err
+							lastStatus = 0
+							lastMsg = ""
+							if !sleepCtx(ctx, backoff(try)) {
+								return true
+							}
+							continue
+						}
+					}
+				}
+
+				// 200 且是流：直接转出去
+				if resp.StatusCode == http.StatusOK && raw == nil {
+					// 答上了：这个账号刚刚被用过，它变热了。
+					s.Mgr.MarkUsed(plan.AccountID)
+					s.writeStream(w, resp, proto, convertBack, model)
+					return true
+				}
+
+				// 200 但身体里有业务错误
+				if resp.StatusCode == http.StatusOK {
+					if err := upstream.CheckEnvelope("chat", raw); err == nil {
+						// 答上了：这个账号刚刚被用过，它变热了。
+						s.Mgr.MarkUsed(plan.AccountID)
+						s.writeJSON(w, resp, raw, proto, convertBack, model)
+						return true
+					}
+				}
+
+				failure := s.failure(resp.StatusCode, raw)
+				lastStatus = resp.StatusCode
+				lastMsg = failure.Message
+				if lastMsg == "" {
+					// 上游自己说的话要给客户端和运维看：只知道一个状态码，
+					// 谁也说不清到底是哪一件事坏了。
+					lastMsg = upstreamMessage(raw)
+				}
+				switch s.action(failure) {
+				case rotator.ActionFailover:
+					// 额度用完了：这个账号的窗口记成用完，换一个账号。
+					s.markSpent(ctx, plan.AccountID, plan.GroupKey)
+					lastErr = fmt.Errorf("the account's credits or plan are used up")
+					quota = true
+					quotaMsg = failure.Message
+					return false
+				case rotator.ActionRenew:
+					if renewed {
+						// 续过一次还是被拒：这个账号先放着，换一个。
+						lastErr = fmt.Errorf("the sign-in was refused (HTTP %d)", resp.StatusCode)
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					newTok, rerr := s.Mgr.ForceRenew(ctx, plan.AccountID)
+					if rerr != nil {
+						// 跨站：不换号、不消耗 refresh token
+						var oe *upstream.OtherSiteError
+						// 续签自己的错要看 rerr：err 是上一次尝试的，
+						// 那时候它是空的，看它永远看不出来。
+						if errors.As(rerr, &oe) {
+							writeError(w, proto, http.StatusBadGateway, oe.Error())
+							return true
+						}
+						lastErr = rerr
+						quota = false
+						quotaMsg = ""
+						return false
+					}
+					// 用新 token 再来一次，还是这个账号
+					renewed = true
+					chatReq.Access = newTok.Access
+					quota = false
+					quotaMsg = ""
+					continue
+				case rotator.ActionRetrySame:
+					// 限流、5xx：这个账号等一等，再问它一次。
+					lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+					quota = false
+					quotaMsg = ""
+					wait, waitOK := waitBeforeRetry(resp, try)
+					if !waitOK {
+						// 上游让等太久：等是等不到的，换一个号。
+						// 那个窗口不记成用完 —— 限流不是额度的事。
+						lastErr = fmt.Errorf("HTTP %d: the upstream asked to wait longer than %s",
+							resp.StatusCode, maxWaitForTheSameAccount)
+						return false
+					}
+					if !sleepCtx(ctx, wait) {
+						return true
+					}
+					continue
+				default:
+					// 给不出别的说法：上游的状态原样给客户端。
+					s.writeFailure(w, proto, false, "", resp.StatusCode, lastMsg, lastErr)
+					return true
+				}
+			}
+			return false
+		}()
+		if answered {
+			return
+		}
+	}
+}
+
 ```
 
 （`bodyTooBig` 是 Task 3 里那个。）
@@ -239,6 +562,7 @@ func TestTheRequestBodyLimitIs64MiB(t *testing.T) {
 		t.Fatalf("maxBodyBytes = %d, want %d (64 MiB)", maxBodyBytes, 64<<20)
 	}
 }
+
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -266,6 +590,7 @@ go test ./internal/gateway/ -run TestTheRequestBodyLimitIs64MiB -v
 // 再大的请求不是对话，是要把它这个网关的内存吃光的东西：没有上限的时候，一
 // 个请求就能让网关没有内存可用。
 const maxBodyBytes = 64 << 20
+
 ```
 
 - [ ] **Step 4: 改 `internal/gateway/failures_test.go` —— 超限那条测试别自己拿着 64 MiB**
@@ -319,6 +644,7 @@ func (m *manyBytes) Read(p []byte) (int, error) {
 }
 
 func (m *manyBytes) Close() error { return nil }
+
 ```
 
 - [ ] **Step 5: 跑测试，看它过了**
@@ -408,6 +734,7 @@ func TestTheTooBigMessageSaysTheLimit(t *testing.T) {
 		t.Errorf("the message does not say how big the body was: %s", msg)
 	}
 }
+
 ```
 
 - [ ] **Step 2: 跑测试，看它失败**
@@ -435,6 +762,7 @@ func bodyTooBig(limit, got int64) string {
 	return fmt.Sprintf("the request body is larger than the %d bytes (%d MiB) the gateway takes",
 		limit, limit>>20)
 }
+
 ```
 
 `handleChat` 里那两处 `writeError` 换成它：
@@ -551,6 +879,7 @@ func BenchmarkChatSendsABigBody(b *testing.B) {
 		resp.Body.Close()
 	}
 }
+
 ```
 
 - [ ] **Step 2: 跑基准，先记下改之前的数**
