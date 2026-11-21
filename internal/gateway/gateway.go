@@ -456,6 +456,17 @@ func (p poolAdapter) Busy(ctx context.Context, accountID string) bool {
 // ServeHTTP routes a request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/healthz":
+		// 活着吗：这个端点不用 key。
+		//
+		// 容器的健康检查手里没有 key（密钥不进镜像），人也要一个不看
+		// 钥匙就能问的地址 —— 它问的是「进程还在吗」，不是「这个人是
+		// 谁」。所以它在两扇门的前面。
+		//
+		// 它什么都不说，只说「在」。
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("ok\n"))
+		return
 	case "/signin":
 		// 登录页不用会话：没有会话的人正要来这里登录。
 		s.signInPage(w, r, http.StatusOK, "")

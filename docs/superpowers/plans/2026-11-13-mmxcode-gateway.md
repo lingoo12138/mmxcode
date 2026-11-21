@@ -4635,8 +4635,10 @@ type Pool interface {
 	Exhausted(ctx context.Context) ([]store.Exhausted, error)
 	// BindSession points a session at an account.
 	BindSession(ctx context.Context, sessionKey, accountID string) error
-	// SessionAccount gives the account a session is bound to.
-	SessionAccount(ctx context.Context, sessionKey string) (string, bool, error)
+	// SessionState gives the session's row in one read.
+	//
+	// 那一行的两列（钉在哪个号上、上游的 id）一起拿：分开问就是两次往返。
+	SessionState(ctx context.Context, sessionKey string) (store.SessionState, error)
 	// MarkExhausted marks an account's window spent.
 	//
 	// The order is the account, the window key, the time it comes
@@ -4747,6 +4749,11 @@ type Plan struct {
 	// bound one had already been tried, and the session stayed where
 	// it was.
 	Retried bool
+	// UpstreamID is the id the upstream knows this conversation by.
+	//
+	// 它是跟着那一行一起读出来的：那一行每个请求都要问一次，所以问出来的
+	// 东西就跟着走，不用再问一遍。
+	UpstreamID string
 }
 
 // Rotator picks accounts.
@@ -4851,11 +4858,18 @@ func (r *Rotator) WindowKey(model string) string {
 //   - a conversation bound to an account that has already been tried in
 //     this request is answered by another account, and the binding is
 //     left alone: one failure does not move the conversation;
-//   - a conversation with no binding takes the account with the most
-//     credits left, and the least recently used one when those are
-//     equal, and is bound to it;
+//   - a conversation bound to a busy account is answered by another
+//     account, and the binding is left alone as well: a busy account is
+//     not one that cannot answer;
+//   - a conversation with no binding takes the least recently used
+//     account, and the one with the most credits left when two were
+//     used the same, and is bound to it;
 //   - a request with no conversation at all rotates: the next account
 //     in turn, so the load is spread.
+//
+// The accounts that are busy right now are not picked. When every
+// account that could answer is busy, the error is ErrAllBusy: the
+// caller waits for one of them to come free.
 //
 // The "round-robin" strategy skips the first three cases and rotates
 // always.
@@ -4874,36 +4888,54 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	if err != nil {
 		return Plan{}, err
 	}
-	group := r.GroupKey(model)
-
-	// The accounts that can answer: they are signed in, their group
-	// is not spent, and they have not been tried yet.
-	usable := make([]store.Account, 0, len(accounts))
-	usableIDs := make(map[string]bool, len(accounts))
-	for _, a := range accounts {
-		if a.Status != store.StatusActive {
-			continue
-		}
-		if used[a.ID] || r.isExhausted(exhausted, a.ID, group) {
-			continue
-		}
-		usable = append(usable, a)
-		usableIDs[a.ID] = true
-	}
+	usable, group := r.usableAccounts(accounts, exhausted, model, used)
 	if len(usable) == 0 {
 		return Plan{}, fmt.Errorf("no account can answer: every account is spent for the %s group or has already been tried", group)
+	}
+	// The accounts that are not busy: a request is in the air on the
+	// other ones, and they are not picked.
+	free, err := r.freeAccounts(ctx, usable)
+	if err != nil {
+		return Plan{}, err
 	}
 
 	sticky := r.opts.Strategy != StrategyRoundRobin
 
-	if sticky && sessionKey != "" {
-		boundID, ok, err := r.pool.SessionAccount(ctx, sessionKey)
+	// 这一段对话在库里那一行：钉在哪个号上、上游的 id。
+	//
+	// 那一行以前是分开读的（两次往返），而每个请求都要问它一次。
+	var state store.SessionState
+	if sessionKey != "" {
+		var err error
+		state, err = r.pool.SessionState(ctx, sessionKey)
 		if err != nil {
-			// A read error is not an unbound session. Were it taken
-			// for one, the binding that is there would be overwritten.
-			return Plan{}, fmt.Errorf("the session binding could not be read: %w", err)
+			// 读不出来不是「没绑定」：当成没绑定的话，库里那个绑定会被覆
+			// 盖掉。
+			return Plan{}, fmt.Errorf("the session row could not be read: %w", err)
 		}
-		if ok {
+	}
+
+	// 上游的 id：那一行里的那个。
+	//
+	// 那一行没有 id（新的对话）：问池子要一个 —— 它会编一个写下去。
+	//
+	// 只有「那一行还没有 id」的时候才问：问一次就是一次写，而热路径上那一
+	// 行已经有 id 了（那一行每个请求都要读一次，所以问出来的东西就跟着
+	// 走，不用再问一遍）。
+	upstreamID := state.UpstreamID
+	if upstreamID == "" && sessionKey != "" {
+		if ids, ok := r.pool.(UpstreamIDs); ok {
+			var err error
+			upstreamID, err = ids.UpstreamID(ctx, sessionKey)
+			if err != nil {
+				return Plan{}, fmt.Errorf("the upstream id could not be read: %w", err)
+			}
+		}
+	}
+
+	if sticky && sessionKey != "" {
+		if state.AccountID != "" {
+			boundID := state.AccountID
 			bound, found := accountByID(accounts, boundID)
 			switch {
 			case !found, bound.Status != store.StatusActive:
@@ -4916,16 +4948,26 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 				// The bound account has already been tried in this
 				// request and failed. Another account answers this
 				// request, and the conversation stays where it is.
-				a, err := r.bestAccount(ctx, usable)
+				a, err := r.bestAccount(ctx, free)
 				if err != nil {
 					return Plan{}, err
 				}
 				r.markUsed(a.ID)
-				return r.plan(a, group, false, true), nil
+				return r.plan(a, group, false, true, upstreamID), nil
+			case r.isBusy(ctx, boundID):
+				// The bound account is busy: another account answers
+				// this request, and the conversation stays where it
+				// is. A busy account is not one that cannot answer.
+				a, err := r.bestAccount(ctx, free)
+				if err != nil {
+					return Plan{}, err
+				}
+				r.markUsed(a.ID)
+				return r.plan(a, group, false, true, upstreamID), nil
 			default:
 				// The bound account can answer: it answers.
 				r.markUsed(boundID)
-				return r.plan(store.Account{ID: boundID}, group, false, false), nil
+				return r.plan(store.Account{ID: boundID}, group, false, false, upstreamID), nil
 			}
 		}
 	}
@@ -4933,7 +4975,7 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 	// No binding, or the bound account cannot answer: another account
 	// is picked and the conversation is bound to it.
 	if sticky && sessionKey != "" {
-		a, err := r.bestAccount(ctx, usable)
+		a, err := r.bestAccount(ctx, free)
 		if err != nil {
 			return Plan{}, err
 		}
@@ -4943,27 +4985,32 @@ func (r *Rotator) Pick(ctx context.Context, sessionKey, model string, used map[s
 			return Plan{}, fmt.Errorf("the session binding could not be written: %w", err)
 		}
 		r.markUsed(a.ID)
-		return r.plan(a, group, true, false), nil
+		return r.plan(a, group, true, false, upstreamID), nil
 	}
 
 	// No conversation, or the round-robin strategy: the next account
 	// in the rotation.
+	usableIDs := make(map[string]bool, len(free))
+	for _, a := range free {
+		usableIDs[a.ID] = true
+	}
 	a, err := r.nextAccount(accounts, usableIDs)
 	if err != nil {
 		return Plan{}, err
 	}
 	r.markUsed(a.ID)
-	return r.plan(a, group, false, false), nil
+	return r.plan(a, group, false, false, upstreamID), nil
 }
 
 // plan gives the plan of a request that goes to an account.
-func (r *Rotator) plan(a store.Account, group string, rebound, retried bool) Plan {
+func (r *Rotator) plan(a store.Account, group string, rebound, retried bool, upstreamID string) Plan {
 	return Plan{
-		AccountID: a.ID,
-		WindowKey: group,
-		GroupKey:  group,
-		Rebound:   rebound,
-		Retried:   retried,
+		AccountID:  a.ID,
+		WindowKey:  group,
+		GroupKey:   group,
+		Rebound:    rebound,
+		Retried:    retried,
+		UpstreamID: upstreamID,
 	}
 }
 
@@ -5014,8 +5061,8 @@ func accountByID(accounts []store.Account, id string) (store.Account, bool) {
 	return store.Account{}, false
 }
 
-// bestAccount gives the account with the most credits left, and the
-// least recently used one when two have the same.
+// bestAccount gives the account that was used least recently, and the
+// one with the most credits left when two were used the same.
 //
 // An account whose credits have not been read is taken after the ones
 // whose credits are known: a known balance is the better guide, and
@@ -5072,16 +5119,38 @@ type scored struct {
 }
 
 // better says one account is a better pick than another.
+//
+// 挑号的规矩，从要紧的到不要紧的：
+//
+//  1. 读到余额的排前面 —— 那是能拿来比较的数字。没读到的不算零，它排在
+//     有数的号后面（规格不变量 2）。
+//  2. 读到「0」的排到有数的号后面 —— 它接不了活了，挑它就是撞一次空，
+//     撞空要一个上游请求，还占着并发。
+//  3. 最久没用过的排前面 —— 把用量摊开：别让一个号被别的号挤在后面一直
+//     闲着，到头来被一口气烧光（规格 §6.5）。
+//  4. 一样的话余额多的排前面。
+//  5. 再一样就按 ID 排 —— 稳定：同样的情况挑出同一个号来。
 func better(a, b scored) bool {
 	if a.known != b.known {
 		// 读到余额的排前面：那是能拿来比较的数字
 		return a.known
 	}
+	if a.known {
+		aEmpty := a.left <= 0
+		bEmpty := b.left <= 0
+		if aEmpty != bEmpty {
+			// 读到 0 的排后面：它撞空是必然的。
+			return bEmpty
+		}
+	}
+	if !a.usedAt.Equal(b.usedAt) {
+		// 最久没用过的排前面
+		return a.usedAt.Before(b.usedAt)
+	}
 	if a.known && a.left != b.left {
 		return a.left > b.left
 	}
-	// 一样就用最久没用的那个
-	return a.usedAt.Before(b.usedAt)
+	return a.acc.ID < b.acc.ID
 }
 
 // nextAccount gives the next account in the rotation.
