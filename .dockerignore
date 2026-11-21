@@ -1,18 +1,28 @@
+# 构建上下文里不要的东西。
+#
+# 第一个要紧的是本地数据库：mmxcode.db 里有全部账号的 token，而
+# `COPY . .` 不认 .gitignore —— 没有这个文件的时候，那个库会被送进构建
+# 上下文，还会留在构建那一层里。密钥和本地配置同理。
+
+# 版本库和它的工作区
 .git
-docs
-data
-tmp.db
-tmp.db-wal
-tmp.db-shm
-*.md
+.gitignore
+.worktrees/
 
-# 本地的东西不进构建上下文：配置文件里有 api key，.env 里也是。
+# 本地的库和它的两个伴生文件
+*.db
+*.db-wal
+*.db-shm
+
+# 本地的配置和密钥
 config.yaml
-config.local.yaml
 .env
-.env.*
-!.env.example
 
-# 计划同步脚本和别的工作文件
-.tmp-review
-.worktrees
+# 编译出来的二进制和日志
+/mmxcode.exe
+/mmxcode.exe~
+/serve.log
+
+# 文档和插件：镜像里用不着
+docs/
+packages/

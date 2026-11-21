@@ -40,5 +40,17 @@ ENV TZ=Asia/Shanghai
 EXPOSE 8080
 VOLUME ["/data"]
 
+# 健康检查：网关有一个不用 key 的 /healthz。
+#
+# 它不用 key 是故意的 —— 密钥不进镜像，健康检查手里也就没有 key；它问的
+# 是「进程还在吗」，不是「这个人是谁」。alpine 自带 busybox 的 wget，
+# 镜像里不用再多装东西。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+
+# 停的时候给网关一点时间：它关之前要让在飞的请求和后台的活儿收尾
+# （最多 10 秒）。
+STOPSIGNAL SIGTERM
+
 ENTRYPOINT ["/usr/local/bin/mmxcode"]
 CMD ["serve"]

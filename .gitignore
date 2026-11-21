@@ -20,3 +20,9 @@ config.yaml
 
 # 差分测试用的临时探针
 .scratch-probe/
+
+# Python 的缓存（计划检查的脚本留下的）
+__pycache__/
+
+# 发布包
+dist/

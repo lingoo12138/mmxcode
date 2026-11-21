@@ -3,6 +3,9 @@ services:
     build: .
     image: mmxcode-gateway:latest
     restart: unless-stopped
+    # 停的时候给网关一点时间：它关之前要让在飞的请求和后台的活儿收尾
+    # （最多 10 秒），断早了那些活儿就写到一半。
+    stop_grace_period: 30s
     ports:
       # 只绑本机，管理界面不暴露到公网
       - "127.0.0.1:8080:8080"
@@ -29,6 +32,12 @@ services:
       TZ: Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # 日志不设上限的话，一个跑上几个月的容器能把磁盘写满。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   # 数据库数据目录（见上面 MMXCODE_DATA_DIR 的说明）。

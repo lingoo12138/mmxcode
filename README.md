@@ -481,10 +481,27 @@ magpie 的额度卡片另有一份：它只现读最热的几个（`usage.refres
 
 ## 部署
 
+两条路：**容器**（服务器上最省心）和**二进制**（本机，或者服务器上不想装
+Docker）。
+
+### 容器
+
 ```bash
 cp .env.example .env
-docker compose up -d
+$EDITOR .env                      # 至少写 MMXCODE_API_KEYS
+docker compose up -d --build
 ```
+
+起来以后：
+
+```bash
+docker compose ps                 # healthy 才算好
+docker compose logs -f mmxcode
+curl -s http://127.0.0.1:8080/healthz      # ok
+```
+
+`/healthz` 不用 key：它问的是「进程还在吗」，不是「这个人是谁」。容器的
+健康检查手里没有 key（密钥不进镜像），所以那个端点也不能要 key。
 
 compose 做的事：
 
@@ -493,9 +510,26 @@ compose 做的事：
 - 挂配置文件：默认挂仓库里的 `config.docker.yaml` 到 `/app/config.yaml`（只读）。要用自己的副本就设 `MMXCODE_CONFIG_FILE=./config.yaml`。
 - 挂数据目录：默认是 Docker 命名卷 `mmxcode-data`，容器里是 `/data`，数据库落在 `/data/mmxcode.db`。
 - 容器以非 root 用户 `mmxcode`（uid 10001）运行，`/data` 归它所有。
-- 环境变量：`MMXCODE_CONFIG=/app/config.yaml`、`TZ=Asia/Shanghai`、`MMXCODE_PROXY_DEFAULT`（默认 `http://host.docker.internal:7890`；容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）、`MMXCODE_PASSWORD_KEY`（批量导入的密码加密密钥；不设就不存密码）、`MMXCODE_API_KEYS`（网关的 key，也就是后台登录那把；镜像里不带密钥，在 `.env` 里写 `MMXCODE_API_KEYS=sk-xxx`，多把用逗号隔开）。
+- 健康检查：镜像里带 HEALTHCHECK，每 30 秒问一次 `/healthz`。
+- 停机给 30 秒：网关关之前要让在飞的请求和后台的活儿收尾（最多 10 秒），断早了那些活儿就写到一半。
+- 日志有上限（10 MB × 3 个）：跑上几个月的容器不能把磁盘写满。
 
-  不设 `MMXCODE_API_KEYS` 的话，容器里的网关只肯听本机：它监听的是 `:8080`（所有网卡），没有 key 就等于把它白送出去，所以它会报错退出。
+环境变量（写在 `.env` 里）：
+
+| 变量 | 干什么 |
+|---|---|
+| `MMXCODE_API_KEYS` | 网关的 key，**也是后台登录那把**。镜像里不带它。多把用逗号隔开。 |
+| `MMXCODE_PASSWORD_KEY` | 导入用的密码加密密钥（base64 的 32 字节）。不设就不存密码。 |
+| `MMXCODE_PROXY_DEFAULT` | 全局出口。默认 `http://host.docker.internal:7890`（容器里访问宿主机的代理要写 `host.docker.internal`，compose 里已经配好）。 |
+| `MMXCODE_DATA_DIR` | 数据目录的挂载源（宿主机侧）。默认是命名卷。 |
+| `MMXCODE_CONFIG_FILE` | 挂进容器的配置文件（宿主机路径）。默认是仓库里的 `config.docker.yaml`。 |
+
+不设 `MMXCODE_API_KEYS` 的话，容器里的网关只肯听本机：它监听的是 `:8080`
+（所有网卡），没有 key 就等于把它白送出去，所以它会报错退出。
+
+**两把 key 别搞混**：`.env` 里那把是**后台登录**用的（管理页只认它）；
+后台 `/keys` 申请的那些是**聊天**用的（`/v1/messages` 那扇门两把都认）。
+聊天用的 key 给别的机器，`.env` 那把自己留着。
 
 数据目录：
 
@@ -505,6 +539,47 @@ compose 做的事：
   ```bash
   mkdir -p data && chown 10001:10001 data
   ```
+
+### 升级
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+数据库在卷里，升级不动它。
+
+### 备份
+
+```bash
+docker compose stop
+docker run --rm -v mmxcode-data:/data -v "$PWD":/out alpine     tar -czf /out/mmxcode-db-$(date +%F).tar.gz -C /data .
+docker compose start
+```
+
+停一下再拷：SQLite 正在写的时候拷出来的库不一定完整。要不停，也得把
+`mmxcode.db`、`mmxcode.db-wal`、`mmxcode.db-shm` 三个文件一起拷。
+
+备份里是全部账号的 token —— 那个 tar.gz 要跟密码一样收好。
+
+### 本机跑二进制
+
+不要 Docker 的时候（比如就在自己电脑上跑）：
+
+```bash
+go build -o mmxcode ./cmd/mmxcode
+cp config.example.yaml config.yaml
+# 改两处：server.listen 改成 "127.0.0.1:8080"，db 改成 "./mmxcode.db"
+./mmxcode --config config.yaml serve
+```
+
+本机跑的时候 `server.api_keys` 可以一把都没有 —— 它只听本机。没有 key 的
+时候管理页也不用登录。
+
+### 内存
+
+容器给 **256 MB** 够 1000 个账号跑 200 KB 的回答；要发多兆的回答就 512 MB。
+要钱的是在飞的回答，不是账号的个数（1000 个账号本身几乎不占内存）。
 
 ### 前面挡着 nginx 的话
 
@@ -524,6 +599,7 @@ server {
 
 - `client_max_body_size 64m`：跟网关自己的上限对齐。nginx 收整个身体，收齐了才转给网关 —— 所以请求体在 nginx 那里也占一份内存（`proxy_request_buffering on` 是默认的，别关：关了的话网关那边会变成流式的慢上传）。
 - `proxy_read_timeout` / `proxy_send_timeout`：流式的对话要传很久，默认 60s 不够。
+
 
 ## magpie 插件
 
@@ -552,6 +628,27 @@ magpie plugin add ./packages/mmxcode
 
 - `usage.refresh.*`：多久读一次额度（`scan_every`）、哪些账号算热（`hot_window`）、一趟读几个（`batch`）、现读的预算（`budget`）、一次读超时多久（`timeout`）。卡片上的数是**上一次读到的**，只有该读的账号会被读（热的、没读过的、签到待补的、标记到期的），冷账号等它被用到再说。
 - `concurrency.*`：一个账号同时接几个请求（`per_account`，默认 1）、整个网关同时接几个（`total_ratio` / `total_min`）、等得到多久（`wait`）。等不到的时候网关回 429 和 `Retry-After`，不假装忙。
+
+## 开发
+
+```bash
+go test ./...                                    # 网关、库、命令行
+go test ./internal/convert -run XXX -bench . -benchmem   # 转换的内存账
+node --test packages/mmxcode/index.test.mjs      # magpie 插件
+```
+
+仓库里有什么：
+
+| 哪儿 | 什么 |
+|---|---|
+| `cmd/mmxcode/` | 命令行：`serve`、`login`、`accounts`、`checkin`、`usage`、`import`、`groups`、`models` |
+| `internal/gateway/` | HTTP 网关：三个协议、鉴权、请求体的闸门、轮转 |
+| `internal/store/` | SQLite。用的是纯 Go 的 `modernc.org/sqlite`，不用 CGO，镜像里不需要 libc |
+| `internal/manager/`、`internal/pool/` | 账号池：挑号、额度、签到 |
+| `internal/rotator/`、`internal/convert/` | 挑哪一个号、协议之间的转换 |
+| `internal/webui/` | 后台页面（账号、额度、出口组、申请 key） |
+| `packages/mmxcode/` | magpie 的 provider 插件（Node） |
+| `docs/superpowers/` | 规格、计划，还有看着「计划跟代码逐字对齐」的脚本 |
 
 ## 协议对齐
 
@@ -607,7 +704,7 @@ magpie plugin add ./packages/mmxcode
   `token_plan/remains_percent` 有没有数、WARP 的免费线路在当前网络下通不通 ——
   这些要拿真的账号量才知道。回退的路都写着，量出来的结果记在
   `docs/superpowers/specs/2026-11-13-mmxcode-gateway-design.md` §19。
-- **容器**：Docker 那套没在这台机器上试过。
+- **容器**：Docker 那套没在这台机器上试过（这里没有 Docker daemon）。配置写了 HEALTHCHECK、.dockerignore、停机的三十秒和日志的上限，但没真跑起来过。
 
 ### 不做的
 
