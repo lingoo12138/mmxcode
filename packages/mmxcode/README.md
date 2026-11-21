@@ -13,11 +13,32 @@ magpie 的 provider 插件，provider id 是 `mmxcode`，在 magpie 里叫 **MMX
 
 ## 怎么装
 
+一条命令：
+
 ```sh
-magpie plugin add ./packages/mmxcode
+magpie plugin add github:lingoo12138/mmxcode
 ```
 
-然后在 magpie 里签入 `MMXCode 网关`：填网关地址和聊天 key。
+magpie 把整个仓库当成一个 npm 包装下来，照着根目录 `package.json` 的 `main`
+找到 `packages/mmxcode/index.mjs`。
+
+自己改插件的话，从源码装（改完重启 magpie 就生效）：
+
+```sh
+git clone https://github.com/lingoo12138/mmxcode.git
+magpie plugin add ./mmxcode/packages/mmxcode
+```
+
+装完在 magpie 里签入 `MMXCode 网关`：填网关地址和聊天 key。
+
+不想点表单就喂给它 —— 地址、key、账号 id，一行一个：
+
+```sh
+printf 'http://127.0.0.1:8080\n\n\n' | magpie plugin login mmxcode
+```
+
+签入的时候它会真打一次网关：网关没起来就直接说「网关连不上」，不会给你
+留一个半签入的账号。
 
 ## 签入的时候问三样
 
@@ -108,8 +129,13 @@ A magpie provider plugin that points magpie at **your own mmxcode gateway**: cha
 The plugin holds no MiniMax account, token or signature — the gateway holds those. It knows the gateway's address (default `http://127.0.0.1:8080`, or the `MMXCODE_BASE` environment variable) and a chat key (one you apply for in the gateway's console; leave it empty when the gateway has no keys at all).
 
 ```sh
-magpie plugin add ./packages/mmxcode
+magpie plugin add github:lingoo12138/mmxcode
 ```
+
+magpie installs the repository as one npm package and loads
+`packages/mmxcode/index.mjs` through the root `package.json`. Working on the
+plugin itself? Install it from a clone instead:
+`magpie plugin add ./mmxcode/packages/mmxcode`.
 
 Signing in asks for three things: the gateway's address, the chat key, and the **account id** — the name magpie shows for that account (leave it empty and the address becomes the name).
 

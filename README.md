@@ -606,7 +606,15 @@ server {
 仓库里带一个 magpie 的 provider 插件，在 `packages/mmxcode/`：把 magpie 指到自己的网关上来。
 
 ```bash
-magpie plugin add ./packages/mmxcode
+magpie plugin add github:lingoo12138/mmxcode
+```
+
+magpie 把整个仓库当成一个 npm 包装下来，照着根目录 `package.json` 的 `main` 找到
+`packages/mmxcode/index.mjs`。自己改插件的话，从源码装：
+
+```bash
+git clone https://github.com/lingoo12138/mmxcode.git
+magpie plugin add ./mmxcode/packages/mmxcode
 ```
 
 装完在 magpie 里签入 `MMXCode 网关`，要答两样东西：
@@ -615,6 +623,14 @@ magpie plugin add ./packages/mmxcode
 |---|---|
 | 网关地址 | 默认 `http://127.0.0.1:8080`。网关在别的机器上就写那个地址 |
 | 聊天用的 key | 后台 `/keys` 申请的那把。网关一把 key 都没有的时候可以留空（那就不鉴权） |
+
+不想点表单就喂给它 —— 地址、key、账号 id，一行一个：
+
+```bash
+printf 'http://127.0.0.1:8080\n\n\n' | magpie plugin login mmxcode
+```
+
+签入的时候它会真打一次网关：网关没起来就直接说「网关连不上」。
 
 插件做的事：
 
