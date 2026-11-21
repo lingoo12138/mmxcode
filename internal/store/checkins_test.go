@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheCheckinTimesAreTheOnesSinceAMoment says the check-in times

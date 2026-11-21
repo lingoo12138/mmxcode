@@ -16,7 +16,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
 )
 
 func openTest(t *testing.T) *Store {

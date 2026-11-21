@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // readCountingStore counts the reads of the database.

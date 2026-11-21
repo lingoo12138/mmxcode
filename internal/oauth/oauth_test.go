@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 func testClient(t *testing.T) *upstream.Client {

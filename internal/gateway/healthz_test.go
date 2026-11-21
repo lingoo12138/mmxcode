@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/config"
 )
 
 // TestTheHealthEndpointAnswers says the health endpoint answers.

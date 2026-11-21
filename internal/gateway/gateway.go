@@ -37,16 +37,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/convert"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/convert"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 )
 
 // nowOffset gives the timezone offset in seconds east of UTC.

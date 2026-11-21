@@ -118,13 +118,13 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/checkin"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 
 	_ "modernc.org/sqlite"
 )
@@ -1764,14 +1764,14 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/checkin"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // renewWindow is how long before a token ends it is renewed.
@@ -3168,7 +3168,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // ChatRequest is one chat request to MiniMax.
@@ -3316,7 +3316,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // fakePool is an account pool that does not touch a database.
@@ -4353,7 +4353,7 @@ import (
 	"errors"
 	"strings"
 
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // Action is what to do about a failed upstream answer.
@@ -7396,16 +7396,16 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/apikey"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // harness is a gateway with one account and a fake upstream.
@@ -8973,7 +8973,7 @@ import (
 	"net/http"
 	"strings"
 
-	"mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
 )
 
 // sessionCookie is the name of the cookie the browser carries.
@@ -9396,13 +9396,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/convert"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/convert"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // nowOffset gives the timezone offset in seconds east of UTC.
@@ -10567,14 +10567,14 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // newTestWebUIWithConfig makes a WebUI with a given configuration.
@@ -12452,15 +12452,15 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 )
 
 //go:embed templates/*.html
@@ -13576,14 +13576,14 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 func TestCheckinDelayIsJittered(t *testing.T) {
@@ -13894,9 +13894,9 @@ import (
 	"math/rand"
 	"time"
 
-	"mmxcode/internal/checkin"
-	"mmxcode/internal/config"
-	"mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/manager"
 )
 
 // egressTarget is the address the outlets are checked against.
@@ -14186,11 +14186,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/gateway"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/scheduler"
-	"mmxcode/internal/webui"
+	"github.com/lingoo12138/mmxcode/internal/gateway"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/scheduler"
+	"github.com/lingoo12138/mmxcode/internal/webui"
 )
 
 func newServeCmd(e *env) *cobra.Command {
@@ -14341,15 +14341,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // Execute runs the command line and gives the process its exit code.
@@ -14491,7 +14491,7 @@ func groupNames(groups map[string]string) string {
 		e.mgr = manager.New(s, e.up, e.acc, e.egr, oauth.NewRenewer())
 ```
 
-import 加上 `"mmxcode/internal/manager"` 与 `"mmxcode/internal/oauth"`。
+import 加上 `"github.com/lingoo12138/mmxcode/internal/manager"` 与 `"github.com/lingoo12138/mmxcode/internal/oauth"`。
 
 在 `root.AddCommand` 那一行加上：
 
@@ -16480,7 +16480,7 @@ import (
 	"sync"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // upstreamRecorder keeps what the upstream was asked.
@@ -16794,14 +16794,14 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // fakeSite is the site itself, answered here.

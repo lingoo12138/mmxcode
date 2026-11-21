@@ -198,7 +198,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // modelIDs reads the ids out of a model list answer.
@@ -323,8 +323,8 @@ import (
 	"log"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // modelsTTL is how long the site's model list is kept.

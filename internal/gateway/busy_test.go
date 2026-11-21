@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheFreeAccountIsFoundEvenWhenTheCountIsShort says a free account

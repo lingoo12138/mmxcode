@@ -1149,7 +1149,7 @@ func TestTheJitterDoesNotCrossTheSitesMidnight(t *testing.T) {
 	}
 ```
 
-`internal/scheduler/scheduler.go` 的 import 里加上 `"mmxcode/internal/store"`。
+`internal/scheduler/scheduler.go` 的 import 里加上 `"github.com/lingoo12138/mmxcode/internal/store"`。
 
 - [ ] **Step 4: 跑测试，确认它过了**
 

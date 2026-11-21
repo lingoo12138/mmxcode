@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // dbFallback is the database's answer for the rotator, taken while

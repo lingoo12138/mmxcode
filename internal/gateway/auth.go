@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
 )
 
 // sessionCookie is the name of the cookie the browser carries.

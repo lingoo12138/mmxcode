@@ -1,4 +1,4 @@
-module mmxcode
+module github.com/lingoo12138/mmxcode
 
 go 1.26.0
 

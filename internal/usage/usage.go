@@ -15,7 +15,7 @@ import (
 	"sort"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // The states an account's credits can be in.

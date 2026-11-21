@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // fakeSource is a set of candidates.

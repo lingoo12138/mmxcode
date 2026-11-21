@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/sign"
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/sign"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // QueryKV is one query parameter for a signed call.

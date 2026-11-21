@@ -21,7 +21,7 @@ package pool
 import (
 	"sync"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // BytesPerAccount is what one account in the pool takes, in bytes.

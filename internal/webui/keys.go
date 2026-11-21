@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/apikey"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // keysData is the keys page's data.

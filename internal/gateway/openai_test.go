@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // upstreamRecorder keeps what the upstream was asked.

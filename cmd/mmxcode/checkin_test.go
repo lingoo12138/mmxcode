@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // checkinServer is a stand-in for MiniMax: the token endpoint, the

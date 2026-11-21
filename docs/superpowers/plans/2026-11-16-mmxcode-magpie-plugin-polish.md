@@ -65,8 +65,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheCardSaysHowManyCreditsAreLeft says the card says what is left.
@@ -880,8 +880,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // shownAccounts is how many accounts get a window of their own.

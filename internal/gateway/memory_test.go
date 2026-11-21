@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
 )
 
 // TestTheBodyIsReadIntoOneBuffer says that reading a body does not

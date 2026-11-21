@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/config"
 )
 
 // busyAccounts counts the requests in the air per account.

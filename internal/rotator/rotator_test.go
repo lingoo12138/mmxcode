@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // fakePool is an account pool that does not touch a database.

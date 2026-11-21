@@ -54,7 +54,7 @@ import (
 	"strings"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // The vectors were produced by running the reference implementation
@@ -755,7 +755,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // Secret is MiniMax Code's request-signing secret.
@@ -2576,8 +2576,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/sign"
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/sign"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // Paths of the calls the login makes.
@@ -3910,10 +3910,10 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // fakeStore keeps what it is given.
@@ -5511,11 +5511,11 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // Store is where an imported account goes.
@@ -6283,9 +6283,9 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/provision"
 )
 
 // aFakeEnv is an env whose batch does not touch the network.
@@ -6549,15 +6549,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // PasswordKeyEnv is the environment variable that holds the key the
@@ -6940,7 +6940,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [x] **Step 1: 写失败的测试**
 
-在 `internal/manager/manager_test.go` 末尾加（并 import `"bytes"` 与 `"mmxcode/internal/secret"`）：
+在 `internal/manager/manager_test.go` 末尾加（并 import `"bytes"` 与 `"github.com/lingoo12138/mmxcode/internal/secret"`）：
 
 ```go
 func TestReloginSignsTheAccountInAgain(t *testing.T) {
@@ -7052,7 +7052,7 @@ func TestReloginAllOnlyTouchesTheAccountsThatHaveAPassword(t *testing.T) {
 
 ```
 
-在 `internal/scheduler/scheduler_test.go` 末尾加（并 import `"bytes"` 与 `"mmxcode/internal/secret"`）：
+在 `internal/scheduler/scheduler_test.go` 末尾加（并 import `"bytes"` 与 `"github.com/lingoo12138/mmxcode/internal/secret"`）：
 
 ```go
 func TestTheReloginJobSignsTheSignedOutAccountsInAgain(t *testing.T) {

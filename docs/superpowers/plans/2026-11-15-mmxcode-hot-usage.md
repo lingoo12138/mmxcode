@@ -511,7 +511,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheLatestCheckinsOfEveryAccount says each account's newest
@@ -604,8 +604,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheAccountsToReadAreTheOnesThatNeedIt says the read set is the
@@ -952,8 +952,8 @@ import (
 	"sort"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Reader reads one account's credits.
@@ -1493,8 +1493,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // fakeReader reads the credits without the network.
@@ -1756,8 +1756,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // The timeouts of the background work.
@@ -1955,7 +1955,7 @@ func (s *Server) markedUntil(ctx context.Context, accountID, groupKey string) (t
 `internal/gateway/gateway.go` 的 import 补上：
 
 ```go
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 ```
 
 `Server` 里加读额度的那个字段（网关读额度只有这一个口子，测试把它换成假的，测试就永远不碰 MiniMax 自己）：
@@ -2263,7 +2263,7 @@ func (r *Round) Settle(ctx context.Context, accountID string) (store.UsageSnapsh
 }
 ```
 
-`internal/usage/round.go` 的 import 补上 `"encoding/json"` 和 `"mmxcode/internal/account"`。
+`internal/usage/round.go` 的 import 补上 `"encoding/json"` 和 `"github.com/lingoo12138/mmxcode/internal/account"`。
 
 - [ ] **Step 4: 调度器签完读一次**
 
@@ -2326,7 +2326,7 @@ func (s *Scheduler) readCheckedIn(ctx context.Context, ids []string) {
 }
 ```
 
-`internal/scheduler/scheduler.go` 的 import 补上 `"mmxcode/internal/usage"`。
+`internal/scheduler/scheduler.go` 的 import 补上 `"github.com/lingoo12138/mmxcode/internal/usage"`。
 
 - [ ] **Step 5: 后台页面上那个签到按钮读完再答**
 
@@ -2353,7 +2353,7 @@ func (w *WebUI) apiCheckin(rw http.ResponseWriter, r *http.Request, id string) {
 }
 ```
 
-`internal/webui/webui.go` 的 import 补上 `"mmxcode/internal/usage"`。
+`internal/webui/webui.go` 的 import 补上 `"github.com/lingoo12138/mmxcode/internal/usage"`。
 
 - [ ] **Step 6: 运行测试确认通过**
 
@@ -2398,8 +2398,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestAnAccountTakesOneRequestAtATime says an account takes one
@@ -2621,8 +2621,8 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // busyAccounts counts the requests in the air per account.
@@ -3780,7 +3780,7 @@ func (s *Server) round() *usage.Round {
 	mgr.HotWindow = cfg.Usage.Refresh.HotWindow.Duration()
 ```
 
-`internal/gateway/gateway.go` 的 import 已经有 `"mmxcode/internal/usage"` 了（Task 5 加的）。
+`internal/gateway/gateway.go` 的 import 已经有 `"github.com/lingoo12138/mmxcode/internal/usage"` 了（Task 5 加的）。
 
 - [ ] **Step 5: 运行测试确认通过**
 

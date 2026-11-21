@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // The vectors were produced by running the reference implementation

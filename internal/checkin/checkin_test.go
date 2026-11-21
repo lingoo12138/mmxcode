@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // panel makes a seven-day panel, with the given day's status.

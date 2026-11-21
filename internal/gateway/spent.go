@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // The timeouts of the background work.

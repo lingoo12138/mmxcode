@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // ErrRefreshOutcomeUnknown says a refresh may have been spent.

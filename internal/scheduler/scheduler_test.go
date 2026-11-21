@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 
 	_ "modernc.org/sqlite"
 )

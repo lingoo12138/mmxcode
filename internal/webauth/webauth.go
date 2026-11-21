@@ -29,8 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/sign"
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/sign"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // Paths of the calls the login makes.

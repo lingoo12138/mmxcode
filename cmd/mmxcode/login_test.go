@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // aFakeSignIn answers the sign-in endpoints.

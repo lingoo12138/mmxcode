@@ -14,9 +14,9 @@ import (
 	"net/http"
 	"sort"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // The outcomes.

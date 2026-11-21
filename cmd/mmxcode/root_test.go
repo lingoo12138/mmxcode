@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // captureStdout runs fn and gives back what it wrote to the standard

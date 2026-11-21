@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // aFakeEnv is an env whose batch does not touch the network.

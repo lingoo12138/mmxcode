@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Reader reads one account's credits.

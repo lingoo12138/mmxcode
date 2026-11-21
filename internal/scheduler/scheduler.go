@@ -9,12 +9,12 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/checkin"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/store"
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 )
 
 // egressTarget is the address the outlets are checked against.

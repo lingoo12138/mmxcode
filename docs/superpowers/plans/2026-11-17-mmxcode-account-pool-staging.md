@@ -1009,7 +1009,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // anAccount is an account that is signed in.
@@ -1357,7 +1357,7 @@ package pool
 import (
 	"sync"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // BytesPerAccount is what one account in the pool takes, in bytes.
@@ -1667,7 +1667,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // fakeSource is a set of candidates.
@@ -2197,7 +2197,7 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Source gives the accounts that could be admitted to the pool.
@@ -2616,9 +2616,9 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // openGatewayStore opens a store for a test.
@@ -2979,8 +2979,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // readCountingStore counts the reads of the database.
@@ -3336,8 +3336,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheUsedSessionsAreWritten says a session that was used is written
@@ -3509,7 +3509,7 @@ Expected: FAIL —— `poolAdapter` 没有 `pool` 字段，`Server` 没有 `Pool
 
 `internal/gateway/gateway.go`，import 里加：
 ```go
-	"mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/pool"
 ```
 
 `internal/gateway/gateway.go`，`Server` 里加三个字段：
@@ -3680,8 +3680,8 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/rotator"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/rotator"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // dbFallback is the database's answer for the rotator, taken while
@@ -3920,9 +3920,9 @@ import (
 	"log"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // poolReadBudget gives how many accounts one filling pass may read the
@@ -4286,9 +4286,9 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // manyAccounts makes a store with n signed-in accounts.
@@ -4488,7 +4488,7 @@ func (s *Server) totalConcurrency(ctx context.Context) int {
 顺手删掉两样现在没人用的东西：
 
 - `internal/gateway/busy.go` 里的 `spentNow` 函数 —— 耗尽判断搬进池了，它没有调用者了。
-- `internal/gateway/busy.go` 的 import 里的 `"mmxcode/internal/store"` —— 删掉 `spentNow` 之后它就没有用处了。
+- `internal/gateway/busy.go` 的 import 里的 `"github.com/lingoo12138/mmxcode/internal/store"` —— 删掉 `spentNow` 之后它就没有用处了。
 
 - [x] **Step 4: 耗尽了出池，后台补号**
 

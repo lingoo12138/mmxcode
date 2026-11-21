@@ -576,7 +576,7 @@ import (
 	"context"
 	"testing"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // 出口组退役了：开机的时候收拾一次 —— 组名变成账号自己的地址。
@@ -1144,15 +1144,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // PasswordKeyEnv is the environment variable that holds the key the
@@ -1498,10 +1498,10 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // aFakeEnv is an env whose batch does not touch the network.
@@ -1796,11 +1796,11 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // Store is where an imported account goes.
@@ -2516,10 +2516,10 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // fakeStore keeps what it is given.

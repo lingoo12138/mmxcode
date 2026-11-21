@@ -15,15 +15,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // PasswordKeyEnv is the environment variable that holds the key the

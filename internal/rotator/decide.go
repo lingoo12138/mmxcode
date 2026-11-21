@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // Action is what to do about a failed upstream answer.

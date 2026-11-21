@@ -44,7 +44,7 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Pool is the account pool the rotator picks from.

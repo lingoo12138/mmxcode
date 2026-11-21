@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
 )
 
 // TestAKeyMadeInTheConsoleIsGivenOnce says the console hands the key back

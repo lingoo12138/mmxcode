@@ -5,7 +5,7 @@ import (
 	"log"
 	"net/http"
 
-	"mmxcode/internal/card"
+	"github.com/lingoo12138/mmxcode/internal/card"
 )
 
 // usageCard says the gateway's usage in magpie's card shape.

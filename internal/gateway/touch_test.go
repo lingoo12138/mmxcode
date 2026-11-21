@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheUsedSessionsAreWritten says a session that was used is written

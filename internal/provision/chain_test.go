@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // fakeStore keeps what it is given.

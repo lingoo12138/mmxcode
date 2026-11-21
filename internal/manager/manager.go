@@ -27,14 +27,14 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/checkin"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // renewWindow is how long before a token ends it is renewed.

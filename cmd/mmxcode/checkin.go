@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
 )
 
 func newCheckinCmd(e *env) *cobra.Command {

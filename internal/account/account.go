@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // modelsTimeout is how long the live model list is waited for.

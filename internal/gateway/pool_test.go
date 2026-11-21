@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // openGatewayStore opens a store for a test.

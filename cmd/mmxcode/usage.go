@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 )
 
 func newUsageCmd(e *env) *cobra.Command {

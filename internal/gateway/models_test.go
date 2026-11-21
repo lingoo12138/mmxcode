@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // modelIDs reads the ids out of a model list answer.

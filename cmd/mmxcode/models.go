@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 func newModelsCmd(e *env) *cobra.Command {

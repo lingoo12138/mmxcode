@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
-	"mmxcode/internal/webauth"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/webauth"
 )
 
 // Store is where an imported account goes.

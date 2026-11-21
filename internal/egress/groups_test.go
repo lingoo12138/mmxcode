@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheCandidatesFollowTheChain says the candidates are the account's

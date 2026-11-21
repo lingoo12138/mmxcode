@@ -5,7 +5,7 @@ import (
 	"net"
 	"strings"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // SetGroups gives the resolver the groups it does not know yet.

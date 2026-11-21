@@ -978,7 +978,7 @@ import (
 	"net"
 	"testing"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestTheCandidatesFollowTheChain says the candidates are the account's
@@ -1171,7 +1171,7 @@ import (
 	"net"
 	"strings"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // SetGroups gives the resolver the groups it does not know yet.
@@ -1955,7 +1955,7 @@ func (m *Manager) MarkEgressBad(ctx context.Context, url string, cause error) er
 					}
 ```
 
-`internal/gateway/gateway.go` 的 import 里加上 `"mmxcode/internal/egress"`（`fmt` 已经有了）。
+`internal/gateway/gateway.go` 的 import 里加上 `"github.com/lingoo12138/mmxcode/internal/egress"`（`fmt` 已经有了）。
 
 - [ ] **Step 5: 跑测试，确认它过了**
 
@@ -2909,8 +2909,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/egress"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 func newGroupsCmd(e *env) *cobra.Command {

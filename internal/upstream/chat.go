@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // ChatRequest is one chat request to MiniMax.

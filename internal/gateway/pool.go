@@ -5,9 +5,9 @@ import (
 	"log"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/pool"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/pool"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // poolReadBudget gives how many accounts one filling pass may read the

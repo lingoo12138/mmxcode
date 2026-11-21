@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/config"
 )
 
 // TestAnUpstreamThatIsDownIsNotARateLimit says a 503 from the upstream

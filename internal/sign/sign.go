@@ -30,7 +30,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // Secret is MiniMax Code's request-signing secret.

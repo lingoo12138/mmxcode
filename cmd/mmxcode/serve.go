@@ -12,11 +12,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/gateway"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/scheduler"
-	"mmxcode/internal/webui"
+	"github.com/lingoo12138/mmxcode/internal/gateway"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/scheduler"
+	"github.com/lingoo12138/mmxcode/internal/webui"
 )
 
 func newServeCmd(e *env) *cobra.Command {

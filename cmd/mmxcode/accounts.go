@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/egress"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 func newAccountsCmd(e *env) *cobra.Command {

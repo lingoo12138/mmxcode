@@ -1494,7 +1494,7 @@ import (
 	"strings"
 	"testing"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // The vectors were produced by running the reference implementation
@@ -2000,7 +2000,7 @@ import (
 	"strconv"
 	"strings"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 // Secret is MiniMax Code's request-signing secret.
@@ -2540,7 +2540,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"mmxcode/internal/apikey"
+	"github.com/lingoo12138/mmxcode/internal/apikey"
 )
 
 func openTest(t *testing.T) *Store {
@@ -8740,7 +8740,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 func TestResolveOrder(t *testing.T) {
@@ -9221,7 +9221,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Direct is the value that means "no proxy".
@@ -9624,7 +9624,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 func testClient(t *testing.T) *upstream.Client {
@@ -10946,7 +10946,7 @@ func testClient(t *testing.T) *upstream.Client {
 
 ```
 
-并加 import `"mmxcode/internal/upstream"`。
+并加 import `"github.com/lingoo12138/mmxcode/internal/upstream"`。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -10981,8 +10981,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // DeviceGrant is the grant type of the device flow.
@@ -11590,8 +11590,8 @@ import (
 	"sync"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // ErrRefreshOutcomeUnknown says a refresh may have been spent.
@@ -12094,8 +12094,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 func testClient(t *testing.T) *upstream.Client {
@@ -13039,7 +13039,7 @@ func TestThePlanNumbersMayBeStrings(t *testing.T) {
 }
 ```
 
-测试文件的 import 补上 `"mmxcode/internal/upstream"`，并加助手：
+测试文件的 import 补上 `"github.com/lingoo12138/mmxcode/internal/upstream"`，并加助手：
 
 ```go
 func testClient(t *testing.T) *upstream.Client {
@@ -13082,8 +13082,8 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // modelsTimeout is how long the live model list is waited for.
@@ -14016,9 +14016,9 @@ import (
 	"strings"
 	"time"
 
-	"mmxcode/internal/sign"
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/sign"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // QueryKV is one query parameter for a signed call.
@@ -14520,8 +14520,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // panel makes a seven-day panel, with the given day's status.
@@ -14784,7 +14784,7 @@ func TestUnknownClaimResult(t *testing.T) {
 }
 ```
 
-测试文件的 import 补上 `"mmxcode/internal/account"` 与 `"mmxcode/internal/upstream"`，并加助手：
+测试文件的 import 补上 `"github.com/lingoo12138/mmxcode/internal/account"` 与 `"github.com/lingoo12138/mmxcode/internal/upstream"`，并加助手：
 
 ```go
 func testAccountClient(t *testing.T, srv *httptest.Server) *account.Client {
@@ -14891,9 +14891,9 @@ import (
 	"net/http"
 	"sort"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/site"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // The outcomes.
@@ -15216,7 +15216,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // accountOf gives the entry of one account.
@@ -15529,7 +15529,7 @@ import (
 	"sort"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // The states an account's credits can be in.
@@ -15800,15 +15800,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/provision"
-	"mmxcode/internal/secret"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/provision"
+	"github.com/lingoo12138/mmxcode/internal/secret"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // Execute runs the command line and gives the process its exit code.
@@ -15959,9 +15959,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/site"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 func newLoginCmd(e *env) *cobra.Command {
@@ -16074,8 +16074,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/egress"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 func newAccountsCmd(e *env) *cobra.Command {
@@ -16210,7 +16210,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/checkin"
+	"github.com/lingoo12138/mmxcode/internal/checkin"
 )
 
 func newCheckinCmd(e *env) *cobra.Command {
@@ -16278,7 +16278,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/usage"
+	"github.com/lingoo12138/mmxcode/internal/usage"
 )
 
 func newUsageCmd(e *env) *cobra.Command {
@@ -16347,7 +16347,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/site"
+	"github.com/lingoo12138/mmxcode/internal/site"
 )
 
 func newModelsCmd(e *env) *cobra.Command {
@@ -16740,8 +16740,8 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/config"
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // captureStdout runs fn and gives back what it wrote to the standard
@@ -17155,7 +17155,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestAccountsListKeepsTheProxySecret says the proxy's credentials are
@@ -17272,12 +17272,12 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
 )
 
 // checkinServer is a stand-in for MiniMax: the token endpoint, the
@@ -17482,14 +17482,14 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"mmxcode/internal/account"
-	"mmxcode/internal/config"
-	"mmxcode/internal/egress"
-	"mmxcode/internal/manager"
-	"mmxcode/internal/oauth"
-	"mmxcode/internal/store"
-	"mmxcode/internal/upstream"
-	"mmxcode/internal/webui"
+	"github.com/lingoo12138/mmxcode/internal/account"
+	"github.com/lingoo12138/mmxcode/internal/config"
+	"github.com/lingoo12138/mmxcode/internal/egress"
+	"github.com/lingoo12138/mmxcode/internal/manager"
+	"github.com/lingoo12138/mmxcode/internal/oauth"
+	"github.com/lingoo12138/mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/upstream"
+	"github.com/lingoo12138/mmxcode/internal/webui"
 )
 
 // TestIsLoopback says which listen addresses stay on this machine.

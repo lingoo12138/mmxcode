@@ -26,7 +26,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // Direct is the value that means "no proxy".

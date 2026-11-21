@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"mmxcode/internal/store"
+	"github.com/lingoo12138/mmxcode/internal/store"
 )
 
 // TestAccountsListKeepsTheProxySecret says the proxy's credentials are
