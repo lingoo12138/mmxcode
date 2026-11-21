@@ -1,7 +1,14 @@
 services:
   mmxcode:
     build: .
-    image: mmxcode-gateway:latest
+    # 镜像在 GHCR 上（仓库里的 workflow 推的，linux/amd64 和 linux/arm64
+    # 各一份）：拉得到就用拉来的，拉不到就在本地编。
+    #
+    # pull_policy: missing 是 compose 的默认：本地没有这个镜像就拉；registry
+    # 里也没有（或者拉不到），就按上面的 build 从源码编。不想用 GHCR 的镜像
+    # 就 `docker compose up -d --build`，那个开关强制编。
+    image: ghcr.io/lingoo12138/mmxcode:latest
+    pull_policy: missing
     restart: unless-stopped
     # 停的时候给网关一点时间：它关之前要让在飞的请求和后台的活儿收尾
     # （最多 10 秒），断早了那些活儿就写到一半。

@@ -1,0 +1,149 @@
+name: release
+
+# 镜像推到 GHCR，各系统的二进制当 release 的附件。
+#
+# 推 master：编一遍、推一遍（master 和 latest 两个标签）。
+# 推 v 开头的标签：编一遍、推一遍（v1.2.3 那个标签），并且把各系统的二进
+# 制挂到 GitHub Release 上。
+# 手动触发：默认只编不推，除非把 push 那个开关打开。
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "推到 GHCR 吗"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 镜像：linux/amd64 和 linux/arm64。
+  #
+  # 一份 Dockerfile 编两个架构：服务器上 docker compose pull 就能用，不用
+  # 在服务器上编（那要下 Go 模块）。
+  image:
+    name: 镜像（linux/amd64 + linux/arm64）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 那份要 QEMU 才能在 x86 的机器上编。
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 标签：分支名（master）、版本标签（v1.2.3）、提交的短 hash，
+      # master 上还多一个 latest。
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          # pull_request 不推；手动触发看那个开关；别的（推 master、推标签）
+          # 都推。
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 构建缓存放在 GitHub 上：下一次编同一个架构能省一大截。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 各系统的二进制。
+  #
+  # Go 交叉编很便宜：全都是 CGO_ENABLED=0 的静态程序，所以在 ubuntu 上编
+  # 出来的东西，windows / macos 都能直接跑。
+  binaries:
+    name: 二进制（${{ matrix.os }}-${{ matrix.arch }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: windows
+            arch: amd64
+          - os: windows
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: 编
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+            -o "dist/mmxcode${{ matrix.os == 'windows' && '.exe' || '' }}" ./cmd/mmxcode
+
+      - name: 打个包
+        shell: bash
+        run: |
+          cp config.example.yaml README.md LICENSE dist/
+          cd dist
+          tar -czf "../mmxcode-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mmxcode-${{ matrix.os }}-${{ matrix.arch }}
+          path: mmxcode-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # 版本标签：把上面编好的二进制挂到 GitHub Release 上。
+  release:
+    name: Release
+    needs: [binaries]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 用 GitHub 自带的 gh，不用第三方的 action。
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.tar.gz \
+            --title "${{ github.ref_name }}" --generate-notes

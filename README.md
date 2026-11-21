@@ -489,6 +489,21 @@ Docker）。
 ```bash
 cp .env.example .env
 $EDITOR .env                      # 至少写 MMXCODE_API_KEYS
+docker compose up -d
+```
+
+镜像在 **GHCR** 上（仓库里的 workflow 推的，`linux/amd64` 和 `linux/arm64` 各一
+份）：compose 拉得到就用拉来的，拉不到就在本地编。服务器上要是不想装 Go、
+不想下模块，那就显式拉一下：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+要自己编（改了代码，或者要审一遍镜像里装了什么）：
+
+```bash
 docker compose up -d --build
 ```
 
@@ -505,7 +520,7 @@ curl -s http://127.0.0.1:8080/healthz      # ok
 
 compose 做的事：
 
-- 用仓库里的 Dockerfile 构建，镜像名 `mmxcode-gateway:latest`。
+- 镜像 `ghcr.io/lingoo12138/mmxcode:latest`：拉得到就用拉来的，拉不到就按仓库里的 Dockerfile 编（`build: .` 那一行）。
 - 端口只绑本机：`127.0.0.1:8080:8080`，管理界面不暴露到公网。
 - 挂配置文件：默认挂仓库里的 `config.docker.yaml` 到 `/app/config.yaml`（只读）。要用自己的副本就设 `MMXCODE_CONFIG_FILE=./config.yaml`。
 - 挂数据目录：默认是 Docker 命名卷 `mmxcode-data`，容器里是 `/data`，数据库落在 `/data/mmxcode.db`。
@@ -544,7 +559,8 @@ compose 做的事：
 
 ```bash
 git pull
-docker compose up -d --build
+docker compose pull        # 拉新镜像（自己编的话就是 up -d --build）
+docker compose up -d
 ```
 
 数据库在卷里，升级不动它。
@@ -575,6 +591,11 @@ cp config.example.yaml config.yaml
 
 本机跑的时候 `server.api_keys` 可以一把都没有 —— 它只听本机。没有 key 的
 时候管理页也不用登录。
+
+**不想自己编**：仓库的 workflow 每个版本都会编出各系统的二进制
+（windows、linux、macos，x86_64 和 arm64），挂在 GitHub Release 上，下载即用。
+程序是静态的（`CGO_ENABLED=0`），那个 tar.gz 里是 `mmxcode`（Windows 的是
+`mmxcode.exe`）、`config.example.yaml` 和这个 README。
 
 ### 内存
 
