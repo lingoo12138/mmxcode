@@ -1,6 +1,6 @@
 # mmxcode
 
-MiniMax Code 国际站的多账号网关。
+mmxcode 的网关版本：把客户端接到 MiniMax Code 上 —— Anthropic、OpenAI、Codex 三种协议都接。
 
 ## 做什么
 

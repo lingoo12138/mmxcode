@@ -14402,7 +14402,7 @@ func newRoot() (*cobra.Command, *env) {
 	)
 	root := &cobra.Command{
 		Use:          "mmxcode",
-		Short:        "MiniMax Code 多账号网关",
+		Short:        "mmxcode 的网关版本",
 		SilenceUsage: true,
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", os.Getenv("MMXCODE_CONFIG"), "配置文件路径")
