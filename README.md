@@ -603,19 +603,15 @@ server {
 
 ## magpie 插件
 
-仓库里带一个 magpie 的 provider 插件，在 `packages/mmxcode/`：把 magpie 指到自己的网关上来。
+magpie 的 provider 插件是**另一个库**：
+[lingoo12138/mmxcode-auth](https://github.com/lingoo12138/mmxcode-auth) —— 把
+magpie 指到自己的网关上来。
 
 ```bash
-magpie plugin add github:lingoo12138/mmxcode
+magpie plugin add github:lingoo12138/mmxcode-auth
 ```
 
-magpie 把整个仓库当成一个 npm 包装下来，照着根目录 `package.json` 的 `main` 找到
-`packages/mmxcode/index.mjs`。自己改插件的话，从源码装：
-
-```bash
-git clone https://github.com/lingoo12138/mmxcode.git
-magpie plugin add ./mmxcode/packages/mmxcode
-```
+装的是插件，不含网关 —— 插件要问的就是这个仓库跑起来的那个网关。
 
 装完在 magpie 里签入 `MMXCode 网关`，要答两样东西：
 
@@ -650,7 +646,13 @@ printf 'http://127.0.0.1:8080\n\n\n' | magpie plugin login mmxcode
 ```bash
 go test ./...                                    # 网关、库、命令行
 go test ./internal/convert -run XXX -bench . -benchmem   # 转换的内存账
-node --test packages/mmxcode/index.test.mjs      # magpie 插件
+```
+
+magpie 插件在另一个库（[lingoo12138/mmxcode-auth](https://github.com/lingoo12138/mmxcode-auth)），
+它的测试在那儿跑：
+
+```bash
+node --test index.test.mjs
 ```
 
 仓库里有什么：
@@ -663,7 +665,7 @@ node --test packages/mmxcode/index.test.mjs      # magpie 插件
 | `internal/manager/`、`internal/pool/` | 账号池：挑号、额度、签到 |
 | `internal/rotator/`、`internal/convert/` | 挑哪一个号、协议之间的转换 |
 | `internal/webui/` | 后台页面（账号、额度、出口组、申请 key） |
-| `packages/mmxcode/` | magpie 的 provider 插件（Node） |
+| （另一个库） | magpie 的 provider 插件在 [lingoo12138/mmxcode-auth](https://github.com/lingoo12138/mmxcode-auth) |
 | `docs/superpowers/` | 规格、计划，还有看着「计划跟代码逐字对齐」的脚本 |
 
 ## 协议对齐

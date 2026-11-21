@@ -23,6 +23,5 @@ config.yaml
 /mmxcode.exe~
 /serve.log
 
-# 文档和插件：镜像里用不着
+# 文档：镜像里用不着
 docs/
-packages/
