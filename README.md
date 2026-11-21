@@ -571,10 +571,43 @@ magpie plugin add ./packages/mmxcode
 
 ## 计划
 
-两个计划都已实现：
+规格在 `docs/superpowers/specs/`，计划在 `docs/superpowers/plans/`。做过的都在这儿：
 
-- 计划 A：核心库与 CLI（`docs/superpowers/plans/2026-11-13-mmxcode-core.md`）
-- 计划 B：HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI、Docker 部署（`docs/superpowers/plans/2026-11-13-mmxcode-gateway.md`）
+| 那一块 | 规格和计划 |
+|---|---|
+| 核心库与 CLI | `2026-11-13-mmxcode-core` |
+| HTTP 网关（Anthropic / OpenAI / Codex 三协议）、WebUI | `2026-11-13-mmxcode-gateway` |
+| 批量导入 | `2026-11-14-mmxcode-batch-import` |
+| 后台申请聊天 key | `2026-11-15-mmxcode-console-keys` |
+| 额度只读热账号 | `2026-11-15-mmxcode-hot-usage` |
+| magpie 的额度卡片 | `2026-11-15-mmxcode-magpie-card` |
+| magpie 插件 | `2026-11-15-mmxcode-magpie-plugin`、`2026-11-16-mmxcode-magpie-plugin-polish` |
+| 模型名单带元数据 | `2026-11-15-mmxcode-model-list` |
+| 开放平台的回退 | `2026-11-15-mmxcode-open-platform-fallback` |
+| 账号池 | `2026-11-17-mmxcode-account-pool-staging` |
+| 自动签到 | `2026-11-18-mmxcode-auto-checkin` |
+| 请求少打几次库 | `2026-11-19-mmxcode-request-db-round-trips` |
+| SQLite 的调优（纯 Go） | `2026-11-19-mmxcode-sqlite-tuning` |
+| 上游重试 | `2026-11-19-mmxcode-upstream-retry` |
+| 回包的大小 | `2026-11-21-mmxcode-upstream-body-limit` |
+| 请求体：闸门在读之前，上限 64 MiB | `2026-11-21-mmxcode-request-body-limit` |
+| 身体分两条道 | `2026-11-21-mmxcode-body-lanes` |
+| 一个身体只占一份 | `2026-11-21-mmxcode-body-memory` |
+| 代理出口和出口组 | `2026-11-21-mmxcode-proxy-outlets`、`2026-11-21-mmxcode-proxy-groups` |
+| SQLite 的写锁 | `2026-11-21-mmxcode-sqlite-write-lock` |
+
+计划里的 Go 块跟仓库里的代码逐字对齐 —— `docs/superpowers/tools/` 里的脚本在看着
+这件事（`check_plan_fences.py` 看块里是不是只有 Go，`check_plan_files.py` 看每一段
+声明在仓库里是不是还是那样，`build_*.py` 把 shipped 的代码拼回计划里）。
+
+### 还没验的
+
+- **站点自己的那几个接口**：上游原生支不支持 `/responses` 和 `/chat/completions`
+  （不支持就本地转，转过去再转回来，两条路输出一样）、国际站的积分账本可不可用、
+  `token_plan/remains_percent` 有没有数、WARP 的免费线路在当前网络下通不通 ——
+  这些要拿真的账号量才知道。回退的路都写着，量出来的结果记在
+  `docs/superpowers/specs/2026-11-13-mmxcode-gateway-design.md` §19。
+- **容器**：Docker 那套没在这台机器上试过。
 
 ### 不做的
 
