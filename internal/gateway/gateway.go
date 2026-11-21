@@ -536,8 +536,31 @@ func protocolOf(path string) protocol {
 // 个请求就能让网关没有内存可用。
 const maxBodyBytes = 64 << 20
 
+// bodyTooBig says the request body is larger than the gateway takes.
+//
+// 数要报出来：传图片的人被挡下来的时候，得知道那个上限是多少、自己超了
+// 多少，才知道该少传一张还是该改配置。got 是负数的时候是不知道有多大
+// （客户端没说是多大的）。
+func bodyTooBig(limit, got int64) string {
+	if got >= 0 {
+		return fmt.Sprintf("the request body is %d bytes; the gateway takes at most %d bytes (%d MiB)",
+			got, limit, limit>>20)
+	}
+	return fmt.Sprintf("the request body is larger than the %d bytes (%d MiB) the gateway takes",
+		limit, limit>>20)
+}
+
 // handleChat serves a chat request.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
+	// 客户端说了身体有多大（Content-Length）的话，超限的那个请求连读都
+	// 不用读就拒了：读进来是 64 MiB 的内存，而它马上就是一个 413。
+	//
+	// 客户端没说的（分块传的）就不知道有多大 —— 那就还是读，MaxBytesReader
+	// 照旧挡着。
+	if r.ContentLength > maxBodyBytes {
+		writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(maxBodyBytes, r.ContentLength))
+		return
+	}
 	ctx := r.Context()
 	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
 	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
@@ -561,7 +584,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeError(w, proto, http.StatusRequestEntityTooLarge, "the request body is too large")
+			writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(tooBig.Limit, -1))
 			return
 		}
 		writeError(w, proto, http.StatusBadRequest, "the request body could not be read")

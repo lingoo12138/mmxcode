@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -162,6 +163,57 @@ func (c *countedBody) Read(p []byte) (int, error) {
 }
 
 func (c *countedBody) Close() error { return nil }
+
+// TestABodyOverTheLimitIsRefusedWithoutBeingRead says a body that
+// declares itself too big is turned away without being read.
+//
+// 客户端说了身体有多大（Content-Length）：知道了就不用读 —— 读进来是 64
+// MiB 的内存，而它马上就是一个 413。
+func TestABodyOverTheLimitIsRefusedWithoutBeingRead(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	body := &countedBody{Reader: strings.NewReader(`{"model":"m"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
+	req.ContentLength = maxBodyBytes + 1
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413, body = %s", w.Code, w.Body.String())
+	}
+	if body.read != 0 {
+		t.Fatalf("the body was read %d bytes, want 0", body.read)
+	}
+	if h.hits != 0 {
+		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	}
+}
+
+// TestTheTooBigMessageSaysTheLimit says the client is told how big the
+// limit is, and how big it sent.
+//
+// 传图片的人被挡下来的时候，得知道那个上限是多少、自己超了多少，才知道
+// 该少传一张还是该改配置。一句「太大」是什么也没说。
+func TestTheTooBigMessageSaysTheLimit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	body := &countedBody{Reader: strings.NewReader(`{"model":"m"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
+	req.ContentLength = maxBodyBytes + 1
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413, body = %s", w.Code, w.Body.String())
+	}
+	msg := w.Body.String()
+	if !strings.Contains(msg, fmt.Sprintf("%d", maxBodyBytes)) {
+		t.Errorf("the message does not say the limit (%d): %s", maxBodyBytes, msg)
+	}
+	if !strings.Contains(msg, fmt.Sprintf("%d", maxBodyBytes+1)) {
+		t.Errorf("the message does not say how big the body was: %s", msg)
+	}
+}
 
 // TestABodyOverTheLimitIsRefused says a body that is too big is turned
 // away instead of being read into memory.

@@ -18,11 +18,11 @@
 
 | 文件 | 干什么 |
 |---|---|
-| `internal/gateway/gateway.go` | 闸门挪到读身体之前；上限 64 MiB |
-| `internal/gateway/failures_test.go` | 排队的时候身体没被读；上限是 64 MiB；超限被拒 |
+| `internal/gateway/gateway.go` | 闸门挪到读身体之前；上限 64 MiB；超限的请求连读都不用读；413 把那个数报出来 |
+| `internal/gateway/failures_test.go` | 排队的时候身体没被读；上限是 64 MiB；超限被拒；超限的请求一个字节都没读；413 说的是那个数 |
 | `internal/upstream/chat.go` | 往上游发的时候不抄身体 |
 | `internal/upstream/chat_test.go` | 身体原样到了上游；那个抄没抄的基准 |
-| `docs/superpowers/plans/2026-11-13-mmxcode-gateway.md` | 那份老计划里的两段跟着改 |
+| `docs/superpowers/plans/2026-11-13-mmxcode-gateway.md` | 那份老计划里的那个数跟着改 |
 
 ---
 
@@ -106,6 +106,15 @@ go test ./internal/gateway/ -run TestABodyIsNotReadWhileTheGatewayIsBusy -v
 
 ```go
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protocol) {
+	// 客户端说了身体有多大（Content-Length）的话，超限的那个请求连读都
+	// 不用读就拒了：读进来是 64 MiB 的内存，而它马上就是一个 413。
+	//
+	// 客户端没说的（分块传的）就不知道有多大 —— 那就还是读，MaxBytesReader
+	// 照旧挡着。
+	if r.ContentLength > maxBodyBytes {
+		writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(maxBodyBytes, r.ContentLength))
+		return
+	}
 	ctx := r.Context()
 	// 总并发：可用账号的五分之一，小规模至少三个。超了的请求等，等
 	// 不到就 429 带 Retry-After —— 客户端自己超时了，网关不该把它吊
@@ -129,7 +138,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeError(w, proto, http.StatusRequestEntityTooLarge, "the request body is too large")
+			writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(tooBig.Limit, -1))
 			return
 		}
 		writeError(w, proto, http.StatusBadRequest, "the request body could not be read")
@@ -143,6 +152,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, proto protoc
 		defer cancel()
 	}
 ```
+
+（`bodyTooBig` 是 Task 3 里那个。）
 
 （`ctx := r.Context()` 从原来「上游请求的时限」那段挪到最前面 —— 它现在先是闸门的
 上下文，再是上游的。）
@@ -289,7 +300,136 @@ git commit -F .git/commit_msg.txt
 
 ---
 
-### Task 3: 往上游发的时候不抄那一遍
+### Task 3: 超限的请求连读都不用读，413 说的是那个数
+
+**Files:**
+- Modify: `internal/gateway/gateway.go`
+- Modify: `internal/gateway/failures_test.go`
+
+**为什么先看规格 §3 的洞二和 §6 的第 2 条：** 客户端在请求头里说了身体有多大
+（`Content-Length`）。知道了就不用读：读进来是 64 MiB 的内存，而它马上就是一个
+413。分块传的客户端没说 —— 那种还是读，`MaxBytesReader` 照旧挡着。
+
+**413 得说那个数**：传图片的人被挡下来的时候，得知道那个上限是多少、自己超了多
+少，才知道该少传一张还是该改配置。一句「太大」是什么也没说。回包那边那道闸早
+就这么说了（「the upstream's answer is larger than %d bytes」）。
+
+- [ ] **Step 1: 写失败的测试**
+
+`internal/gateway/failures_test.go` —— 加两条（`fmt` 要 import）：
+
+```go
+// TestABodyOverTheLimitIsRefusedWithoutBeingRead says a body that
+// declares itself too big is turned away without being read.
+//
+// 客户端说了身体有多大（Content-Length）：知道了就不用读 —— 读进来是 64
+// MiB 的内存，而它马上就是一个 413。
+func TestABodyOverTheLimitIsRefusedWithoutBeingRead(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	body := &countedBody{Reader: strings.NewReader(`{"model":"m"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
+	req.ContentLength = maxBodyBytes + 1
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413, body = %s", w.Code, w.Body.String())
+	}
+	if body.read != 0 {
+		t.Fatalf("the body was read %d bytes, want 0", body.read)
+	}
+	if h.hits != 0 {
+		t.Fatalf("the upstream was asked %d times, want 0", h.hits)
+	}
+}
+
+// TestTheTooBigMessageSaysTheLimit says the client is told how big the
+// limit is, and how big it sent.
+//
+// 传图片的人被挡下来的时候，得知道那个上限是多少、自己超了多少，才知道
+// 该少传一张还是该改配置。一句「太大」是什么也没说。
+func TestTheTooBigMessageSaysTheLimit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	body := &countedBody{Reader: strings.NewReader(`{"model":"m"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", body)
+	req.ContentLength = maxBodyBytes + 1
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code = %d, want 413, body = %s", w.Code, w.Body.String())
+	}
+	msg := w.Body.String()
+	if !strings.Contains(msg, fmt.Sprintf("%d", maxBodyBytes)) {
+		t.Errorf("the message does not say the limit (%d): %s", maxBodyBytes, msg)
+	}
+	if !strings.Contains(msg, fmt.Sprintf("%d", maxBodyBytes+1)) {
+		t.Errorf("the message does not say how big the body was: %s", msg)
+	}
+}
+```
+
+- [ ] **Step 2: 跑测试，看它失败**
+
+```bash
+go test ./internal/gateway/ -run "TestABodyOverTheLimitIsRefusedWithoutBeingRead|TestTheTooBigMessageSaysTheLimit" -v
+```
+
+失败：答的是 200 —— 没有那道早退，身体读进去了（那 13 个字节是假身体的大小），
+上游被问了一回。
+
+- [ ] **Step 3: 改 `internal/gateway/gateway.go` —— 那个消息**
+
+```go
+// bodyTooBig says the request body is larger than the gateway takes.
+//
+// 数要报出来：传图片的人被挡下来的时候，得知道那个上限是多少、自己超了
+// 多少，才知道该少传一张还是该改配置。got 是负数的时候是不知道有多大
+// （客户端没说是多大的）。
+func bodyTooBig(limit, got int64) string {
+	if got >= 0 {
+		return fmt.Sprintf("the request body is %d bytes; the gateway takes at most %d bytes (%d MiB)",
+			got, limit, limit>>20)
+	}
+	return fmt.Sprintf("the request body is larger than the %d bytes (%d MiB) the gateway takes",
+		limit, limit>>20)
+}
+```
+
+`handleChat` 里那两处 `writeError` 换成它：
+
+```go
+	if r.ContentLength > maxBodyBytes {
+		writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(maxBodyBytes, r.ContentLength))
+		return
+	}
+```
+
+```go
+			writeError(w, proto, http.StatusRequestEntityTooLarge, bodyTooBig(tooBig.Limit, -1))
+```
+
+- [ ] **Step 4: 跑测试，看它过了**
+
+```bash
+gofmt -l .
+go build ./...
+go vet ./...
+go test ./internal/gateway/ -count=1
+```
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add internal/gateway/gateway.go internal/gateway/failures_test.go
+git commit -F .git/commit_msg.txt
+```
+
+---
+
+### Task 4: 往上游发的时候不抄那一遍
 
 **Files:**
 - Modify: `internal/upstream/chat.go`
@@ -429,7 +569,7 @@ git commit -F .git/commit_msg.txt
 
 ---
 
-### Task 4: 那份老计划里那个数跟着改
+### Task 5: 那份老计划里那个数跟着改
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-11-13-mmxcode-gateway.md`
@@ -455,7 +595,7 @@ git commit -F .git/commit_msg.txt
 
 ---
 
-### Task 5: 全查一遍
+### Task 6: 全查一遍
 
 - [ ] **Step 1: 全部的测试**
 
