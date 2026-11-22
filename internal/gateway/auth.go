@@ -307,11 +307,12 @@ const signInHTML = `<!DOCTYPE html>
   --surface: #ffffff;
   --line: #e5e8ee;
   --line-strong: #d0d6df;
+  --line-control: #7f8794;
   --text: #0f1522;
   --text-2: #4c5666;
-  --text-3: #6b7686;
-  --accent: #2f6feb;
-  --accent-hover: #1e5bd8;
+  --text-3: #5f6a7a;
+  --accent: #1f5fd6;
+  --accent-hover: #1a4fb5;
   --accent-ink: #ffffff;
   --bad: #c62f38;
   --bad-soft: #fdecec;
@@ -323,9 +324,10 @@ const signInHTML = `<!DOCTYPE html>
     --surface: #121821;
     --line: #222c38;
     --line-strong: #35414f;
+    --line-control: #687382;
     --text: #e8edf4;
     --text-2: #a5b0be;
-    --text-3: #7b8797;
+    --text-3: #8b97a7;
     --accent: #5b93ff;
     --accent-hover: #7ba6ff;
     --accent-ink: #06101f;
@@ -333,6 +335,39 @@ const signInHTML = `<!DOCTYPE html>
     --bad-soft: #2e1618;
     --shadow: 0 8px 28px -12px rgba(0, 0, 0, .8);
   }
+}
+/* 人自己挑的那个模式说了算：管理页那边也是这么记的。 */
+:root[data-theme="light"] {
+  --bg: #f1f3f7;
+  --surface: #ffffff;
+  --line: #e5e8ee;
+  --line-strong: #d0d6df;
+  --line-control: #7f8794;
+  --text: #0f1522;
+  --text-2: #4c5666;
+  --text-3: #5f6a7a;
+  --accent: #1f5fd6;
+  --accent-hover: #1a4fb5;
+  --accent-ink: #ffffff;
+  --bad: #c62f38;
+  --bad-soft: #fdecec;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px -12px rgba(16, 24, 40, .18);
+}
+:root[data-theme="dark"] {
+  --bg: #0a0e14;
+  --surface: #121821;
+  --line: #222c38;
+  --line-strong: #35414f;
+  --line-control: #687382;
+  --text: #e8edf4;
+  --text-2: #a5b0be;
+  --text-3: #8b97a7;
+  --accent: #5b93ff;
+  --accent-hover: #7ba6ff;
+  --accent-ink: #06101f;
+  --bad: #ff7b72;
+  --bad-soft: #2e1618;
+  --shadow: 0 8px 28px -12px rgba(0, 0, 0, .8);
 }
 * { box-sizing: border-box; }
 body {
@@ -368,9 +403,11 @@ form { display: flex; flex-direction: column; gap: 8px; }
 input {
   font: inherit; font-size: 13px; color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--line-strong); border-radius: 6px; padding: 8px 10px;
+  border: 1px solid var(--line-control); border-radius: 6px; padding: 8px 10px;
 }
-input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgba(47, 111, 235, .16); }
+/* 聚焦的那一圈得看得见：键盘按 Tab 的时候，那道实线告诉人焦点在哪儿。 */
+input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47, 111, 235, .16); }
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button {
   font: inherit; font-size: 13px; font-weight: 600;
   padding: 8px 14px; cursor: pointer;
@@ -383,9 +420,49 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
   margin: 16px 0 0; padding: 9px 11px; border-radius: 4px;
   background: var(--bad-soft); color: var(--bad); font-size: 13px;
 }
+/* 主题按钮：跟管理页上那个是同一件事，同一个记法。 */
+.theme {
+  position: fixed; top: 14px; right: 14px;
+  display: grid; place-items: center;
+  width: 34px; height: 34px; padding: 0;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--text-2); cursor: pointer;
+}
+.theme:hover { border-color: var(--line-strong); color: var(--text); }
+.theme svg { width: 18px; height: 18px; }
 </style>
+<script>
+// 主题得在第一帧之前定下来：不然深色的人会看见一帧白。
+(function () {
+  try {
+    var t = localStorage.getItem('mmxcode-theme');
+    if (t === 'light' || t === 'dark') {
+      document.documentElement.setAttribute('data-theme', t);
+    }
+  } catch (e) {
+    /* 存不下就跟着系统走 */
+  }
+})();
+</script>
 </head>
 <body>
+<button type="button" class="theme" id="theme-toggle" title="换个深浅" aria-label="换个深浅">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <g data-mode="auto">
+      <path d="M9.173 14.83a4 4 0 1 1 5.657 -5.657"/>
+      <path d="M11.294 12.707l.174 .247a7.5 7.5 0 0 0 8.845 2.492a9 9 0 1 1 -14.671 2.914"/>
+      <path d="M3 12h1"/><path d="M12 3v1"/><path d="M5.6 5.6l.7 .7"/><path d="M3 21l18 -18"/>
+    </g>
+    <g data-mode="light" hidden>
+      <path d="M12 12m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0"/>
+      <path d="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7"/>
+    </g>
+    <g data-mode="dark" hidden>
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"/>
+    </g>
+  </svg>
+</button>
 <div class="box">
   <div class="brand"><span class="mark">mx</span>mmxcode</div>
   {{if .HasKeys}}
@@ -402,6 +479,46 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
   <p>这个网关没有配 API key，不用登录。</p>
   {{end}}
 </div>
+<script>
+// 主题：跟管理页上那个是同一件事，同一个记法（跟着系统、浅色、深色）。
+//
+// 图标是 Tabler 的官方路径（MIT），跟管理页那一套是同一份，所以两处摆出
+// 来的是同一个样子。
+(function () {
+  var button = document.getElementById('theme-toggle');
+  if (!button) return;
+  var order = ['', 'light', 'dark'];
+  var names = { '': '跟着系统', light: '浅色', dark: '深色' };
+  var current = '';
+  try {
+    current = localStorage.getItem('mmxcode-theme') || '';
+  } catch (e) {
+    current = '';
+  }
+  if (order.indexOf(current) < 0) current = '';
+  var paint = function () {
+    // 存着的那个值是 ''（跟着系统），图标的分组是 'auto'：对一下。
+    var mode = current === '' ? 'auto' : current;
+    for (var g of button.querySelectorAll('g[data-mode]')) {
+      g.hidden = g.dataset.mode !== mode;
+    }
+    button.title = '主题：' + names[current] + '（按一下换一个）';
+    button.setAttribute('aria-label', '主题：' + names[current]);
+  };
+  paint();
+  button.addEventListener('click', function () {
+    current = order[(order.indexOf(current) + 1) % order.length];
+    try {
+      localStorage.setItem('mmxcode-theme', current);
+    } catch (e) {
+      /* 存不下也就算了 */
+    }
+    if (current) document.documentElement.setAttribute('data-theme', current);
+    else document.documentElement.removeAttribute('data-theme');
+    paint();
+  });
+})();
+</script>
 </body>
 </html>
 `

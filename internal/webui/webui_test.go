@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -411,6 +412,102 @@ func TestAPICheckin(t *testing.T) {
 	w.ServeHTTP(rec, req)
 	if rec.Code == http.StatusNotFound {
 		t.Fatalf("the route is missing")
+	}
+}
+
+// TestNoDataAttributeIsTreatedAsAnAddress says no data attribute has a
+// name Go would take for an address.
+//
+// Go 的 html/template 看见属性名里有 url、src、uri，就把那一条当网址
+// 来转义：换行变成 %0a，socks5 那种地址变成 #ZgotmplZ。data 属性装的是
+// 页面自己的数据，不该受这套规矩管。
+//
+// 属性名里不能有这三个字：data-proxy、data-group-list 这样就没事。
+func TestNoDataAttributeIsTreatedAsAnAddress(t *testing.T) {
+	entries, err := templateFS.ReadDir("templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Go 去掉 data- 之后，名字里带 url、src、uri 的就按网址算。
+	suspect := regexp.MustCompile(`(?i)(url|src|uri)`)
+	attr := regexp.MustCompile(`data-[a-zA-Z0-9_-]+`)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		body, err := templateFS.ReadFile("templates/" + e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range attr.FindAllString(string(body), -1) {
+			name := strings.TrimPrefix(m, "data-")
+			if suspect.MatchString(name) {
+				t.Errorf("%s: the attribute %q is treated as an address by html/template",
+					e.Name(), m)
+			}
+		}
+	}
+}
+
+// TestTheEgressPageKeepsEveryAddressOfAGroup says the addresses of a group
+// reach the browser one by one.
+//
+// 组里的地址要整个儿装进一个属性里，一行一个。Go 的 html/template 看见
+// 属性名里有 url、src、uri，就当那是网址：换行被换成 %0a，socks5 那种
+// 地址直接被换成 #ZgotmplZ。两条都坏掉，存回去就存成了别的东西。
+func TestTheEgressPageKeepsEveryAddressOfAGroup(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	rec := w.do(t, http.MethodPost, "/api/proxy-groups",
+		`{"name":"clash","urls":["http://127.0.0.1:7890","socks5h://127.0.0.1:7891"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/egress", nil)
+	rec = httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// 这两条都得原样在页面上：少了谁，存回去就少了谁。
+	for _, u := range []string{"http://127.0.0.1:7890", "socks5h://127.0.0.1:7891"} {
+		if !strings.Contains(body, u) {
+			t.Errorf("the address %q is not on the page: %s", u, body)
+		}
+	}
+	// %0a 是换行被当成网址编码过的样子：它在，地址就是粘在一起的。
+	if strings.Contains(body, "%0a") {
+		t.Errorf("the addresses were joined into one line: %s", body)
+	}
+	// #ZgotmplZ 是 Go 说「这个地址我不给」的地方。
+	if strings.Contains(body, "ZgotmplZ") {
+		t.Errorf("an address was refused: %s", body)
+	}
+}
+
+// TestTheAccountsPageKeepsItsOwnAddress says the address of an account
+// reaches the browser as it is.
+//
+// 账号自己那条地址也是塞进属性的。属性名带 url 的话，socks5 那种地址
+// 会被换成 #ZgotmplZ —— 人看着是一串乱码，存回去就把真的地址弄没了。
+func TestTheAccountsPageKeepsItsOwnAddress(t *testing.T) {
+	w, s := newTestWebUI(t)
+	if err := s.SetAccountOutlet(context.Background(), "acc_01",
+		"socks5h://10.0.0.6:1080", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "socks5h://10.0.0.6:1080") {
+		t.Errorf("the address is not on the page: %s", body)
+	}
+	if strings.Contains(body, "ZgotmplZ") {
+		t.Errorf("the address was refused: %s", body)
 	}
 }
 

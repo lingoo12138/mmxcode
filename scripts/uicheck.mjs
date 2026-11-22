@@ -87,7 +87,7 @@ out.chips = await evaluate('document.querySelectorAll("#status-chips .chip").len
 if (out.rows) {
   await evaluate(`(() => {
     const box = document.getElementById('account-filter')
-    box.value = 'user03'
+    box.value = '备用'
     box.dispatchEvent(new Event('input'))
     return true
   })()`)
@@ -131,7 +131,8 @@ if (out.rows) {
   out.sorted = await evaluate('document.querySelector("th.sortable.num").dataset.sort || ""')
   out.firstRemaining = await evaluate(`(() => {
     const row = document.querySelector('tr[data-row]')
-    const cell = row ? row.cells[4] : null
+    // 第 3 格是积分（0 勾选、1 账号、2 状态、3 积分）。
+    const cell = row ? row.cells[3] : null
     return cell ? (cell.dataset.sort || '') : ''
   })()`)
 }
@@ -160,16 +161,23 @@ out.drawerFields = await evaluate('document.querySelectorAll(".drawer .kv dt").l
 await key('Escape', 'Escape', 27)
 out.drawerClosed = await evaluate('!document.querySelector(".drawer")')
 
-// 右下角那句话。
+// 出口那一格：改一下，下拉框得把话说出来。
 if (out.rows) {
   await evaluate(`(() => {
+    const row = document.querySelector('tr[data-row]')
+    if (row) row.click()
+    return true
+  })()`)
+  await sleep(300)
+  await evaluate(`(() => {
     const sel = document.querySelector('select[data-field="proxy_group"]')
-    sel.dispatchEvent(new Event('change', { bubbles: true }))
+    if (sel) sel.dispatchEvent(new Event('change', { bubbles: true }))
     return true
   })()`)
   await sleep(600)
   out.toast = await evaluate('document.getElementById("status").textContent')
   out.toastVisible = await evaluate('getComputedStyle(document.getElementById("status")).opacity')
+  await key('Escape', 'Escape', 27)
 }
 
 // 主题：按一下换深浅。

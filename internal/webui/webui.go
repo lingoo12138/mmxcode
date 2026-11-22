@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -101,7 +102,10 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 	// Only the layout is parsed here. Every page defines "content",
 	// and one set of templates for all of them would keep only the
 	// last page's content, so every page would render the last one.
-	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num, "statusName": statusName}).ParseFS(templateFS, "templates/layout.html"))
+	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{
+		"num": num, "statusName": statusName,
+		"clipMail": clipMail, "host": hostOf,
+	}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
 		Mgr:        mgr,
 		Cfg:        cfg,
@@ -330,19 +334,40 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 		default:
 			errored++
 		}
+		// 额度还剩多少，是那个账号还能用多久的意思。摆成一条量表，
+		// 扫一眼就知道谁快见底了。
+		pct, bar := 0.0, ""
+		if snap.Granted > 0 {
+			pct = snap.Remaining / snap.Granted * 100
+		}
+		switch {
+		case pct <= 0:
+			bar = "bad"
+		case pct < 20:
+			bar = "warn"
+		}
+		model, used, hasWindow := w.windowTop(ctx, a.ID)
 		out = append(out, map[string]any{
 			"ID":            a.ID,
 			"Name":          a.Name,
 			"Email":         a.Email,
 			"Status":        a.Status,
+			// 排序按人的看法来：正常的在前面，然后是签出的，最后是
+			// 出错的。排反了就是坏的在前（点一下就反过来）。
+			"StatusRank": statusRank(a.Status),
 			"ProxyURL":      egress.Redacted(a.ProxyURL),
 			"ProxyGroup":    a.ProxyGroup,
 			"HasAmounts":    snap.HasAmounts,
 			"Granted":       snap.Granted,
 			"Remaining":     snap.Remaining,
+			"Pct":           pct,
+			"Bar":           bar,
 			"Plan":          snap.Plan,
 			"WindowsError":  snap.WindowsError,
 			"WindowSummary": w.windowSummary(ctx, a.ID),
+			"WindowModel":   model,
+			"WindowUsed":    used,
+			"HasWindow":     hasWindow,
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
 			// 账号在 error 或者 signed_out 的时候，光有状态是没用的：
@@ -510,6 +535,77 @@ func (w *WebUI) windowSummary(ctx context.Context, accountID string) string {
 	return strings.Join(parts, " · ")
 }
 
+// windowTop gives the window that is closest to running out.
+//
+// 表里只摆一个：用的最多的那个。摆全了就得三行，行高就不齐了。
+func (w *WebUI) windowTop(ctx context.Context, accountID string) (string, float64, bool) {
+	ws, err := w.Mgr.LatestWindows(ctx, accountID)
+	if err != nil || len(ws) == 0 {
+		return "", 0, false
+	}
+	top := ws[0]
+	for _, x := range ws[1:] {
+		if x.Used > top.Used {
+			top = x
+		}
+	}
+	return top.ModelName, top.Used, true
+}
+
+// statusRank says how bad a status is, for sorting.
+//
+// 排的时候要按人的看法来：正常的在前面，然后是签出去的，最后是出错
+// 的。排反了（点第二下）就是坏的在前。
+func statusRank(status string) int {
+	switch status {
+	case store.StatusActive:
+		return 0
+	case store.StatusSignedOut:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// clipMail shortens an email from the front.
+//
+// 域名那一头说明这个号是哪一家的，那是该留住的部分；前面那一截省下来。
+func clipMail(s string) string {
+	r := []rune(s)
+	if len(r) <= 26 {
+		return s
+	}
+	return "…" + string(r[len(r)-25:])
+}
+
+// hostOf gives the host of an address, with the port.
+//
+// 「direct」那种不是地址的，原样还回去。
+func hostOf(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	return u.Host
+}
+
+// jsonList turns a list of strings into one JSON array.
+//
+// 组里的地址要整个儿塞进一个属性里。用换行连起来是不行的：Go 的
+// html/template 看见属性名里有 url，就当那是网址，把换行变成 %0a，
+// 一行一个的地址就粘成了一条。所以这里给一个 JSON 数组，
+// 属性名也避开 url、src、uri 这几个字。
+func jsonList(items []string) string {
+	b, err := json.Marshal(items)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
 // todayCheckin says whether the account has checked in today.
 func (w *WebUI) todayCheckin(ctx context.Context, accountID string) (bool, int) {
 	day := store.DayKey(time.Now())
@@ -577,7 +673,7 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 			"Name":   g.Name,
 			"Global": g.Name == store.GlobalGroup,
 			"Count":  len(g.URLs),
-			"Text":   strings.Join(text, "\n"),
+			"List":   jsonList(text),
 		})
 	}
 	out, err := w.egressRows(ctx)

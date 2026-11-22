@@ -2,37 +2,42 @@
 <div class="page-head">
   <p class="lead">网关后面站着的每一个账号。出口、签到、积分都在这一页上改。</p>
   <div class="page-actions">
-    <a class="btn" href="/import"><svg class="ic ic-sm"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
-    <a class="btn primary" href="/login"><svg class="ic ic-sm"><use href="/static/icons.svg#login"/></svg><span>登录新账号</span></a>
+    <a class="btn" href="/import"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
+    <a class="btn primary" href="/login"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>登录新账号</span></a>
   </div>
 </div>
 
 <div class="toolbar">
   <div class="search grow">
-    <svg class="ic ic-sm"><use href="/static/icons.svg#search"/></svg>
-    <input id="account-filter" type="search" placeholder="筛账号：邮箱、标签、ID 都行" autocomplete="off">
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#search"/></svg>
+    <input id="account-filter" type="search" placeholder="筛账号：邮箱、标签、ID 都行" autocomplete="off"
+           aria-label="筛账号：邮箱、标签、ID 都行">
   </div>
-  <span class="muted" id="account-count"></span>
+  <span class="muted" id="account-count" role="status" aria-live="polite"></span>
   <div class="chips" id="status-chips">
-    <button type="button" class="chip is-on" data-status="">全部 <span class="n">{{.TotalCount}}</span></button>
-    <button type="button" class="chip" data-status="active">正常 <span class="n">{{.ActiveCount}}</span></button>
-    <button type="button" class="chip" data-status="signed_out">已登出 <span class="n">{{.SignedOutCount}}</span></button>
-    <button type="button" class="chip" data-status="error">出错 <span class="n">{{.ErrorCount}}</span></button>
+    <button type="button" class="chip is-on" data-status="" aria-pressed="true">全部 <span class="n">{{.TotalCount}}</span></button>
+    <button type="button" class="chip" data-status="active" aria-pressed="false">正常 <span class="n">{{.ActiveCount}}</span></button>
+    <button type="button" class="chip" data-status="signed_out" aria-pressed="false">已登出 <span class="n">{{.SignedOutCount}}</span></button>
+    <button type="button" class="chip" data-status="error" aria-pressed="false">出错 <span class="n">{{.ErrorCount}}</span></button>
   </div>
 </div>
 
 <div class="table-wrap">
-<table>
+<table class="acc-table" data-groups="{{range $i, $g := .Groups}}{{if $i}},{{end}}{{$g.Name}}{{end}}">
+<caption class="sr-only">账号清单，一共 {{.TotalCount}} 个账号</caption>
+<colgroup>
+  <col class="c-pick"><col class="c-acc"><col class="c-status"><col class="c-cr">
+  <col class="c-plan"><col class="c-out"><col class="c-ck"><col class="c-act">
+</colgroup>
 <thead><tr>
-  <th class="pick"><input type="checkbox" id="pick-all" aria-label="全选"></th>
-  <th class="sortable" data-col="1">标签<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
-  <th class="sortable" data-col="2">邮箱<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
-  <th class="sortable" data-col="3">状态<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
-  <th class="sortable num" data-col="4">积分<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
-  <th class="sortable" data-col="5">套餐<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
-  <th>出口</th>
-  <th>今日签到</th>
-  <th></th>
+  <th scope="col" class="pick"><input type="checkbox" id="pick-all" aria-label="全选（筛出来的那些）"></th>
+  <th scope="col" class="sortable" data-col="1" tabindex="0" aria-sort="none">账号<span class="sort"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th scope="col" class="sortable" data-col="2" tabindex="0" aria-sort="none">状态<span class="sort"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th scope="col" class="sortable num" data-col="3" tabindex="0" aria-sort="none">积分<span class="sort"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th scope="col" class="sortable" data-col="4" tabindex="0" aria-sort="none">套餐<span class="sort"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th scope="col">出口</th>
+  <th scope="col">今日签到</th>
+  <th scope="col"><span class="sr-only">操作</span></th>
 </tr></thead>
 <tbody>
 {{range $acc := .Accounts}}
@@ -40,34 +45,32 @@
     data-name="{{$acc.Name}}" data-email="{{$acc.Email}}" data-plan="{{$acc.Plan}}"
     data-window="{{$acc.WindowSummary}}" data-error="{{$acc.LastError}}"
     data-has-amounts="{{$acc.HasAmounts}}" data-remaining="{{$acc.Remaining}}"
-    data-granted="{{$acc.Granted}}" data-group="{{$acc.ProxyGroup}}" data-url="{{$acc.ProxyURL}}"
+    data-granted="{{$acc.Granted}}" data-group="{{$acc.ProxyGroup}}" data-proxy="{{$acc.ProxyURL}}"
     data-checked="{{$acc.CheckedIn}}" data-streak="{{$acc.Streak}}">
-  <td class="pick"><input type="checkbox" class="pick-row" data-id="{{$acc.ID}}" aria-label="选 {{$acc.Name}}"></td>
-  <td class="nowrap" data-sort="{{$acc.Name}}">{{$acc.Name}}<div class="sub mono">{{$acc.ID}}</div></td>
-  <td class="nowrap" data-sort="{{$acc.Email}}">{{if $acc.Email}}{{$acc.Email}}{{else}}<span class="muted">没有邮箱</span>{{end}}</td>
-  <td data-sort="{{$acc.Status}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">已登出</span>{{else}}<span class="pill bad">{{statusName $acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err two" title="{{$acc.LastError}}">{{$acc.LastError}}</div>{{end}}</td>
-  <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}{{printf "%.2f" $acc.Remaining}} / {{printf "%.2f" $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
-  <td data-sort="{{$acc.Plan}}">{{if $acc.Plan}}{{$acc.Plan}}{{else}}<span class="muted">未知</span>{{end}}{{if $acc.WindowSummary}}<div class="sub">{{$acc.WindowSummary}}</div>{{end}}</td>
-  <td>
-    <div class="outlet">
-      <select data-account="{{$acc.ID}}" data-field="proxy_group" aria-label="出口组">
-        <option value="">跟随全局</option>
-        {{range $.Groups}}<option value="{{.Name}}"{{if eq .Name $acc.ProxyGroup}} selected{{end}}>{{.Name}}</option>{{end}}
-      </select>
-      <input placeholder="单独地址（空 = 跟随全局）" data-account="{{$acc.ID}}" data-field="proxy_url" value="{{$acc.ProxyURL}}">
-    </div>
+  <td class="pick"><input type="checkbox" class="pick-row" data-id="{{$acc.ID}}" aria-label="选 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}}"></td>
+  <td class="acct">
+    <button type="button" class="row-open" data-open="{{$acc.ID}}" title="{{$acc.Name}}">{{if $acc.Name}}{{$acc.Name}}{{else}}未命名{{end}}</button>
+    <span class="sub clip" title="{{$acc.Email}}">{{if $acc.Email}}{{clipMail $acc.Email}}{{else}}没有邮箱{{end}}</span>
   </td>
-  <td class="nowrap">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
+  <td class="nowrap" data-sort="{{$acc.StatusRank}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">已登出</span>{{else}}<span class="pill bad">{{statusName $acc.Status}}</span>{{end}}</td>
+  <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}<span class="nowrap">{{printf "%.2f" $acc.Remaining}} / {{printf "%.0f" $acc.Granted}}</span><span class="meter"><span class="{{$acc.Bar}}" style="width: {{printf "%.1f" $acc.Pct}}%"></span></span><span class="sub">{{printf "%.0f" $acc.Pct}}% 还剩</span>{{else}}<span class="warn">读不到</span>{{end}}</td>
+  <td class="nowrap" data-sort="{{$acc.Plan}}">{{if $acc.Plan}}{{$acc.Plan}}{{else if $acc.WindowModel}}{{$acc.WindowModel}}{{else}}<span class="muted">未知</span>{{end}}{{if $acc.HasWindow}}<span class="sub clip" title="{{$acc.WindowModel}} 已用 {{printf "%.0f" $acc.WindowUsed}}%">已用 {{printf "%.0f" $acc.WindowUsed}}%</span>{{end}}</td>
+  <td class="nowrap" data-outlet="1" data-sort="{{$acc.ProxyGroup}}">{{if $acc.ProxyGroup}}{{$acc.ProxyGroup}}{{else if $acc.ProxyURL}}<span class="mono clip" title="{{$acc.ProxyURL}}">{{host $acc.ProxyURL}}</span>{{else}}<span class="muted">跟随全局</span>{{end}}</td>
+  <td class="nowrap" data-checked-cell="1">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
   <td class="nowrap"><button class="small" data-checkin="{{$acc.ID}}">立即签到</button></td>
 </tr>
+{{if $acc.LastError}}
+<tr class="err-row" data-owner="{{$acc.ID}}"><td colspan="8" class="err-band" title="{{$acc.LastError}}"><span class="who">{{statusName $acc.Status}}</span>{{$acc.LastError}}</td></tr>
 {{end}}
-{{if not .Accounts}}<tr><td class="empty" colspan="9">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}
+{{end}}
+{{if not .Accounts}}<tr><td class="empty" colspan="8">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}
+<tr id="no-rows" hidden><td class="empty" colspan="8">没有符合的账号。换个词试试，或者把上面的药丸点回「全部」。</td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="bulkbar" id="bulkbar" hidden>
-  <span class="n">选了 <span id="bulk-count">0</span> 个</span>
+  <span class="n">选了 <span id="bulk-count" aria-live="polite">0</span> 个</span>
   <span class="spacer"></span>
   <button type="button" class="small" id="bulk-checkin">批量签到</button>
   <button type="button" class="small" id="bulk-group">批量设出口组</button>

@@ -29,3 +29,6 @@ __pycache__/
 
 # 发布包
 dist/
+
+# 预览用的临时服务（不进版本库）
+/cmd/previewtmp/

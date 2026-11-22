@@ -29,26 +29,26 @@
     <nav class="side-nav">
       <p class="side-group">看情况</p>
       <a href="/"{{if eq .Nav "overview"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#layout-dashboard"/></svg><span>概览</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#layout-dashboard"/></svg><span>概览</span></a>
       <a href="/accounts"{{if eq .Nav "accounts"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#users"/></svg><span>账号</span><span class="side-count">{{.AccountCount}}</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#users"/></svg><span>账号</span><span class="side-count">{{.AccountCount}}</span></a>
       <a href="/usage"{{if eq .Nav "usage"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#chart-bar"/></svg><span>用量</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#chart-bar"/></svg><span>用量</span></a>
       <a href="/egress"{{if eq .Nav "egress"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#world"/></svg><span>出口</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#world"/></svg><span>出口</span></a>
       <p class="side-group">动手</p>
       <a href="/keys"{{if eq .Nav "keys"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#key"/></svg><span>密钥</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#key"/></svg><span>密钥</span></a>
       <a href="/login"{{if eq .Nav "login"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#login"/></svg><span>登录</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>登录</span></a>
       <a href="/import"{{if eq .Nav "import"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
       <a href="/relogin"{{if eq .Nav "relogin"}} class="is-current"{{end}}>
-        <svg class="ic"><use href="/static/icons.svg#refresh"/></svg><span>重登</span></a>
+        <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>重登</span></a>
     </nav>
     <div class="side-foot">
       <div class="row">
-        <svg class="ic ic-sm"><use href="/static/icons.svg#plug"/></svg>
+        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plug"/></svg>
         <span>网关在跑</span>
       </div>
     </div>
@@ -58,10 +58,10 @@
       <div class="crumb"><h1>{{.Title}}</h1></div>
       <div class="topbar-end">
         <button type="button" id="theme-toggle" class="icon" title="换个深浅" aria-label="换个深浅">
-          <svg class="ic" id="theme-icon"><use href="/static/icons.svg#sun-moon"/></svg>
+          <svg class="ic" id="theme-icon" aria-hidden="true"><use href="/static/icons.svg#sun-moon"/></svg>
         </button>
         {{if .HasKeys}}<a href="/signin" id="sign-out" class="nav-signout">
-          <svg class="ic ic-sm"><use href="/static/icons.svg#logout"/></svg><span>退出</span></a>{{end}}
+          <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#logout"/></svg><span>退出</span></a>{{end}}
       </div>
     </header>
     <main class="page" id="main">

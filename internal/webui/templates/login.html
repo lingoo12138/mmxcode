@@ -5,14 +5,14 @@
 
 {{if .Pending}}
 <div class="notice">
-  <h3>还差一步</h3>
+  <h2>还差一步</h2>
   <p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
      <a href="{{.Pending.URL}}" target="_blank" rel="noopener">这个页面</a>。</p>
 </div>
 {{else}}
 <div class="toolbar">
   <button id="start-login" type="button" class="primary icon">
-    <svg class="ic ic-sm"><use href="/static/icons.svg#login"/></svg><span>开始登录</span></button>
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>开始登录</span></button>
   <span class="muted">浏览器会给你一个验证码，填到站点上就成了。</span>
 </div>
 {{end}}

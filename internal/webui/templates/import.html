@@ -9,12 +9,12 @@
 <div class="grid-2">
   <section class="panel">
     <div class="panel-head">
-      <svg class="ic ic-sm"><use href="/static/icons.svg#upload"/></svg>
-      <h3>上传文件</h3>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg>
+      <h2>上传文件</h2>
     </div>
     <div class="panel-body">
       <form id="import-form" enctype="multipart/form-data" class="toolbar">
-        <input class="grow" type="file" name="file" accept=".txt" required>
+        <input class="grow" type="file" name="file" accept=".txt" required aria-label="上传文件">
         <button type="submit" class="primary">开始</button>
       </form>
       <p class="note">不想让明文密码走网络的话，在服务器上跑 <code>mmxcode import --file accounts.txt</code> 也一样。</p>
@@ -23,14 +23,14 @@
 
   <section class="panel">
     <div class="panel-head">
-      <svg class="ic ic-sm"><use href="/static/icons.svg#upload"/></svg>
-      <h3>或者直接贴清单</h3>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg>
+      <h2>或者直接贴清单</h2>
       <span class="spacer"></span>
       <span class="muted" id="import-text-count">0 行</span>
     </div>
     <div class="panel-body">
       <form id="import-text-form">
-        <textarea id="import-text" rows="8"
+        <textarea id="import-text" rows="8" aria-label="直接贴清单"
           placeholder="a@example.com|pw&#10;b@example.com|pw"></textarea>
         <p class="note">最多 {{.TextLines}} 行。</p>
         <button type="submit" id="import-text-button" class="primary">开始</button>
@@ -43,7 +43,8 @@
 
 <div class="table-wrap" id="import-results" hidden>
 <table>
-<thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+<caption class="sr-only">这一次导入的结果</caption>
+<thead><tr><th scope="col">账号</th><th scope="col">结果</th><th scope="col">说明</th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -53,7 +54,8 @@
   <h2>最近的导入</h2>
   <div class="table-wrap">
   <table>
-    <thead><tr><th>时间</th><th>来源</th><th class="num">成功</th><th class="num">失败</th><th>说明</th></tr></thead>
+    <caption class="sr-only">最近的导入</caption>
+    <thead><tr><th scope="col">时间</th><th scope="col">来源</th><th scope="col" class="num">成功</th><th scope="col" class="num">失败</th><th scope="col">说明</th></tr></thead>
     <tbody>
       {{range .Runs}}
       <tr>

@@ -4,19 +4,20 @@
   <div class="page-actions">
     <span class="muted" id="relogin-status"></span>
     <button id="relogin-all" type="button" class="primary icon">
-      <svg class="ic ic-sm"><use href="/static/icons.svg#refresh"/></svg><span>全部重登</span></button>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>全部重登</span></button>
   </div>
 </div>
 
 <div class="table-wrap">
 <table>
-  <thead><tr><th>账号</th><th>邮箱</th><th>上次为什么掉的</th></tr></thead>
+  <caption class="sr-only">签出去的账号，和它们掉线的原因</caption>
+  <thead><tr><th scope="col">账号</th><th scope="col">邮箱</th><th scope="col">上次为什么掉的</th></tr></thead>
   <tbody>
     {{range .SignedOut}}
     <tr>
       <td class="nowrap">{{.Name}}</td>
       <td>{{.Email}}</td>
-      <td class="err">{{.Error}}</td>
+      <td><div class="err">{{.Error}}</div></td>
     </tr>
     {{end}}
     {{if not .SignedOut}}<tr><td class="empty" colspan="3">没有签出去的账号。</td></tr>{{end}}

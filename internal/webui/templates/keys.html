@@ -4,23 +4,28 @@
 </div>
 
 <form id="key-form" class="toolbar">
-  <input class="grow" id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）" autocomplete="off">
+  <input class="grow" id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）" autocomplete="off"
+         aria-label="这把 key 给谁用（比如：我的笔记本）">
   <button type="submit" class="primary icon">
-    <svg class="ic ic-sm"><use href="/static/icons.svg#plus"/></svg><span>申请一把</span></button>
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plus"/></svg><span>申请一把</span></button>
   <span class="muted" id="key-status"></span>
 </form>
 
-<div id="key-new" class="notice" hidden>
-  <h3>这一把 key 就是它了，抄走收好</h3>
+<div id="key-new" class="notice ok" hidden>
+  <h2>这一把 key 就是它了，抄走收好</h2>
   <p>页面一刷新它就没了。库里只留着它的哈希，谁都拿不回原文。</p>
   <code class="key-plain" id="key-plain"></code>
   <button type="button" id="key-copy" class="icon">
-    <svg class="ic ic-sm"><use href="/static/icons.svg#copy"/></svg><span>复制</span></button>
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#copy"/></svg><span>复制</span></button>
 </div>
 
 <div class="table-wrap">
-<table>
-<thead><tr><th>名字</th><th>开头</th><th>申请时间</th><th>状态</th><th></th></tr></thead>
+<table class="keys-table">
+<caption class="sr-only">聊天用的 key</caption>
+<colgroup>
+  <col class="k-name"><col class="k-prefix"><col class="k-time"><col class="k-state"><col class="k-act">
+</colgroup>
+<thead><tr><th scope="col">名字</th><th scope="col">开头</th><th scope="col">申请时间</th><th scope="col">状态</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
 <tbody id="key-rows">
 {{range .Keys}}
 <tr>
@@ -28,7 +33,7 @@
   <td class="mono">{{.Prefix}}</td>
   <td class="muted nowrap">{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
   <td>{{if .Revoked}}<span class="pill">已撤销</span>{{else}}<span class="pill good">能用</span>{{end}}</td>
-  <td>{{if not .Revoked}}<button type="button" class="small danger" data-revoke="{{.ID}}">撤销</button>{{end}}</td>
+  <td>{{if not .Revoked}}<button type="button" class="small danger" data-revoke="{{.ID}}" data-name="{{.Name}}" aria-label="撤销 {{if .Name}}{{.Name}}{{else}}这把 key{{end}}">撤销</button>{{end}}</td>
 </tr>
 {{end}}
 {{if not .Keys}}<tr><td class="empty" colspan="5">还没有申请过 key。</td></tr>{{end}}

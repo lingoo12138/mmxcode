@@ -75,20 +75,26 @@ function safeURL(raw) {
 
 // busy says how many requests are in the air.
 //
-// 页面顶上那道细线就是它：只要还有一个请求在路上，它就亮着。
+// 页面顶上那道细线就是它：只要还有一个请求在路上，它就亮着。手上那件
+// 事也得说一声：那一行小字写着「正在签到」之类的话。
 let inFlight = 0;
 
-function setBusy(on) {
+function setBusy(on, text) {
   inFlight += on ? 1 : -1;
   if (inFlight < 0) inFlight = 0;
   document.body.classList.toggle('is-busy', inFlight > 0);
+  if (inFlight > 0 && text) {
+    document.body.dataset.busy = text;
+  } else if (inFlight <= 0) {
+    delete document.body.dataset.busy;
+  }
 }
 
 // call asks the gateway something.
 //
 // 页面上的按钮都在等这个回答，所以从发出到答回来，页顶那道线亮着。
-async function call(url, options) {
-  setBusy(true);
+async function call(url, options, busyText) {
+  setBusy(true, busyText);
   try {
     const res = await fetch(url, options);
     return await readAnswer(res);
@@ -97,30 +103,30 @@ async function call(url, options) {
   }
 }
 
-async function post(url, body) {
+async function post(url, body, busyText) {
   const answer = await call(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  }, busyText);
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
   return answer.json;
 }
 
-async function patch(url, body) {
+async function patch(url, body, busyText) {
   const answer = await call(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, busyText);
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
 }
 
 // del 删掉一个东西。
-async function del(url) {
-  const answer = await call(url, { method: 'DELETE' });
+async function del(url, busyText) {
+  const answer = await call(url, { method: 'DELETE' }, busyText);
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
 }
@@ -146,65 +152,102 @@ async function signIn(key) {
 let keyBox = null;
 function askForKey() {
   if (keyBox) return;
-  keyBox = document.createElement('div');
-  keyBox.className = 'card';
-  const panel = document.createElement('div');
-  panel.className = 'card-box';
-  const title = document.createElement('h3');
-  title.textContent = '这个网关要一把 API key';
-  const label = document.createElement('p');
-  label.textContent = '填进去就能继续。';
-  const form = document.createElement('form');
+  const card = makeCard('这个网关要一把 API key', '填进去就能继续。');
+  keyBox = card.box;
   const input = document.createElement('input');
   input.type = 'password';
   input.placeholder = 'API key';
+  input.setAttribute('aria-label', 'API key');
   input.autocomplete = 'current-password';
   const button = document.createElement('button');
   button.type = 'submit';
   button.textContent = '进入';
-  const msg = document.createElement('p');
-  msg.className = 'card-msg';
-  form.append(input, button);
-  panel.append(title, label, form, msg);
-  keyBox.appendChild(panel);
-  form.addEventListener('submit', async (ev) => {
+  card.form.append(input, button);
+  card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
     try {
       await signIn(input.value);
       location.reload();
     } catch (e) {
-      msg.textContent = e.message;
+      card.msg.textContent = e.message;
       button.disabled = false;
     }
   });
-  keyBox.addEventListener('click', (ev) => {
-    if (ev.target === keyBox) closeCard(keyBox);
+  card.open(input);
+}
+
+// makeCard 造一个飘出来的框。
+//
+// 它是个对话框：跟读屏器说得清自己是什么（role、aria-modal、标题），
+// 焦点关在里面按 Tab 跑不出去，关上的时候焦点回到摆它出来的那一下。
+// 三个飘出来的框（要 key、改组、批量换组）都长一个样，所以放在一起造。
+let cardSeq = 0;
+function makeCard(titleText, leadText) {
+  const opener = document.activeElement;
+  const box = document.createElement('div');
+  box.className = 'card';
+  const panel = document.createElement('div');
+  panel.className = 'card-box';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  panel.setAttribute('tabindex', '-1');
+  const title = document.createElement('h3');
+  cardSeq++;
+  title.id = 'card-title-' + cardSeq;
+  title.textContent = titleText;
+  panel.setAttribute('aria-labelledby', title.id);
+  const lead = document.createElement('p');
+  lead.textContent = leadText;
+  const form = document.createElement('form');
+  const msg = document.createElement('p');
+  msg.className = 'card-msg';
+  msg.setAttribute('role', 'status');
+  panel.append(title, lead, form, msg);
+  box.appendChild(panel);
+
+  box.addEventListener('click', (ev) => {
+    if (ev.target === box) closeCard(box);
   });
-  document.body.appendChild(keyBox);
-  input.focus();
+  document.body.appendChild(box);
+
+  return {
+    box: box,
+    panel: panel,
+    form: form,
+    msg: msg,
+    // open 把焦点摆进去：先落在框里的第一个能聚焦的东西上。
+    open: function (first) {
+      const target = first || panel.querySelector('input, select, textarea, button');
+      if (target && target.focus) target.focus();
+    },
+  };
 }
 
 // closeCard 关掉一个飘出来的框。
+//
+// 焦点回到摆它出来的那一下：不然人在一百行表格里就找不着刚才按的是哪
+// 一个了。
 function closeCard(box) {
   if (!box) return;
+  const opener = box._opener;
   box.remove();
   if (box === keyBox) keyBox = null;
+  if (opener && opener.focus && document.contains(opener)) opener.focus();
 }
 
 // Esc 关掉最上面那个框。
+//
+// 飘出来的框压在抽屉上面：先关框，再关抽屉。
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape') return;
-  const drawer = document.querySelector('.drawer');
-  if (drawer) {
-    closeDrawer();
+  const boxes = document.querySelectorAll('.card');
+  if (boxes.length) {
+    closeCard(boxes[boxes.length - 1]);
     return;
   }
-  const boxes = document.querySelectorAll('.card');
-  if (!boxes.length) return;
-  closeCard(boxes[boxes.length - 1]);
+  if (drawerBox) closeDrawer();
 });
-
 // say 在右下角说一句。
 //
 // 说过的话过一会儿自己没了：那是给人看的反馈，不是页面上的一行字。
@@ -220,6 +263,34 @@ function say(text) {
   }, 4000);
 }
 
+// sayAndReload 说一句，然后重新取一页。
+//
+// 页面是服务端渲染的：改完了得重新取一次才是真的样子。可是重新取页面
+// 会把刚才那句话一起冲掉 —— 那句话得先放进 sessionStorage，刷新完了
+// 再摆出来。
+function sayAndReload(text) {
+  say(text);
+  try {
+    sessionStorage.setItem('mmxcode-flash', text);
+  } catch (e) {
+    /* 存不下也就算了 */
+  }
+  location.reload();
+}
+
+// 刷新之后把刚才那句话摆出来。
+(function () {
+  let text = '';
+  try {
+    text = sessionStorage.getItem('mmxcode-flash') || '';
+    sessionStorage.removeItem('mmxcode-flash');
+  } catch (e) {
+    text = '';
+  }
+  if (!text) return;
+  say(text);
+})();
+
 // icon 造一个图标。
 //
 // 图标是 Tabler 的官方路径，摆在 /static/icons.svg 里。颜色跟着
@@ -232,6 +303,37 @@ function icon(name, cls) {
   use.setAttribute('href', '/static/icons.svg#' + name);
   svg.appendChild(use);
   return svg;
+}
+
+// statusNames 是机器认的字和人读的字中间那一层。
+//
+// 表格和抽屉得说同一句话：一个写「出错」，另一个写 error，人会以为是
+// 两回事。
+const statusNames = {
+  active: '正常',
+  signed_out: '已登出',
+  error: '出错',
+};
+
+// outcomeWords 是签到那几种结果人读的话。
+//
+// 网关给的是 claimed、done、ineligible 这些机器字，直接摆到页面上，人
+// 得自己猜。
+function outcomeWords(out) {
+  switch (out && out.outcome) {
+    case 'claimed':
+      return '领到 ' + (out.credit || 0);
+    case 'done':
+      return '今天已经签过了';
+    case 'ineligible':
+      return '这个号不能签';
+    case 'inactive':
+      return '这个号已经不能用了';
+    case 'failed':
+      return (out.message || '签到没成');
+    default:
+      return String((out && out.outcome) || '');
+  }
 }
 
 // ---------------------------------------------------------------- 主题
@@ -258,7 +360,10 @@ function icon(name, cls) {
       const use = glyph.querySelector('use');
       if (use) use.setAttribute('href', '/static/icons.svg#' + marks[current]);
     }
-    button.title = '主题：' + names[current] + '（按一下换一个）';
+    // 现在是哪个模式，得说得出来：图标变了只是一张图，读屏器读不出来。
+    const text = '主题：' + names[current];
+    button.title = text + '（按一下换一个）';
+    button.setAttribute('aria-label', text);
     if (current) document.documentElement.setAttribute('data-theme', current);
     else document.documentElement.removeAttribute('data-theme');
   };
@@ -271,6 +376,8 @@ function icon(name, cls) {
       /* 存不下也就算了 */
     }
     paint();
+    // 换完了说一声：不然按下去页面上什么也没变，人不知道按没按上。
+    say('主题换成' + names[current]);
   });
 })();
 
@@ -285,20 +392,36 @@ function icon(name, cls) {
   if (!box && !chips) return;
   const rows = Array.from(document.querySelectorAll('tr[data-row]'));
   const counter = document.getElementById('account-count');
+  const empty = document.getElementById('no-rows');
   let want = '';
   const apply = () => {
     const q = box ? box.value.trim().toLowerCase() : '';
     let shown = 0;
     for (const row of rows) {
-      const hitText = !q || row.textContent.toLowerCase().indexOf(q) >= 0;
+      // ID 也算：它在抽屉里，表格上不一定看得见，可是人要能拿它筛。
+      const hay = (row.textContent + ' ' + row.dataset.row).toLowerCase();
+      const hitText = !q || hay.indexOf(q) >= 0;
       const status = row.dataset.status;
       const hitStatus = !want ||
         (want === 'error' ? status !== 'active' && status !== 'signed_out' : status === want);
       const hit = hitText && hitStatus;
       row.classList.toggle('is-hidden', !hit);
+      // 藏起来的行，勾也要去掉：它看不见，却还占着「选中了几个」。
+      if (!hit) {
+        for (const b of row.querySelectorAll('.pick-row')) {
+          if (b.checked) {
+            b.checked = false;
+            b.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+      }
+      // 错的那一行是跟着这个号走的：号藏起来了，那一行也得藏起来。
+      const band = bandOf(row);
+      if (band) band.classList.toggle('is-hidden', !hit);
       if (hit) shown++;
     }
     if (counter) counter.textContent = rows.length ? shown + ' / ' + rows.length : '';
+    if (empty) empty.hidden = shown > 0 || !rows.length;
   };
   if (box) box.addEventListener('input', apply);
   if (chips) {
@@ -306,12 +429,27 @@ function icon(name, cls) {
       const chip = ev.target.closest('.chip');
       if (!chip) return;
       want = chip.dataset.status || '';
-      for (const c of chips.querySelectorAll('.chip')) c.classList.toggle('is-on', c === chip);
+      for (const c of chips.querySelectorAll('.chip')) {
+        const on = c === chip;
+        c.classList.toggle('is-on', on);
+        c.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
       apply();
     });
   }
   apply();
 })();
+
+// bandOf finds the error line that belongs to an account row.
+//
+// 错的那一句自己占一行（占了整张表那么宽），它跟账号那一行是一对：排序
+// 的时候得一齐挪，藏起来的时候也得一齐藏。
+function bandOf(row) {
+  if (!row || !row.dataset) return null;
+  const owner = row.dataset.row;
+  if (!owner) return null;
+  return document.querySelector('tr.err-row[data-owner="' + owner + '"]');
+}
 
 // ---------------------------------------------------------------- 排序
 
@@ -326,15 +464,32 @@ function icon(name, cls) {
   const heads = table.querySelectorAll('thead th.sortable');
   if (!body || !heads.length) return;
   for (const th of heads) {
-    th.addEventListener('click', () => {
+    const doSort = () => {
       const col = Number(th.dataset.col);
       // 再点一次是反过来。
       const down = th.dataset.sort !== 'desc';
-      for (const h of heads) delete h.dataset.sort;
+      for (const h of heads) {
+        delete h.dataset.sort;
+        h.setAttribute('aria-sort', 'none');
+      }
       th.dataset.sort = down ? 'asc' : 'desc';
+      th.setAttribute('aria-sort', down ? 'ascending' : 'descending');
       const rows = Array.from(body.querySelectorAll('tr[data-row]'));
       rows.sort((a, b) => compare(cellValue(a, col), cellValue(b, col)) * (down ? 1 : -1));
-      for (const row of rows) body.appendChild(row);
+      for (const row of rows) {
+        body.appendChild(row);
+        // 错的那一行跟着这个号走。
+        const band = bandOf(row);
+        if (band) body.appendChild(band);
+      }
+    };
+    th.addEventListener('click', doSort);
+    // 键盘也得能排：表头是能聚焦的，按回车或者空格就是排一下。
+    th.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        doSort();
+      }
     });
   }
 })();
@@ -367,15 +522,28 @@ function compare(a, b) {
   const bar = document.getElementById('bulkbar');
   const count = document.getElementById('bulk-count');
   if (!all || !bar) return;
-  const boxes = () => Array.from(document.querySelectorAll('.pick-row'));
+  // 只算看得见的那些：筛掉了的行不该被「全选」选上。
+  //
+  // 以前这里是全部的勾选框：筛出一个号，点一下全选，批量删除会把十四条
+  // 一起删了 —— 人看见的只有一个。
+  const boxes = () => Array.from(document.querySelectorAll('.pick-row'))
+    .filter((b) => {
+      const row = b.closest('tr');
+      return row && !row.classList.contains('is-hidden');
+    });
   const paint = () => {
     const picked = boxes().filter((b) => b.checked);
     if (count) count.textContent = String(picked.length);
     bar.hidden = picked.length === 0;
     all.checked = picked.length > 0 && picked.length === boxes().length;
-    for (const b of boxes()) {
+    all.indeterminate = picked.length > 0 && picked.length < boxes().length;
+    for (const b of document.querySelectorAll('.pick-row')) {
       const row = b.closest('tr');
-      if (row) row.classList.toggle('is-picked', b.checked);
+      if (!row) continue;
+      row.classList.toggle('is-picked', b.checked);
+      // 错的那一行也是这个号的一部分：选中了它也得跟着亮。
+      const band = bandOf(row);
+      if (band) band.classList.toggle('is-picked', b.checked);
     }
   };
   const pickedIDs = () => boxes().filter((b) => b.checked).map((b) => b.dataset.id);
@@ -452,25 +620,37 @@ function compare(a, b) {
 
 // askGroup 让人选一个组，给选中的账号换上。
 //
-// 组的名字从页面上那一列下拉框里拿：那一列列的就是库里所有的组。
-function askGroup(ids) {
-  const pick = document.querySelector('select[data-field="proxy_group"]');
-  const names = [];
-  if (pick) {
-    for (const opt of pick.options) {
-      if (opt.value) names.push(opt.value);
-    }
+// 组的名字从表格上那一列读：那一列记着库里所有的组。
+function groupNames() {
+  const table = document.querySelector('.acc-table');
+  if (!table) return [];
+  return (table.dataset.groups || '').split(',').filter(Boolean);
+}
+
+// groupList 把组里的地址读出来，一行一个。
+//
+// 地址在 data-group-list 里，是个 JSON 数组。属性名里不能带 url：
+// Go 的 html/template 看见 url、src、uri 就当那是网址，把换行换成
+// %0a，socks5 那种地址直接换成 #ZgotmplZ。
+function groupList(raw) {
+  if (!raw) return '';
+  let list;
+  try {
+    list = JSON.parse(raw);
+  } catch (e) {
+    return '';
   }
-  const box = document.createElement('div');
-  box.className = 'card';
-  const panel = document.createElement('div');
-  panel.className = 'card-box';
-  const title = document.createElement('h3');
-  title.textContent = '把选中的 ' + ids.length + ' 个账号放进哪个组';
-  const label = document.createElement('p');
-  label.textContent = '选「跟随全局」就是回到全局默认。';
-  const form = document.createElement('form');
+  if (!Array.isArray(list)) return '';
+  return list.join('\n');
+}
+
+function askGroup(ids) {
+  const names = groupNames();
+  const card = makeCard(
+    '把选中的 ' + ids.length + ' 个账号放进哪个组',
+    '选「跟随全局」就是回到全局默认。');
   const select = document.createElement('select');
+  select.setAttribute('aria-label', '出口组');
   const none = document.createElement('option');
   none.value = '';
   none.textContent = '跟随全局';
@@ -484,31 +664,31 @@ function askGroup(ids) {
   const button = document.createElement('button');
   button.type = 'submit';
   button.textContent = '换过去';
-  const msg = document.createElement('p');
-  msg.className = 'card-msg';
-  form.append(select, button);
-  panel.append(title, label, form, msg);
-  box.appendChild(panel);
-  form.addEventListener('submit', async (ev) => {
+  card.form.append(select, button);
+  card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
+    card.msg.textContent = '';
     let ok = 0;
+    const bad = [];
     for (const id of ids) {
       try {
         await patch('/api/accounts/' + encodeURIComponent(id), { proxy_group: select.value });
         ok++;
       } catch (e) {
-        msg.textContent = e.message;
+        bad.push(id + '：' + e.message);
       }
     }
-    closeCard(box);
-    say('换了 ' + ok + ' 个');
-    location.reload();
+    if (bad.length) {
+      // 有没换成的：框不能关。关了，那句「谁没换成、为什么」就没了。
+      card.msg.textContent = '换了 ' + ok + ' 个，' + bad.length + ' 个没换成。' + bad.join('；');
+      button.disabled = false;
+      return;
+    }
+    closeCard(card.box);
+    sayAndReload('换了 ' + ok + ' 个');
   });
-  box.addEventListener('click', (ev) => {
-    if (ev.target === box) closeCard(box);
-  });
-  document.body.appendChild(box);
+  card.open(select);
 }
 
 // ---------------------------------------------------------------- 抽屉
@@ -529,6 +709,9 @@ function askGroup(ids) {
 })();
 
 let drawerBox = null;
+// drawerOpener 是摆出抽屉的那一行：抽屉关上的时候，焦点得回到那儿，
+// 不然人在一百行里就找不着刚才在看哪一行了。
+let drawerOpener = null;
 
 function closeDrawer() {
   if (!drawerBox) return;
@@ -536,11 +719,17 @@ function closeDrawer() {
   const scrim = document.querySelector('.drawer-scrim');
   if (scrim) scrim.remove();
   drawerBox = null;
+  if (drawerOpener) {
+    const opener = drawerOpener;
+    drawerOpener = null;
+    if (opener.focus) opener.focus();
+  }
 }
 
 // openDrawer 摆出那个号的详情。
 function openDrawer(row) {
   closeDrawer();
+  drawerOpener = row;
   const d = row.dataset;
   const scrim = document.createElement('div');
   scrim.className = 'drawer-scrim';
@@ -549,11 +738,15 @@ function openDrawer(row) {
   const box = document.createElement('aside');
   box.className = 'drawer';
   box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  box.setAttribute('tabindex', '-1');
 
   const head = document.createElement('div');
   head.className = 'drawer-head';
   const title = document.createElement('h3');
+  title.id = 'drawer-title';
   title.textContent = d.name || d.email || d.row;
+  box.setAttribute('aria-labelledby', 'drawer-title');
   const spacer = document.createElement('span');
   spacer.className = 'spacer';
   const close = document.createElement('button');
@@ -569,19 +762,18 @@ function openDrawer(row) {
 
   const list = document.createElement('dl');
   list.className = 'kv';
-  const statusText = d.status === 'active' ? '正常'
-    : (d.status === 'signed_out' ? '已登出' : d.status);
+  const statusText = statusNames[d.status] || d.status;
   const left = d.hasAmounts === 'true'
     ? (Number(d.remaining).toFixed(2) + ' / ' + Number(d.granted).toFixed(2))
     : '读不到';
-  const outlet = d.group ? ('组 ' + d.group) : (d.url || '跟随全局');
+  const outlet = d.group ? ('组 ' + d.group) : (d.proxy || '跟随全局');
   const checked = d.checked === 'true' ? ('已签 ' + d.streak + ' 天') : '未签';
   for (const pair of [
     ['账号 ID', d.row],
     ['邮箱', d.email || '没有'],
     ['状态', statusText],
     ['积分', left],
-    ['套餐', d.plan || '不知道'],
+    ['套餐', d.plan || '未知'],
     ['额度窗口', d.window || '没有读到'],
     ['出口', outlet],
     ['今日签到', checked],
@@ -606,7 +798,9 @@ function openDrawer(row) {
   field.className = 'field';
   const nameLabel = document.createElement('label');
   nameLabel.textContent = '标签';
+  nameLabel.htmlFor = 'drawer-name';
   const nameInput = document.createElement('input');
+  nameInput.id = 'drawer-name';
   nameInput.value = d.name || '';
   const save = document.createElement('button');
   save.type = 'button';
@@ -619,9 +813,7 @@ function openDrawer(row) {
       row.dataset.name = nameInput.value;
       const cell = row.querySelector('td[data-sort]');
       if (cell) cell.dataset.sort = nameInput.value;
-      say('已保存');
-      closeDrawer();
-      location.reload();
+      sayAndReload('已保存');
     } catch (e) {
       say('保存失败：' + e.message);
       save.disabled = false;
@@ -633,20 +825,61 @@ function openDrawer(row) {
   field.append(nameLabel, nameRow);
   body.appendChild(field);
 
+  // 出口：组和单独的地址。表里只写着这个号走哪儿，改在这儿改。
+  const outletField = document.createElement('div');
+  outletField.className = 'field';
+  const outletLabel = document.createElement('label');
+  outletLabel.textContent = '出口';
+  outletLabel.htmlFor = 'drawer-group';
+  const outletRow = document.createElement('div');
+  outletRow.className = 'row';
+  const groupSelect = document.createElement('select');
+  groupSelect.id = 'drawer-group';
+  groupSelect.dataset.account = d.row;
+  groupSelect.dataset.field = 'proxy_group';
+  groupSelect.setAttribute('aria-label', '出口组');
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '跟随全局';
+  groupSelect.appendChild(none);
+  for (const n of groupNames()) {
+    const opt = document.createElement('option');
+    opt.value = n;
+    opt.textContent = n;
+    groupSelect.appendChild(opt);
+  }
+  groupSelect.value = d.group || '';
+  const urlInput = document.createElement('input');
+  urlInput.id = 'drawer-url';
+  urlInput.placeholder = '单独地址（空 = 跟随全局）';
+  urlInput.setAttribute('aria-label', '单独地址');
+  urlInput.dataset.account = d.row;
+  urlInput.dataset.field = 'proxy_url';
+  urlInput.value = d.proxy || '';
+  outletRow.append(groupSelect, urlInput);
+  outletField.append(outletLabel, outletRow);
+  body.appendChild(outletField);
+
   const foot = document.createElement('div');
   foot.className = 'drawer-foot';
+  // 抽屉里的话就在抽屉里说：右下角那个飘字被抽屉盖住了，出了错人根本
+  // 看不见。这句话就摆在按钮底下。
+  const footMsg = document.createElement('p');
+  footMsg.className = 'card-msg';
+  footMsg.setAttribute('role', 'status');
   const checkin = document.createElement('button');
   checkin.type = 'button';
   checkin.className = 'primary icon';
   checkin.append(icon('check'), document.createTextNode('立即签到'));
   checkin.addEventListener('click', async () => {
     checkin.disabled = true;
+    footMsg.textContent = '正在签到……';
     try {
-      const out = await post('/api/accounts/' + encodeURIComponent(d.row) + '/checkin');
-      say(out.outcome === 'claimed' ? ('领到 ' + out.credit) : out.outcome);
-      location.reload();
+      const out = await post('/api/accounts/' + encodeURIComponent(d.row) + '/checkin', undefined, '正在签到');
+      footMsg.textContent = outcomeWords(out);
+      sayAndReload(outcomeWords(out));
     } catch (e) {
-      say('失败：' + e.message);
+      footMsg.textContent = '失败：' + e.message;
       checkin.disabled = false;
     }
   });
@@ -656,36 +889,92 @@ function openDrawer(row) {
   remove.append(icon('trash'), document.createTextNode('删掉'));
   remove.addEventListener('click', async () => {
     if (!confirm('删掉这个账号？它的令牌和读数也跟着没了。')) return;
+    remove.disabled = true;
     try {
       await del('/api/accounts/' + encodeURIComponent(d.row));
       row.remove();
       closeDrawer();
-      say('删掉了');
-      location.reload();
+      sayAndReload('删掉了');
     } catch (e) {
-      say('删除失败：' + e.message);
+      footMsg.textContent = '删除失败：' + e.message;
+      remove.disabled = false;
     }
   });
-  foot.append(checkin, remove);
+  foot.append(checkin, remove, footMsg);
 
   box.append(head, body, foot);
   document.body.appendChild(scrim);
   document.body.appendChild(box);
   drawerBox = box;
+  box.focus();
+}
+
+// Tab 不能从浮层里跑出去：抽屉或者飘出来的框开着的时候，后头的表格不该
+// 还能按。
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Tab') return;
+  const layer = topLayer();
+  if (!layer) return;
+  const f = layer.querySelectorAll(
+    'button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])');
+  if (!f.length) return;
+  const first = f[0];
+  const last = f[f.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault();
+    last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault();
+    first.focus();
+  }
+});
+
+// topLayer 是眼下最上面那层浮层：飘出来的框比抽屉高，先关框再关抽屉。
+function topLayer() {
+  const cards = document.querySelectorAll('.card');
+  if (cards.length) return cards[cards.length - 1];
+  return drawerBox;
 }
 
 document.addEventListener('click', async (ev) => {
+  // 账号名是个按钮：按下去就摆出那个号的详情。
+  const opener = ev.target.closest('.row-open');
+  if (opener) {
+    const row = opener.closest('tr[data-row]');
+    if (row) openDrawer(row);
+    return;
+  }
+
   const checkin = ev.target.closest('button[data-checkin]');
   if (checkin) {
     const id = checkin.dataset.checkin;
+    const row = checkin.closest('tr');
     checkin.disabled = true;
     checkin.textContent = '签到中……';
     try {
-      const out = await post(`/api/accounts/${id}/checkin`);
-      checkin.textContent = out.outcome === 'claimed' ? `领到 ${out.credit}` : out.outcome;
+      const out = await post(`/api/accounts/${id}/checkin`, undefined, '正在签到');
+      checkin.textContent = outcomeWords(out);
+      // 签到了就把那一格改过来：不然表格还在说「未签」。
+      const cell = row ? row.querySelector('[data-checked-cell]') : null;
+      if (cell && out.outcome === 'claimed') {
+        cell.textContent = '';
+        const pill = document.createElement('span');
+        pill.className = 'pill good';
+        pill.textContent = '已签 ' + (out.streak || 1) + ' 天';
+        cell.appendChild(pill);
+      }
     } catch (e) {
+      // 失败要说清楚为什么，还得能再按一次。
       checkin.textContent = '失败';
+      checkin.disabled = false;
       checkin.title = String(e.message);
+      const cell = checkin.closest('td');
+      if (cell) {
+        const msg = document.createElement('div');
+        msg.className = 'err';
+        msg.textContent = e.message;
+        cell.appendChild(msg);
+      }
     }
     return;
   }
@@ -694,22 +983,51 @@ document.addEventListener('click', async (ev) => {
   if (egress) {
     // 页面上显示的是去掉凭据的地址，服务器拿它去对上真的那个地址。
     const url = egress.dataset.egress;
+    // 结果写在左边那格「健康」里，按钮自己还是那个按钮：按一下换了形状，
+    // 表格就跳了。
+    const health = egress.closest('td') ? egress.closest('td').previousElementSibling : null;
     egress.disabled = true;
     egress.textContent = '测试中……';
     try {
-      const out = await post('/api/egress/test', { url });
-      egress.textContent = out.ok ? '可用' : '不可用';
-      egress.className = out.ok ? 'good' : 'bad';
+      const out = await post('/api/egress/test', { url }, '正在测出口');
+      if (health) {
+        health.textContent = '';
+        const pill = document.createElement('span');
+        pill.className = 'pill ' + (out.ok ? 'good' : 'bad');
+        pill.textContent = out.ok ? '可用' : '不可用';
+        health.appendChild(pill);
+        if (!out.ok && out.error) {
+          const sub = document.createElement('div');
+          sub.className = 'sub bad';
+          sub.textContent = out.error;
+          health.appendChild(sub);
+        }
+      }
+      egress.textContent = '再测一次';
+      egress.title = out.ok ? '这条地址现在能用' : (out.error || '这条地址用不了');
     } catch (e) {
-      egress.textContent = '失败';
-      egress.className = 'bad';
+      if (health) {
+        health.textContent = '';
+        const pill = document.createElement('span');
+        pill.className = 'pill bad';
+        pill.textContent = '测不了';
+        health.appendChild(pill);
+        const sub = document.createElement('div');
+        sub.className = 'sub bad';
+        sub.textContent = e.message;
+        health.appendChild(sub);
+      }
+      egress.textContent = '再测一次';
+      egress.title = e.message;
+    } finally {
+      egress.disabled = false;
     }
     return;
   }
 
   const groupEdit = ev.target.closest('button[data-group-edit]');
   if (groupEdit) {
-    editGroup(groupEdit.dataset.groupEdit, groupEdit.dataset.groupUrls || '');
+    editGroup(groupEdit.dataset.groupEdit, groupList(groupEdit.dataset.groupList));
     return;
   }
 
@@ -736,12 +1054,17 @@ document.addEventListener('click', async (ev) => {
 
   if (ev.target.id === 'start-login') {
     const box = document.getElementById('login-result');
+    const button = ev.target.closest('#start-login');
+    // 登录要走验证码，可能要等一会儿：按钮锁着，别让人按两遍。
+    if (button) button.disabled = true;
     box.textContent = '请稍候……';
     try {
       const out = await post('/api/accounts');
       // 验证码和地址是上游给的：它们只作为字和地址进页面，不作为
       // 标记。地址还得是 http 或者 https 才配当链接。
       box.textContent = '';
+      // 这一格讲的事变了：不再是「等一下」，而是「成了，去填验证码」。
+      box.className = 'notice ok';
       const code = document.createElement('strong');
       code.textContent = out.user_code;
       const link = document.createElement('a');
@@ -753,7 +1076,9 @@ document.addEventListener('click', async (ev) => {
       box.append('把验证码 ', code, ' 填到 ', link, '。');
       poll(out.id);
     } catch (e) {
+      box.className = 'notice err';
       box.textContent = '失败：' + e.message;
+      if (button) button.disabled = false;
     }
   }
 });
@@ -763,25 +1088,72 @@ document.addEventListener('change', async (ev) => {
   if (!sel) return;
   const body = {};
   body[sel.dataset.field] = sel.value;
+  const row = sel.closest('tr');
+  const account = sel.dataset.account;
   // 地址和组是二选一：选了组，地址框就清掉；填了地址，下拉框就回到空。
   if (sel.dataset.field === 'proxy_group' && sel.value) {
-    const input = document.querySelector(`input[data-account="${sel.dataset.account}"][data-field="proxy_url"]`);
+    const input = document.querySelector(`input[data-account="${account}"][data-field="proxy_url"]`);
     if (input) input.value = '';
   }
   if (sel.dataset.field === 'proxy_url' && sel.value) {
-    const pick = document.querySelector(`select[data-account="${sel.dataset.account}"][data-field="proxy_group"]`);
+    const pick = document.querySelector(`select[data-account="${account}"][data-field="proxy_group"]`);
     if (pick) pick.value = '';
   }
+  // 存不进去的时候，框里的话得退回去：屏幕上不能写着没发生过的事。
+  const restore = () => {
+    const pick = document.querySelector(`select[data-account="${account}"][data-field="proxy_group"]`);
+    const url = document.querySelector(`input[data-account="${account}"][data-field="proxy_url"]`);
+    if (pick) pick.value = (row && row.dataset.group) || '';
+    if (url) url.value = (row && row.dataset.proxy) || '';
+  };
+  sel.disabled = true;
   try {
-    await patch(`/api/accounts/${sel.dataset.account}`, body);
+    await patch(`/api/accounts/${account}`, body, '正在保存');
+    if (row) {
+      if (sel.dataset.field === 'proxy_group') row.dataset.group = sel.value;
+      else row.dataset.proxy = sel.value;
+      const cell = row.querySelector('[data-outlet]');
+      if (cell) {
+        cell.textContent = '';
+        if (sel.dataset.field === 'proxy_group') {
+          if (sel.value) cell.textContent = sel.value;
+          else cell.textContent = '跟随全局';
+        } else if (sel.value) {
+          const span = document.createElement('span');
+          span.className = 'mono clip';
+          span.textContent = sel.value;
+          cell.appendChild(span);
+        } else {
+          cell.textContent = '跟随全局';
+        }
+      }
+    }
     say('已保存');
   } catch (e) {
+    restore();
     say('保存失败：' + e.message);
+  } finally {
+    sel.disabled = false;
   }
 });
 
+// poll 问一次登录走到哪儿了。
+//
+// 等的是人把验证码填到站点上：那是几分钟的事，也可能人填完就忘了。这
+// 个轮询不能永远转下去 —— 等够了就停，把话摆出来，人还能再按一次。
+const pollWait = 10 * 60 * 1000;
+
 function poll(id) {
+  const started = Date.now();
   const timer = setInterval(async () => {
+    if (Date.now() - started > pollWait) {
+      clearInterval(timer);
+      const box = document.getElementById('poll-result');
+      if (box) box.textContent = '等太久了，停了。回上边重新开始登录。';
+      const button = document.getElementById('start-login');
+      if (button) button.disabled = false;
+      return;
+    }
     try {
       const out = await post(`/api/accounts/poll`, { id });
       const box = document.getElementById('poll-result');
@@ -792,6 +1164,8 @@ function poll(id) {
       } else if (out.error) {
         clearInterval(timer);
         if (box) box.textContent = '失败：' + out.error;
+        const button = document.getElementById('start-login');
+        if (button) button.disabled = false;
       }
     } catch (e) {
       /* 继续等 */
@@ -808,7 +1182,10 @@ document.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const status = document.getElementById('import-status');
   const input = form.querySelector('input[type=file]');
+  const button = form.querySelector('button[type=submit]');
   if (!input || !input.files || !input.files[0]) return;
+  // 这件事要跑好一会儿：按钮得锁住，不然人按两下就导了两遍。
+  lockImport(true);
   status.textContent = '上传中……';
   const data = new FormData();
   data.append('file', input.files[0]);
@@ -819,6 +1196,7 @@ document.addEventListener('submit', async (ev) => {
     watchImport(answer.json.id);
   } catch (e) {
     status.textContent = '失败：' + e.message;
+    lockImport(false);
   }
 });
 
@@ -838,6 +1216,7 @@ document.addEventListener('submit', async (ev) => {
     status.textContent = '失败：这段清单有 ' + lines + ' 行，最多 ' + importTextLimit + ' 行';
     return;
   }
+  lockImport(true);
   status.textContent = '导入中……';
   try {
     const answer = await call('/api/import', {
@@ -849,6 +1228,7 @@ document.addEventListener('submit', async (ev) => {
     watchImport(answer.json.id);
   } catch (e) {
     status.textContent = '失败：' + e.message;
+    lockImport(false);
   }
 });
 
@@ -860,7 +1240,8 @@ document.addEventListener('input', (ev) => {
   const counter = document.getElementById('import-text-count');
   if (counter) counter.textContent = lines + ' 行';
   const button = document.getElementById('import-text-button');
-  if (button) button.disabled = lines > importTextLimit;
+  // 正在导入的时候别把按钮放开了：那是另一次导入的按钮。
+  if (button && !importRunning) button.disabled = lines > importTextLimit;
 });
 
 // countListLines counts the lines of a pasted list.
@@ -878,20 +1259,57 @@ function countListLines(text) {
 // 页面上写死的那个数跟服务端的是同一个：服务端是 maxImportTextLines。
 const importTextLimit = 100;
 
+// importWait is how long a single import run may take.
+//
+// 一百个账号，一个一个登上去：那是好几分钟的事。给得宽一点，可也得有个
+// 头：不然服务端那边卡住了，这个轮询就永远转下去。
+const importWait = 20 * 60 * 1000;
+
+// importRunning 记着有一趟导入正在跑。
+//
+// 跑着的时候，两个「开始」按钮都得锁着：不然人以为按了一下没动静，又
+// 按一下，就导了两遍。
+let importRunning = false;
+
+// lockImport locks both import buttons while a run is going.
+function lockImport(on) {
+  importRunning = on;
+  const text = document.getElementById('import-text');
+  const lines = countListLines(text ? text.value : '');
+  for (const b of document.querySelectorAll('#import-form button[type=submit]')) {
+    b.disabled = on;
+  }
+  const tb = document.getElementById('import-text-button');
+  if (tb) tb.disabled = on || lines > importTextLimit;
+}
+
 function watchImport(id) {
+  const started = Date.now();
   const timer = setInterval(async () => {
+    if (Date.now() - started > importWait) {
+      clearInterval(timer);
+      lockImport(false);
+      const status = document.getElementById('import-status');
+      if (status) status.textContent = '导入等太久了，停了。看看下面的结果，或者再导一次。';
+      return;
+    }
     try {
       const answer = await call('/api/import/' + encodeURIComponent(id));
       if (!answer.ok) throw new Error(messageOf(answer));
       const run = answer.json;
       const status = document.getElementById('import-status');
-      status.textContent = '导入中……成功 ' + run.ok + '，失败 ' + run.failed;
       if (run.finished_at) {
         clearInterval(timer);
+        lockImport(false);
+        // 完了就把「导入中」换掉：不然那句话一直挂在那儿，人以为还在跑。
+        status.textContent = '导入完了：成功 ' + (run.ok || 0) + '，失败 ' + (run.failed || 0);
         showImportResults(run);
+      } else {
+        status.textContent = '导入中……成功 ' + run.ok + '，失败 ' + run.failed;
       }
     } catch (e) {
       clearInterval(timer);
+      lockImport(false);
       const status = document.getElementById('import-status');
       if (status) status.textContent = '失败：' + e.message;
     }
@@ -929,7 +1347,7 @@ function showImportResults(run) {
   if (whole) {
     const status = document.getElementById('import-status');
     if (status) {
-      status.textContent = '成功 ' + (run.ok || 0) + '，失败 ' + (run.failed || 0) +
+      status.textContent = '导入完了：成功 ' + (run.ok || 0) + '，失败 ' + (run.failed || 0) +
         '。' + (whole.message || '整趟导入没能完成');
     }
   }
@@ -940,6 +1358,8 @@ document.addEventListener('click', async (ev) => {
   const button = ev.target.closest('#relogin-all');
   if (!button) return;
   const status = document.getElementById('relogin-status');
+  // 重登要跑好一会儿：按钮锁住，不然人按两下就登了两遍。
+  button.disabled = true;
   status.textContent = '重登中……';
   try {
     const answer = await call('/api/relogin', { method: 'POST' });
@@ -954,6 +1374,8 @@ document.addEventListener('click', async (ev) => {
     status.textContent = text;
   } catch (e) {
     status.textContent = '失败：' + e.message;
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -1015,7 +1437,9 @@ document.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const status = document.getElementById('key-status');
   const name = document.getElementById('key-name');
+  const button = form.querySelector('button[type=submit]');
   if (status) status.textContent = '正在申请……';
+  if (button) button.disabled = true;
   try {
     const out = await post('/api/keys', { name: name ? name.value : '' });
     const plain = document.getElementById('key-plain');
@@ -1027,6 +1451,8 @@ document.addEventListener('submit', async (ev) => {
     await renderKeys();
   } catch (e) {
     if (status) status.textContent = '失败：' + e.message;
+  } finally {
+    if (button) button.disabled = false;
   }
 });
 
@@ -1046,10 +1472,16 @@ document.addEventListener('click', async (ev) => {
   }
   const revoke = ev.target.closest('button[data-revoke]');
   if (revoke) {
+    const id = revoke.dataset.revoke;
+    const name = revoke.dataset.name || '这把 key';
+    // 撤销了就是废了：拿它的那边从此答 401。得先问一句。
+    if (!confirm('撤销' + name + '？用它的那边从此就答 401 了。')) return;
     revoke.disabled = true;
     try {
-      await del('/api/keys/' + encodeURIComponent(revoke.dataset.revoke));
+      await del('/api/keys/' + encodeURIComponent(id));
       await renderKeys();
+      const status = document.getElementById('key-status');
+      if (status) status.textContent = '撤销了' + name;
     } catch (e) {
       revoke.disabled = false;
       const status = document.getElementById('key-status');
@@ -1097,8 +1529,11 @@ async function renderKeys() {
     if (!revoked) {
       const button = document.createElement('button');
       button.type = 'button';
+      button.className = 'small danger';
       button.textContent = '撤销';
       button.dataset.revoke = k.id;
+      button.dataset.name = k.name || '这把 key';
+      button.setAttribute('aria-label', '撤销 ' + (k.name || '这把 key'));
       last.appendChild(button);
     }
     tr.appendChild(last);
@@ -1111,50 +1546,40 @@ async function renderKeys() {
 // 组里的地址一行一个，顺序就是故障转移的顺序：第一个是主路，后面的都是
 // 备路。名字空着就是新建一个。
 function editGroup(name, urls) {
-  const box = document.createElement('div');
-  box.className = 'card';
-  const panel = document.createElement('div');
-  panel.className = 'card-box';
-  const title = document.createElement('h3');
-  title.textContent = name ? ('组 ' + name + ' 的地址') : '新建一个组';
-  const label = document.createElement('p');
-  label.textContent = '一行一个，第一个是主路，后面的都是备路。';
-  const form = document.createElement('form');
+  const card = makeCard(
+    name ? ('组 ' + name + ' 的地址') : '新建一个组',
+    '一行一个，第一个是主路，后面的都是备路。');
   const nameInput = document.createElement('input');
   nameInput.placeholder = '组的名字';
+  nameInput.setAttribute('aria-label', '组的名字');
   nameInput.value = name;
   const input = document.createElement('textarea');
   input.rows = 6;
+  input.setAttribute('aria-label', '组里的地址');
   input.value = urls;
   const button = document.createElement('button');
   button.type = 'submit';
   button.textContent = '存回去';
-  const msg = document.createElement('p');
-  msg.className = 'card-msg';
-  form.append(nameInput, input, button);
-  panel.append(title, label, form, msg);
-  box.appendChild(panel);
-  form.addEventListener('submit', async (ev) => {
+  card.form.append(nameInput, input, button);
+  card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
+    card.msg.textContent = '';
     const groupName = nameInput.value.trim();
     if (!groupName) {
-      msg.textContent = '这个组还没有名字。';
+      card.msg.textContent = '这个组还没有名字。';
       button.disabled = false;
       return;
     }
     try {
       const list = input.value.split('\n').map((s) => s.trim()).filter(Boolean);
       await post('/api/proxy-groups', { name: groupName, urls: list });
-      location.reload();
+      closeCard(card.box);
+      sayAndReload('存好了');
     } catch (e) {
-      msg.textContent = e.message;
+      card.msg.textContent = e.message;
       button.disabled = false;
     }
   });
-  box.addEventListener('click', (ev) => {
-    if (ev.target === box) closeCard(box);
-  });
-  document.body.appendChild(box);
-  (name ? input : nameInput).focus();
+  card.open(name ? input : nameInput);
 }

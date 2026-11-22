@@ -3,28 +3,29 @@
   <p class="lead">账号从哪出去。组里第一个地址是主路，后面的都是备路。</p>
   <div class="page-actions">
     <button type="button" class="btn" data-group-new>
-      <svg class="ic ic-sm"><use href="/static/icons.svg#plus"/></svg><span>新建组</span></button>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plus"/></svg><span>新建组</span></button>
   </div>
 </div>
 
 <div class="grid-2">
   <section class="panel">
     <div class="panel-head">
-      <svg class="ic ic-sm"><use href="/static/icons.svg#world"/></svg>
-      <h3>组</h3>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg>
+      <h2>组</h2>
       <span class="spacer"></span>
       <span class="muted">一个组一条出口</span>
     </div>
     <div class="panel-body flush">
       <table>
-      <thead><tr><th>名字</th><th class="num">条数</th><th></th></tr></thead>
+      <caption class="sr-only">出口分组</caption>
+      <thead><tr><th scope="col">名字</th><th scope="col" class="num">条数</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
       <tbody>
       {{range .Groups}}
       <tr>
         <td class="nowrap">{{.Name}}{{if .Global}} <span class="pill info">全局默认</span>{{end}}</td>
         <td class="muted num">{{.Count}} 条</td>
         <td class="nowrap">
-          <button class="small" data-group-edit="{{.Name}}" data-group-urls="{{.Text}}">改</button>
+          <button class="small" data-group-edit="{{.Name}}" data-group-list="{{.List}}">改</button>
           {{if not .Global}}<button class="small danger" data-group-rm="{{.Name}}">删</button>{{end}}
         </td>
       </tr>
@@ -37,14 +38,15 @@
 
   <section class="panel">
     <div class="panel-head">
-      <svg class="ic ic-sm"><use href="/static/icons.svg#plug"/></svg>
-      <h3>在用的地址</h3>
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plug"/></svg>
+      <h2>在用的地址</h2>
       <span class="spacer"></span>
       <span class="muted">现在有人在走的</span>
     </div>
     <div class="panel-body flush">
       <table>
-      <thead><tr><th>从哪来</th><th>地址</th><th>健康</th><th></th></tr></thead>
+      <caption class="sr-only">现在有人在走的出口地址</caption>
+      <thead><tr><th scope="col">从哪来</th><th scope="col">地址</th><th scope="col">健康</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
       <tbody>
       {{range .Egress}}
       <tr>

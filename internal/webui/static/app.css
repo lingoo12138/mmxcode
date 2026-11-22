@@ -9,6 +9,9 @@
  *
  * 图标是 Tabler（MIT）的官方路径，摆在 static/icons.svg 里，页面用
  * <use> 引它：颜色跟着 currentColor 走。
+ *
+ * 间隔只用一档：4 / 8 / 12 / 16 / 20 / 24 / 32。字也一样，停在
+ * 11 / 12 / 13 / 14 / 16 / 21 / 24 上，别出现半个像素。
  */
 
 /* ---------------------------------------------------------------- 变量 */
@@ -23,12 +26,16 @@
   --side-bg: #fbfcfd;
   --line: #e5e8ee;
   --line-strong: #d0d6df;
+  /* 控件的边：按钮、输入框、药丸靠着它跟底色分开。
+   * 3:1 是 WCAG 对「界面部件的边界」的要求：深浅两套都得够。
+   * 分界线（--line / --line-strong）是装饰，不需要 3:1，所以另起一个。 */
+  --line-control: #7f8794;
   --text: #0f1522;
   --text-2: #4c5666;
-  --text-3: #6b7686;
+  --text-3: #5f6a7a;
 
-  --accent: #2f6feb;
-  --accent-hover: #1e5bd8;
+  --accent: #1f5fd6;
+  --accent-hover: #1a4fb5;
   --accent-soft: #e7f0ff;
   --accent-ink: #ffffff;
 
@@ -64,9 +71,10 @@
     --side-bg: #0e141c;
     --line: #222c38;
     --line-strong: #35414f;
+    --line-control: #687382;
     --text: #e8edf4;
     --text-2: #a5b0be;
-    --text-3: #7b8797;
+    --text-3: #8b97a7;
 
     --accent: #5b93ff;
     --accent-hover: #7ba6ff;
@@ -80,7 +88,7 @@
     --bad: #ff7b72;
     --bad-soft: #2e1618;
 
-    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4);
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 1px rgba(255, 255, 255, .04);
     --shadow-pop: 0 18px 44px -18px rgba(0, 0, 0, .85);
   }
 }
@@ -94,9 +102,10 @@
   --side-bg: #0e141c;
   --line: #222c38;
   --line-strong: #35414f;
+  --line-control: #687382;
   --text: #e8edf4;
   --text-2: #a5b0be;
-  --text-3: #7b8797;
+  --text-3: #8b97a7;
 
   --accent: #5b93ff;
   --accent-hover: #7ba6ff;
@@ -110,7 +119,7 @@
   --bad: #ff7b72;
   --bad-soft: #2e1618;
 
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 1px rgba(255, 255, 255, .04);
   --shadow-pop: 0 18px 44px -18px rgba(0, 0, 0, .85);
 }
 
@@ -181,9 +190,23 @@ code {
   height: 15px;
 }
 
+/* 只有读屏的人看得见的那句话。 */
 .skip {
   position: absolute;
   left: -9999px;
+}
+
+/* 同样只有读屏的人看得见：这个是给表格起名字的（caption）。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 .skip:focus {
@@ -191,7 +214,7 @@ code {
   top: 8px;
   z-index: 100;
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
   padding: 6px 10px;
 }
@@ -215,12 +238,13 @@ code {
   border-right: 1px solid var(--line);
 }
 
+/* 品牌那行的字，要跟下面导航的字站在同一条竖线上：12 + 22 + 6 = 40。 */
 .side-brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   height: var(--top-h);
-  padding: 0 18px;
+  padding: 0 12px;
   border-bottom: 1px solid var(--line);
   color: var(--text);
   font-weight: 650;
@@ -235,38 +259,43 @@ code {
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
   background: var(--accent);
   color: var(--accent-ink);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
 }
 
 .side-nav {
   flex: 1;
   overflow-y: auto;
-  padding: 14px 12px 20px;
+  padding: 16px 12px 20px;
 }
 
+/* 组的标签离它自己那组近，离上一组远。 */
 .side-group {
-  margin: 0 0 4px;
-  padding: 14px 10px 6px;
+  margin: 20px 0 0;
+  padding: 0 10px 4px;
   color: var(--text-3);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: .04em;
 }
 
+.side-nav .side-group:first-child {
+  margin-top: 0;
+}
+
 .side-nav a {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 8px 10px;
   border-radius: var(--radius);
   color: var(--text-2);
-  font-size: 13.5px;
+  font-size: 13px;
   text-decoration: none;
 }
 
@@ -303,7 +332,7 @@ code {
 
 .side-foot {
   border-top: 1px solid var(--line);
-  padding: 12px 18px 16px;
+  padding: 12px 16px 16px;
   color: var(--text-3);
   font-size: 12px;
 }
@@ -311,7 +340,7 @@ code {
 .side-foot .row {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
 }
 
 /* 右边：顶上一条，内容在下面。 */
@@ -372,7 +401,7 @@ code {
 
 .page {
   flex: 1;
-  padding: 22px 24px 64px;
+  padding: 24px 24px 64px;
   max-width: 1360px;
   width: 100%;
 }
@@ -383,7 +412,7 @@ code {
   justify-content: space-between;
   gap: 20px;
   flex-wrap: wrap;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 
 .page-head h2 {
@@ -401,7 +430,7 @@ code {
 }
 
 .page-head p {
-  margin: 6px 0 0;
+  margin: 8px 0 0;
   max-width: 70ch;
   color: var(--text-2);
   font-size: 13px;
@@ -414,21 +443,32 @@ code {
 }
 
 .section {
-  margin-top: 22px;
+  margin-top: 24px;
 }
 
 .section > h2,
 .section > h3 {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   font-size: 14px;
   font-weight: 650;
 }
 
-.grid-2 {
+/* 两栏。栏数是写死的：auto-fit 会多出一条空轨道，页面跟着内容变形状。 */
+.grid-2,
+.cols {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   align-items: start;
+}
+
+/* 每一栏自己往下摞。grid 排四块的时候，一行的高度是最高的那个撑出来
+   的：矮的那块底下就空一大片。 */
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
 }
 
 /* ---------------------------------------------------------------- 卡片 */
@@ -443,13 +483,14 @@ code {
 .panel-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 13px 16px;
+  gap: 8px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--line);
 }
 
-.panel-head h3 {
-  font-size: 13.5px;
+/* 面板的标题是 h2：页面顶上那个 h1 之后就是它，中间不跳级。 */
+.panel-head h2 {
+  font-size: 13px;
   font-weight: 650;
 }
 
@@ -458,7 +499,7 @@ code {
 }
 
 .panel-body {
-  padding: 14px 16px;
+  padding: 12px 16px;
 }
 
 .panel-body.flush {
@@ -470,29 +511,36 @@ code {
 .kpis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
-  gap: 14px;
-  margin-bottom: 18px;
+  gap: 16px;
+  margin-bottom: 24px;
 }
 
+/* 三个数的那一排：不要摊成三张半屏宽的卡片。 */
+.kpis.kpis-3 {
+  grid-template-columns: repeat(3, minmax(0, 240px));
+  justify-content: start;
+}
+
+/* 上头这一排数字跟下头的面板不是一样的东西：数字是垫底的一个个格子，
+   面板是浮在上面的卡片。 */
 .kpi {
-  background: var(--surface);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
-  padding: 15px 17px 16px;
+  padding: 12px 16px;
 }
 
 .kpi .label {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   color: var(--text-3);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 .kpi .value {
-  margin-top: 6px;
-  font-size: 28px;
+  margin-top: 8px;
+  font-size: 24px;
   font-weight: 650;
   letter-spacing: -.025em;
   line-height: 1.15;
@@ -507,41 +555,18 @@ code {
 }
 
 .kpi .foot {
-  margin-top: 7px;
+  margin-top: 8px;
   color: var(--text-3);
   font-size: 12px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
+/* 那颗点：它分开的是几个数，得看得见。--line-strong 在这儿只有 1.38:1，
+ * 那几个数会连成一片。 */
 .kpi .foot .sep {
-  color: var(--line-strong);
-}
-
-.dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: currentColor;
-  flex: none;
-}
-
-.dot.good {
-  color: var(--good);
-}
-
-.dot.warn {
-  color: var(--warn);
-}
-
-.dot.bad {
-  color: var(--bad);
-}
-
-.dot.mute {
   color: var(--text-3);
 }
 
@@ -557,6 +582,12 @@ code {
 .bar > span {
   display: block;
   height: 100%;
+}
+
+/* 段与段之间要有一道看得见的界：颜色挨着的两段（正常/已登出、出错）在
+ * 屏幕上只差 1.05:1，不画一道界就分不出哪里到哪里。 */
+.bar > span + span {
+  box-shadow: inset 1px 0 0 var(--surface);
 }
 
 .bar > span.good {
@@ -578,22 +609,23 @@ code {
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 16px;
-  margin-top: 10px;
+  gap: 8px 16px;
+  margin-top: 12px;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 .legend span {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 /* 额度还剩多少：一条细的量表。 */
 .meter {
+  display: block;
   height: 5px;
-  margin-top: 6px;
+  margin-top: 8px;
   border-radius: var(--radius-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -614,6 +646,12 @@ code {
   background: var(--bad);
 }
 
+/* 表里那一格里的量表：跟上面的数对齐，右边贴着。 */
+td.num .meter {
+  width: 88px;
+  margin-left: auto;
+}
+
 /* ---------------------------------------------------------------- 表格 */
 
 .table-wrap {
@@ -623,8 +661,9 @@ code {
   box-shadow: var(--shadow-card);
   /* 圆角要切住表格的两头，可 overflow:hidden 会把这一块变成滚动容
      器：吸顶的表头就会贴着这个框的顶浮起来，压住第一行。clip 一样
-     切得掉角，却不是滚动容器。 */
-  overflow: hidden;
+     切得掉角，却不是滚动容器。
+     这里只写 clip：不认得 clip 的老浏览器会退回 visible，表格宽了
+     也只是露出来，不会把表头弄坏。 */
   overflow: clip;
 }
 
@@ -633,12 +672,100 @@ table {
   border-collapse: collapse;
 }
 
+/* 账号表：列宽是定死的。
+ *
+ * auto 布局下，浏览器按每格最宽的时候算：一句长的错误消息就能把整张表
+ * 撑出屏幕，右边那一列就看不见了。定死列宽以后，超长的东西自己收起来
+ * （省略号或者换行），表格永远在框里。 */
+.acc-table {
+  table-layout: fixed;
+}
+
+.acc-table col.c-pick {
+  width: 36px;
+}
+
+.acc-table col.c-acc {
+  width: auto;
+}
+
+.acc-table col.c-status {
+  width: 11%;
+}
+
+.acc-table col.c-cr {
+  width: 13%;
+}
+
+.acc-table col.c-plan {
+  width: 14%;
+}
+
+.acc-table col.c-out {
+  width: 14%;
+}
+
+.acc-table col.c-ck {
+  width: 10%;
+}
+
+.acc-table col.c-act {
+  width: 10%;
+}
+
+/* 用量表也定死列宽：邮箱那一格长的能撑破整张表，数字那几格得留在原地。 */
+.usage-table {
+  table-layout: fixed;
+}
+
+.usage-table col.u-acc {
+  width: auto;
+}
+
+.usage-table col.u-left {
+  width: 13%;
+}
+
+.usage-table col.u-meter {
+  width: 20%;
+}
+
+.usage-table col.u-date {
+  width: 12%;
+}
+
+/* 钥匙表同理：名字长的那一格不该把「撤销」按钮挤出屏幕。 */
+.keys-table {
+  table-layout: fixed;
+}
+
+.keys-table col.k-name {
+  width: auto;
+}
+
+.keys-table col.k-prefix {
+  width: 20%;
+}
+
+.keys-table col.k-time {
+  width: 20%;
+}
+
+.keys-table col.k-state {
+  width: 12%;
+}
+
+.keys-table col.k-act {
+  width: 92px;
+}
+
 th,
 td {
   text-align: left;
-  padding: 9px 14px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--line);
   vertical-align: top;
+  overflow: hidden;
 }
 
 thead th {
@@ -697,7 +824,8 @@ th.sortable .sort .ic {
   transition: opacity .12s ease;
 }
 
-th.sortable:hover .sort .ic {
+th.sortable:hover .sort .ic,
+th.sortable:focus-visible .sort .ic {
   opacity: .5;
 }
 
@@ -722,25 +850,91 @@ td.nowrap {
 }
 
 td .sub {
-  margin-top: 3px;
+  display: block;
+  margin-top: 4px;
   color: var(--text-3);
   font-size: 12px;
 }
 
 td .sub.mono {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
+}
+
+/* 长了就收起来：完整的那一句在抽屉里，或者在 title 里。 */
+.clip {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 账号名：它是个按钮，按下去就摆出那个号的详情。 */
+.row-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-open:hover {
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* 错的那一句自己占一行：占的是整张表那么宽，一行就写得下。 */
+.err-row td {
+  padding: 0 12px 12px 48px;
+  background: var(--surface-2);
+}
+
+.err-row:hover td {
+  background: var(--surface-3);
+}
+
+.err-row.is-picked td {
+  background: var(--accent-soft);
+}
+
+.err-band {
+  color: var(--bad);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.err-band .who {
+  display: inline-block;
+  margin-right: 8px;
+  font-weight: 600;
 }
 
 .empty {
-  padding: 40px 16px;
+  padding: 32px 16px;
   color: var(--text-3);
   text-align: center;
 }
 
+td.empty {
+  padding: 24px 12px;
+  text-align: left;
+}
+
 .empty .ic {
   display: block;
-  margin: 0 auto 10px;
+  margin: 0 auto 12px;
   width: 26px;
   height: 26px;
   color: var(--text-3);
@@ -750,7 +944,7 @@ td .sub.mono {
 /* 勾选框那一列 */
 th.pick,
 td.pick {
-  width: 38px;
+  width: 36px;
   padding-right: 0;
 }
 
@@ -762,12 +956,18 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
+/* 勾选框没有边框可以变颜色，指望不上 focus 的那圈线。 */
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ---------------------------------------------------------------- 筛选 */
 
 .chips {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   flex-wrap: wrap;
   margin-left: auto;
 }
@@ -775,13 +975,13 @@ input[type="checkbox"] {
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 11px;
-  border: 1px solid var(--line-strong);
+  gap: 8px;
+  padding: 4px 12px;
+  border: 1px solid var(--line-control);
   border-radius: var(--radius-pill);
   background: var(--surface);
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: 12px;
   cursor: pointer;
   transition: background .12s ease, color .12s ease, border-color .12s ease;
 }
@@ -798,9 +998,10 @@ input[type="checkbox"] {
   font-weight: 600;
 }
 
+/* 药丸里那个数：不是装饰，它就是那个数。
+ * 半透明会把 12px 的数字压到 2.75:1，看着轻，读不出来。 */
 .chip .n {
   font-variant-numeric: tabular-nums;
-  opacity: .75;
 }
 
 /* ---------------------------------------------------------------- 控件 */
@@ -809,8 +1010,8 @@ button {
   font: inherit;
   font-size: 13px;
   line-height: 1.4;
-  padding: 7px 12px;
-  border: 1px solid var(--line-strong);
+  padding: 8px 12px;
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
@@ -828,8 +1029,11 @@ button:active {
   transform: translateY(1px);
 }
 
+/* 按不了的东西：字还得认得出来。
+ * 整块半透明会把字压到 2.96:1，primary 的白字更是只剩 1.34:1 —— 那看着
+ * 像坏了，不像按不了。 */
 button:disabled {
-  opacity: .45;
+  opacity: .7;
   cursor: default;
   transform: none;
 }
@@ -851,8 +1055,8 @@ a.quiet {
   border-color: transparent;
   background: transparent;
   color: var(--accent);
-  padding: 5px 8px;
-  font-size: 13px;
+  padding: 4px 8px;
+  font-size: 12px;
   text-decoration: none;
 }
 
@@ -867,9 +1071,9 @@ a.quiet:hover {
 a.btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
-  border: 1px solid var(--line-strong);
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
@@ -900,9 +1104,9 @@ a.btn.primary:hover {
 .nav-signout {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border: 1px solid var(--line-strong);
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
   color: var(--text-2);
   font-size: 13px;
@@ -917,7 +1121,7 @@ a.btn.primary:hover {
 
 button.danger {
   color: var(--bad);
-  border-color: var(--line-strong);
+  border-color: var(--line-control);
 }
 
 button.danger:hover {
@@ -926,14 +1130,14 @@ button.danger:hover {
 }
 
 button.small {
-  padding: 4px 9px;
+  padding: 4px 8px;
   font-size: 12px;
 }
 
 button.icon {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 input,
@@ -943,9 +1147,9 @@ textarea {
   font-size: 13px;
   color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
-  padding: 6px 9px;
+  padding: 6px 8px;
   max-width: 100%;
 }
 
@@ -954,19 +1158,30 @@ textarea::placeholder {
   color: var(--text-3);
 }
 
+/* 聚焦的那一圈：键盘按 Tab 的时候得看得见自己在哪儿。
+ *
+ * 早先这里是 outline: none 加一圈 --accent-soft 的影子。那圈影子在白底
+ * 上是 1.15:1，等于没有：按 Tab 的人根本不知道焦点在哪儿。焦点环必须是
+ * --accent 那道实线（对底色 5:1 以上），键盘看得见，鼠标点的时候不刺眼。 */
 input:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
-  outline: none;
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 textarea {
   display: block;
   width: 100%;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.6;
   resize: vertical;
 }
@@ -974,7 +1189,7 @@ textarea {
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .field label {
@@ -997,7 +1212,7 @@ textarea {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 12px;
 }
@@ -1026,28 +1241,12 @@ textarea {
   padding-left: 32px;
 }
 
-/* 出口那一格：下拉框和地址框并排，别把行撑成两倍高。 */
-.outlet {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.outlet select {
-  flex: none;
-}
-
-.outlet input {
-  flex: 1;
-  min-width: 0;
-}
-
 /* ---------------------------------------------------------------- 标记 */
 
 .pill {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   padding: 3px 10px;
   border-radius: var(--radius-pill);
   background: var(--surface-3);
@@ -1078,6 +1277,12 @@ textarea {
   color: var(--accent);
 }
 
+/* 药丸里的「未检查」这类中性字：--text-3 落在 --surface-3 上只有 4.06:1，
+ * 差一点。用 --text-2。 */
+.pill.muted {
+  color: var(--text-2);
+}
+
 .good {
   color: var(--good);
 }
@@ -1101,24 +1306,15 @@ textarea {
 /* 上一次的错是一整句：给它一块地方，别让它撑着整张表。 */
 .err {
   display: block;
-  margin-top: 6px;
+  margin-top: 8px;
   max-width: 22rem;
-  padding: 5px 9px;
+  padding: 4px 8px;
   border-radius: var(--radius-sm);
   background: var(--bad-soft);
   color: var(--bad);
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
-}
-
-/* 表里那一句只摆两行：再多就把行撑开，一百行就成了一堵墙。整句在点
-   开的那一格（抽屉）里。 */
-.err.two {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 
 /* ---------------------------------------------------------------- 列表 */
@@ -1132,8 +1328,8 @@ textarea {
 .rows li {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 16px;
+  gap: 8px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -1156,7 +1352,7 @@ textarea {
 
 .rows .who .s {
   display: block;
-  margin-top: 2px;
+  margin-top: 4px;
   color: var(--text-3);
   font-size: 12px;
   overflow: hidden;
@@ -1174,20 +1370,32 @@ textarea {
 
 /* ---------------------------------------------------------------- 提示 */
 
+/* 提示框：它讲的事有好几种（有一步没走完、拿到了一把 key、出了错），
+ * 所以颜色跟着事情走，不是一律黄的。 */
 .notice {
   border: 1px solid var(--warn);
   border-radius: var(--radius);
   background: var(--warn-soft);
-  padding: 14px 16px;
+  padding: 16px;
 }
 
-.notice h3 {
-  margin: 0 0 6px;
+.notice.ok {
+  border-color: var(--good);
+  background: var(--good-soft);
+}
+
+.notice.err {
+  border-color: var(--bad);
+  background: var(--bad-soft);
+}
+
+.notice h2 {
+  margin: 0 0 8px;
   font-size: 14px;
 }
 
 .notice p {
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   color: var(--text-2);
   font-size: 13px;
 }
@@ -1200,7 +1408,7 @@ textarea {
 .key-plain {
   display: block;
   margin: 8px 0;
-  padding: 10px 12px;
+  padding: 12px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
   background: var(--surface);
@@ -1210,19 +1418,21 @@ textarea {
 }
 
 .note {
-  margin: 10px 0 0;
+  margin: 12px 0 0;
   color: var(--text-2);
   font-size: 13px;
 }
 
-/* 飘在右下角的那句话。空的时候不占地方。 */
+/* 飘在右下角的那句话。空的时候不占地方。
+ *
+ * 它得在抽屉上面：抽屉里的动作出了错，这句话是唯一的话。 */
 .status {
   position: fixed;
   right: 20px;
   bottom: 20px;
-  z-index: 60;
+  z-index: 90;
   max-width: 30rem;
-  padding: 9px 14px;
+  padding: 8px 12px;
   border-radius: var(--radius);
   background: var(--text);
   color: var(--surface);
@@ -1249,13 +1459,15 @@ textarea {
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(8, 12, 20, .45);
+  /* 罩子得把底下的页面压下去：深色底本来就黑，罩子再淡就等于没有，
+   * 框一开，人不知道多了一层。 */
+  background: rgba(2, 4, 8, .72);
 }
 
 .card .card-box {
   width: min(560px, 100%);
   padding: 20px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-control);
   border-radius: var(--radius);
   background: var(--surface);
   box-shadow: var(--shadow-pop);
@@ -1293,7 +1505,7 @@ textarea {
 }
 
 .card .card-msg {
-  margin: 10px 0 0;
+  margin: 12px 0 0;
   color: var(--bad);
 }
 
@@ -1309,7 +1521,7 @@ textarea {
   display: flex;
   flex-direction: column;
   background: var(--surface);
-  border-left: 1px solid var(--line);
+  border-left: 1px solid var(--line-control);
   box-shadow: var(--shadow-pop);
   animation: mmx-slide .18s cubic-bezier(.16, 1, .3, 1);
 }
@@ -1318,7 +1530,7 @@ textarea {
   position: fixed;
   inset: 0;
   z-index: 69;
-  background: rgba(8, 12, 20, .35);
+  background: rgba(2, 4, 8, .55);
   animation: mmx-fade .18s ease;
 }
 
@@ -1338,13 +1550,13 @@ textarea {
 .drawer-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 14px 16px;
+  gap: 8px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--line);
 }
 
 .drawer-head h3 {
-  font-size: 14.5px;
+  font-size: 14px;
   font-weight: 650;
   min-width: 0;
   overflow: hidden;
@@ -1362,11 +1574,21 @@ textarea {
   padding: 16px;
 }
 
+.drawer-body .field {
+  margin-top: 16px;
+}
+
 .drawer-foot {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--line);
+}
+
+.drawer-foot .card-msg {
+  flex: 1 0 100%;
+  margin: 0;
 }
 
 .kv {
@@ -1392,13 +1614,13 @@ textarea {
 .bulkbar {
   position: fixed;
   left: 50%;
-  bottom: 22px;
+  bottom: 20px;
   z-index: 65;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px 8px 16px;
+  gap: 8px;
+  padding: 8px 12px 8px 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
   background: var(--surface);
@@ -1449,6 +1671,23 @@ body.is-busy::after {
   }
 }
 
+/* 正在忙的时候，顺手说一声忙的是哪件事。 */
+body.is-busy[data-busy]::before {
+  content: attr(data-busy);
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 101;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------ 窄屏 */
 
 @media (max-width: 960px) {
@@ -1467,7 +1706,7 @@ body.is-busy::after {
     display: flex;
     gap: 4px;
     overflow-x: auto;
-    padding: 10px 14px;
+    padding: 12px 14px;
   }
 
   .side-group {
@@ -1483,11 +1722,16 @@ body.is-busy::after {
   }
 
   .page {
-    padding: 18px 14px 60px;
+    padding: 16px 14px 60px;
   }
 
   .topbar {
     padding: 0 14px;
+  }
+
+  .grid-2,
+  .cols {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   thead th {
