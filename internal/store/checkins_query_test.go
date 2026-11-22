@@ -198,3 +198,43 @@ func TestTheAccountsWithoutACheckinAskTheDayAtOnce(t *testing.T) {
 		t.Fatalf("the plan does not use the index on the day: %s", plan)
 	}
 }
+
+// TestTheNumberOfAccountsCheckedInOnADay says how many accounts were
+// checked in on a day.
+//
+// 数的是签过的账号，不管那次签到有没有给积分：签到没给积分也是签了，
+// 后台那个「今日签到」要的是这个数。一个号一天签一次，可补签会再写一
+// 行 —— 一个号还是算一个。
+func TestTheNumberOfAccountsCheckedInOnADay(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	makeAccount(t, s, "one")
+	makeAccount(t, s, "two")
+	makeAccount(t, s, "three")
+	day := "2026-11-18"
+	for _, c := range []Checkin{
+		{AccountID: "one", Day: day, Outcome: "claimed", Credit: 25},
+		{AccountID: "two", Day: day, Outcome: "ineligible"},
+		{AccountID: "three", Day: "2026-11-17", Outcome: "claimed", Credit: 25},
+	} {
+		c.CreatedAt = time.Now()
+		if err := s.SaveCheckin(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 补签：同一个号又写了一行，还是一个号。
+	if err := s.SaveCheckin(ctx, Checkin{
+		AccountID: "one", Day: day, Outcome: "claimed", Credit: 25,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.CountDayCheckins(ctx, day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("the accounts checked in on %s = %d, want 2", day, n)
+	}
+}

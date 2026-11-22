@@ -101,7 +101,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 	// Only the layout is parsed here. Every page defines "content",
 	// and one set of templates for all of them would keep only the
 	// last page's content, so every page would render the last one.
-	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num}).ParseFS(templateFS, "templates/layout.html"))
+	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{"num": num, "statusName": statusName}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
 		Mgr:        mgr,
 		Cfg:        cfg,
@@ -120,6 +120,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	case "/static/app.css":
 		w.serveStatic(rw, r, "app.css", "text/css; charset=utf-8")
+		return
+	case "/static/icons.svg":
+		w.serveStatic(rw, r, "icons.svg", "image/svg+xml; charset=utf-8")
 		return
 	case "/api/accounts":
 		w.apiAccounts(rw, r)
@@ -172,6 +175,8 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/":
+		w.page(rw, r, "overview.html", w.overviewData)
+	case "/accounts":
 		w.page(rw, r, "accounts.html", w.accountsData)
 	case "/egress":
 		w.page(rw, r, "egress.html", w.egressData)
@@ -207,6 +212,22 @@ func num(v *float64) float64 {
 	return *v
 }
 
+// statusName gives an account's status in words a person reads.
+//
+// 库里存的是机器认的字（active、signed_out、error），页面上摆的是人
+// 读的字。中间这一层是它。
+func statusName(s string) string {
+	switch s {
+	case store.StatusActive:
+		return "正常"
+	case store.StatusSignedOut:
+		return "已登出"
+	case store.StatusError:
+		return "出错"
+	}
+	return s
+}
+
 // serveStatic gives a file from the static directory.
 func (w *WebUI) serveStatic(rw http.ResponseWriter, r *http.Request, name, contentType string) {
 	b, err := staticFS.ReadFile("static/" + name)
@@ -226,6 +247,7 @@ var pageNames = map[string]struct {
 	Title string
 	Nav   string
 }{
+	"overview": {"概览", "overview"},
 	"accounts": {"账号", "accounts"},
 	"egress":   {"出口", "egress"},
 	"usage":    {"用量", "usage"},
@@ -251,6 +273,12 @@ func (w *WebUI) page(rw http.ResponseWriter, r *http.Request, name string, data 
 	}
 	// 配了 key 才有登录和退出可做：没配 key 的网关不用登录。
 	d["HasKeys"] = len(w.Cfg.Server.APIKeys) > 0
+	// 侧边栏上那个账号数：每一页都在，一个数就够。
+	if accounts, err := w.Store.ListAccounts(r.Context()); err == nil {
+		d["AccountCount"] = len(accounts)
+	} else {
+		d["AccountCount"] = 0
+	}
 	// The page brings its own "content", so it is parsed into a copy
 	// of the layout.
 	tmpl, err := w.tmpl.Clone()
@@ -290,9 +318,18 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 		byAccount[s.AccountID] = s
 	}
 	out := make([]map[string]any, 0, len(accounts))
+	active, signedOut, errored := 0, 0, 0
 	for _, a := range accounts {
 		snap := byAccount[a.ID]
 		checkedIn, streak := w.todayCheckin(ctx, a.ID)
+		switch a.Status {
+		case store.StatusActive:
+			active++
+		case store.StatusSignedOut:
+			signedOut++
+		default:
+			errored++
+		}
 		out = append(out, map[string]any{
 			"ID":            a.ID,
 			"Name":          a.Name,
@@ -313,7 +350,133 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"LastError": a.LastError,
 		})
 	}
-	return map[string]any{"Accounts": out, "Groups": groupList(groups)}, nil
+	return map[string]any{
+		"Accounts": out, "Groups": groupList(groups),
+		"TotalCount": len(accounts), "ActiveCount": active,
+		"SignedOutCount": signedOut, "ErrorCount": errored,
+	}, nil
+}
+
+// overviewData is the overview page's data.
+//
+// 概览是「网关现在的样子」：多少账号在站着，还剩多少积分，哪里出了
+// 事。看数的人想的是「哪儿出事了」，所以每一件要人动手的事都得摆在这
+// 一页上，不必先去别的页找一遍。
+func (w *WebUI) overviewData(ctx context.Context) (map[string]any, error) {
+	accounts, err := w.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snaps, err := w.Store.LatestUsageSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	summary := usage.Aggregate(snaps, accounts, time.Now())
+
+	// 账号按状态分。active 以外的都要人来管：签出的要重登，出错的要
+	// 看它为什么错。
+	active, signedOut, errored := 0, 0, 0
+	attention := make([]map[string]any, 0, 8)
+	attentionCount := 0
+	for _, a := range accounts {
+		switch a.Status {
+		case store.StatusActive:
+			active++
+		case store.StatusSignedOut:
+			signedOut++
+		default:
+			errored++
+		}
+		if a.Status == store.StatusActive {
+			continue
+		}
+		attentionCount++
+		if len(attention) >= 8 {
+			continue
+		}
+		attention = append(attention, map[string]any{
+			"ID": a.ID, "Name": a.Name, "Email": a.Email,
+			"Status": a.Status, "Error": a.LastError,
+		})
+	}
+
+	// 今天签到的号。签到那一趟只签 active 的号，所以分母是 active。
+	checkedToday, err := w.Store.CountDayCheckins(ctx, store.DayKey(time.Now()))
+	if err != nil {
+		return nil, err
+	}
+
+	// 出口：在用的那些，健康的和没测过的分开数。
+	outlets, err := w.egressRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	egressOK, egressUntested := 0, 0
+	for _, o := range outlets {
+		switch {
+		case o["OK"] == true:
+			egressOK++
+		case o["Checked"] == false:
+			egressUntested++
+		}
+	}
+
+	// 聊天用的 key：能用的和撤销了的分开数。
+	keys, err := w.Store.ListAPIKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	keysLive, keysRevoked := 0, 0
+	for _, k := range keys {
+		if k.RevokedAt == nil {
+			keysLive++
+		} else {
+			keysRevoked++
+		}
+	}
+
+	// 最近的导入：给人看「刚才那一趟成了几个」。
+	runs, err := w.Store.ListImportRuns(ctx, 5)
+	if err != nil {
+		return nil, err
+	}
+	runRows := make([]map[string]any, 0, len(runs))
+	for _, r := range runs {
+		runRows = append(runRows, map[string]any{
+			"ID": r.ID, "Source": r.Source, "StartedAt": r.StartedAt,
+			"OK": r.OK, "Failed": r.Failed,
+		})
+	}
+
+	return map[string]any{
+		"Total": len(accounts), "Active": active,
+		"SignedOut": signedOut, "Errored": errored,
+		"Attention": attention, "AttentionCount": attentionCount,
+		"Remaining": summary.TotalRemaining, "Granted": summary.TotalGranted,
+		"Readings": summary.Readings, "Unread": summary.AccountsUnread,
+		"UpdatedAt":    summary.UpdatedAt,
+		"CheckedToday": checkedToday, "Waiting": active - checkedToday,
+		"Egress": outlets, "EgressOK": egressOK, "EgressUntested": egressUntested,
+		"KeysLive": keysLive, "KeysRevoked": keysRevoked,
+		"Runs": runRows,
+		// 那条横条上每一段占多宽。页面上算百分比要除法，除零是 NaN，
+		// 摆到 style 里就成了一段没宽度的怪东西：这里算好给页面。
+		"ActivePct":    percent(active, len(accounts)),
+		"SignedOutPct": percent(signedOut, len(accounts)),
+		"ErroredPct":   percent(errored, len(accounts)),
+		"EgressPct":    percent(egressOK, len(outlets)),
+	}, nil
+}
+
+// percent gives how much of the whole a part is, in percent.
+//
+// 一个都没有的时候是零：没有账号的那条横条是空的，不是一段宽度没定义
+// 的东西。
+func percent(part, whole int) float64 {
+	if whole <= 0 {
+		return 0
+	}
+	return float64(part) / float64(whole) * 100
 }
 
 // groupList gives the groups for the page: the name and how many
@@ -362,11 +525,11 @@ func (w *WebUI) todayCheckin(ctx context.Context, accountID string) (bool, int) 
 	return false, 0
 }
 
-// egressData is the outlets page's data.
+// egressRows gives the outlets that are in use, with their health.
 //
 // 列的是在用的那些：全局默认，加上账号自己写的地址。列那些没人走的地址
 // 没有意义 —— 「可用」什么也不说明。
-func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
+func (w *WebUI) egressRows(ctx context.Context) ([]map[string]any, error) {
 	health, err := w.Store.EgressHealth(ctx)
 	if err != nil {
 		return nil, err
@@ -383,7 +546,27 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 组：一个组一行 —— 名字、几条地址、那些地址（去掉凭据的）。
+	// 库里还没有全局组的时候，配置里那个全局默认就是全局组。
+	gm := egress.GroupsWithDefault(egress.GroupMap(groups), w.Cfg.Proxy.Default)
+	var out []map[string]any
+	for _, o := range egress.Outlets(accounts, gm) {
+		h, ok := byURL[o.URL]
+		out = append(out, map[string]any{
+			"Name": o.Name, "URL": egress.Redacted(o.URL),
+			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
+		})
+	}
+	return out, nil
+}
+
+// egressData is the outlets page's data.
+//
+// 组：一个组一行 —— 名字、几条地址、那些地址（去掉凭据的）。
+func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
+	groups, err := w.Store.ListProxyGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var groupRows []map[string]any
 	for _, g := range groups {
 		text := make([]string, 0, len(g.URLs))
@@ -397,16 +580,9 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 			"Text":   strings.Join(text, "\n"),
 		})
 	}
-	// 在用的地址：从哪来、地址本身、健不健康。
-	// 库里还没有全局组的时候，配置里那个全局默认就是全局组。
-	gm := egress.GroupsWithDefault(egress.GroupMap(groups), w.Cfg.Proxy.Default)
-	var out []map[string]any
-	for _, o := range egress.Outlets(accounts, gm) {
-		h, ok := byURL[o.URL]
-		out = append(out, map[string]any{
-			"Name": o.Name, "URL": egress.Redacted(o.URL),
-			"OK": ok && h.OK, "Checked": ok, "Error": h.Error,
-		})
+	out, err := w.egressRows(ctx)
+	if err != nil {
+		return nil, err
 	}
 	return map[string]any{"Groups": groupRows, "Egress": out}, nil
 }
@@ -422,7 +598,30 @@ func (w *WebUI) usageData(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	s := usage.Aggregate(snaps, accounts, time.Now())
-	return map[string]any{"Summary": s}, nil
+	// 每一行带着一条量表：剩下的还占发下来的多少。
+	//
+	// 剩下的那一栏是数，量表是那个数在整条里的位置：光看「剩 1200」
+	// 看不出这是满的还是要用完了。
+	rows := make([]map[string]any, 0, len(s.Accounts))
+	for _, a := range s.Accounts {
+		pct := 0.0
+		if a.Granted != nil && *a.Granted > 0 && a.Remaining != nil {
+			pct = *a.Remaining / *a.Granted * 100
+		}
+		bar := ""
+		switch {
+		case pct <= 0:
+			bar = "bad"
+		case pct < 20:
+			bar = "warn"
+		}
+		rows = append(rows, map[string]any{
+			"ID": a.ID, "Email": a.Email, "State": a.State,
+			"Granted": a.Granted, "Consumed": a.Consumed, "Remaining": a.Remaining,
+			"ExpiresAt": a.ExpiresAt, "Pct": pct, "Bar": bar,
+		})
+	}
+	return map[string]any{"Summary": s, "Rows": rows}, nil
 }
 
 // loginData is the login page's data.

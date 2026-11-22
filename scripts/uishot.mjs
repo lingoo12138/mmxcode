@@ -1,16 +1,25 @@
-// 拍一张飘出来的框的照：给设计看。
+// 拍一张页面的照：给人看设计。
+//
+// 用法：node scripts/uishot.mjs [url] [out.png] [按一下的脚本]
+//
+// 第三个参数是截图之前要跑的那句脚本：比如点开一个框。
+// 第四个参数写 dark 就是深色（preferredColorScheme=0）。
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 const chrome = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const url = process.argv[2] || 'http://127.0.0.1:8793/egress'
-const out = process.argv[3] || 'C:/Users/lishihua/AppData/Local/Temp/mmx-modal.png'
+const out = process.argv[3] || 'C:/Users/lishihua/AppData/Local/Temp/mmx-shot.png'
+const before = process.argv[4] || ''
+const dark = process.argv[5] === 'dark'
 const port = 9334
 
-const proc = spawn(chrome, [
+const flags = [
   '--headless=new', '--disable-gpu', '--hide-scrollbars', `--remote-debugging-port=${port}`,
   '--user-data-dir=' + process.env.TEMP + '/mmx-cdp-profile2', 'about:blank',
-], { stdio: 'ignore' })
+]
+if (dark) flags.splice(2, 0, '--blink-settings=preferredColorScheme=0')
+const proc = spawn(chrome, flags, { stdio: 'ignore' })
 process.on('exit', () => proc.kill())
 
 let target = null
@@ -42,11 +51,13 @@ async function evaluate(expression) {
 }
 
 await send('Page.enable')
-await send('Emulation.setDeviceMetricsOverride', { width: 1200, height: 700, deviceScaleFactor: 1, mobile: false })
+await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
 await send('Page.navigate', { url })
-await sleep(1500)
-await evaluate(`(() => { const b = document.querySelector('[data-group-edit]'); if (b) b.click(); return true })()`)
-await sleep(500)
+await sleep(1600)
+if (before) {
+  await evaluate(`(() => { ${before} ; return true })()`)
+  await sleep(600)
+}
 const shot = await send('Page.captureScreenshot', { format: 'png' })
 const fs = await import('node:fs')
 fs.writeFileSync(out, Buffer.from(shot.result.data, 'base64'))

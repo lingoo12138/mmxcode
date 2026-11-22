@@ -1,12 +1,10 @@
 {{define "content"}}
 <div class="page-head">
-  <div>
-    <h1>重登</h1>
-    <p>签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
-  </div>
+  <p class="lead">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
   <div class="page-actions">
     <span class="muted" id="relogin-status"></span>
-    <button id="relogin-all" type="button" class="primary">全部重登</button>
+    <button id="relogin-all" type="button" class="primary icon">
+      <svg class="ic ic-sm"><use href="/static/icons.svg#refresh"/></svg><span>全部重登</span></button>
   </div>
 </div>
 

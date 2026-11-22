@@ -1,14 +1,12 @@
 {{define "content"}}
 <div class="page-head">
-  <div>
-    <h1>密钥</h1>
-    <p>聊天用的 key 在这里申请。申请出来的那一把只在这一页出现一次：抄走收好，之后就再也拿不出来了（库里存的是它的哈希，不是它）。</p>
-  </div>
+  <p class="lead">聊天用的 key 在这里申请。申请出来的那一把只在这一页出现一次：抄走收好，之后就再也拿不出来了（库里存的是它的哈希，不是它）。</p>
 </div>
 
 <form id="key-form" class="toolbar">
   <input class="grow" id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）" autocomplete="off">
-  <button type="submit" class="primary">申请一把</button>
+  <button type="submit" class="primary icon">
+    <svg class="ic ic-sm"><use href="/static/icons.svg#plus"/></svg><span>申请一把</span></button>
   <span class="muted" id="key-status"></span>
 </form>
 
@@ -16,7 +14,8 @@
   <h3>这一把 key 就是它了，抄走收好</h3>
   <p>页面一刷新它就没了。库里只留着它的哈希，谁都拿不回原文。</p>
   <code class="key-plain" id="key-plain"></code>
-  <button type="button" id="key-copy">复制</button>
+  <button type="button" id="key-copy" class="icon">
+    <svg class="ic ic-sm"><use href="/static/icons.svg#copy"/></svg><span>复制</span></button>
 </div>
 
 <div class="table-wrap">

@@ -1,9 +1,6 @@
 {{define "content"}}
 <div class="page-head">
-  <div>
-    <h1>登录</h1>
-    <p>拿一个 mcode 账号登进网关。登进来的账号就是网关后面站着的人。</p>
-  </div>
+  <p class="lead">拿一个 mcode 账号登进网关。登进来的账号就是网关后面站着的人。</p>
 </div>
 
 {{if .Pending}}
@@ -14,7 +11,9 @@
 </div>
 {{else}}
 <div class="toolbar">
-  <button id="start-login" type="button" class="primary">开始登录</button>
+  <button id="start-login" type="button" class="primary icon">
+    <svg class="ic ic-sm"><use href="/static/icons.svg#login"/></svg><span>开始登录</span></button>
+  <span class="muted">浏览器会给你一个验证码，填到站点上就成了。</span>
 </div>
 {{end}}
 {{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，

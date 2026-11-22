@@ -298,33 +298,40 @@ const signInHTML = `<!DOCTYPE html>
 <meta name="color-scheme" content="light dark">
 <title>登录 · mmxcode</title>
 <style>
+/* 这一页自己带样式：它在管理页之前就出现了，那会儿管理页的样式还
+   没有被请来（也不该请）。可它的颜色跟管理页是同一套：那边换了，
+   这边也得跟着换，不然人从登录页进后台，像走了两个地方。 */
 :root {
   color-scheme: light dark;
-  --bg: #f4f6f8;
+  --bg: #f1f3f7;
   --surface: #ffffff;
-  --line: #e2e6ea;
-  --line-strong: #c9d0d8;
-  --text: #10151b;
-  --text-2: #545d68;
-  --text-3: #6f7883;
-  --accent: #0f62fe;
+  --line: #e5e8ee;
+  --line-strong: #d0d6df;
+  --text: #0f1522;
+  --text-2: #4c5666;
+  --text-3: #6b7686;
+  --accent: #2f6feb;
+  --accent-hover: #1e5bd8;
   --accent-ink: #ffffff;
-  --bad: #c02525;
+  --bad: #c62f38;
   --bad-soft: #fdecec;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px -12px rgba(16, 24, 40, .18);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d1117;
-    --surface: #151b23;
-    --line: #242d38;
-    --line-strong: #39444f;
-    --text: #e7ecf2;
-    --text-2: #a3adba;
-    --text-3: #7e8894;
+    --bg: #0a0e14;
+    --surface: #121821;
+    --line: #222c38;
+    --line-strong: #35414f;
+    --text: #e8edf4;
+    --text-2: #a5b0be;
+    --text-3: #7b8797;
     --accent: #5b93ff;
-    --accent-ink: #061020;
+    --accent-hover: #7ba6ff;
+    --accent-ink: #06101f;
     --bad: #ff7b72;
-    --bad-soft: #2d1618;
+    --bad-soft: #2e1618;
+    --shadow: 0 8px 28px -12px rgba(0, 0, 0, .8);
   }
 }
 * { box-sizing: border-box; }
@@ -340,38 +347,40 @@ body {
     "Microsoft YaHei", system-ui, sans-serif;
 }
 .box {
-  width: min(420px, 100%);
+  width: min(400px, 100%);
   padding: 26px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
+  box-shadow: var(--shadow);
 }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.02em; }
 .mark {
   display: grid; place-items: center;
-  width: 26px; height: 26px; border-radius: 6px;
+  width: 28px; height: 28px; border-radius: 7px;
   background: var(--accent); color: var(--accent-ink);
   font-size: 12px; font-weight: 700;
 }
-h1 { margin: 16px 0 6px; font-size: 19px; letter-spacing: -.015em; }
-p { margin: 0 0 16px; color: var(--text-2); font-size: 13px; }
-form { display: flex; gap: 8px; }
+h1 { margin: 18px 0 6px; font-size: 19px; letter-spacing: -.015em; }
+p { margin: 0 0 18px; color: var(--text-2); font-size: 13px; }
+label { display: block; margin-bottom: 6px; color: var(--text-2); font-size: 12px; font-weight: 600; }
+form { display: flex; flex-direction: column; gap: 8px; }
 input {
-  flex: 1; min-width: 0;
   font: inherit; font-size: 13px; color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 10px;
+  border: 1px solid var(--line-strong); border-radius: 6px; padding: 8px 10px;
 }
+input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgba(47, 111, 235, .16); }
 button {
   font: inherit; font-size: 13px; font-weight: 600;
-  padding: 7px 14px; cursor: pointer;
+  padding: 8px 14px; cursor: pointer;
   border: 1px solid var(--accent); border-radius: 6px;
   background: var(--accent); color: var(--accent-ink);
 }
-button:hover { filter: brightness(.94); }
+button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .bad {
-  margin: 14px 0 0; padding: 8px 10px; border-radius: 4px;
+  margin: 16px 0 0; padding: 9px 11px; border-radius: 4px;
   background: var(--bad-soft); color: var(--bad); font-size: 13px;
 }
 </style>
@@ -383,7 +392,8 @@ button:hover { filter: brightness(.94); }
   <h1>进管理页</h1>
   <p>这个网关要一把 API key。填进去就能进管理页。</p>
   <form method="post" action="/api/session">
-  <input type="password" name="key" placeholder="API key" autocomplete="current-password" autofocus>
+  <label for="key">API key</label>
+  <input id="key" type="password" name="key" placeholder="sk-..." autocomplete="current-password" autofocus>
   <button type="submit">进入</button>
   </form>
   {{if .Error}}<p class="bad">{{.Error}}</p>{{end}}

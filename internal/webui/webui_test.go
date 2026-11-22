@@ -85,7 +85,7 @@ func newTestWebUI(t *testing.T) (*WebUI, *store.Store) {
 
 func TestAccountsPage(t *testing.T) {
 	w, _ := newTestWebUI(t)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -93,6 +93,77 @@ func TestAccountsPage(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "主号") {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+// TestTheOverviewPageSaysHowTheGatewayLooks says the front page says how
+// many accounts are there and which of them need a hand.
+//
+// 一进来就要看见「现在怎么样」：账号多少、剩多少积分、哪里出了事。别的
+// 页面是去做事的，这一页是看情况的。
+func TestTheOverviewPageSaysHowTheGatewayLooks(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	// 一个签出去的号：它要人来管，所以得摆在概览上。
+	s.CreateAccount(ctx, store.Account{
+		ID: "acc_02", Name: "签出的号", Status: store.StatusSignedOut,
+		LastError: "the refresh token can no longer be used",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "概览") {
+		t.Fatalf("the front page is not the overview: %s", body)
+	}
+	if !strings.Contains(body, "签出的号") {
+		t.Fatalf("the account that needs a hand is not on the front page: %s", body)
+	}
+	if !strings.Contains(body, "需要处理") {
+		t.Fatalf("the front page does not say what needs a hand: %s", body)
+	}
+}
+
+// TestTheAccountsPageHasTheTools says the accounts page has the things
+// that make a hundred accounts manageable.
+//
+// 一百个账号：筛状态、排一下、勾几个一起办。这三样没有的话，一百个
+// 账号就只能一个一个点。
+func TestTheAccountsPageHasTheTools(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"account-filter", "status-chips", "pick-all", "bulkbar"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the accounts page has no %s: %s", want, body)
+		}
+	}
+}
+
+// TestTheIconsAreServed says the icon sheet is served.
+//
+// 图标是 /static/icons.svg 里的一个 <symbol>：页面用 <use> 引它。没有
+// 这个文件，页面上每一个图标都是空的。
+func TestTheIconsAreServed(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	req := httptest.NewRequest(http.MethodGet, "/static/icons.svg", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "<symbol") {
+		t.Fatalf("the icon sheet has no symbols: %s", rec.Body.String())
 	}
 }
 
@@ -437,7 +508,7 @@ func TestAccountsPageHideTheProxyCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -535,7 +606,7 @@ func TestTheAccountPageShowsTheLastError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -552,7 +623,7 @@ func TestTheAccountPageShowsTheLastError(t *testing.T) {
 // 没有错就别占地方：一页账号，一半是空的说明，就成了一堵墙。
 func TestTheAccountPageSaysNothingWhenThereIsNoError(t *testing.T) {
 	w, _ := newTestWebUI(t)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -581,7 +652,7 @@ func TestTheLastErrorIsNotMarkup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
 	rec := httptest.NewRecorder()
 	w.ServeHTTP(rec, req)
 	if rec.Code != 200 {

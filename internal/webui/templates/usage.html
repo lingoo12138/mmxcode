@@ -1,42 +1,54 @@
 {{define "content"}}
 <div class="page-head">
-  <div>
-    <h1>用量</h1>
-    <p>每个账号的积分。页面上是上一次读数时的数，按一下就是现在读一遍。</p>
-  </div>
+  <p class="lead">每个账号的积分。页面上是上一次读数时的数，按一下就是现在读一遍。</p>
   <div class="page-actions">
     <span class="muted" id="usage-status"></span>
-    <button id="usage-refresh" type="button" class="primary">刷新账本</button>
+    <button id="usage-refresh" type="button" class="primary icon">
+      <svg class="ic ic-sm"><use href="/static/icons.svg#refresh"/></svg><span>刷新账本</span></button>
   </div>
 </div>
 
-<div class="stats">
-  <div class="stat"><div class="label">总积分</div><div class="value">{{printf "%.2f" .Summary.TotalGranted}}</div></div>
-  <div class="stat"><div class="label">总消耗</div><div class="value">{{printf "%.2f" .Summary.TotalConsumed}}</div></div>
-  <div class="stat"><div class="label">总剩余</div><div class="value">{{printf "%.2f" .Summary.TotalRemaining}}</div></div>
+<div class="kpis">
+  <div class="kpi">
+    <div class="label"><svg class="ic ic-sm"><use href="/static/icons.svg#coin"/></svg><span>总发放</span></div>
+    <div class="value">{{printf "%.2f" .Summary.TotalGranted}}<span class="unit">分</span></div>
+    <div class="foot"><span class="muted">站点一共发下来的</span></div>
+  </div>
+  <div class="kpi">
+    <div class="label"><svg class="ic ic-sm"><use href="/static/icons.svg#activity"/></svg><span>总消耗</span></div>
+    <div class="value">{{printf "%.2f" .Summary.TotalConsumed}}<span class="unit">分</span></div>
+    <div class="foot"><span class="muted">已经用掉的</span></div>
+  </div>
+  <div class="kpi">
+    <div class="label"><svg class="ic ic-sm"><use href="/static/icons.svg#chart-bar"/></svg><span>总剩余</span></div>
+    <div class="value">{{printf "%.2f" .Summary.TotalRemaining}}<span class="unit">分</span></div>
+    <div class="foot">
+      {{if .Summary.ExpiresAt}}<span class="muted">最近过期 {{.Summary.ExpiresAt.Format "2006-01-02"}}</span>
+      {{else}}<span class="muted">没有会过期的批次</span>{{end}}
+    </div>
+  </div>
 </div>
 
-<p class="note">{{if .Summary.ExpiresAt}}最近过期：{{.Summary.ExpiresAt.Format "2006-01-02 15:04"}}{{end}}</p>
-{{if .Summary.Readings}}<p class="note">读数时间：{{.Summary.UpdatedAt.Format "2006-01-02 15:04"}}</p>
-{{else}}<p class="note">还没有读过任何一个账号的积分。</p>{{end}}
+<p class="note">{{if .Summary.Readings}}读数时间：{{.Summary.UpdatedAt.Format "2006-01-02 15:04"}}{{else}}还没有读过任何一个账号的积分。{{end}}</p>
 {{if .Summary.AccountsUnavailable}}<p class="note bad">有 {{.Summary.AccountsUnavailable}} 个账号的积分读不到。</p>{{end}}
 {{if .Summary.AccountsUnread}}<p class="note">有 {{.Summary.AccountsUnread}} 个账号的积分还没读过。</p>{{end}}
 {{if .Summary.AccountsExpired}}<p class="note">有 {{.Summary.AccountsExpired}} 个账号的积分已经过期，没有算进总数。</p>{{end}}
 
 <div class="table-wrap">
 <table>
-<thead><tr><th>账号</th><th class="num">积分</th><th class="num">消耗</th><th class="num">剩余</th><th>过期</th></tr></thead>
+<thead><tr><th>账号</th><th class="num">剩余</th><th>还剩多少</th><th class="num">总积分</th><th class="num">消耗</th><th>过期</th></tr></thead>
 <tbody>
-{{range .Summary.Accounts}}
+{{range .Rows}}
 <tr>
   <td>{{if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}{{if eq .State "expired"}} <span class="muted">已过期</span>{{end}}</td>
+  <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if .Remaining}}{{printf "%.2f" (num .Remaining)}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td>{{if eq .State "unread"}}<span class="muted">还没读</span>{{else}}<div class="meter"><span class="{{.Bar}}" style="width: {{printf "%.1f" .Pct}}%"></span></div><div class="sub">{{printf "%.0f" .Pct}}% 还剩</div>{{end}}</td>
   <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if .Granted}}{{printf "%.2f" (num .Granted)}}{{else}}<span class="muted">读不到</span>{{end}}</td>
-  <td class="num">{{if eq .State "unread"}}<span class="muted">—</span>{{else if .Consumed}}{{printf "%.2f" (num .Consumed)}}{{else}}0{{end}}</td>
-  <td class="num">{{if eq .State "unread"}}<span class="muted">—</span>{{else if .Remaining}}{{printf "%.2f" (num .Remaining)}}{{else}}0{{end}}</td>
+  <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if .Consumed}}{{printf "%.2f" (num .Consumed)}}{{else}}0{{end}}</td>
   <td class="muted nowrap">{{if .ExpiresAt}}{{.ExpiresAt.Format "2006-01-02"}}{{end}}</td>
 </tr>
 {{end}}
-{{if not .Summary.Accounts}}<tr><td class="empty" colspan="5">还没有账号可以算。</td></tr>{{end}}
+{{if not .Rows}}<tr><td class="empty" colspan="6">还没有账号可以算。</td></tr>{{end}}
 </tbody>
 </table>
 </div>

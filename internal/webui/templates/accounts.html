@@ -1,30 +1,56 @@
 {{define "content"}}
 <div class="page-head">
-  <div>
-    <h1>账号</h1>
-    <p>网关后面站着的每一个账号。出口、签到、积分都在这一页上改。</p>
+  <p class="lead">网关后面站着的每一个账号。出口、签到、积分都在这一页上改。</p>
+  <div class="page-actions">
+    <a class="btn" href="/import"><svg class="ic ic-sm"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
+    <a class="btn primary" href="/login"><svg class="ic ic-sm"><use href="/static/icons.svg#login"/></svg><span>登录新账号</span></a>
   </div>
 </div>
 
 <div class="toolbar">
-  <input class="grow" id="account-filter" type="search" placeholder="筛账号：邮箱、标签、ID 都行" autocomplete="off">
+  <div class="search grow">
+    <svg class="ic ic-sm"><use href="/static/icons.svg#search"/></svg>
+    <input id="account-filter" type="search" placeholder="筛账号：邮箱、标签、ID 都行" autocomplete="off">
+  </div>
   <span class="muted" id="account-count"></span>
+  <div class="chips" id="status-chips">
+    <button type="button" class="chip is-on" data-status="">全部 <span class="n">{{.TotalCount}}</span></button>
+    <button type="button" class="chip" data-status="active">正常 <span class="n">{{.ActiveCount}}</span></button>
+    <button type="button" class="chip" data-status="signed_out">已登出 <span class="n">{{.SignedOutCount}}</span></button>
+    <button type="button" class="chip" data-status="error">出错 <span class="n">{{.ErrorCount}}</span></button>
+  </div>
 </div>
 
 <div class="table-wrap">
 <table>
-<thead><tr><th>标签</th><th>邮箱</th><th>状态</th><th class="num">积分</th><th>套餐</th><th>出口</th><th>今日签到</th><th></th></tr></thead>
+<thead><tr>
+  <th class="pick"><input type="checkbox" id="pick-all" aria-label="全选"></th>
+  <th class="sortable" data-col="1">标签<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th class="sortable" data-col="2">邮箱<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th class="sortable" data-col="3">状态<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th class="sortable num" data-col="4">积分<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th class="sortable" data-col="5">套餐<span class="sort"><svg class="ic ic-sm"><use href="/static/icons.svg#arrows-sort"/></svg></span></th>
+  <th>出口</th>
+  <th>今日签到</th>
+  <th></th>
+</tr></thead>
 <tbody>
 {{range $acc := .Accounts}}
-<tr data-row="{{$acc.ID}}">
-  <td class="nowrap">{{$acc.Name}}<div class="sub mono">{{$acc.ID}}</div></td>
-  <td>{{$acc.Email}}</td>
-  <td>{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill bad">已登出</span>{{else}}<span class="pill bad">{{$acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err">{{$acc.LastError}}</div>{{end}}</td>
-  <td class="num">{{if $acc.HasAmounts}}{{printf "%.2f" $acc.Remaining}} / {{printf "%.2f" $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
-  <td>{{$acc.Plan}}<div class="sub">{{$acc.WindowSummary}}</div></td>
+<tr data-row="{{$acc.ID}}" id="acc-{{$acc.ID}}" data-status="{{$acc.Status}}"
+    data-name="{{$acc.Name}}" data-email="{{$acc.Email}}" data-plan="{{$acc.Plan}}"
+    data-window="{{$acc.WindowSummary}}" data-error="{{$acc.LastError}}"
+    data-has-amounts="{{$acc.HasAmounts}}" data-remaining="{{$acc.Remaining}}"
+    data-granted="{{$acc.Granted}}" data-group="{{$acc.ProxyGroup}}" data-url="{{$acc.ProxyURL}}"
+    data-checked="{{$acc.CheckedIn}}" data-streak="{{$acc.Streak}}">
+  <td class="pick"><input type="checkbox" class="pick-row" data-id="{{$acc.ID}}" aria-label="选 {{$acc.Name}}"></td>
+  <td class="nowrap" data-sort="{{$acc.Name}}">{{$acc.Name}}<div class="sub mono">{{$acc.ID}}</div></td>
+  <td class="nowrap" data-sort="{{$acc.Email}}">{{if $acc.Email}}{{$acc.Email}}{{else}}<span class="muted">没有邮箱</span>{{end}}</td>
+  <td data-sort="{{$acc.Status}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">已登出</span>{{else}}<span class="pill bad">{{statusName $acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err two" title="{{$acc.LastError}}">{{$acc.LastError}}</div>{{end}}</td>
+  <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}{{printf "%.2f" $acc.Remaining}} / {{printf "%.2f" $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td data-sort="{{$acc.Plan}}">{{if $acc.Plan}}{{$acc.Plan}}{{else}}<span class="muted">未知</span>{{end}}{{if $acc.WindowSummary}}<div class="sub">{{$acc.WindowSummary}}</div>{{end}}</td>
   <td>
     <div class="outlet">
-      <select data-account="{{$acc.ID}}" data-field="proxy_group">
+      <select data-account="{{$acc.ID}}" data-field="proxy_group" aria-label="出口组">
         <option value="">跟随全局</option>
         {{range $.Groups}}<option value="{{.Name}}"{{if eq .Name $acc.ProxyGroup}} selected{{end}}>{{.Name}}</option>{{end}}
       </select>
@@ -32,11 +58,20 @@
     </div>
   </td>
   <td class="nowrap">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
-  <td><button class="small" data-checkin="{{$acc.ID}}">立即签到</button></td>
+  <td class="nowrap"><button class="small" data-checkin="{{$acc.ID}}">立即签到</button></td>
 </tr>
 {{end}}
-{{if not .Accounts}}<tr><td class="empty" colspan="8">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}
+{{if not .Accounts}}<tr><td class="empty" colspan="9">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}
 </tbody>
 </table>
+</div>
+
+<div class="bulkbar" id="bulkbar" hidden>
+  <span class="n">选了 <span id="bulk-count">0</span> 个</span>
+  <span class="spacer"></span>
+  <button type="button" class="small" id="bulk-checkin">批量签到</button>
+  <button type="button" class="small" id="bulk-group">批量设出口组</button>
+  <button type="button" class="small danger" id="bulk-delete">批量删除</button>
+  <button type="button" class="small" id="bulk-cancel">取消</button>
 </div>
 {{end}}

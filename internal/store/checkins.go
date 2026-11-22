@@ -87,6 +87,23 @@ func (s *Store) DayCheckins(ctx context.Context, day string) ([]CheckinCredit, e
 	return out, nil
 }
 
+// CountDayCheckins counts the accounts that were checked in on a day.
+//
+// 数的是账号，不是签到的次数：一天签一次，签到表里也只有那一行，可补签
+// 会再写一行 —— 一个号还是算一个。
+//
+// DayCheckins 数的是给了积分的那些。这里数的是签过的：签到没给积分也是
+// 签了，后台的「今日签到」要的是这个。
+func (s *Store) CountDayCheckins(ctx context.Context, day string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT account_id) FROM checkins WHERE day = ?`, day).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("the number of accounts checked in on %s: %w", day, err)
+	}
+	return n, nil
+}
+
 // accountsWithoutCheckinSQL is the query that gives the accounts that
 // were not checked in on a day.
 //
