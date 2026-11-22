@@ -32,3 +32,4 @@ dist/
 
 # 预览用的临时服务（不进版本库）
 /cmd/previewtmp/
+previewtmp.exe

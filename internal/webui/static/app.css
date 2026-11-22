@@ -677,10 +677,14 @@ body.side-min .side-collapse .ic {
 .stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
-  /* 格子之间那道线是底色露出来的：换行的时候线也跟着换，不用另外算。 */
+  /* 格子之间那道线是每格自己画的一圈：相邻两格的圈正好落在同一条缝
+   * 上，看起来还是一道线。
+   *
+   * 底下不能是线的颜色：最后一行不满的时候，空出来的地方会露出一块
+   * 灰的。底下跟格子一个颜色，空出来的地方就是干净的一块面板。 */
   gap: 1px;
   margin-bottom: 24px;
-  background: var(--line);
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
@@ -699,6 +703,8 @@ body.side-min .side-collapse .ic {
   min-width: 0;
   padding: 14px 16px;
   background: var(--surface);
+  /* 这一圈就是格子之间那道线。 */
+  box-shadow: 0 0 0 1px var(--line);
   color: inherit;
   text-decoration: none;
 }
