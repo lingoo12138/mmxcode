@@ -10,6 +10,9 @@
 config.yaml
 .env
 
+# 导出来的账号清单：里面有明文密码，不进版本库
+accounts-export.txt
+
 # 编译出来的二进制和运行日志
 /mmxcode.exe
 /mmxcode.exe~
