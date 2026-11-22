@@ -1,13 +1,24 @@
 {{define "content"}}
-<h2>登录</h2>
+<div class="page-head">
+  <div>
+    <h1>登录</h1>
+    <p>拿一个 mcode 账号登进网关。登进来的账号就是网关后面站着的人。</p>
+  </div>
+</div>
+
 {{if .Pending}}
-<p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
-   <a href="{{.Pending.URL}}" target="_blank">这个页面</a>。</p>
+<div class="notice">
+  <h3>还差一步</h3>
+  <p>把验证码 <strong>{{.Pending.UserCode}}</strong> 填到
+     <a href="{{.Pending.URL}}" target="_blank" rel="noopener">这个页面</a>。</p>
+</div>
 {{else}}
-<button id="start-login">开始登录</button>
+<div class="toolbar">
+  <button id="start-login" type="button" class="primary">开始登录</button>
+</div>
 {{end}}
 {{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，
      失败的话也得让人看见那句话。 */}}
-<div id="login-result"></div>
-<p id="poll-result" class="muted">{{if .Pending}}正在等……{{end}}</p>
+<div id="login-result" class="notice"></div>
+<p id="poll-result" class="note">{{if .Pending}}正在等……{{end}}</p>
 {{end}}

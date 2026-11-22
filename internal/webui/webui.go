@@ -116,7 +116,10 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/static/app.js":
-		w.serveStatic(rw, r)
+		w.serveStatic(rw, r, "app.js", "application/javascript; charset=utf-8")
+		return
+	case "/static/app.css":
+		w.serveStatic(rw, r, "app.css", "text/css; charset=utf-8")
 		return
 	case "/api/accounts":
 		w.apiAccounts(rw, r)
@@ -204,15 +207,32 @@ func num(v *float64) float64 {
 	return *v
 }
 
-// serveStatic gives the script.
-func (w *WebUI) serveStatic(rw http.ResponseWriter, r *http.Request) {
-	b, err := staticFS.ReadFile("static/app.js")
+// serveStatic gives a file from the static directory.
+func (w *WebUI) serveStatic(rw http.ResponseWriter, r *http.Request, name, contentType string) {
+	b, err := staticFS.ReadFile("static/" + name)
 	if err != nil {
 		http.Error(rw, "not found", http.StatusNotFound)
 		return
 	}
-	rw.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	rw.Header().Set("Content-Type", contentType)
 	rw.Write(b)
+}
+
+// pageNames says what a page is called and which nav item is the one
+// being looked at.
+//
+// 名字是人读的中文，导航上那一个亮起来靠的是 Nav。
+var pageNames = map[string]struct {
+	Title string
+	Nav   string
+}{
+	"accounts": {"账号", "accounts"},
+	"egress":   {"出口", "egress"},
+	"usage":    {"用量", "usage"},
+	"keys":     {"密钥", "keys"},
+	"login":    {"登录", "login"},
+	"import":   {"导入", "import"},
+	"relogin":  {"重登", "relogin"},
 }
 
 // page renders one page.
@@ -222,7 +242,13 @@ func (w *WebUI) page(rw http.ResponseWriter, r *http.Request, name string, data 
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	d["Title"] = strings.TrimSuffix(name, ".html")
+	key := strings.TrimSuffix(name, ".html")
+	d["Title"] = key
+	d["Nav"] = ""
+	if p, ok := pageNames[key]; ok {
+		d["Title"] = p.Title
+		d["Nav"] = p.Nav
+	}
 	// 配了 key 才有登录和退出可做：没配 key 的网关不用登录。
 	d["HasKeys"] = len(w.Cfg.Server.APIKeys) > 0
 	// The page brings its own "content", so it is parsed into a copy

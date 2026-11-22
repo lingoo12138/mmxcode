@@ -1,50 +1,63 @@
 {{define "content"}}
-<section>
-  <h1>批量导入</h1>
-  {{if .PasswordNote}}
-    <p class="muted" id="import-password-note">{{.PasswordNote}}</p>
-  {{end}}
-  <p class="muted">清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。
-     不想让明文密码走网络的话，在服务器上跑
-     <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+<div class="page-head">
+  <div>
+    <h1>批量导入</h1>
+    <p>清单每行一个账号，写成 <code>邮箱|密码</code>；<code>#</code> 开头的是注释。</p>
+    {{if .PasswordNote}}
+    <p class="note">{{.PasswordNote}}</p>
+    {{end}}
+  </div>
+</div>
 
-  <h2>上传文件</h2>
-  <form id="import-form" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".txt" required>
-    <button type="submit">开始</button>
-  </form>
+<div class="grid-2">
+  <section class="section">
+    <h2>上传文件</h2>
+    <form id="import-form" enctype="multipart/form-data" class="toolbar">
+      <input class="grow" type="file" name="file" accept=".txt" required>
+      <button type="submit" class="primary">开始</button>
+    </form>
+    <p class="note">不想让明文密码走网络的话，在服务器上跑 <code>mmxcode import --file accounts.txt</code> 也一样。</p>
+  </section>
 
-  <h2>或者直接贴清单</h2>
-  <form id="import-text-form">
-    <p>
-      <textarea id="import-text" rows="10" cols="60"
+  <section class="section">
+    <h2>或者直接贴清单</h2>
+    <form id="import-text-form">
+      <textarea id="import-text" rows="10"
         placeholder="a@example.com|pw&#10;b@example.com|pw"></textarea>
-    </p>
-    <p class="muted">最多 {{.TextLines}} 行。<span id="import-text-count">0 行</span></p>
-    <button type="submit" id="import-text-button">开始</button>
-  </form>
+      <p class="note">最多 {{.TextLines}} 行。<span id="import-text-count">0 行</span></p>
+      <button type="submit" id="import-text-button" class="primary">开始</button>
+    </form>
+  </section>
+</div>
 
-  <p class="muted" id="import-status"></p>
-  <table id="import-results" hidden>
-    <thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
-    <tbody></tbody>
-  </table>
-  {{if .Runs}}
+<p class="note" id="import-status"></p>
+
+<div class="table-wrap" id="import-results" hidden>
+<table>
+<thead><tr><th>账号</th><th>结果</th><th>说明</th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+{{if .Runs}}
+<section class="section">
   <h2>最近的导入</h2>
+  <div class="table-wrap">
   <table>
-    <thead><tr><th>时间</th><th>来源</th><th>成功</th><th>失败</th><th>说明</th></tr></thead>
+    <thead><tr><th>时间</th><th>来源</th><th class="num">成功</th><th class="num">失败</th><th>说明</th></tr></thead>
     <tbody>
       {{range .Runs}}
       <tr>
-        <td>{{.StartedAt.Format "2006-01-02 15:04:05"}}</td>
+        <td class="muted nowrap">{{.StartedAt.Format "2006-01-02 15:04:05"}}</td>
         <td>{{.Source}}</td>
-        <td class="good">{{.OK}}</td>
-        <td class="bad">{{.Failed}}</td>
+        <td class="num good">{{.OK}}</td>
+        <td class="num bad">{{.Failed}}</td>
         <td>{{.Whole}}</td>
       </tr>
       {{end}}
     </tbody>
   </table>
-  {{end}}
+  </div>
 </section>
+{{end}}
 {{end}}

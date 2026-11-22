@@ -287,33 +287,111 @@ var signInTemplate = template.Must(template.New("signin").Parse(signInHTML))
 //
 // 表单里只有一个框：把 key 填进去。没有 key 的网关不需要登录，所以
 // 那时候页面只说一句。
+//
+// 这一页自己带样式：它在管理页之前就出现了，那会儿管理页的样式还
+// 没有被请来（也不该请）。
 const signInHTML = `<!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>登录 · mmxcode</title>
 <style>
-:root { color-scheme: light dark; }
-body { font: 14px/1.6 system-ui, sans-serif; margin: 0; padding: 2rem 1rem; }
-h1 { font-size: 1.1rem; }
-form { display: flex; gap: .5rem; align-items: center; max-width: 32rem; }
-input { flex: 1; padding: .4rem; }
-button { padding: .25rem .8rem; cursor: pointer; }
-.bad { color: #c0392b; }
+:root {
+  color-scheme: light dark;
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --line: #e2e6ea;
+  --line-strong: #c9d0d8;
+  --text: #10151b;
+  --text-2: #545d68;
+  --text-3: #6f7883;
+  --accent: #0f62fe;
+  --accent-ink: #ffffff;
+  --bad: #c02525;
+  --bad-soft: #fdecec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #151b23;
+    --line: #242d38;
+    --line-strong: #39444f;
+    --text: #e7ecf2;
+    --text-2: #a3adba;
+    --text-3: #7e8894;
+    --accent: #5b93ff;
+    --accent-ink: #061020;
+    --bad: #ff7b72;
+    --bad-soft: #2d1618;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", system-ui, sans-serif;
+}
+.box {
+  width: min(420px, 100%);
+  padding: 26px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.02em; }
+.mark {
+  display: grid; place-items: center;
+  width: 26px; height: 26px; border-radius: 6px;
+  background: var(--accent); color: var(--accent-ink);
+  font-size: 12px; font-weight: 700;
+}
+h1 { margin: 16px 0 6px; font-size: 19px; letter-spacing: -.015em; }
+p { margin: 0 0 16px; color: var(--text-2); font-size: 13px; }
+form { display: flex; gap: 8px; }
+input {
+  flex: 1; min-width: 0;
+  font: inherit; font-size: 13px; color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 10px;
+}
+button {
+  font: inherit; font-size: 13px; font-weight: 600;
+  padding: 7px 14px; cursor: pointer;
+  border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--accent); color: var(--accent-ink);
+}
+button:hover { filter: brightness(.94); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bad {
+  margin: 14px 0 0; padding: 8px 10px; border-radius: 4px;
+  background: var(--bad-soft); color: var(--bad); font-size: 13px;
+}
 </style>
 </head>
 <body>
-<h1>mmxcode</h1>
-{{if .HasKeys}}
-<p>这个网关要一把 API key。填进去就能进管理页。</p>
-<form method="post" action="/api/session">
-<input type="password" name="key" placeholder="API key" autocomplete="current-password" autofocus>
-<button type="submit">进入</button>
-</form>
-{{if .Error}}<p class="bad">{{.Error}}</p>{{end}}
-{{else}}
-<p>这个网关没有配 API key，不用登录。</p>
-{{end}}
+<div class="box">
+  <div class="brand"><span class="mark">mx</span>mmxcode</div>
+  {{if .HasKeys}}
+  <h1>进管理页</h1>
+  <p>这个网关要一把 API key。填进去就能进管理页。</p>
+  <form method="post" action="/api/session">
+  <input type="password" name="key" placeholder="API key" autocomplete="current-password" autofocus>
+  <button type="submit">进入</button>
+  </form>
+  {{if .Error}}<p class="bad">{{.Error}}</p>{{end}}
+  {{else}}
+  <h1>不用登录</h1>
+  <p>这个网关没有配 API key，不用登录。</p>
+  {{end}}
+</div>
 </body>
 </html>
 `

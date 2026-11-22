@@ -1,19 +1,28 @@
 {{define "content"}}
-<section>
-  <h1>重登</h1>
-  <p class="muted">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
-  <p><button id="relogin-all">全部重登</button> <span class="muted" id="relogin-status"></span></p>
-  <table>
-    <thead><tr><th>账号</th><th>邮箱</th><th>上次为什么掉的</th></tr></thead>
-    <tbody>
-      {{range .SignedOut}}
-      <tr>
-        <td>{{.Name}}</td>
-        <td>{{.Email}}</td>
-        <td class="err">{{.Error}}</td>
-      </tr>
-      {{end}}
-    </tbody>
-  </table>
-</section>
+<div class="page-head">
+  <div>
+    <h1>重登</h1>
+    <p>签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
+  </div>
+  <div class="page-actions">
+    <span class="muted" id="relogin-status"></span>
+    <button id="relogin-all" type="button" class="primary">全部重登</button>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>账号</th><th>邮箱</th><th>上次为什么掉的</th></tr></thead>
+  <tbody>
+    {{range .SignedOut}}
+    <tr>
+      <td class="nowrap">{{.Name}}</td>
+      <td>{{.Email}}</td>
+      <td class="err">{{.Error}}</td>
+    </tr>
+    {{end}}
+    {{if not .SignedOut}}<tr><td class="empty" colspan="3">没有签出去的账号。</td></tr>{{end}}
+  </tbody>
+</table>
+</div>
 {{end}}

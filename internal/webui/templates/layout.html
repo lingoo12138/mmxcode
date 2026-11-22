@@ -1,47 +1,33 @@
 {{define "layout"}}<!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>{{.Title}} · mmxcode</title>
-<style>
-:root { color-scheme: light dark; }
-body { font: 14px/1.6 system-ui, sans-serif; margin: 0; padding: 0 1rem 3rem; }
-header { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #8884; }
-header h1 { font-size: 1.1rem; margin: 0; }
-nav a { margin-right: 1rem; text-decoration: none; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8883; }
-th { font-weight: 600; }
-.bad { color: #c0392b; }
-.good { color: #27ae60; }
-.muted { color: #888; }
-/* 上一次的错是一整句：给它一块地方，别让它撑着整张表。 */
-.err { color: #c0392b; max-width: 28rem; overflow-wrap: anywhere; }
-button { padding: .25rem .6rem; cursor: pointer; }
-input, select { padding: .25rem; }
-.cards { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
-.card { border: 1px solid #8884; border-radius: 6px; padding: .8rem 1.2rem; }
-.card .n { font-size: 1.6rem; }
-</style>
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header>
-  <h1>mmxcode</h1>
-  <nav>
-    <a href="/">账号</a>
-    <a href="/egress">出口</a>
-    <a href="/usage">用量</a>
-    <a href="/keys">密钥</a>
-    <a href="/login">登录</a>
-    <a href="/import">导入</a>
-    <a href="/relogin">重登</a>
-    {{if .HasKeys}}<a href="/signin" id="sign-out">退出</a>{{end}}
+<a class="skip" href="#main">跳到正文</a>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark">mx</span><span class="brand-name">mmxcode</span></a>
+  <nav class="nav">
+    <a href="/"{{if eq .Nav "accounts"}} class="is-current"{{end}}>账号</a>
+    <a href="/egress"{{if eq .Nav "egress"}} class="is-current"{{end}}>出口</a>
+    <a href="/usage"{{if eq .Nav "usage"}} class="is-current"{{end}}>用量</a>
+    <a href="/keys"{{if eq .Nav "keys"}} class="is-current"{{end}}>密钥</a>
+    <a href="/login"{{if eq .Nav "login"}} class="is-current"{{end}}>登录</a>
+    <a href="/import"{{if eq .Nav "import"}} class="is-current"{{end}}>导入</a>
+    <a href="/relogin"{{if eq .Nav "relogin"}} class="is-current"{{end}}>重登</a>
   </nav>
-  <span class="muted" id="status"></span>
+  <div class="topbar-end">
+    {{if .HasKeys}}<a href="/signin" id="sign-out" class="nav-signout">退出</a>{{end}}
+  </div>
 </header>
-<main>
+<main class="wrap" id="main">
 {{template "content" .}}
 </main>
+<span class="status" id="status" role="status" aria-live="polite"></span>
 <script src="/static/app.js"></script>
 {{if .HasKeys}}
 <script>

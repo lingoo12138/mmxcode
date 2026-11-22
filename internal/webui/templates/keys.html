@@ -1,27 +1,39 @@
 {{define "content"}}
-<h2>密钥</h2>
-<p>聊天用的 key 在这里申请。申请出来的那一把只在这一页出现一次：抄走收好，之后就再也拿不出来了（库里存的是它的哈希，不是它）。</p>
-<form id="key-form">
-  <input id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）">
-  <button type="submit">申请一把</button>
+<div class="page-head">
+  <div>
+    <h1>密钥</h1>
+    <p>聊天用的 key 在这里申请。申请出来的那一把只在这一页出现一次：抄走收好，之后就再也拿不出来了（库里存的是它的哈希，不是它）。</p>
+  </div>
+</div>
+
+<form id="key-form" class="toolbar">
+  <input class="grow" id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）" autocomplete="off">
+  <button type="submit" class="primary">申请一把</button>
   <span class="muted" id="key-status"></span>
 </form>
-<div id="key-new" hidden>
-  <p>这一把 key 就是它了，抄走收好：</p>
-  <p><code id="key-plain"></code> <button type="button" id="key-copy">复制</button></p>
+
+<div id="key-new" class="notice" hidden>
+  <h3>这一把 key 就是它了，抄走收好</h3>
+  <p>页面一刷新它就没了。库里只留着它的哈希，谁都拿不回原文。</p>
+  <code class="key-plain" id="key-plain"></code>
+  <button type="button" id="key-copy">复制</button>
 </div>
+
+<div class="table-wrap">
 <table>
-<tr><th>名字</th><th>开头</th><th>申请时间</th><th>状态</th><th></th></tr>
+<thead><tr><th>名字</th><th>开头</th><th>申请时间</th><th>状态</th><th></th></tr></thead>
 <tbody id="key-rows">
 {{range .Keys}}
 <tr>
   <td>{{.Name}}</td>
-  <td><code>{{.Prefix}}</code></td>
-  <td class="muted">{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
-  <td>{{if .Revoked}}<span class="muted">已撤销</span>{{else}}<span class="good">能用</span>{{end}}</td>
-  <td>{{if not .Revoked}}<button type="button" data-revoke="{{.ID}}">撤销</button>{{end}}</td>
+  <td class="mono">{{.Prefix}}</td>
+  <td class="muted nowrap">{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
+  <td>{{if .Revoked}}<span class="pill">已撤销</span>{{else}}<span class="pill good">能用</span>{{end}}</td>
+  <td>{{if not .Revoked}}<button type="button" class="small danger" data-revoke="{{.ID}}">撤销</button>{{end}}</td>
 </tr>
 {{end}}
+{{if not .Keys}}<tr><td class="empty" colspan="5">还没有申请过 key。</td></tr>{{end}}
 </tbody>
 </table>
+</div>
 {{end}}

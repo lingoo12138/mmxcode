@@ -1,25 +1,42 @@
 {{define "content"}}
-<h2>账号</h2>
+<div class="page-head">
+  <div>
+    <h1>账号</h1>
+    <p>网关后面站着的每一个账号。出口、签到、积分都在这一页上改。</p>
+  </div>
+</div>
+
+<div class="toolbar">
+  <input class="grow" id="account-filter" type="search" placeholder="筛账号：邮箱、标签、ID 都行" autocomplete="off">
+  <span class="muted" id="account-count"></span>
+</div>
+
+<div class="table-wrap">
 <table>
-<tr><th>标签</th><th>邮箱</th><th>状态</th><th>积分</th><th>套餐</th><th>出口</th><th>今日签到</th><th></th></tr>
+<thead><tr><th>标签</th><th>邮箱</th><th>状态</th><th class="num">积分</th><th>套餐</th><th>出口</th><th>今日签到</th><th></th></tr></thead>
+<tbody>
 {{range $acc := .Accounts}}
-<tr>
-  <td>{{$acc.Name}}<div class="muted">{{$acc.ID}}</div></td>
+<tr data-row="{{$acc.ID}}">
+  <td class="nowrap">{{$acc.Name}}<div class="sub mono">{{$acc.ID}}</div></td>
   <td>{{$acc.Email}}</td>
-  <td>{{if eq $acc.Status "active"}}<span class="good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="bad">已登出</span>{{else}}<span class="bad">{{$acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err">{{$acc.LastError}}</div>{{end}}</td>
-  <td>{{if $acc.HasAmounts}}{{printf "%.2f / %.2f" $acc.Remaining $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
-  <td>{{$acc.Plan}}<div class="muted">{{$acc.WindowSummary}}</div></td>
+  <td>{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill bad">已登出</span>{{else}}<span class="pill bad">{{$acc.Status}}</span>{{end}}{{if $acc.LastError}}<div class="err">{{$acc.LastError}}</div>{{end}}</td>
+  <td class="num">{{if $acc.HasAmounts}}{{printf "%.2f" $acc.Remaining}} / {{printf "%.2f" $acc.Granted}}{{else}}<span class="muted">读不到</span>{{end}}</td>
+  <td>{{$acc.Plan}}<div class="sub">{{$acc.WindowSummary}}</div></td>
   <td>
-    <select data-account="{{$acc.ID}}" data-field="proxy_group">
-      <option value="">跟随全局</option>
-      {{range $.Groups}}<option value="{{.Name}}"{{if eq .Name $acc.ProxyGroup}} selected{{end}}>{{.Name}}</option>{{end}}
-    </select>
-    <input size="24" placeholder="单独代理地址（空 = 跟随全局）" data-account="{{$acc.ID}}" data-field="proxy_url" value="{{$acc.ProxyURL}}">
+    <div class="outlet">
+      <select data-account="{{$acc.ID}}" data-field="proxy_group">
+        <option value="">跟随全局</option>
+        {{range $.Groups}}<option value="{{.Name}}"{{if eq .Name $acc.ProxyGroup}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+      <input placeholder="单独地址（空 = 跟随全局）" data-account="{{$acc.ID}}" data-field="proxy_url" value="{{$acc.ProxyURL}}">
+    </div>
   </td>
-  <td>{{if $acc.CheckedIn}}<span class="good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="muted">未签</span>{{end}}</td>
-  <td><button data-checkin="{{$acc.ID}}">立即签到</button></td>
+  <td class="nowrap">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
+  <td><button class="small" data-checkin="{{$acc.ID}}">立即签到</button></td>
 </tr>
 {{end}}
+{{if not .Accounts}}<tr><td class="empty" colspan="8">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}
+</tbody>
 </table>
-{{if not .Accounts}}<p class="muted">还没有账号。<a href="/login">去登录</a>。</p>{{end}}
+</div>
 {{end}}

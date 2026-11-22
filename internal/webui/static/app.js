@@ -73,33 +73,54 @@ function safeURL(raw) {
   }
 }
 
+// busy says how many requests are in the air.
+//
+// 页面顶上那道细线就是它：只要还有一个请求在路上，它就亮着。
+let inFlight = 0;
+
+function setBusy(on) {
+  inFlight += on ? 1 : -1;
+  if (inFlight < 0) inFlight = 0;
+  document.body.classList.toggle('is-busy', inFlight > 0);
+}
+
+// call asks the gateway something.
+//
+// 页面上的按钮都在等这个回答，所以从发出到答回来，页顶那道线亮着。
+async function call(url, options) {
+  setBusy(true);
+  try {
+    const res = await fetch(url, options);
+    return await readAnswer(res);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function post(url, body) {
-  const res = await fetch(url, {
+  const answer = await call(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const answer = await readAnswer(res);
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
   return answer.json;
 }
 
 async function patch(url, body) {
-  const res = await fetch(url, {
+  const answer = await call(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const answer = await readAnswer(res);
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
 }
 
 // del 删掉一个东西。
 async function del(url) {
-  const res = await fetch(url, { method: 'DELETE' });
-  const answer = await readAnswer(res);
+  const answer = await call(url, { method: 'DELETE' });
   if (answer.status === 401) askForKey();
   if (!answer.ok) throw new Error(messageOf(answer));
 }
@@ -109,12 +130,11 @@ async function del(url) {
 // 回答可能是登录页（HTML），也可能是 JSON：网关现在给的是前者。两样
 // 都读，人看到的是同一句话。
 async function signIn(key) {
-  const res = await fetch('/api/session', {
+  const answer = await call('/api/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: key }),
   });
-  const answer = await readAnswer(res);
   if (!answer.ok) throw new Error(messageOf(answer));
   return answer;
 }
@@ -128,8 +148,12 @@ function askForKey() {
   if (keyBox) return;
   keyBox = document.createElement('div');
   keyBox.className = 'card';
+  const panel = document.createElement('div');
+  panel.className = 'card-box';
+  const title = document.createElement('h3');
+  title.textContent = '这个网关要一把 API key';
   const label = document.createElement('p');
-  label.textContent = '这个网关要一把 API key。填进去就能继续。';
+  label.textContent = '填进去就能继续。';
   const form = document.createElement('form');
   const input = document.createElement('input');
   input.type = 'password';
@@ -139,8 +163,10 @@ function askForKey() {
   button.type = 'submit';
   button.textContent = '进入';
   const msg = document.createElement('p');
+  msg.className = 'card-msg';
   form.append(input, button);
-  keyBox.append(label, form, msg);
+  panel.append(title, label, form, msg);
+  keyBox.appendChild(panel);
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
@@ -152,8 +178,64 @@ function askForKey() {
       button.disabled = false;
     }
   });
+  keyBox.addEventListener('click', (ev) => {
+    if (ev.target === keyBox) closeCard(keyBox);
+  });
   document.body.appendChild(keyBox);
+  input.focus();
 }
+
+// closeCard 关掉一个飘出来的框。
+function closeCard(box) {
+  if (!box) return;
+  box.remove();
+  if (box === keyBox) keyBox = null;
+}
+
+// Esc 关掉最上面那个框。
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  const boxes = document.querySelectorAll('.card');
+  if (!boxes.length) return;
+  closeCard(boxes[boxes.length - 1]);
+});
+
+// say 在右下角说一句。
+//
+// 说过的话过一会儿自己没了：那是给人看的反馈，不是页面上的一行字。
+let sayTimer = null;
+
+function say(text) {
+  const box = document.getElementById('status');
+  if (!box) return;
+  box.textContent = text;
+  if (sayTimer) clearTimeout(sayTimer);
+  sayTimer = setTimeout(() => {
+    box.textContent = '';
+  }, 4000);
+}
+
+// 筛账号：输入的字跟账号对得上就留着，对不上就藏起来。
+//
+// 一百个账号的表，往下滚着找一个邮箱是很笨的事。
+(function () {
+  const box = document.getElementById('account-filter');
+  if (!box) return;
+  const rows = Array.from(document.querySelectorAll('tr[data-row]'));
+  const counter = document.getElementById('account-count');
+  const apply = () => {
+    const q = box.value.trim().toLowerCase();
+    let shown = 0;
+    for (const row of rows) {
+      const hit = !q || row.textContent.toLowerCase().indexOf(q) >= 0;
+      row.classList.toggle('is-hidden', !hit);
+      if (hit) shown++;
+    }
+    if (counter) counter.textContent = rows.length ? shown + ' / ' + rows.length : '';
+  };
+  box.addEventListener('input', apply);
+  apply();
+})();
 
 document.addEventListener('click', async (ev) => {
   const checkin = ev.target.closest('[data-checkin]');
@@ -203,7 +285,7 @@ document.addEventListener('click', async (ev) => {
       await del(`/api/proxy-groups?name=${encodeURIComponent(name)}`);
       location.reload();
     } catch (e) {
-      document.getElementById('status').textContent = '删除失败：' + e.message;
+      say('删除失败：' + e.message);
       groupRm.disabled = false;
     }
     return;
@@ -249,9 +331,9 @@ document.addEventListener('change', async (ev) => {
   }
   try {
     await patch(`/api/accounts/${sel.dataset.account}`, body);
-    document.getElementById('status').textContent = '已保存';
+    say('已保存');
   } catch (e) {
-    document.getElementById('status').textContent = '保存失败：' + e.message;
+    say('保存失败：' + e.message);
   }
 });
 
@@ -288,8 +370,7 @@ document.addEventListener('submit', async (ev) => {
   const data = new FormData();
   data.append('file', input.files[0]);
   try {
-    const res = await fetch('/api/import', { method: 'POST', body: data });
-    const answer = await readAnswer(res);
+    const answer = await call('/api/import', { method: 'POST', body: data });
     if (!answer.ok) throw new Error(messageOf(answer));
     status.textContent = '导入中……';
     watchImport(answer.json.id);
@@ -316,12 +397,11 @@ document.addEventListener('submit', async (ev) => {
   }
   status.textContent = '导入中……';
   try {
-    const res = await fetch('/api/import', {
+    const answer = await call('/api/import', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ list: list }),
     });
-    const answer = await readAnswer(res);
     if (!answer.ok) throw new Error(messageOf(answer));
     watchImport(answer.json.id);
   } catch (e) {
@@ -358,8 +438,7 @@ const importTextLimit = 100;
 function watchImport(id) {
   const timer = setInterval(async () => {
     try {
-      const res = await fetch('/api/import/' + encodeURIComponent(id));
-      const answer = await readAnswer(res);
+      const answer = await call('/api/import/' + encodeURIComponent(id));
       if (!answer.ok) throw new Error(messageOf(answer));
       const run = answer.json;
       const status = document.getElementById('import-status');
@@ -420,8 +499,7 @@ document.addEventListener('click', async (ev) => {
   const status = document.getElementById('relogin-status');
   status.textContent = '重登中……';
   try {
-    const res = await fetch('/api/relogin', { method: 'POST' });
-    const answer = await readAnswer(res);
+    const answer = await call('/api/relogin', { method: 'POST' });
     if (!answer.ok) throw new Error(messageOf(answer));
     // 理由要摆出来：只说「失败 2」，人得自己去一个一个看是哪个账号、
     // 为什么。
@@ -448,8 +526,7 @@ document.addEventListener('click', async (ev) => {
   button.disabled = true;
   if (status) status.textContent = '正在读账本……';
   try {
-    const res = await fetch('/api/usage/refresh', { method: 'POST' });
-    const answer = await readAnswer(res);
+    const answer = await call('/api/usage/refresh', { method: 'POST' });
     if (!answer.ok) throw new Error(messageOf(answer));
     // 理由要摆出来：只说「失败 1」，人得自己去一个一个看是哪个账号、
     // 为什么。
@@ -545,8 +622,7 @@ document.addEventListener('click', async (ev) => {
 async function renderKeys() {
   const body = document.getElementById('key-rows');
   if (!body) return;
-  const res = await fetch('/api/keys');
-  const answer = await readAnswer(res);
+  const answer = await call('/api/keys');
   if (!answer.ok) return;
   const keys = Array.isArray(answer.json.keys) ? answer.json.keys : [];
   body.textContent = '';
@@ -594,16 +670,22 @@ async function renderKeys() {
 function editGroup(name, urls) {
   const box = document.createElement('div');
   box.className = 'card';
+  const panel = document.createElement('div');
+  panel.className = 'card-box';
+  const title = document.createElement('h3');
+  title.textContent = `组 ${name} 的地址`;
   const label = document.createElement('p');
-  label.textContent = `组 ${name} 的地址（一行一个，第一个是主路）`;
+  label.textContent = '一行一个，第一个是主路，后面的都是备路。';
   const input = document.createElement('textarea');
   input.rows = 6;
-  input.cols = 48;
   input.value = urls;
   const button = document.createElement('button');
+  button.type = 'button';
   button.textContent = '存回去';
   const msg = document.createElement('p');
-  box.append(label, input, button, msg);
+  msg.className = 'card-msg';
+  panel.append(title, label, input, button, msg);
+  box.appendChild(panel);
   button.addEventListener('click', async () => {
     button.disabled = true;
     try {
@@ -615,5 +697,9 @@ function editGroup(name, urls) {
       button.disabled = false;
     }
   });
+  box.addEventListener('click', (ev) => {
+    if (ev.target === box) closeCard(box);
+  });
   document.body.appendChild(box);
+  input.focus();
 }
