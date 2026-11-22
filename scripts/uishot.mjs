@@ -4,6 +4,9 @@
 //
 // 第三个参数是截图之前要跑的那句脚本：比如点开一个框。
 // 第四个参数写 dark 就是深色（preferredColorScheme=0）。
+//
+// 窗口的大小平时是 1440×900。要看窄屏，MMX_W / MMX_H 两个环境变量说了算：
+// MMX_W=420 MMX_H=900 node scripts/uishot.mjs ...
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 
@@ -51,7 +54,12 @@ async function evaluate(expression) {
 }
 
 await send('Page.enable')
-await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
+await send('Emulation.setDeviceMetricsOverride', {
+  width: Number(process.env.MMX_W || 1440),
+  height: Number(process.env.MMX_H || 900),
+  deviceScaleFactor: 1,
+  mobile: false,
+})
 await send('Page.navigate', { url })
 await sleep(1600)
 if (before) {

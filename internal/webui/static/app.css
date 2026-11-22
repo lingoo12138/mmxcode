@@ -19,44 +19,64 @@
 :root {
   color-scheme: light dark;
 
-  --bg: #f1f3f7;
+  /* 页面底比卡片暗一档。卡片是浮在这层上面的东西：不画边，靠深浅分
+   * 开（这是大厂后台的老办法，比一圈 1px 线干净）。 */
+  --bg: #f6f7f8;
   --surface: #ffffff;
-  --surface-2: #f7f8fa;
-  --surface-3: #eef1f5;
-  --side-bg: #fbfcfd;
-  --line: #e5e8ee;
-  --line-strong: #d0d6df;
+  --surface-2: #f1f2f4;
+  --surface-3: #e6e8eb;
+
+  /* 侧栏是深色的。
+   *
+   * 不管页面是浅是深，它都是「另一个地方」：一个人从左边一眼就知道
+   * 哪些是导航、哪些是内容。浅色的侧栏跟正文一个颜色，那条界线只能
+   * 靠一根线撑着，看着还是一页表单。 */
+  --side-bg: #0f1115;
+  --side-bg-2: #171a20;
+  --side-line: #23272f;
+  --side-text: #99a1ad;
+  --side-text-2: #7b838f;
+  --side-text-hi: #eef0f3;
+  --side-accent: #6c9bff;
+
+  --line: #e8eaed;
+  --line-strong: #d6dae0;
   /* 控件的边：按钮、输入框、药丸靠着它跟底色分开。
    * 3:1 是 WCAG 对「界面部件的边界」的要求：深浅两套都得够。
    * 分界线（--line / --line-strong）是装饰，不需要 3:1，所以另起一个。 */
   --line-control: #7f8794;
-  --text: #0f1522;
-  --text-2: #4c5666;
-  --text-3: #5f6a7a;
+  --text: #0f1218;
+  --text-2: #4c545f;
+  /* 最浅的那层字：它得在 11px 上也读得出来。
+   * #79818d 落在白底上只有 3.79:1，AA 要 4.5:1，所以往下压一档。 */
+  --text-3: #656d78;
 
   --accent: #1f5fd6;
   --accent-hover: #1a4fb5;
-  --accent-soft: #e7f0ff;
+  --accent-soft: #e8f0ff;
   --accent-ink: #ffffff;
 
   --good: #0d7a45;
-  --good-soft: #e2f4ea;
-  --warn: #9a6100;
-  --warn-soft: #fcf0d9;
+  --good-soft: #e3f4ea;
+  --warn: #96600a;
+  --warn-soft: #fbf0d9;
   --bad: #c62f38;
   --bad-soft: #fdecec;
 
-  --radius: 6px;
-  --radius-sm: 4px;
+  /* 圆角只有两档，面板和表格走大的，控件走小的。
+   * 药丸（--radius-pill）是第三档，它天生就是圆的，不算混。 */
+  --radius: 8px;
+  --radius-ctl: 6px;
+  --radius-sm: 5px;
   --radius-pill: 999px;
 
-  --shadow-card: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .06);
-  --shadow-pop: 0 16px 40px -16px rgba(16, 24, 40, .3);
+  --shadow-card: 0 1px 2px rgba(15, 20, 30, .04), 0 1px 3px rgba(15, 20, 30, .05);
+  --shadow-pop: 0 16px 40px -16px rgba(15, 20, 30, .28);
 
-  --side-w: 236px;
+  --side-w: 208px;
   /* 侧栏收起来以后只剩一条图标道：够摆下 18 的图标和两边的空当。 */
-  --side-w-min: 56px;
-  --top-h: 60px;
+  --side-w-min: 52px;
+  --top-h: 44px;
 
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
@@ -66,17 +86,25 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0a0e14;
-    --surface: #121821;
-    --surface-2: #182029;
-    --surface-3: #202a35;
-    --side-bg: #0e141c;
-    --line: #222c38;
-    --line-strong: #35414f;
+    --bg: #0b0d10;
+    --surface: #14171c;
+    --surface-2: #1a1e24;
+    --surface-3: #232830;
+
+    --side-bg: #08090c;
+    --side-bg-2: #101318;
+    --side-line: #1d2128;
+    --side-text: #8b939f;
+    --side-text-2: #7c8592;
+    --side-text-hi: #e6e9ee;
+    --side-accent: #5b93ff;
+
+    --line: #22262d;
+    --line-strong: #333945;
     --line-control: #687382;
-    --text: #e8edf4;
-    --text-2: #a5b0be;
-    --text-3: #8b97a7;
+    --text: #e6e9ee;
+    --text-2: #a2abb8;
+    --text-3: #7e8794;
 
     --accent: #5b93ff;
     --accent-hover: #7ba6ff;
@@ -90,24 +118,32 @@
     --bad: #ff7b72;
     --bad-soft: #2e1618;
 
-    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 1px rgba(255, 255, 255, .04);
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .5);
     --shadow-pop: 0 18px 44px -18px rgba(0, 0, 0, .85);
   }
 }
 
 /* 手动切的那一套：不管系统是深是浅，都按这里的值走。 */
 :root[data-theme="dark"] {
-  --bg: #0a0e14;
-  --surface: #121821;
-  --surface-2: #182029;
-  --surface-3: #202a35;
-  --side-bg: #0e141c;
-  --line: #222c38;
-  --line-strong: #35414f;
+  --bg: #0b0d10;
+  --surface: #14171c;
+  --surface-2: #1a1e24;
+  --surface-3: #232830;
+
+  --side-bg: #08090c;
+  --side-bg-2: #101318;
+  --side-line: #1d2128;
+  --side-text: #8b939f;
+  --side-text-2: #7c8592;
+  --side-text-hi: #e6e9ee;
+  --side-accent: #5b93ff;
+
+  --line: #22262d;
+  --line-strong: #333945;
   --line-control: #687382;
-  --text: #e8edf4;
-  --text-2: #a5b0be;
-  --text-3: #8b97a7;
+  --text: #e6e9ee;
+  --text-2: #a2abb8;
+  --text-3: #7e8794;
 
   --accent: #5b93ff;
   --accent-hover: #7ba6ff;
@@ -121,7 +157,7 @@
   --bad: #ff7b72;
   --bad-soft: #2e1618;
 
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 1px rgba(255, 255, 255, .04);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .5);
   --shadow-pop: 0 18px 44px -18px rgba(0, 0, 0, .85);
 }
 
@@ -143,14 +179,14 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.55 var(--sans);
+  font: 13px/1.5 var(--sans);
   -webkit-font-smoothing: antialiased;
 }
 
 h1,
 h2,
 h3 {
-  letter-spacing: -.015em;
+  letter-spacing: -.01em;
   margin: 0;
 }
 
@@ -229,7 +265,10 @@ code {
   min-height: 100dvh;
 }
 
-/* 左边那条：品牌、导航、网关自己的状态。 */
+/* 左边那条：品牌、导航、网关自己的状态。
+ *
+ * 它是深色的，跟正文隔着一条明暗的界。深色底上不画边：深色自己就是
+ * 那条界。 */
 .side {
   position: sticky;
   top: 0;
@@ -237,20 +276,18 @@ code {
   display: flex;
   flex-direction: column;
   background: var(--side-bg);
-  border-right: 1px solid var(--line);
 }
 
-/* 品牌那行的字，要跟下面导航的字站在同一条竖线上：12 + 22 + 6 = 40。 */
+/* 品牌那行的字，要跟下面导航的字站在同一条竖线上。 */
 .side-brand {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   height: var(--top-h);
-  padding: 0 12px;
-  border-bottom: 1px solid var(--line);
-  color: var(--text);
-  font-weight: 650;
-  letter-spacing: -.02em;
+  padding: 0 14px;
+  color: var(--side-text-hi);
+  font-weight: 600;
+  letter-spacing: -.015em;
   text-decoration: none;
 }
 
@@ -263,9 +300,9 @@ code {
   place-items: center;
   width: 22px;
   height: 22px;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: var(--accent-ink);
+  border-radius: var(--radius-ctl);
+  background: var(--side-accent);
+  color: #07101f;
   font-size: 11px;
   font-weight: 700;
 }
@@ -273,14 +310,14 @@ code {
 .side-nav {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 12px 20px;
+  padding: 12px 8px 16px;
 }
 
 /* 组的标签离它自己那组近，离上一组远。 */
 .side-group {
-  margin: 20px 0 0;
-  padding: 0 10px 4px;
-  color: var(--text-3);
+  margin: 16px 0 0;
+  padding: 0 8px 4px;
+  color: var(--side-text-2);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: .04em;
@@ -295,63 +332,63 @@ code {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 32px;
-  padding: 6px 10px;
-  border-radius: var(--radius);
-  color: var(--text-2);
+  min-height: 28px;
+  padding: 4px 8px;
+  border-radius: var(--radius-ctl);
+  color: var(--side-text);
   font-size: 13px;
   text-decoration: none;
   transition: background .12s ease, color .12s ease;
 }
 
 .side-nav a:hover {
-  background: var(--surface-2);
-  color: var(--text);
+  background: rgba(255, 255, 255, .06);
+  color: var(--side-text-hi);
   text-decoration: none;
 }
 
-/* 看的那一页：底色加一道左边的竖线。
+/* 看的那一页：底色深一档，字变白，左边一道竖线。
  *
  * 竖线是内嵌的（inset），不是另外摆一个元素：那样的话它得挂在导航条的
  * 左边那块空当上，而导航条是要滚的（overflow），挂在外面会被裁掉。 */
 .side-nav a.is-current {
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 600;
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: rgba(255, 255, 255, .09);
+  color: var(--side-text-hi);
+  font-weight: 550;
+  box-shadow: inset 2px 0 0 var(--side-accent);
 }
 
 .side-nav a .ic {
-  color: var(--text-3);
+  color: var(--side-text-2);
 }
 
 .side-nav a:hover .ic {
-  color: var(--text-2);
+  color: var(--side-text);
 }
 
 .side-nav a.is-current .ic {
-  color: var(--accent);
+  color: var(--side-text-hi);
 }
 
 .side-count {
   margin-left: auto;
-  color: var(--text-3);
-  font-size: 12px;
+  color: var(--side-text-2);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
 
 .side-foot {
-  border-top: 1px solid var(--line);
-  padding: 10px 12px 12px;
-  color: var(--text-3);
-  font-size: 12px;
+  border-top: 1px solid var(--side-line);
+  padding: 8px 10px 10px;
+  color: var(--side-text-2);
+  font-size: 11px;
 }
 
 .side-foot .row {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 28px;
+  min-height: 24px;
   padding: 0 4px;
 }
 
@@ -360,19 +397,19 @@ code {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   margin-left: auto;
   padding: 0;
   border-color: transparent;
   background: transparent;
-  color: var(--text-3);
+  color: var(--side-text-2);
 }
 
 .side-collapse:hover {
-  background: var(--surface-2);
+  background: rgba(255, 255, 255, .08);
   border-color: transparent;
-  color: var(--text);
+  color: var(--side-text-hi);
 }
 
 .side-collapse .ic {
@@ -425,7 +462,10 @@ body.side-min .side-collapse .ic {
   transform: rotate(0deg);
 }
 
-/* 右边：顶上一条，内容在下面。 */
+/* 右边：顶上一条，内容在下面。
+ *
+ * 顶栏是半透明的：底下的内容从它底下滚过去，模糊一层，看着像上面浮着
+ * 一条玻璃。底下不画边 —— 边线跟卡片的边线加起来太多。 */
 .main {
   display: flex;
   flex-direction: column;
@@ -440,14 +480,13 @@ body.side-min .side-collapse .ic {
   align-items: center;
   gap: 16px;
   height: var(--top-h);
-  padding: 0 24px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
+  padding: 0 20px;
+  background: var(--bg);
 }
 
 @supports (background: color-mix(in srgb, red 50%, transparent)) {
   .topbar {
-    background: color-mix(in srgb, var(--surface) 86%, transparent);
+    background: color-mix(in srgb, var(--bg) 78%, transparent);
     backdrop-filter: saturate(1.4) blur(12px);
   }
 }
@@ -460,8 +499,8 @@ body.side-min .side-collapse .ic {
 }
 
 .crumb h1 {
-  font-size: 16px;
-  font-weight: 650;
+  font-size: 15px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -477,14 +516,14 @@ body.side-min .side-collapse .ic {
 .topbar-end {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-left: auto;
 }
 
 .page {
   flex: 1;
-  padding: 24px 24px 64px;
-  max-width: 1360px;
+  padding: 8px 20px 48px;
+  max-width: 1320px;
   width: 100%;
 }
 
@@ -494,20 +533,22 @@ body.side-min .side-collapse .ic {
   justify-content: space-between;
   gap: 20px;
   flex-wrap: wrap;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 .page-head h2 {
-  font-size: 21px;
-  font-weight: 650;
+  font-size: 19px;
+  font-weight: 600;
   line-height: 1.25;
 }
 
-/* 页面顶上那一句话：这一页是干什么的。 */
+/* 页面顶上那一句话：这一页是干什么的。
+ *
+ * 它是灰的、小的：它是引子，不是标题。标题在顶栏上。 */
 .lead {
   margin: 0;
   max-width: 72ch;
-  color: var(--text-2);
+  color: var(--text-3);
   font-size: 13px;
 }
 
@@ -521,18 +562,18 @@ body.side-min .side-collapse .ic {
 .page-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .section {
-  margin-top: 24px;
+  margin-top: 20px;
 }
 
 .section > h2,
 .section > h3 {
   margin: 0 0 8px;
-  font-size: 14px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 /* 两栏。栏数是写死的：auto-fit 会多出一条空轨道，页面跟着内容变形状。 */
@@ -563,18 +604,33 @@ body.side-min .side-collapse .ic {
 
 /* ---------------------------------------------------------------- 卡片 */
 
+/* 卡片不画边。
+ *
+ * 页面底是浅灰的，卡片是白的：深浅自己分得开。再加一圈线，页面上就是
+ * 一堆框。深色下白对不上底，就靠一层极淡的影子把那道界补回来。 */
 .panel {
   background: var(--surface);
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
+}
+
+/* 深色下卡片跟页面底挨得太近：补一层极淡的边，不然它就化在底里。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .panel {
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, .06);
+  }
+}
+
+:root[data-theme="dark"] .panel {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .06);
 }
 
 .panel-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -586,7 +642,7 @@ body.side-min .side-collapse .ic {
 /* 面板的标题是 h2：页面顶上那个 h1 之后就是它，中间不跳级。 */
 .panel-head h2 {
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .panel-head .spacer {
@@ -600,7 +656,7 @@ body.side-min .side-collapse .ic {
   flex: 1;
   min-width: 0;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .panel-toggle {
@@ -608,14 +664,14 @@ body.side-min .side-collapse .ic {
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 10px 16px;
+  padding: 8px 14px;
   border: 0;
   border-radius: 0;
   background: none;
   color: var(--text);
   font: inherit;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
   text-align: left;
 }
 
@@ -656,11 +712,11 @@ body.side-min .side-collapse .ic {
 /* 头右边那个动作（去看账号页之类）：离边留一点空当。 */
 .panel-head > .quiet,
 .panel-head > .muted:last-child {
-  margin-right: 16px;
+  margin-right: 14px;
 }
 
 .panel-body {
-  padding: 12px 16px;
+  padding: 12px 14px;
 }
 
 .panel-body.flush {
@@ -669,26 +725,16 @@ body.side-min .side-collapse .ic {
 
 /* ---------------------------------------------------------------- 数字 */
 
-/* 一排数字摆成一块，不摆成六张卡片。
+/* 一排数字：不摆成六个一模一样的白盒子。
  *
- * 六个一模一样的白盒子排一排，是那种一眼就知道是机器画的看板。真正
- * 用得多的后台不这么摆：一块面板，中间隔着细线，一格一个数。格子少了，
- * 数与数之间也就不用抢注意力了。 */
+ * 六个一样大的盒子并排，中间再各画一圈线，那一眼就是机器拼的看板。
+ * 这一页用的是另一种摆法：每个数自己是一小块浮在灰底上的白卡，靠底
+ * 色和间隔分开，不画框。 */
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
-  /* 格子之间那道线是每格自己画的一圈：相邻两格的圈正好落在同一条缝
-   * 上，看起来还是一道线。
-   *
-   * 底下不能是线的颜色：最后一行不满的时候，空出来的地方会露出一块
-   * 灰的。底下跟格子一个颜色，空出来的地方就是干净的一块面板。 */
-  gap: 1px;
-  margin-bottom: 24px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
-  overflow: clip;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
 }
 
 /* 三个数的那一排：不要摊成半屏宽。 */
@@ -699,14 +745,15 @@ body.side-min .side-collapse .ic {
 .stat {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
   min-width: 0;
-  padding: 14px 16px;
+  padding: 10px 13px 11px;
+  border-radius: var(--radius);
   background: var(--surface);
-  /* 这一圈就是格子之间那道线。 */
-  box-shadow: 0 0 0 1px var(--line);
+  box-shadow: var(--shadow-card);
   color: inherit;
   text-decoration: none;
+  transition: background .12s ease;
 }
 
 a.stat:hover {
@@ -717,24 +764,26 @@ a.stat:hover {
 .stat .label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 11px;
+  letter-spacing: .01em;
 }
 
 .stat .value {
-  font-size: 24px;
-  font-weight: 650;
-  letter-spacing: -.025em;
-  line-height: 1.15;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -.02em;
+  line-height: 1.2;
   font-variant-numeric: tabular-nums;
 }
 
 .stat .value .unit {
-  margin-left: 3px;
+  margin-left: 2px;
   color: var(--text-3);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
+  letter-spacing: 0;
 }
 
 /* 有事要办的那一格：数是别的颜色，一眼就知道不干净。 */
@@ -746,12 +795,12 @@ a.stat:hover {
   /* 脚注贴着格子底下：一排格子里，最高的那个定了这排的高度，脚注不贴
    * 底就悬在半空，看着像没排完。 */
   margin-top: auto;
-  padding-top: 6px;
+  padding-top: 5px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 11px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
@@ -863,7 +912,6 @@ a.stat:hover {
 
 .table-wrap {
   background: var(--surface);
-  border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
   /* 圆角要切住表格的两头，可 overflow:hidden 会把这一块变成滚动容
@@ -872,6 +920,17 @@ a.stat:hover {
      这里只写 clip：不认得 clip 的老浏览器会退回 visible，表格宽了
      也只是露出来，不会把表头弄坏。 */
   overflow: clip;
+}
+
+/* 深色底下白卡片没有影子，只有一层发白的边才看得出它在那儿。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .table-wrap {
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, .06);
+  }
+}
+
+:root[data-theme="dark"] .table-wrap {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .06);
 }
 
 table {
@@ -969,20 +1028,22 @@ table {
 th,
 td {
   text-align: left;
-  padding: 8px 12px;
+  padding: 7px 12px;
   border-bottom: 1px solid var(--line);
   vertical-align: top;
   overflow: hidden;
 }
 
+/* 表头就是一行小字：它说的是这一列是什么，不是标题。 */
 thead th {
   position: sticky;
   top: var(--top-h);
   z-index: 10;
   background: var(--surface-2);
-  color: var(--text-2);
-  font-size: 12px;
+  color: var(--text-3);
+  font-size: 11px;
   font-weight: 600;
+  letter-spacing: .02em;
   border-bottom: 1px solid var(--line-strong);
   white-space: nowrap;
 }
@@ -1255,8 +1316,8 @@ input[type="checkbox"]:focus-visible {
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 12px;
+  gap: 6px;
+  padding: 3px 10px;
   border: 1px solid var(--line-control);
   border-radius: var(--radius-pill);
   background: var(--surface);
@@ -1290,9 +1351,9 @@ button {
   font: inherit;
   font-size: 13px;
   line-height: 1.4;
-  padding: 8px 12px;
+  padding: 6px 11px;
   border: 1px solid var(--line-control);
-  border-radius: var(--radius);
+  border-radius: var(--radius-ctl);
   background: var(--surface);
   color: var(--text);
   cursor: pointer;
@@ -1374,10 +1435,10 @@ a.quiet:hover {
 a.btn {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 11px;
   border: 1px solid var(--line-control);
-  border-radius: var(--radius);
+  border-radius: var(--radius-ctl);
   background: var(--surface);
   color: var(--text);
   font-size: 13px;
@@ -1409,10 +1470,10 @@ a.btn.primary:hover {
 .cmd-hint {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 6px 5px 10px;
+  gap: 6px;
+  padding: 4px 6px 4px 9px;
   border: 1px solid var(--line-control);
-  border-radius: var(--radius);
+  border-radius: var(--radius-ctl);
   background: var(--surface);
   color: var(--text-3);
   font-size: 12px;
@@ -1438,10 +1499,9 @@ a.btn.primary:hover {
 .nav-signout {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--line-control);
-  border-radius: var(--radius);
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: var(--radius-ctl);
   color: var(--text-2);
   font-size: 13px;
   text-decoration: none;
@@ -1482,8 +1542,8 @@ textarea {
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--line-control);
-  border-radius: var(--radius);
-  padding: 6px 8px;
+  border-radius: var(--radius-ctl);
+  padding: 5px 8px;
   max-width: 100%;
 }
 
@@ -1583,12 +1643,12 @@ textarea {
 .pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 3px 10px;
+  gap: 6px;
+  padding: 2px 9px;
   border-radius: var(--radius-pill);
   background: var(--surface-3);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   line-height: 1.5;
   white-space: nowrap;
@@ -1666,7 +1726,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 16px;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -1718,7 +1778,7 @@ textarea {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 8px 16px;
+  padding: 7px 14px;
   color: inherit;
   text-decoration: none;
 }
@@ -1899,7 +1959,7 @@ textarea {
 
 .card .card-box {
   width: min(560px, 100%);
-  padding: 20px;
+  padding: 16px;
   border: 1px solid var(--line-control);
   border-radius: var(--radius);
   background: var(--surface);
@@ -1907,8 +1967,8 @@ textarea {
 }
 
 .card h3 {
-  margin: 0 0 8px;
-  font-size: 15px;
+  margin: 0 0 6px;
+  font-size: 14px;
 }
 
 /* 框的头：名字在左，关掉的那一下在右。
@@ -2014,7 +2074,7 @@ textarea {
   right: 0;
   bottom: 0;
   z-index: 70;
-  width: min(420px, 100%);
+  width: min(400px, 100%);
   display: flex;
   flex-direction: column;
   background: var(--surface);
@@ -2048,13 +2108,13 @@ textarea {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--line);
 }
 
 .drawer-head h3 {
-  font-size: 14px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2068,18 +2128,18 @@ textarea {
 .drawer-body {
   flex: 1;
   overflow-y: auto;
-  padding: 16px;
+  padding: 14px;
 }
 
 .drawer-body .field {
-  margin-top: 16px;
+  margin-top: 14px;
 }
 
 .drawer-foot {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 10px 14px;
   border-top: 1px solid var(--line);
 }
 
@@ -2183,11 +2243,27 @@ body.has-drawer .status {
   border-color: transparent;
 }
 
-/* 命令面板：Ctrl+K 弹出来的那一叠。 */
+/* 命令面板：Ctrl+K 弹出来的那一叠。
+ *
+ * 它比别的框窄：命令不多，宽了只是白。这一叠该贴着顶，别杵在正中间
+ * 让人找不着。 */
+.palette-box {
+  width: min(440px, 100%);
+  padding: 8px;
+  align-self: start;
+  margin-top: 12vh;
+}
+
+.palette-box > input {
+  width: 100%;
+}
+
 .palette {
   list-style: none;
-  margin: 12px 0 0;
+  margin: 6px 0 0;
   padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
 }
 
 .palette li {
@@ -2197,11 +2273,12 @@ body.has-drawer .status {
 .palette-item {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
-  padding: 8px;
+  padding: 6px 8px;
   border-color: transparent;
   background: transparent;
+  border-radius: var(--radius-ctl);
   font-size: 13px;
   text-align: left;
 }
@@ -2278,21 +2355,28 @@ body.is-busy[data-busy]::before {
 
 @media (max-width: 960px) {
   .shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
+  /* 窄屏上侧栏变成一条横着的导航带。
+   *
+   * 网格里的那一格默认不肯比自己那一格的内容窄（min-width: auto）：导航
+   * 条上的字一多，整页就被撑得比屏幕宽，横向滚半天。这个得说清楚：这一格
+   * 可以窄，导航条自己横着滚。 */
   .side {
     position: static;
     height: auto;
+    min-width: 0;
     border-right: none;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--side-line);
   }
 
   .side-nav {
     display: flex;
     gap: 4px;
+    min-width: 0;
     overflow-x: auto;
-    padding: 12px 14px;
+    padding: 10px 12px;
   }
 
   .side-group {
@@ -2310,7 +2394,7 @@ body.is-busy[data-busy]::before {
   /* 窄屏上侧栏是一条横着的导航带：收不收都一个样子，图标道那套在这儿没
    * 有意思，字还得摆出来。 */
   body.side-min .shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   body.side-min .brand-name,

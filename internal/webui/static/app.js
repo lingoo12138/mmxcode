@@ -1890,7 +1890,7 @@ function openPalette() {
   const box = document.createElement('div');
   box.className = 'card';
   const panel = document.createElement('div');
-  panel.className = 'card-box';
+  panel.className = 'card-box palette-box';
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-modal', 'true');
   panel.setAttribute('aria-label', '命令');
