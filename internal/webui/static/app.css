@@ -26,18 +26,23 @@
   --surface-2: #f1f2f4;
   --surface-3: #e6e8eb;
 
-  /* 侧栏是深色的。
+  /* 侧栏跟着主题走。
    *
-   * 不管页面是浅是深，它都是「另一个地方」：一个人从左边一眼就知道
-   * 哪些是导航、哪些是内容。浅色的侧栏跟正文一个颜色，那条界线只能
-   * 靠一根线撑着，看着还是一页表单。 */
-  --side-bg: #0f1115;
-  --side-bg-2: #171a20;
-  --side-line: #23272f;
-  --side-text: #99a1ad;
-  --side-text-2: #7b838f;
-  --side-text-hi: #eef0f3;
-  --side-accent: #6c9bff;
+   * 浅色下它是一块比页面深的浅灰，深色下它是最深的那一层。两种都是
+   * 「另一个地方」：靠深浅跟内容分开，不靠一根线撑着。
+   *
+   * 侧栏里的字单独一套：它在自己的底色上，得重新算对比度，不能跟正文
+   * 那套共用。 */
+  --side-bg: #e9ebee;
+  --side-hover: rgba(15, 18, 24, .05);
+  --side-current: rgba(15, 18, 24, .07);
+  --side-line: #dde0e5;
+  --side-text: #4c545f;
+  --side-text-2: #5b6470;
+  --side-text-hi: #0f1218;
+  --side-accent: #1f5fd6;
+  /* 压在强调色上的字：浅色主题里强调色是深蓝，字得反过来是白的。 */
+  --side-accent-ink: #ffffff;
 
   --line: #e8eaed;
   --line-strong: #d6dae0;
@@ -92,12 +97,14 @@
     --surface-3: #232830;
 
     --side-bg: #08090c;
-    --side-bg-2: #101318;
+    --side-hover: rgba(255, 255, 255, .06);
+    --side-current: rgba(255, 255, 255, .09);
     --side-line: #1d2128;
     --side-text: #8b939f;
     --side-text-2: #7c8592;
     --side-text-hi: #e6e9ee;
     --side-accent: #5b93ff;
+    --side-accent-ink: #06101f;
 
     --line: #22262d;
     --line-strong: #333945;
@@ -131,12 +138,14 @@
   --surface-3: #232830;
 
   --side-bg: #08090c;
-  --side-bg-2: #101318;
+  --side-hover: rgba(255, 255, 255, .06);
+  --side-current: rgba(255, 255, 255, .09);
   --side-line: #1d2128;
   --side-text: #8b939f;
   --side-text-2: #7c8592;
   --side-text-hi: #e6e9ee;
   --side-accent: #5b93ff;
+  --side-accent-ink: #06101f;
 
   --line: #22262d;
   --line-strong: #333945;
@@ -267,8 +276,8 @@ code {
 
 /* 左边那条：品牌、导航、网关自己的状态。
  *
- * 它是深色的，跟正文隔着一条明暗的界。深色底上不画边：深色自己就是
- * 那条界。 */
+ * 它跟着主题走，但永远比正文深一档：浅色下是深一点的灰，深色下是更深
+ * 的黑。靠深浅跟内容分开，不画边。 */
 .side {
   position: sticky;
   top: 0;
@@ -302,7 +311,7 @@ code {
   height: 22px;
   border-radius: var(--radius-ctl);
   background: var(--side-accent);
-  color: #07101f;
+  color: var(--side-accent-ink);
   font-size: 11px;
   font-weight: 700;
 }
@@ -342,17 +351,17 @@ code {
 }
 
 .side-nav a:hover {
-  background: rgba(255, 255, 255, .06);
+  background: var(--side-hover);
   color: var(--side-text-hi);
   text-decoration: none;
 }
 
-/* 看的那一页：底色深一档，字变白，左边一道竖线。
+/* 看的那一页：底色深一档，字重一档，左边一道竖线。
  *
  * 竖线是内嵌的（inset），不是另外摆一个元素：那样的话它得挂在导航条的
  * 左边那块空当上，而导航条是要滚的（overflow），挂在外面会被裁掉。 */
 .side-nav a.is-current {
-  background: rgba(255, 255, 255, .09);
+  background: var(--side-current);
   color: var(--side-text-hi);
   font-weight: 550;
   box-shadow: inset 2px 0 0 var(--side-accent);
@@ -407,7 +416,7 @@ code {
 }
 
 .side-collapse:hover {
-  background: rgba(255, 255, 255, .08);
+  background: var(--side-hover);
   border-color: transparent;
   color: var(--side-text-hi);
 }
