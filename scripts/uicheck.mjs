@@ -66,6 +66,10 @@ async function key(k, code, vk) {
 }
 
 await send('Page.enable')
+// 窗口得是宽的：窄屏那一套（侧栏变成横条）不是这里要验的东西。
+await send('Emulation.setDeviceMetricsOverride', {
+  width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
+})
 
 const out = {}
 
@@ -73,8 +77,44 @@ const out = {}
 
 await goto(base + '/')
 out.overviewTitle = await evaluate('document.querySelector(".crumb h1") ? document.querySelector(".crumb h1").textContent : ""')
-out.overviewKpis = await evaluate('document.querySelectorAll(".kpi").length')
+out.overviewStats = await evaluate('document.querySelectorAll(".stat").length')
 out.overviewBars = await evaluate('document.querySelectorAll(".bar span").length')
+
+// 面板能折起来：点一下头，收起来；再点一下，摊开。
+out.panels = await evaluate('document.querySelectorAll(".panel[data-panel]").length')
+await evaluate(`(() => {
+  const b = document.querySelector('.panel[data-panel] .panel-toggle')
+  if (b) b.click()
+  return true
+})()`)
+await sleep(200)
+out.panelCollapsed = await evaluate('document.querySelectorAll(".panel.is-collapsed").length')
+out.panelBodyHidden = await evaluate('!!document.querySelector(".panel.is-collapsed .panel-body[hidden]")')
+await evaluate(`(() => {
+  const b = document.querySelector('.panel[data-panel] .panel-toggle')
+  if (b) b.click()
+  return true
+})()`)
+await sleep(200)
+out.panelBack = await evaluate('document.querySelectorAll(".panel.is-collapsed").length')
+
+// 侧栏能收成一条图标道。
+await evaluate(`(() => {
+  const b = document.getElementById('side-toggle')
+  if (b) b.click()
+  return true
+})()`)
+await sleep(200)
+out.sideMin = await evaluate('document.body.classList.contains("side-min")')
+out.sideLabelsHidden = await evaluate(
+  'getComputedStyle(document.querySelector(".side-nav a span")).display === "none"')
+await evaluate(`(() => {
+  const b = document.getElementById('side-toggle')
+  if (b) b.click()
+  return true
+})()`)
+await sleep(200)
+out.sideFull = await evaluate('!document.body.classList.contains("side-min")')
 
 // ------------------------------------------------------------ 账号
 
@@ -94,6 +134,8 @@ if (out.rows) {
   await sleep(200)
   out.shown = await evaluate('document.querySelectorAll("tr[data-row]:not(.is-hidden)").length')
   out.countAfter = await evaluate('document.getElementById("account-count").textContent')
+  // 筛的条件得在地址栏里：改完东西重新取一次页面，它还在。
+  out.filterInURL = await evaluate('location.search.indexOf("q=") >= 0')
   await evaluate(`(() => {
     const box = document.getElementById('account-filter')
     box.value = ''
@@ -102,6 +144,18 @@ if (out.rows) {
   })()`)
   await sleep(200)
 }
+
+// 命令面板：Ctrl+K 弹出来，里面有几条能跳的。
+await evaluate(`(() => {
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }))
+  return true
+})()`)
+await sleep(300)
+out.paletteOpen = await evaluate('!!document.querySelector(".palette")')
+out.paletteItems = await evaluate('document.querySelectorAll(".palette-item").length')
+await key('Escape', 'Escape', 27)
+await sleep(200)
+out.paletteClosed = await evaluate('!document.querySelector(".palette")')
 
 // 状态那几颗药丸：点「已登出」，只剩签出的那些。
 await evaluate(`(() => {
@@ -112,6 +166,8 @@ await evaluate(`(() => {
 await sleep(200)
 out.afterChip = await evaluate('document.querySelectorAll("tr[data-row]:not(.is-hidden)").length')
 out.chipPicked = await evaluate('document.querySelectorAll("#status-chips .chip.is-on").length')
+// 药丸的条件得在地址栏里：改完东西重新取一次页面，它还在。
+out.chipInURL = await evaluate('location.search.indexOf("s=signed_out") >= 0')
 await evaluate(`(() => {
   const chip = document.querySelector('#status-chips .chip[data-status=""]')
   if (chip) chip.click()

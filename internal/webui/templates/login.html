@@ -18,6 +18,6 @@
 {{end}}
 {{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，
      失败的话也得让人看见那句话。 */}}
-<div id="login-result" class="notice"></div>
-<p id="poll-result" class="note">{{if .Pending}}正在等……{{end}}</p>
+<div id="login-result" class="notice" role="status"></div>
+<p id="poll-result" class="note" role="status">{{if .Pending}}正在等……{{end}}</p>
 {{end}}

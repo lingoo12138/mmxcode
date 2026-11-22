@@ -47,6 +47,8 @@ function makePage() {
         };
       },
       querySelector: function () { return null; },
+      // 这一页没有能折起来的面板：app.js 找不到就自己收手。
+      querySelectorAll: function () { return []; },
     },
   };
 }

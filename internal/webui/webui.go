@@ -567,15 +567,17 @@ func statusRank(status string) int {
 	}
 }
 
-// clipMail shortens an email from the front.
+// clipMail shortens an email from the back.
 //
-// 域名那一头说明这个号是哪一家的，那是该留住的部分；前面那一截省下来。
+// 前面那一截才是能认出这个号的地方：backup.one@example.com 和
+// backup.two@example.com 就差在前面。域名多半都一样，剪掉不要紧。
+// 完整的那一句在 title 里。
 func clipMail(s string) string {
 	r := []rune(s)
 	if len(r) <= 26 {
 		return s
 	}
-	return "…" + string(r[len(r)-25:])
+	return string(r[:25]) + "…"
 }
 
 // hostOf gives the host of an address, with the port.
@@ -673,7 +675,10 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 			"Name":   g.Name,
 			"Global": g.Name == store.GlobalGroup,
 			"Count":  len(g.URLs),
-			"List":   jsonList(text),
+			// 地址摆在页面上：组里到底有哪些路，看一眼就知道，
+			// 不用点「改」才知道。
+			"Addrs": text,
+			"List":  jsonList(text),
 		})
 	}
 	out, err := w.egressRows(ctx)

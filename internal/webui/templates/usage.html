@@ -2,30 +2,30 @@
 <div class="page-head">
   <p class="lead">每个账号的积分。页面上是上一次读数时的数，按一下就是现在读一遍。</p>
   <div class="page-actions">
-    <span class="muted" id="usage-status"></span>
+    <span class="muted" id="usage-status" role="status"></span>
     <button id="usage-refresh" type="button" class="primary icon">
       <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>刷新账本</span></button>
   </div>
 </div>
 
-<div class="kpis kpis-3">
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#coin"/></svg><span>总发放</span></div>
-    <div class="value">{{printf "%.2f" .Summary.TotalGranted}}<span class="unit">分</span></div>
-    <div class="foot"><span class="muted">站点一共发下来的</span></div>
+<div class="stats stats-3">
+  <div class="stat">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#coin"/></svg><span>总发放</span></span>
+    <span class="value">{{printf "%.2f" .Summary.TotalGranted}}<span class="unit">分</span></span>
+    <span class="foot"><span class="muted">站点一共发下来的</span></span>
   </div>
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#activity"/></svg><span>总消耗</span></div>
-    <div class="value">{{printf "%.2f" .Summary.TotalConsumed}}<span class="unit">分</span></div>
-    <div class="foot"><span class="muted">已经用掉的</span></div>
+  <div class="stat">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#activity"/></svg><span>总消耗</span></span>
+    <span class="value">{{printf "%.2f" .Summary.TotalConsumed}}<span class="unit">分</span></span>
+    <span class="foot"><span class="muted">已经用掉的</span></span>
   </div>
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-bar"/></svg><span>总剩余</span></div>
-    <div class="value">{{printf "%.2f" .Summary.TotalRemaining}}<span class="unit">分</span></div>
-    <div class="foot">
+  <div class="stat">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-bar"/></svg><span>总剩余</span></span>
+    <span class="value">{{printf "%.2f" .Summary.TotalRemaining}}<span class="unit">分</span></span>
+    <span class="foot">
       {{if .Summary.ExpiresAt}}<span class="muted">最近过期 {{.Summary.ExpiresAt.Format "2006-01-02"}}</span>
       {{else}}<span class="muted">没有会过期的批次</span>{{end}}
-    </div>
+    </span>
   </div>
 </div>
 
@@ -48,7 +48,7 @@
   {{/* 一行里的话得是同一件事：读不到的号，那几格都得说读不到。
        一格写「读不到」、旁边一格写「0% 还剩」，那是在说两件事。 */}}
   <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if eq .State "unavailable"}}<span class="muted">读不到</span>{{else}}{{printf "%.2f" (num .Remaining)}}{{end}}</td>
-  <td>{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if eq .State "unavailable"}}<span class="muted">读不到</span>{{else}}<div class="meter"><span class="{{.Bar}}" style="width: {{printf "%.1f" .Pct}}%"></span></div><div class="sub">{{printf "%.0f" .Pct}}% 还剩</div>{{end}}</td>
+  <td>{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if eq .State "unavailable"}}<span class="muted">读不到</span>{{else}}<span class="meter-line"><span class="meter"><span class="{{.Bar}}" style="width: {{printf "%.1f" .Pct}}%"></span></span><span class="pct">{{printf "%.0f" .Pct}}%</span></span>{{end}}</td>
   <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if eq .State "unavailable"}}<span class="muted">读不到</span>{{else}}{{printf "%.2f" (num .Granted)}}{{end}}</td>
   <td class="num">{{if eq .State "unread"}}<span class="muted">还没读</span>{{else if eq .State "unavailable"}}<span class="muted">读不到</span>{{else}}{{printf "%.2f" (num .Consumed)}}{{end}}</td>
   <td class="muted nowrap">{{if .ExpiresAt}}{{.ExpiresAt.Format "2006-01-02"}}{{end}}</td>

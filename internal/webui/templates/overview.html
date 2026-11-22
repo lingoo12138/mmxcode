@@ -7,75 +7,74 @@
   </div>
 </div>
 
-<div class="kpis">
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#users"/></svg><span>账号</span></div>
-    <div class="value">{{.Total}}<span class="unit">个</span></div>
-    <div class="foot">
-      <span class="good">正常 {{.Active}}</span>
-      <span class="sep">·</span>
-      <span class="muted">已登出 {{.SignedOut}}</span>
-      <span class="sep">·</span>
-      <span class="muted">出错 {{.Errored}}</span>
-    </div>
-  </div>
+{{/* 一块面板，一格一个数。
+     六个一模一样的白盒子排一排，是那种一眼就知道是机器画的看板。
+     真正用得多的后台不这么摆。 */}}
+<div class="stats">
+  <a class="stat" href="/accounts">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#users"/></svg><span>账号</span></span>
+    <span class="value">{{.Total}}<span class="unit">个</span></span>
+    <span class="foot"><span class="good">正常 {{.Active}}</span></span>
+  </a>
 
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#coin"/></svg><span>剩余积分</span></div>
-    <div class="value">{{printf "%.0f" .Remaining}}<span class="unit">分</span></div>
-    <div class="foot">
+  <a class="stat" href="/usage">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#coin"/></svg><span>剩余积分</span></span>
+    <span class="value">{{printf "%.0f" .Remaining}}<span class="unit">分</span></span>
+    <span class="foot">
       <span class="muted">一共发了 {{printf "%.0f" .Granted}}</span>
       {{if .Readings}}
-      <span class="sep">·</span>
       <span class="muted">读数于 {{.UpdatedAt.Format "01-02 15:04"}}</span>
       {{else}}
-      <span class="sep">·</span>
       <span class="muted">还没读过账本</span>
       {{end}}
-    </div>
-  </div>
+    </span>
+  </a>
 
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg><span>今日签到</span></div>
-    <div class="value">{{.CheckedToday}}<span class="unit">/ {{.Active}}</span></div>
-    <div class="foot">
+  <a class="stat" href="/accounts">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg><span>今日签到</span></span>
+    <span class="value">{{.CheckedToday}}<span class="unit">/ {{.Active}}</span></span>
+    <span class="foot">
       {{if .Waiting}}<span class="muted">还有 {{.Waiting}} 个没签</span>{{else}}<span class="good">能签的都签了</span>{{end}}
-    </div>
-  </div>
+    </span>
+  </a>
 
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg><span>出口</span></div>
-    <div class="value">{{.EgressOK}}<span class="unit">/ {{len .Egress}}</span></div>
-    <div class="foot">
+  <a class="stat" href="/egress">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg><span>出口</span></span>
+    <span class="value">{{.EgressOK}}<span class="unit">/ {{len .Egress}}</span></span>
+    <span class="foot">
       {{if .EgressUntested}}<span class="muted">{{.EgressUntested}} 条没测过</span>{{else}}<span class="muted">都测过了</span>{{end}}
-    </div>
-  </div>
+    </span>
+  </a>
 
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#key"/></svg><span>聊天 key</span></div>
-    <div class="value">{{.KeysLive}}<span class="unit">把</span></div>
-    <div class="foot"><span class="muted">已撤销 {{.KeysRevoked}} 把</span></div>
-  </div>
+  <a class="stat" href="/keys">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#key"/></svg><span>聊天 key</span></span>
+    <span class="value">{{.KeysLive}}<span class="unit">把</span></span>
+    <span class="foot"><span class="muted">已撤销 {{.KeysRevoked}} 把</span></span>
+  </a>
 
-  <div class="kpi">
-    <div class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#alert-triangle"/></svg><span>需要处理</span></div>
-    <div class="value">{{.AttentionCount}}<span class="unit">个</span></div>
-    <div class="foot">
-      {{if .AttentionCount}}<a href="/accounts">去账号页挑</a>{{else}}<span class="good">没有坏的账号</span>{{end}}
-    </div>
-  </div>
+  <a class="stat{{if .AttentionCount}} is-warn{{end}}" href="/accounts">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#alert-triangle"/></svg><span>需要处理</span></span>
+    <span class="value">{{.AttentionCount}}<span class="unit">个</span></span>
+    <span class="foot">
+      {{if .AttentionCount}}<span>去账号页挑</span>{{else}}<span class="good">没有坏的账号</span>{{end}}
+    </span>
+  </a>
 </div>
 
 <div class="cols">
   <div class="col">
-    <section class="panel">
-      <div class="panel-head">
-        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#users"/></svg>
-        <h2>账号健康</h2>
-        <span class="spacer"></span>
+    <section class="panel" data-panel="health">
+      <div class="panel-head is-toggle">
+        <h2 class="panel-title">
+          <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-health">
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#users"/></svg>
+            <span>账号健康</span>
+            <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+          </button>
+        </h2>
         <a class="quiet" href="/accounts">全部账号</a>
       </div>
-      <div class="panel-body">
+      <div class="panel-body" id="p-health">
         {{if .Total}}
         <div class="bar">
           <span class="good" style="width: {{printf "%.2f" .ActivePct}}%"></span>
@@ -96,14 +95,18 @@
       </div>
     </section>
 
-    <section class="panel">
-      <div class="panel-head">
-        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg>
-        <h2>出口健康</h2>
-        <span class="spacer"></span>
+    <section class="panel" data-panel="egress">
+      <div class="panel-head is-toggle">
+        <h2 class="panel-title">
+          <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-egress">
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg>
+            <span>出口健康</span>
+            <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+          </button>
+        </h2>
         <a class="quiet" href="/egress">去出口页</a>
       </div>
-      <div class="panel-body flush">
+      <div class="panel-body flush" id="p-egress">
         {{if .Egress}}
         <ul class="rows">
           {{range .Egress}}
@@ -127,24 +130,30 @@
   </div>
 
   <div class="col">
-    <section class="panel">
-      <div class="panel-head">
-        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#alert-triangle"/></svg>
-        <h2>需要处理</h2>
-        <span class="spacer"></span>
+    <section class="panel" data-panel="attention">
+      <div class="panel-head is-toggle">
+        <h2 class="panel-title">
+          <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-attention">
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#alert-triangle"/></svg>
+            <span>需要处理</span>
+            <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+          </button>
+        </h2>
         {{if .AttentionCount}}<span class="muted">{{.AttentionCount}} 个</span>{{end}}
       </div>
-      <div class="panel-body flush">
+      <div class="panel-body flush" id="p-attention">
         {{if .Attention}}
-        <ul class="rows">
+        <ul class="rows rows-link">
           {{range .Attention}}
           <li>
-            <span class="pill {{if eq .Status "signed_out"}}warn{{else}}bad{{end}}">{{statusName .Status}}</span>
-            <span class="who">
-              <span class="t">{{if .Name}}{{.Name}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}</span>
-              <span class="s">{{if .Error}}{{.Error}}{{else}}这个号掉线了，得重新登一次{{end}}</span>
-            </span>
-            <span class="right"><a href="/accounts#acc-{{.ID}}">看</a></span>
+            <a class="row-link" href="/accounts#acc-{{.ID}}">
+              <span class="pill {{if eq .Status "signed_out"}}warn{{else}}bad{{end}}">{{statusName .Status}}</span>
+              <span class="who">
+                <span class="t">{{if .Name}}{{.Name}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}</span>
+                <span class="s">{{if .Error}}{{.Error}}{{else}}这个号掉线了，得重新登一次{{end}}</span>
+              </span>
+              <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-right"/></svg>
+            </a>
           </li>
           {{end}}
         </ul>
@@ -157,14 +166,18 @@
       </div>
     </section>
 
-    <section class="panel">
-      <div class="panel-head">
-        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg>
-        <h2>最近的导入</h2>
-        <span class="spacer"></span>
+    <section class="panel" data-panel="imports">
+      <div class="panel-head is-toggle">
+        <h2 class="panel-title">
+          <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-imports">
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg>
+            <span>最近的导入</span>
+            <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+          </button>
+        </h2>
         <a class="quiet" href="/import">去导入页</a>
       </div>
-      <div class="panel-body flush">
+      <div class="panel-body flush" id="p-imports">
         {{if .Runs}}
         <ul class="rows">
           {{range .Runs}}

@@ -24,39 +24,47 @@
 <body>
 <a class="skip" href="#main">跳到正文</a>
 <div class="shell">
-  <aside class="side">
-    <a class="side-brand" href="/"><span class="brand-mark">mx</span><span class="brand-name">mmxcode</span></a>
+  <aside class="side" id="side">
+    <a class="side-brand" href="/" title="mmxcode"><span class="brand-mark">mx</span><span class="brand-name">mmxcode</span></a>
     <nav class="side-nav">
       <p class="side-group">看情况</p>
-      <a href="/"{{if eq .Nav "overview"}} class="is-current"{{end}}>
+      <a href="/" title="概览"{{if eq .Nav "overview"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#layout-dashboard"/></svg><span>概览</span></a>
-      <a href="/accounts"{{if eq .Nav "accounts"}} class="is-current"{{end}}>
+      <a href="/accounts" title="账号"{{if eq .Nav "accounts"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#users"/></svg><span>账号</span><span class="side-count">{{.AccountCount}}</span></a>
-      <a href="/usage"{{if eq .Nav "usage"}} class="is-current"{{end}}>
+      <a href="/usage" title="用量"{{if eq .Nav "usage"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#chart-bar"/></svg><span>用量</span></a>
-      <a href="/egress"{{if eq .Nav "egress"}} class="is-current"{{end}}>
+      <a href="/egress" title="出口"{{if eq .Nav "egress"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#world"/></svg><span>出口</span></a>
       <p class="side-group">动手</p>
-      <a href="/keys"{{if eq .Nav "keys"}} class="is-current"{{end}}>
+      <a href="/keys" title="密钥"{{if eq .Nav "keys"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#key"/></svg><span>密钥</span></a>
-      <a href="/login"{{if eq .Nav "login"}} class="is-current"{{end}}>
+      <a href="/login" title="登录"{{if eq .Nav "login"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>登录</span></a>
-      <a href="/import"{{if eq .Nav "import"}} class="is-current"{{end}}>
+      <a href="/import" title="导入"{{if eq .Nav "import"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
-      <a href="/relogin"{{if eq .Nav "relogin"}} class="is-current"{{end}}>
+      <a href="/relogin" title="重登"{{if eq .Nav "relogin"}} class="is-current" aria-current="page"{{end}}>
         <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>重登</span></a>
     </nav>
     <div class="side-foot">
-      <div class="row">
+      <div class="row side-status">
         <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plug"/></svg>
         <span>网关在跑</span>
       </div>
+      <button type="button" id="side-toggle" class="side-collapse"
+              aria-expanded="true" aria-controls="side" title="收起侧栏" aria-label="收起侧栏">
+        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chevron-right"/></svg>
+      </button>
     </div>
   </aside>
   <div class="main">
     <header class="topbar">
       <div class="crumb"><h1>{{.Title}}</h1></div>
       <div class="topbar-end">
+        <button type="button" id="palette-open" class="cmd-hint" title="命令面板">
+          <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#search"/></svg>
+          <span>命令</span><kbd id="palette-key">Ctrl K</kbd>
+        </button>
         <button type="button" id="theme-toggle" class="icon" title="换个深浅" aria-label="换个深浅">
           <svg class="ic" id="theme-icon" aria-hidden="true"><use href="/static/icons.svg#sun-moon"/></svg>
         </button>

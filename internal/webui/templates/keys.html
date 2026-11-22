@@ -3,30 +3,43 @@
   <p class="lead">聊天用的 key 在这里申请。申请出来的那一把只在这一页出现一次：抄走收好，之后就再也拿不出来了（库里存的是它的哈希，不是它）。</p>
 </div>
 
-<form id="key-form" class="toolbar">
-  <input class="grow" id="key-name" placeholder="这把 key 给谁用（比如：我的笔记本）" autocomplete="off"
-         aria-label="这把 key 给谁用（比如：我的笔记本）">
-  <button type="submit" class="primary icon">
-    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plus"/></svg><span>申请一把</span></button>
-  <span class="muted" id="key-status"></span>
-</form>
+<section class="panel">
+  <div class="panel-head">
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#key"/></svg>
+    <h2>申请一把</h2>
+  </div>
+  <div class="panel-body">
+    <form id="key-form">
+      <div class="field field-narrow">
+        <label for="key-name">这把 key 给谁用</label>
+        <div class="row">
+          <input class="grow" id="key-name" placeholder="比如：我的笔记本" autocomplete="off">
+          <button type="submit" class="primary icon">
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plus"/></svg><span>申请一把</span></button>
+        </div>
+      </div>
+      <p class="muted" id="key-status" role="status"></p>
+    </form>
+  </div>
+</section>
 
 <div id="key-new" class="notice ok" hidden>
   <h2>这一把 key 就是它了，抄走收好</h2>
   <p>页面一刷新它就没了。库里只留着它的哈希，谁都拿不回原文。</p>
-  <code class="key-plain" id="key-plain"></code>
+  <code class="key-plain" id="key-plain" tabindex="0"></code>
   <button type="button" id="key-copy" class="icon">
-    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#copy"/></svg><span>复制</span></button>
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#copy"/></svg><span id="key-copy-label">复制</span></button>
 </div>
 
+<section class="section">
 <div class="table-wrap">
 <table class="keys-table">
-<caption class="sr-only">聊天用的 key</caption>
-<colgroup>
-  <col class="k-name"><col class="k-prefix"><col class="k-time"><col class="k-state"><col class="k-act">
-</colgroup>
-<thead><tr><th scope="col">名字</th><th scope="col">开头</th><th scope="col">申请时间</th><th scope="col">状态</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
-<tbody id="key-rows">
+  <caption class="sr-only">聊天用的 key</caption>
+  <colgroup>
+    <col class="k-name"><col class="k-prefix"><col class="k-time"><col class="k-state"><col class="k-act">
+  </colgroup>
+  <thead><tr><th scope="col">名字</th><th scope="col">开头</th><th scope="col">申请时间</th><th scope="col">状态</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+  <tbody id="key-rows">
 {{range .Keys}}
 <tr>
   <td>{{.Name}}</td>
@@ -40,4 +53,5 @@
 </tbody>
 </table>
 </div>
+</section>
 {{end}}

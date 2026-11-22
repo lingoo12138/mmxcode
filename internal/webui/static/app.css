@@ -54,6 +54,8 @@
   --shadow-pop: 0 16px 40px -16px rgba(16, 24, 40, .3);
 
   --side-w: 236px;
+  /* 侧栏收起来以后只剩一条图标道：够摆下 18 的图标和两边的空当。 */
+  --side-w-min: 56px;
   --top-h: 60px;
 
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
@@ -289,14 +291,17 @@ code {
 }
 
 .side-nav a {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  min-height: 32px;
+  padding: 6px 10px;
   border-radius: var(--radius);
   color: var(--text-2);
   font-size: 13px;
   text-decoration: none;
+  transition: background .12s ease, color .12s ease;
 }
 
 .side-nav a:hover {
@@ -305,10 +310,15 @@ code {
   text-decoration: none;
 }
 
+/* 看的那一页：底色加一道左边的竖线。
+ *
+ * 竖线是内嵌的（inset），不是另外摆一个元素：那样的话它得挂在导航条的
+ * 左边那块空当上，而导航条是要滚的（overflow），挂在外面会被裁掉。 */
 .side-nav a.is-current {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .side-nav a .ic {
@@ -332,7 +342,7 @@ code {
 
 .side-foot {
   border-top: 1px solid var(--line);
-  padding: 12px 16px 16px;
+  padding: 10px 12px 12px;
   color: var(--text-3);
   font-size: 12px;
 }
@@ -341,6 +351,78 @@ code {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 28px;
+  padding: 0 4px;
+}
+
+/* 收侧栏的那一下：它就住在侧栏底下，收起来以后也还在那儿。 */
+.side-collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+}
+
+.side-collapse:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.side-collapse .ic {
+  transform: rotate(180deg);
+  transition: transform .15s ease;
+}
+
+/* --------------------------------------------------- 侧栏收起来的样子 */
+
+body.side-min .shell {
+  grid-template-columns: var(--side-w-min) minmax(0, 1fr);
+}
+
+body.side-min .side-brand {
+  justify-content: center;
+  padding: 0;
+}
+
+body.side-min .side-nav {
+  padding: 16px 0 20px;
+}
+
+body.side-min .side-nav a {
+  justify-content: center;
+  padding: 6px;
+}
+
+/* 收起来以后只剩图标：那些字都藏起来，图标得自己站住。 */
+body.side-min .brand-name,
+body.side-min .side-group,
+body.side-min .side-nav a span,
+body.side-min .side-foot .row span {
+  display: none;
+}
+
+body.side-min .side-foot {
+  padding: 10px 0 12px;
+}
+
+body.side-min .side-foot .row {
+  justify-content: center;
+  padding: 0;
+}
+
+body.side-min .side-collapse {
+  margin: 4px auto 0;
+}
+
+body.side-min .side-collapse .ic {
+  transform: rotate(0deg);
 }
 
 /* 右边：顶上一条，内容在下面。 */
@@ -488,6 +570,11 @@ code {
   border-bottom: 1px solid var(--line);
 }
 
+/* 能折起来的那个头：整个左边都是按钮，按哪儿都收得起来。 */
+.panel-head.is-toggle {
+  padding: 0;
+}
+
 /* 面板的标题是 h2：页面顶上那个 h1 之后就是它，中间不跳级。 */
 .panel-head h2 {
   font-size: 13px;
@@ -496,6 +583,72 @@ code {
 
 .panel-head .spacer {
   margin-left: auto;
+}
+
+/* 折叠：头那一行就是开关。
+ *
+ * 按钮里头是「图标 + 名字 + 一个尖头」：尖头转一下就是收起来了。 */
+.panel-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+}
+
+.panel-toggle:hover {
+  background: var(--surface-2);
+  border: 0;
+}
+
+.panel-toggle:active {
+  transform: none;
+}
+
+.panel-toggle .ic {
+  color: var(--text-3);
+}
+
+.panel-toggle .chev {
+  margin-left: 2px;
+  transition: transform .15s ease;
+}
+
+.panel-toggle:hover .chev {
+  color: var(--accent);
+}
+
+.panel.is-collapsed .panel-toggle .chev {
+  transform: rotate(-90deg);
+}
+
+.panel.is-collapsed .panel-head {
+  border-bottom: 0;
+}
+
+.panel.is-collapsed .panel-body {
+  display: none;
+}
+
+/* 头右边那个动作（去看账号页之类）：离边留一点空当。 */
+.panel-head > .quiet,
+.panel-head > .muted:last-child {
+  margin-right: 16px;
 }
 
 .panel-body {
@@ -508,29 +661,46 @@ code {
 
 /* ---------------------------------------------------------------- 数字 */
 
-.kpis {
+/* 一排数字摆成一块，不摆成六张卡片。
+ *
+ * 六个一模一样的白盒子排一排，是那种一眼就知道是机器画的看板。真正
+ * 用得多的后台不这么摆：一块面板，中间隔着细线，一格一个数。格子少了，
+ * 数与数之间也就不用抢注意力了。 */
+.stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  /* 格子之间那道线是底色露出来的：换行的时候线也跟着换，不用另外算。 */
+  gap: 1px;
   margin-bottom: 24px;
-}
-
-/* 三个数的那一排：不要摊成三张半屏宽的卡片。 */
-.kpis.kpis-3 {
-  grid-template-columns: repeat(3, minmax(0, 240px));
-  justify-content: start;
-}
-
-/* 上头这一排数字跟下头的面板不是一样的东西：数字是垫底的一个个格子，
-   面板是浮在上面的卡片。 */
-.kpi {
-  background: var(--surface-2);
+  background: var(--line);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 12px 16px;
+  box-shadow: var(--shadow-card);
+  overflow: clip;
 }
 
-.kpi .label {
+/* 三个数的那一排：不要摊成半屏宽。 */
+.stats.stats-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px 16px;
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+}
+
+a.stat:hover {
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.stat .label {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -538,8 +708,7 @@ code {
   font-size: 12px;
 }
 
-.kpi .value {
-  margin-top: 8px;
+.stat .value {
   font-size: 24px;
   font-weight: 650;
   letter-spacing: -.025em;
@@ -547,15 +716,23 @@ code {
   font-variant-numeric: tabular-nums;
 }
 
-.kpi .value .unit {
+.stat .value .unit {
   margin-left: 3px;
   color: var(--text-3);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
 }
 
-.kpi .foot {
-  margin-top: 8px;
+/* 有事要办的那一格：数是别的颜色，一眼就知道不干净。 */
+.stat.is-warn .value {
+  color: var(--warn);
+}
+
+.stat .foot {
+  /* 脚注贴着格子底下：一排格子里，最高的那个定了这排的高度，脚注不贴
+   * 底就悬在半空，看着像没排完。 */
+  margin-top: auto;
+  padding-top: 6px;
   color: var(--text-3);
   font-size: 12px;
   display: flex;
@@ -566,7 +743,7 @@ code {
 
 /* 那颗点：它分开的是几个数，得看得见。--line-strong 在这儿只有 1.38:1，
  * 那几个数会连成一片。 */
-.kpi .foot .sep {
+.stat .foot .sep {
   color: var(--text-3);
 }
 
@@ -625,7 +802,6 @@ code {
 .meter {
   display: block;
   height: 5px;
-  margin-top: 8px;
   border-radius: var(--radius-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -646,10 +822,27 @@ code {
   background: var(--bad);
 }
 
-/* 表里那一格里的量表：跟上面的数对齐，右边贴着。 */
-td.num .meter {
-  width: 88px;
-  margin-left: auto;
+/* 量表和它的数并排。
+ *
+ * 以前那个百分数是另起一行的：格子高了一倍，扫一眼看不见的是数不是行。 */
+.meter-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.meter-line .meter {
+  flex: 1;
+  min-width: 40px;
+  margin-top: 0;
+}
+
+.meter-line .pct {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------------------------------------------------------------- 表格 */
@@ -710,7 +903,7 @@ table {
 }
 
 .acc-table col.c-act {
-  width: 10%;
+  width: 56px;
 }
 
 /* 用量表也定死列宽：邮箱那一格长的能撑破整张表，数字那几格得留在原地。 */
@@ -792,7 +985,21 @@ tbody tr:last-child td {
   border-bottom: none;
 }
 
-tbody tr:hover td {
+/* 只有真能按的行才给鼠标的样子：指着它却按不动，那是骗人。 */
+.acc-table tbody tr[data-row] {
+  cursor: pointer;
+}
+
+.acc-table tbody tr[data-row]:hover td {
+  background: var(--surface-2);
+}
+
+/* 这一行能按：左边缘亮一道竖线，跟导航条上那个是一回事。 */
+.acc-table tbody tr[data-row]:hover td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.keys-table tbody tr:hover td {
   background: var(--surface-2);
 }
 
@@ -890,6 +1097,49 @@ td .sub.mono {
   background: none;
   color: var(--accent);
   text-decoration: underline;
+}
+
+/* 行里的动作：平时收起来，指着这一行或者键盘走到这一行才露出来。
+ *
+ * 一百行都摆着一个一样的「立即签到」，那一片按钮把真正要紧的东西淹了。
+ * 收起来不是藏：指着那一行它就在，键盘 Tab 过去它也在。 */
+.row-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease, color .12s ease;
+}
+
+.acc-table tr[data-row]:hover .row-act,
+.acc-table tr[data-row]:focus-within .row-act {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.row-act:hover {
+  background: var(--surface-3);
+  border-color: var(--line-control);
+  color: var(--accent);
+}
+
+/* 手指头点的设备上没有「指着」这一说：那就一直摆着。 */
+@media (hover: none) {
+  .row-act {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+td.act {
+  text-align: right;
 }
 
 /* 错的那一句自己占一行：占的是整张表那么宽，一行就写得下。 */
@@ -1032,10 +1282,33 @@ button:active {
 /* 按不了的东西：字还得认得出来。
  * 整块半透明会把字压到 2.96:1，primary 的白字更是只剩 1.34:1 —— 那看着
  * 像坏了，不像按不了。 */
+/* 按不了的东西，鼠标底下也得是那个样子。
+ *
+ * 按钮禁用的时候只是把透明度调了一下，底色照旧会变：那个样子看着像
+ * 「按一下试试」，不像按不了。 */
 button:disabled {
   opacity: .7;
   cursor: default;
   transform: none;
+}
+
+button:disabled:hover,
+button:disabled:active {
+  background: var(--surface);
+  border-color: var(--line-control);
+  color: var(--text);
+}
+
+button.primary:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+button.danger:disabled:hover {
+  background: var(--surface);
+  border-color: var(--line-control);
+  color: var(--bad);
 }
 
 button.primary {
@@ -1100,6 +1373,37 @@ a.btn.primary:hover {
   border-color: var(--accent-hover);
 }
 
+/* 顶栏上那个「命令」：它自己是命令面板的入口。
+ *
+ * 键盘快捷键藏得太深：没有这个按钮，人根本不知道还有那么一回事。 */
+.cmd-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid var(--line-control);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.cmd-hint:hover {
+  background: var(--surface-2);
+  border-color: var(--text-3);
+  color: var(--text-2);
+}
+
+.cmd-hint kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font: inherit;
+  font-size: 11px;
+}
+
 /* 顶栏上那个退出：它是个动作，不是正文。 */
 .nav-signout {
   display: inline-flex;
@@ -1162,17 +1466,15 @@ textarea::placeholder {
  *
  * 早先这里是 outline: none 加一圈 --accent-soft 的影子。那圈影子在白底
  * 上是 1.15:1，等于没有：按 Tab 的人根本不知道焦点在哪儿。焦点环必须是
- * --accent 那道实线（对底色 5:1 以上），键盘看得见，鼠标点的时候不刺眼。 */
-input:focus,
-select:focus,
-textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-
+ * --accent 那道实线（对底色 5:1 以上），键盘看得见，鼠标点的时候不刺眼。
+ *
+ * 用 :focus-visible 而不是 :focus：鼠标点进输入框的时候不必再画一圈，
+ * 那是键盘的人的记号。 */
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -1207,6 +1509,11 @@ textarea {
 .field .row input {
   flex: 1;
   min-width: 0;
+}
+
+/* 一格窄一点的：一个名字用不着铺满一整行。 */
+.field-narrow {
+  max-width: 480px;
 }
 
 .toolbar {
@@ -1368,6 +1675,102 @@ textarea {
   text-align: right;
 }
 
+/* 整行就是那个链接。
+ *
+ * 以前是右边挂一个「看」字：那一行说的是出错的账号，那个字说的是去看
+ * 它，两样东西隔着一整行，谁也挨不着谁。 */
+.rows.rows-link li {
+  padding: 0;
+}
+
+.rows-link .row-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 16px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.rows-link .row-link:hover {
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.rows-link .row-link .chev {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-3);
+  transition: color .12s ease;
+}
+
+.rows-link .row-link:hover .chev {
+  color: var(--accent);
+}
+
+/* 组：名字一行，底下是它那几条地址。
+ *
+ * 组以前是一张表，只有名字和条数：组里到底有哪些路，得点「改」才看得见。
+ * 这一页要干的事就是看这个，不该藏在一个框后面。 */
+.rows-groups li {
+  display: block;
+  padding: 10px 16px;
+}
+
+.group-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.group-top .g-name {
+  font-weight: 600;
+}
+
+.group-top .right {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.addr-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.addr-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.9;
+}
+
+.addr-list .mono {
+  overflow-wrap: anywhere;
+}
+
+/* 主路那个记号：不是药丸，是个字。
+ *
+ * 一排地址里每条都挂一个蓝底药丸，那点蓝比地址本身还响。它说的是顺序，
+ * 一两个字就够。 */
+.main-mark {
+  flex: none;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.group-empty {
+  margin: 6px 0 0;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
 /* ---------------------------------------------------------------- 提示 */
 
 /* 提示框：它讲的事有好几种（有一步没走完、拿到了一把 key、出了错），
@@ -1478,6 +1881,41 @@ textarea {
   font-size: 15px;
 }
 
+/* 框的头：名字在左，关掉的那一下在右。
+ *
+ * 没有关掉的那一下，人就只能按 Esc 或者点外面：知道 Esc 的人不多。 */
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.card-head h3 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.card-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+}
+
+.card-close:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--text);
+}
+
 .card p {
   margin: 0 0 12px;
   color: var(--text-2);
@@ -1491,17 +1929,46 @@ textarea {
   align-items: flex-start;
 }
 
-.card form input,
-.card form select {
+/* 这一条只管直接摆在框里的控件（没有格子包着的那些）。 */
+.card form > input,
+.card form > select {
   flex: 1 1 12rem;
 }
 
-.card form textarea {
+.card form > textarea {
   flex: 1 1 100%;
 }
 
-.card form button {
+/* 框里的每一格占满一整行：标签在上，控件在下。 */
+.card form .field {
+  flex: 1 0 100%;
+}
+
+/* 格子是竖着排的：里面的控件按自己该有的高矮来，不跟旁边的一格抢。
+ *
+ * 上头那条 flex: 1 1 12rem 是给横着摆的控件准备的；同样的数值落在这个
+ * 竖着的格子里，意思就变成了「高十二 rem」——一个只放名字的输入框会
+ * 撑成半张纸高。 */
+.card form .field > input,
+.card form .field > select,
+.card form .field > textarea {
   flex: none;
+  width: 100%;
+}
+
+/* 框里那一下按下去的事，摆在右边。 */
+.card form > button {
+  flex: none;
+  margin-left: auto;
+}
+
+/* 框底下那一排动作：取消在左，正事在右。 */
+.card form .card-actions {
+  flex: 1 0 100%;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
 }
 
 .card .card-msg {
@@ -1646,6 +2113,78 @@ textarea {
   background: var(--line);
 }
 
+/* 抽屉开着的时候：底下的页面不滚，飘字挪到抽屉左边去。 */
+body.has-drawer {
+  overflow: hidden;
+}
+
+body.has-drawer .status {
+  right: 436px;
+}
+
+/* --------------------------------------------- 浮在上头的菜单和命令面板 */
+
+/* 右键一行弹出来的那一小块。 */
+.rowmenu {
+  position: fixed;
+  z-index: 95;
+  min-width: 172px;
+  padding: 4px;
+  border: 1px solid var(--line-control);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-pop);
+}
+
+.rowmenu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.rowmenu-item:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+}
+
+/* 命令面板：Ctrl+K 弹出来的那一叠。 */
+.palette {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.palette li {
+  margin: 0;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.palette-item:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+}
+
+.palette .muted {
+  padding: 8px;
+}
+
 /* ------------------------------------------------------------ 正在忙的 */
 
 body.is-busy::after {
@@ -1688,6 +2227,23 @@ body.is-busy[data-busy]::before {
   white-space: nowrap;
 }
 
+/* 顶上那两道是给人看的，不是给人按的：它们不能把点击吃了。 */
+body.is-busy::after,
+body.is-busy[data-busy]::before {
+  pointer-events: none;
+}
+
+/* 正在忙的图标转一圈：比把字换成「签到中……」安静。 */
+.ic.is-spin {
+  animation: mmx-spin .9s linear infinite;
+}
+
+@keyframes mmx-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* ------------------------------------------------------------ 窄屏 */
 
 @media (max-width: 960px) {
@@ -1719,6 +2275,22 @@ body.is-busy[data-busy]::before {
 
   .side-foot {
     display: none;
+  }
+
+  /* 窄屏上侧栏是一条横着的导航带：收不收都一个样子，图标道那套在这儿没
+   * 有意思，字还得摆出来。 */
+  body.side-min .shell {
+    grid-template-columns: 1fr;
+  }
+
+  body.side-min .brand-name,
+  body.side-min .side-nav a span {
+    display: inline;
+  }
+
+  body.side-min .side-nav a {
+    justify-content: flex-start;
+    padding: 6px 10px;
   }
 
   .page {

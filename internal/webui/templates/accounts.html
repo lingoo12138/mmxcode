@@ -14,7 +14,7 @@
            aria-label="筛账号：邮箱、标签、ID 都行">
   </div>
   <span class="muted" id="account-count" role="status" aria-live="polite"></span>
-  <div class="chips" id="status-chips">
+  <div class="chips" id="status-chips" role="group" aria-label="按状态筛选">
     <button type="button" class="chip is-on" data-status="" aria-pressed="true">全部 <span class="n">{{.TotalCount}}</span></button>
     <button type="button" class="chip" data-status="active" aria-pressed="false">正常 <span class="n">{{.ActiveCount}}</span></button>
     <button type="button" class="chip" data-status="signed_out" aria-pressed="false">已登出 <span class="n">{{.SignedOutCount}}</span></button>
@@ -49,15 +49,19 @@
     data-checked="{{$acc.CheckedIn}}" data-streak="{{$acc.Streak}}">
   <td class="pick"><input type="checkbox" class="pick-row" data-id="{{$acc.ID}}" aria-label="选 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}}"></td>
   <td class="acct">
-    <button type="button" class="row-open" data-open="{{$acc.ID}}" title="{{$acc.Name}}">{{if $acc.Name}}{{$acc.Name}}{{else}}未命名{{end}}</button>
+    <button type="button" class="row-open" data-open="{{$acc.ID}}" title="{{$acc.Name}}"
+            aria-haspopup="dialog" aria-expanded="false" aria-controls="acc-drawer">{{if $acc.Name}}{{$acc.Name}}{{else}}未命名{{end}}</button>
     <span class="sub clip" title="{{$acc.Email}}">{{if $acc.Email}}{{clipMail $acc.Email}}{{else}}没有邮箱{{end}}</span>
   </td>
   <td class="nowrap" data-sort="{{$acc.StatusRank}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">已登出</span>{{else}}<span class="pill bad">{{statusName $acc.Status}}</span>{{end}}</td>
-  <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}<span class="nowrap">{{printf "%.2f" $acc.Remaining}} / {{printf "%.0f" $acc.Granted}}</span><span class="meter"><span class="{{$acc.Bar}}" style="width: {{printf "%.1f" $acc.Pct}}%"></span></span><span class="sub">{{printf "%.0f" $acc.Pct}}% 还剩</span>{{else}}<span class="warn">读不到</span>{{end}}</td>
+  <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}<span class="nowrap">{{printf "%.2f" $acc.Remaining}} / {{printf "%.0f" $acc.Granted}}</span><span class="meter-line"><span class="meter"><span class="{{$acc.Bar}}" style="width: {{printf "%.1f" $acc.Pct}}%"></span></span><span class="pct">{{printf "%.0f" $acc.Pct}}%</span></span>{{else}}<span class="warn">读不到</span>{{end}}</td>
   <td class="nowrap" data-sort="{{$acc.Plan}}">{{if $acc.Plan}}{{$acc.Plan}}{{else if $acc.WindowModel}}{{$acc.WindowModel}}{{else}}<span class="muted">未知</span>{{end}}{{if $acc.HasWindow}}<span class="sub clip" title="{{$acc.WindowModel}} 已用 {{printf "%.0f" $acc.WindowUsed}}%">已用 {{printf "%.0f" $acc.WindowUsed}}%</span>{{end}}</td>
   <td class="nowrap" data-outlet="1" data-sort="{{$acc.ProxyGroup}}">{{if $acc.ProxyGroup}}{{$acc.ProxyGroup}}{{else if $acc.ProxyURL}}<span class="mono clip" title="{{$acc.ProxyURL}}">{{host $acc.ProxyURL}}</span>{{else}}<span class="muted">跟随全局</span>{{end}}</td>
   <td class="nowrap" data-checked-cell="1">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
-  <td class="nowrap"><button class="small" data-checkin="{{$acc.ID}}">立即签到</button></td>
+  <td class="act">{{if not $acc.CheckedIn}}<button type="button" class="row-act" data-checkin="{{$acc.ID}}"
+    title="立即签到" aria-label="给 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}} 签到">
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg>
+  </button>{{end}}</td>
 </tr>
 {{if $acc.LastError}}
 <tr class="err-row" data-owner="{{$acc.ID}}"><td colspan="8" class="err-band" title="{{$acc.LastError}}"><span class="who">{{statusName $acc.Status}}</span>{{$acc.LastError}}</td></tr>
@@ -71,6 +75,7 @@
 
 <div class="bulkbar" id="bulkbar" hidden>
   <span class="n">选了 <span id="bulk-count" aria-live="polite">0</span> 个</span>
+  <span class="n muted" id="bulk-progress" role="status"></span>
   <span class="spacer"></span>
   <button type="button" class="small" id="bulk-checkin">批量签到</button>
   <button type="button" class="small" id="bulk-group">批量设出口组</button>

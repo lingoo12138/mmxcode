@@ -8,42 +8,58 @@
 </div>
 
 <div class="grid-2">
-  <section class="panel">
-    <div class="panel-head">
-      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg>
-      <h2>组</h2>
-      <span class="spacer"></span>
+  <section class="panel" data-panel="groups">
+    <div class="panel-head is-toggle">
+      <h2 class="panel-title">
+        <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-groups">
+          <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#world"/></svg>
+          <span>组</span>
+          <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+        </button>
+      </h2>
       <span class="muted">一个组一条出口</span>
     </div>
-    <div class="panel-body flush">
-      <table>
-      <caption class="sr-only">出口分组</caption>
-      <thead><tr><th scope="col">名字</th><th scope="col" class="num">条数</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
-      <tbody>
-      {{range .Groups}}
-      <tr>
-        <td class="nowrap">{{.Name}}{{if .Global}} <span class="pill info">全局默认</span>{{end}}</td>
-        <td class="muted num">{{.Count}} 条</td>
-        <td class="nowrap">
-          <button class="small" data-group-edit="{{.Name}}" data-group-list="{{.List}}">改</button>
-          {{if not .Global}}<button class="small danger" data-group-rm="{{.Name}}">删</button>{{end}}
-        </td>
-      </tr>
-      {{end}}
-      {{if not .Groups}}<tr><td class="empty" colspan="3">还没有组。<code>mmxcode groups set --name X --url 地址</code> 建一个。</td></tr>{{end}}
-      </tbody>
-      </table>
+    <div class="panel-body flush" id="p-groups">
+      <ul class="rows rows-groups">
+        {{range .Groups}}
+        <li>
+          <div class="group-top">
+            <span class="g-name">{{.Name}}</span>
+            {{if .Global}}<span class="pill info">全局默认</span>{{end}}
+            <span class="muted">{{.Count}} 条</span>
+            <span class="right">
+              <button class="small" data-group-edit="{{.Name}}" data-group-list="{{.List}}">改</button>
+              {{if not .Global}}<button class="small danger" data-group-rm="{{.Name}}">删</button>{{end}}
+            </span>
+          </div>
+          {{if .Addrs}}
+          <ul class="addr-list">
+            {{range $i, $a := .Addrs}}
+            <li>{{if eq $i 0}}<span class="main-mark">主路</span>{{end}}<span class="mono">{{$a}}</span></li>
+            {{end}}
+          </ul>
+          {{else}}
+          <p class="group-empty">这个组里还没有地址。</p>
+          {{end}}
+        </li>
+        {{end}}
+      </ul>
+      {{if not .Groups}}<div class="empty">还没有组。<code>mmxcode groups set --name X --url 地址</code> 建一个。</div>{{end}}
     </div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plug"/></svg>
-      <h2>在用的地址</h2>
-      <span class="spacer"></span>
+  <section class="panel" data-panel="egress">
+    <div class="panel-head is-toggle">
+      <h2 class="panel-title">
+        <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-egress">
+          <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#plug"/></svg>
+          <span>在用的地址</span>
+          <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+        </button>
+      </h2>
       <span class="muted">现在有人在走的</span>
     </div>
-    <div class="panel-body flush">
+    <div class="panel-body flush" id="p-egress">
       <table>
       <caption class="sr-only">现在有人在走的出口地址</caption>
       <thead><tr><th scope="col">从哪来</th><th scope="col">地址</th><th scope="col">健康</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>

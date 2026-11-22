@@ -154,15 +154,22 @@ function askForKey() {
   if (keyBox) return;
   const card = makeCard('这个网关要一把 API key', '填进去就能继续。');
   keyBox = card.box;
+  const field = document.createElement('div');
+  field.className = 'field';
+  const label = document.createElement('label');
+  label.textContent = '后台登录密钥';
+  label.htmlFor = 'card-key';
   const input = document.createElement('input');
+  input.id = 'card-key';
   input.type = 'password';
   input.placeholder = 'API key';
-  input.setAttribute('aria-label', 'API key');
   input.autocomplete = 'current-password';
+  field.append(label, input);
   const button = document.createElement('button');
   button.type = 'submit';
+  button.className = 'primary';
   button.textContent = '进入';
-  card.form.append(input, button);
+  card.form.append(field, button);
   card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
@@ -192,24 +199,39 @@ function makeCard(titleText, leadText) {
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-modal', 'true');
   panel.setAttribute('tabindex', '-1');
+  // 头一行：名字在左，关掉的那一下在右。
+  //
+  // 没有关掉的那一下，人就只能按 Esc 或者点外面：知道 Esc 的人不多。
+  const head = document.createElement('div');
+  head.className = 'card-head';
   const title = document.createElement('h3');
   cardSeq++;
   title.id = 'card-title-' + cardSeq;
   title.textContent = titleText;
   panel.setAttribute('aria-labelledby', title.id);
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'card-close';
+  close.setAttribute('aria-label', '关上');
+  close.appendChild(icon('x'));
+  close.addEventListener('click', () => closeCard(box));
+  head.append(title, close);
   const lead = document.createElement('p');
   lead.textContent = leadText;
   const form = document.createElement('form');
   const msg = document.createElement('p');
   msg.className = 'card-msg';
   msg.setAttribute('role', 'status');
-  panel.append(title, lead, form, msg);
+  panel.append(head, lead, form, msg);
   box.appendChild(panel);
 
   box.addEventListener('click', (ev) => {
     if (ev.target === box) closeCard(box);
   });
   document.body.appendChild(box);
+  // 关上的时候焦点得还给摆它出来的那一下。
+  box._opener = opener;
+  refreshInert();
 
   return {
     box: box,
@@ -224,6 +246,18 @@ function makeCard(titleText, leadText) {
   };
 }
 
+// refreshInert 把底下的页面按停。
+//
+// 框和抽屉是模态的：它们开着的时候，底下的表格不该还能按 —— Tab 跑出去
+// 按到看不见的按钮上，人会以为自己在框里。
+function refreshInert() {
+  const on = !!document.querySelector('.card') || !!drawerBox;
+  for (const el of document.querySelectorAll('.shell, .drawer')) {
+    if (on) el.setAttribute('inert', '');
+    else el.removeAttribute('inert');
+  }
+}
+
 // closeCard 关掉一个飘出来的框。
 //
 // 焦点回到摆它出来的那一下：不然人在一百行表格里就找不着刚才按的是哪
@@ -233,6 +267,7 @@ function closeCard(box) {
   const opener = box._opener;
   box.remove();
   if (box === keyBox) keyBox = null;
+  refreshInert();
   if (opener && opener.focus && document.contains(opener)) opener.focus();
 }
 
@@ -241,6 +276,11 @@ function closeCard(box) {
 // 飘出来的框压在抽屉上面：先关框，再关抽屉。
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape') return;
+  // 命令面板也用它那层罩子：它比别的框都高，先关它。
+  if (paletteBox) {
+    closePalette();
+    return;
+  }
   const boxes = document.querySelectorAll('.card');
   if (boxes.length) {
     closeCard(boxes[boxes.length - 1]);
@@ -393,7 +433,26 @@ function outcomeWords(out) {
   const rows = Array.from(document.querySelectorAll('tr[data-row]'));
   const counter = document.getElementById('account-count');
   const empty = document.getElementById('no-rows');
-  let want = '';
+
+  // 筛的条件放在地址栏里。
+  //
+  // 页面上改完东西要重新取一次页面：筛要是只活在页面上，那一下就丢了。
+  // 筛出三个坏了的号，修掉一个，页面却跳回一百行，人得从头再筛一遍。
+  // 放在地址栏里，改完还在，链接也能发给同事。
+  const params = new URLSearchParams(location.search);
+  if (box && params.get('q')) box.value = params.get('q');
+  let want = params.get('s') || '';
+
+  const keepURL = () => {
+    const url = new URL(location.href);
+    const q = box ? box.value.trim() : '';
+    if (q) url.searchParams.set('q', q);
+    else url.searchParams.delete('q');
+    if (want) url.searchParams.set('s', want);
+    else url.searchParams.delete('s');
+    history.replaceState(null, '', url);
+  };
+
   const apply = () => {
     const q = box ? box.value.trim().toLowerCase() : '';
     let shown = 0;
@@ -422,18 +481,22 @@ function outcomeWords(out) {
     }
     if (counter) counter.textContent = rows.length ? shown + ' / ' + rows.length : '';
     if (empty) empty.hidden = shown > 0 || !rows.length;
+    // 药丸的样子得跟着条件走：从地址栏里回来的页面上也是。
+    if (chips) {
+      for (const c of chips.querySelectorAll('.chip')) {
+        const on = (c.dataset.status || '') === want;
+        c.classList.toggle('is-on', on);
+        c.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
   };
-  if (box) box.addEventListener('input', apply);
+  if (box) box.addEventListener('input', () => { keepURL(); apply(); });
   if (chips) {
     chips.addEventListener('click', (ev) => {
       const chip = ev.target.closest('.chip');
       if (!chip) return;
       want = chip.dataset.status || '';
-      for (const c of chips.querySelectorAll('.chip')) {
-        const on = c === chip;
-        c.classList.toggle('is-on', on);
-        c.setAttribute('aria-pressed', on ? 'true' : 'false');
-      }
+      keepURL();
       apply();
     });
   }
@@ -570,20 +633,20 @@ function compare(a, b) {
       const ids = pickedIDs();
       if (!ids.length) return;
       checkin.disabled = true;
+      const progress = document.getElementById('bulk-progress');
       let ok = 0;
-      const bad = [];
+      let bad = 0;
       for (const id of ids) {
         try {
           await post('/api/accounts/' + encodeURIComponent(id) + '/checkin');
           ok++;
         } catch (e) {
-          bad.push(id);
+          bad++;
         }
-        say('签到 ' + (ok + bad.length) + ' / ' + ids.length);
+        // 进度写在条上，不写飘字：一百个飘字没人看得见。
+        if (progress) progress.textContent = (ok + bad) + ' / ' + ids.length;
       }
-      checkin.disabled = false;
-      say('签了 ' + ok + ' 个，失败 ' + bad.length + ' 个');
-      location.reload();
+      sayAndReload('签了 ' + ok + ' 个，失败 ' + bad + ' 个');
     });
   }
 
@@ -598,25 +661,61 @@ function compare(a, b) {
 
   const remove = document.getElementById('bulk-delete');
   if (remove) {
-    remove.addEventListener('click', async () => {
+    remove.addEventListener('click', () => {
       const ids = pickedIDs();
       if (!ids.length) return;
-      if (!confirm('删掉选中的 ' + ids.length + ' 个账号？它们的令牌和读数也跟着没了。')) return;
-      remove.disabled = true;
-      let ok = 0;
-      for (const id of ids) {
-        try {
-          await del('/api/accounts/' + encodeURIComponent(id));
-          ok++;
-        } catch (e) {
-          say('删除失败：' + e.message);
-        }
-      }
-      say('删了 ' + ok + ' 个');
-      location.reload();
+      confirmCard('删掉选中的 ' + ids.length + ' 个账号？',
+        '它们的令牌和读数也跟着没了。', '删掉', async () => {
+          let ok = 0;
+          const bad = [];
+          for (const id of ids) {
+            try {
+              await del('/api/accounts/' + encodeURIComponent(id));
+              ok++;
+            } catch (e) {
+              bad.push(id + '：' + e.message);
+            }
+          }
+          sayAndReload('删了 ' + ok + ' 个' + (bad.length ? '，' + bad.length + ' 个没删掉' : ''));
+        });
     });
   }
 })();
+
+// confirmCard 用自己的框问一句。
+//
+// 焦点先落在「取消」上：手快按回车不该删东西。
+//
+// 不用浏览器那个 confirm：那是浏览器的东西，不是这个后台的东西，而且它
+// 一弹出来就把整个页面锁住了。
+function confirmCard(title, lead, okText, onOk) {
+  const card = makeCard(title, lead);
+  const ok = document.createElement('button');
+  ok.type = 'submit';
+  ok.className = 'danger';
+  ok.textContent = okText;
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = '取消';
+  cancel.addEventListener('click', () => closeCard(card.box));
+  // 两个动作摆一排：取消在左，正事在右。中间空着的地方别去填满。
+  const acts = document.createElement('div');
+  acts.className = 'card-actions';
+  acts.append(cancel, ok);
+  card.form.append(acts);
+  card.form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    ok.disabled = true;
+    try {
+      await onOk(card);
+    } catch (e) {
+      card.msg.textContent = e.message;
+      ok.disabled = false;
+    }
+  });
+  card.open(cancel);
+  return card;
+}
 
 // askGroup 让人选一个组，给选中的账号换上。
 //
@@ -650,7 +749,12 @@ function askGroup(ids) {
     '把选中的 ' + ids.length + ' 个账号放进哪个组',
     '选「跟随全局」就是回到全局默认。');
   const select = document.createElement('select');
-  select.setAttribute('aria-label', '出口组');
+  select.id = 'card-group-pick';
+  const field = document.createElement('div');
+  field.className = 'field';
+  const label = document.createElement('label');
+  label.textContent = '出口组';
+  label.htmlFor = 'card-group-pick';
   const none = document.createElement('option');
   none.value = '';
   none.textContent = '跟随全局';
@@ -661,10 +765,12 @@ function askGroup(ids) {
     opt.textContent = n;
     select.appendChild(opt);
   }
+  field.append(label, select);
   const button = document.createElement('button');
   button.type = 'submit';
+  button.className = 'primary';
   button.textContent = '换过去';
-  card.form.append(select, button);
+  card.form.append(field, button);
   card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
@@ -712,6 +818,8 @@ let drawerBox = null;
 // drawerOpener 是摆出抽屉的那一行：抽屉关上的时候，焦点得回到那儿，
 // 不然人在一百行里就找不着刚才在看哪一行了。
 let drawerOpener = null;
+// drawerTrigger 是行里那个名字按钮：它得说出抽屉开着没有。
+let drawerTrigger = null;
 
 function closeDrawer() {
   if (!drawerBox) return;
@@ -719,10 +827,19 @@ function closeDrawer() {
   const scrim = document.querySelector('.drawer-scrim');
   if (scrim) scrim.remove();
   drawerBox = null;
+  document.body.classList.remove('has-drawer');
+  if (drawerTrigger) {
+    drawerTrigger.setAttribute('aria-expanded', 'false');
+    drawerTrigger = null;
+  }
+  refreshInert();
   if (drawerOpener) {
     const opener = drawerOpener;
     drawerOpener = null;
-    if (opener.focus) opener.focus();
+    // <tr> 聚焦不了：焦点得还给行里那个名字按钮。
+    const btn = opener.querySelector ? opener.querySelector('.row-open') : null;
+    if (btn && btn.focus) btn.focus();
+    else if (opener.focus) opener.focus();
   }
 }
 
@@ -733,13 +850,22 @@ function openDrawer(row) {
   const d = row.dataset;
   const scrim = document.createElement('div');
   scrim.className = 'drawer-scrim';
+  scrim.setAttribute('aria-hidden', 'true');
   scrim.addEventListener('click', closeDrawer);
 
   const box = document.createElement('aside');
+  box.id = 'acc-drawer';
   box.className = 'drawer';
   box.setAttribute('role', 'dialog');
   box.setAttribute('aria-modal', 'true');
   box.setAttribute('tabindex', '-1');
+
+  // 摆它出来的那个按钮，得说出抽屉开着没有。
+  const trigger = row.querySelector ? row.querySelector('.row-open') : null;
+  if (trigger) {
+    trigger.setAttribute('aria-expanded', 'true');
+    drawerTrigger = trigger;
+  }
 
   const head = document.createElement('div');
   head.className = 'drawer-head';
@@ -887,18 +1013,14 @@ function openDrawer(row) {
   remove.type = 'button';
   remove.className = 'danger icon';
   remove.append(icon('trash'), document.createTextNode('删掉'));
-  remove.addEventListener('click', async () => {
-    if (!confirm('删掉这个账号？它的令牌和读数也跟着没了。')) return;
-    remove.disabled = true;
-    try {
+  remove.addEventListener('click', () => {
+    confirmCard('删掉这个账号？', '它的令牌和读数也跟着没了。', '删掉', async (card) => {
       await del('/api/accounts/' + encodeURIComponent(d.row));
       row.remove();
       closeDrawer();
+      closeCard(card.box);
       sayAndReload('删掉了');
-    } catch (e) {
-      footMsg.textContent = '删除失败：' + e.message;
-      remove.disabled = false;
-    }
+    });
   });
   foot.append(checkin, remove, footMsg);
 
@@ -906,6 +1028,9 @@ function openDrawer(row) {
   document.body.appendChild(scrim);
   document.body.appendChild(box);
   drawerBox = box;
+  // 抽屉开着的时候底下的页面不滚，飘字也挪到抽屉左边去。
+  document.body.classList.add('has-drawer');
+  refreshInert();
   box.focus();
 }
 
@@ -915,15 +1040,19 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Tab') return;
   const layer = topLayer();
   if (!layer) return;
-  const f = layer.querySelectorAll(
-    'button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])');
-  if (!f.length) return;
-  const first = f[0];
-  const last = f[f.length - 1];
-  if (ev.shiftKey && document.activeElement === first) {
-    ev.preventDefault();
-    last.focus();
-  } else if (!ev.shiftKey && document.activeElement === last) {
+  const list = Array.from(layer.querySelectorAll(
+    'button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])'));
+  if (!list.length) return;
+  const first = list[0];
+  const last = list[list.length - 1];
+  const idx = list.indexOf(document.activeElement);
+  if (ev.shiftKey) {
+    // 焦点在框自己身上（它是 tabindex="-1"，不在那一列里）也算在头一个前面。
+    if (idx <= 0) {
+      ev.preventDefault();
+      last.focus();
+    }
+  } else if (idx === -1 || idx === list.length - 1) {
     ev.preventDefault();
     first.focus();
   }
@@ -949,13 +1078,20 @@ document.addEventListener('click', async (ev) => {
   if (checkin) {
     const id = checkin.dataset.checkin;
     const row = checkin.closest('tr');
+    const cell = row ? row.querySelector('[data-checked-cell]') : null;
+    const use = checkin.querySelector('use');
+    const svg = checkin.querySelector('svg');
     checkin.disabled = true;
-    checkin.textContent = '签到中……';
+    // 正在签到：图标转一圈，比把字换成「签到中……」安静。
+    if (use) use.setAttribute('href', '/static/icons.svg#refresh');
+    if (svg) svg.classList.add('is-spin');
     try {
-      const out = await post(`/api/accounts/${id}/checkin`, undefined, '正在签到');
-      checkin.textContent = outcomeWords(out);
+      const out = await post('/api/accounts/' + encodeURIComponent(id) + '/checkin', undefined, '正在签到');
+      const word = outcomeWords(out);
+      // 签过了就把这一行的按钮收掉：跟服务端渲染出来的样子一样。
+      const td = checkin.closest('td');
+      if (td) td.textContent = '';
       // 签到了就把那一格改过来：不然表格还在说「未签」。
-      const cell = row ? row.querySelector('[data-checked-cell]') : null;
       if (cell && out.outcome === 'claimed') {
         cell.textContent = '';
         const pill = document.createElement('span');
@@ -963,18 +1099,15 @@ document.addEventListener('click', async (ev) => {
         pill.textContent = '已签 ' + (out.streak || 1) + ' 天';
         cell.appendChild(pill);
       }
+      say(word);
     } catch (e) {
       // 失败要说清楚为什么，还得能再按一次。
-      checkin.textContent = '失败';
+      if (use) use.setAttribute('href', '/static/icons.svg#alert-triangle');
+      if (svg) svg.classList.remove('is-spin');
       checkin.disabled = false;
       checkin.title = String(e.message);
-      const cell = checkin.closest('td');
-      if (cell) {
-        const msg = document.createElement('div');
-        msg.className = 'err';
-        msg.textContent = e.message;
-        cell.appendChild(msg);
-      }
+      checkin.setAttribute('aria-label', '签到失败：' + e.message);
+      say('签到失败：' + e.message);
     }
     return;
   }
@@ -1040,15 +1173,11 @@ document.addEventListener('click', async (ev) => {
   const groupRm = ev.target.closest('button[data-group-rm]');
   if (groupRm) {
     const name = groupRm.dataset.groupRm;
-    if (!confirm(`删掉组 ${name}？指着它的账号回到全局组。`)) return;
-    groupRm.disabled = true;
-    try {
+    confirmCard('删掉组 ' + name + '？', '指着它的账号回到全局组。', '删掉', async (card) => {
       await del(`/api/proxy-groups?name=${encodeURIComponent(name)}`);
-      location.reload();
-    } catch (e) {
-      say('删除失败：' + e.message);
-      groupRm.disabled = false;
-    }
+      closeCard(card.box);
+      sayAndReload('删掉了组 ' + name);
+    });
     return;
   }
 
@@ -1291,6 +1420,7 @@ function watchImport(id) {
       lockImport(false);
       const status = document.getElementById('import-status');
       if (status) status.textContent = '导入等太久了，停了。看看下面的结果，或者再导一次。';
+      sayImport('导入等太久了，停了。');
       return;
     }
     try {
@@ -1304,6 +1434,7 @@ function watchImport(id) {
         // 完了就把「导入中」换掉：不然那句话一直挂在那儿，人以为还在跑。
         status.textContent = '导入完了：成功 ' + (run.ok || 0) + '，失败 ' + (run.failed || 0);
         showImportResults(run);
+        sayImport(status.textContent);
       } else {
         status.textContent = '导入中……成功 ' + run.ok + '，失败 ' + run.failed;
       }
@@ -1312,8 +1443,18 @@ function watchImport(id) {
       lockImport(false);
       const status = document.getElementById('import-status');
       if (status) status.textContent = '失败：' + e.message;
+      sayImport('失败：' + e.message);
     }
   }, 3000);
+}
+
+// sayImport 念一句导入的话。
+//
+// 进度那一行每三秒变一次，不能拿去念：读屏器自己都说不过来。完了的那
+// 一句才是该念的。
+function sayImport(text) {
+  const live = document.getElementById('import-live');
+  if (live) live.textContent = text;
 }
 
 function showImportResults(run) {
@@ -1443,7 +1584,12 @@ document.addEventListener('submit', async (ev) => {
   try {
     const out = await post('/api/keys', { name: name ? name.value : '' });
     const plain = document.getElementById('key-plain');
-    if (plain) plain.textContent = out.key;
+    if (plain) {
+      plain.textContent = out.key;
+      // 焦点落在 key 上：Ctrl+A、Ctrl+C 直接能用。
+      plain.focus();
+      plain.setSelectionRange(0, out.key.length);
+    }
     const box = document.getElementById('key-new');
     if (box) box.hidden = false;
     if (status) status.textContent = '申请好了。抄走收好：过了这一会儿就拿不出来了。';
@@ -1461,12 +1607,13 @@ document.addEventListener('click', async (ev) => {
   if (copy) {
     const plain = document.getElementById('key-plain');
     if (!plain) return;
+    const label = document.getElementById('key-copy-label');
     try {
       await navigator.clipboard.writeText(plain.textContent);
-      copy.textContent = '复制好了';
+      if (label) label.textContent = '复制好了';
     } catch (e) {
       // 剪贴板不给用的时候，人自己选中那段字也一样。
-      copy.textContent = '选中最下面那段字自己复制';
+      if (label) label.textContent = '选中最下面那段字自己复制';
     }
     return;
   }
@@ -1539,6 +1686,19 @@ async function renderKeys() {
     tr.appendChild(last);
     body.appendChild(tr);
   }
+  if (!keys.length) {
+    // 空清单也得有话说：不然表里就是一片白。
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.className = 'empty';
+    td.colSpan = 5;
+    td.textContent = '还没有申请过 key。';
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+  // 重摆完表，焦点得还在表里：别把人甩回页面顶上。
+  const again = body.querySelector('button[data-revoke]');
+  if (again) again.focus();
 }
 
 // editGroup 改一个组。
@@ -1549,18 +1709,33 @@ function editGroup(name, urls) {
   const card = makeCard(
     name ? ('组 ' + name + ' 的地址') : '新建一个组',
     '一行一个，第一个是主路，后面的都是备路。');
+  const nameField = document.createElement('div');
+  nameField.className = 'field';
+  const nameLabel = document.createElement('label');
+  nameLabel.textContent = '组的名字';
+  nameLabel.htmlFor = 'card-group-name';
   const nameInput = document.createElement('input');
-  nameInput.placeholder = '组的名字';
-  nameInput.setAttribute('aria-label', '组的名字');
+  nameInput.id = 'card-group-name';
+  nameInput.placeholder = '比如：clash';
   nameInput.value = name;
+  nameField.append(nameLabel, nameInput);
+
+  const addrField = document.createElement('div');
+  addrField.className = 'field';
+  const addrLabel = document.createElement('label');
+  addrLabel.textContent = '组里的地址';
+  addrLabel.htmlFor = 'card-group-list';
   const input = document.createElement('textarea');
+  input.id = 'card-group-list';
   input.rows = 6;
-  input.setAttribute('aria-label', '组里的地址');
   input.value = urls;
+  addrField.append(addrLabel, input);
+
   const button = document.createElement('button');
   button.type = 'submit';
+  button.className = 'primary';
   button.textContent = '存回去';
-  card.form.append(nameInput, input, button);
+  card.form.append(nameField, addrField, button);
   card.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     button.disabled = true;
@@ -1582,4 +1757,262 @@ function editGroup(name, urls) {
     }
   });
   card.open(name ? input : nameInput);
+}
+
+// ---------------------------------------------------------------- 侧栏
+
+// 侧栏能收成一条图标道：宽的表格要地方的时候用得上。
+//
+// 收起来的样子记下来：下次打开还是那个样子。
+(function () {
+  const button = document.getElementById('side-toggle');
+  if (!button) return;
+  let min = false;
+  try {
+    min = localStorage.getItem('mmxcode-side') === 'min';
+  } catch (e) {
+    min = false;
+  }
+  const paint = () => {
+    document.body.classList.toggle('side-min', min);
+    button.setAttribute('aria-expanded', min ? 'false' : 'true');
+    const text = min ? '摊开侧栏' : '收起侧栏';
+    button.setAttribute('aria-label', text);
+    button.title = text;
+  };
+  paint();
+  button.addEventListener('click', () => {
+    min = !min;
+    try {
+      localStorage.setItem('mmxcode-side', min ? 'min' : 'full');
+    } catch (e) {
+      /* 存不下也就算了 */
+    }
+    paint();
+  });
+})();
+
+// ---------------------------------------------------------------- 折叠
+
+// 面板的头就是开关：点一下收起来，再点一下摊开。
+//
+// 一页上摆着四块东西，其中两块这会儿用不上：收起来眼前就干净了。收起来
+// 的样子记下来：下次打开还是那个样子。
+(function () {
+  const panels = Array.from(document.querySelectorAll('.panel[data-panel]'));
+  if (!panels.length) return;
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem('mmxcode-panels') || '{}') || {};
+  } catch (e) {
+    saved = {};
+  }
+  const paint = (panel) => {
+    const id = panel.dataset.panel;
+    const button = panel.querySelector('.panel-toggle');
+    const body = panel.querySelector('.panel-body');
+    if (!button || !body) return;
+    // 存下来的 false 才是收起来的。没存过的都是摊开的。
+    const open = saved[id] !== false;
+    panel.classList.toggle('is-collapsed', !open);
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    body.hidden = !open;
+  };
+  for (const panel of panels) {
+    paint(panel);
+    const button = panel.querySelector('.panel-toggle');
+    if (!button) continue;
+    button.addEventListener('click', () => {
+      const id = panel.dataset.panel;
+      const open = button.getAttribute('aria-expanded') === 'true';
+      saved[id] = !open;
+      try {
+        localStorage.setItem('mmxcode-panels', JSON.stringify(saved));
+      } catch (e) {
+        /* 存不下也就算了 */
+      }
+      paint(panel);
+    });
+  }
+})();
+
+// ---------------------------------------------------------------- 快捷键
+
+// / 走到筛账号那格，Esc 把那格清空。
+//
+// 一百行的表，筛是最快的那一下：从顶上 Tab 到那个框要按十几下。
+document.addEventListener('keydown', (ev) => {
+  const tag = (ev.target && ev.target.tagName) || '';
+  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+    (ev.target && ev.target.isContentEditable);
+  if (ev.key === '/' && !typing && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    const box = document.getElementById('account-filter');
+    if (!box) return;
+    ev.preventDefault();
+    box.focus();
+    box.select();
+    return;
+  }
+  if (ev.key === 'Escape' && typing) {
+    const box = document.getElementById('account-filter');
+    if (box && ev.target === box && box.value) {
+      box.value = '';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+});
+
+// Ctrl+K 弹命令面板：不用记地址就能跳到任何一页。
+//
+// 面板自己是个模态：它开着的时候，底下的页面不该还能按。
+const paletteCommands = [
+  { label: '概览', ic: 'layout-dashboard', to: '/' },
+  { label: '账号', ic: 'users', to: '/accounts' },
+  { label: '用量', ic: 'chart-bar', to: '/usage' },
+  { label: '出口', ic: 'world', to: '/egress' },
+  { label: '密钥', ic: 'key', to: '/keys' },
+  { label: '登录新账号', ic: 'login', to: '/login' },
+  { label: '导入账号', ic: 'upload', to: '/import' },
+  { label: '重登掉线的账号', ic: 'refresh', to: '/relogin' },
+];
+
+let paletteBox = null;
+
+function closePalette() {
+  if (!paletteBox) return;
+  paletteBox.remove();
+  paletteBox = null;
+  refreshInert();
+}
+
+function openPalette() {
+  closePalette();
+  const box = document.createElement('div');
+  box.className = 'card';
+  const panel = document.createElement('div');
+  panel.className = 'card-box';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  panel.setAttribute('aria-label', '命令');
+  const input = document.createElement('input');
+  input.type = 'search';
+  input.placeholder = '去哪儿，或者做什么';
+  input.setAttribute('aria-label', '命令');
+  const list = document.createElement('ul');
+  list.className = 'palette';
+  const paint = (q) => {
+    list.textContent = '';
+    const hit = paletteCommands.filter((c) => c.label.indexOf(q) >= 0);
+    for (const c of hit) {
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'palette-item';
+      b.append(icon(c.ic, 'ic ic-sm'), document.createTextNode(c.label));
+      b.addEventListener('click', () => {
+        closePalette();
+        location.href = c.to;
+      });
+      li.appendChild(b);
+      list.appendChild(li);
+    }
+    if (!hit.length) {
+      const li = document.createElement('li');
+      li.className = 'muted';
+      li.textContent = '没有这样的命令';
+      list.appendChild(li);
+    }
+  };
+  input.addEventListener('input', () => paint(input.value.trim()));
+  paint('');
+  panel.append(input, list);
+  box.appendChild(panel);
+  box.addEventListener('click', (ev) => {
+    if (ev.target === box) closePalette();
+  });
+  document.body.appendChild(box);
+  paletteBox = box;
+  refreshInert();
+  input.focus();
+}
+
+document.addEventListener('keydown', (ev) => {
+  if ((ev.metaKey || ev.ctrlKey) && (ev.key || '').toLowerCase() === 'k') {
+    ev.preventDefault();
+    if (paletteBox) closePalette();
+    else openPalette();
+  } else if (ev.key === 'Escape' && paletteBox) {
+    ev.preventDefault();
+    closePalette();
+  }
+});
+
+// 顶栏上那个按钮：快捷键藏得太深，得有个能看见的入口。
+(function () {
+  const button = document.getElementById('palette-open');
+  if (!button) return;
+  button.addEventListener('click', openPalette);
+  // 苹果的机器上按的是 ⌘，别在人家屏幕上写 Ctrl。
+  const key = document.getElementById('palette-key');
+  if (key) {
+    const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+    key.textContent = mac ? '⌘K' : 'Ctrl K';
+    button.setAttribute('aria-label', mac ? '命令面板（⌘K）' : '命令面板（Ctrl+K）');
+  }
+})();
+
+// ---------------------------------------------------------------- 右键
+
+// 右键一行：几个常用的动作摆出来。
+//
+// 一百行里找一个号的 ID：以前得点开抽屉抄；现在右键就抄。
+document.addEventListener('contextmenu', (ev) => {
+  const row = ev.target.closest('tr[data-row]');
+  if (!row) return;
+  ev.preventDefault();
+  const id = row.dataset.row || '';
+  const mail = row.dataset.email || '';
+  const name = row.dataset.name || mail || id;
+  const items = [
+    { label: '打开详情', ic: 'pencil', run: () => openDrawer(row) },
+    { label: '复制账号 ID', ic: 'copy', run: () => copyText(id) },
+    { label: '复制邮箱', ic: 'copy', run: () => copyText(mail) },
+  ];
+  const menu = document.createElement('div');
+  menu.className = 'rowmenu';
+  menu.setAttribute('role', 'menu');
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'rowmenu-item';
+    b.setAttribute('role', 'menuitem');
+    b.append(icon(it.ic, 'ic ic-sm'), document.createTextNode(it.label));
+    b.addEventListener('click', () => {
+      menu.remove();
+      it.run();
+    });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(ev.clientX, window.innerWidth - r.width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(ev.clientY, window.innerHeight - r.height - 8)) + 'px';
+  const away = () => {
+    menu.remove();
+    document.removeEventListener('click', away, true);
+    document.removeEventListener('keydown', away, true);
+  };
+  setTimeout(() => {
+    document.addEventListener('click', away, true);
+    document.addEventListener('keydown', away, true);
+  }, 0);
+});
+
+// copyText 把一段字抄走，抄不成也说一声。
+function copyText(text) {
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(
+    () => say('抄好了'),
+    () => say('抄不了：' + text)
+  );
 }
