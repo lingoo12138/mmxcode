@@ -429,7 +429,12 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
   background: var(--surface); color: var(--text-2); cursor: pointer;
 }
 .theme:hover { border-color: var(--line-strong); color: var(--text); }
-.theme svg { width: 18px; height: 18px; }
+/* 雪碧里的图标是描边的：跟着文字颜色走。 */
+.theme svg {
+  width: 18px; height: 18px;
+  stroke: currentColor; fill: none;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+}
 </style>
 <script>
 // 主题得在第一帧之前定下来：不然深色的人会看见一帧白。
@@ -447,21 +452,7 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
 </head>
 <body>
 <button type="button" class="theme" id="theme-toggle" title="换个深浅" aria-label="换个深浅">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-    <g data-mode="auto">
-      <path d="M9.173 14.83a4 4 0 1 1 5.657 -5.657"/>
-      <path d="M11.294 12.707l.174 .247a7.5 7.5 0 0 0 8.845 2.492a9 9 0 1 1 -14.671 2.914"/>
-      <path d="M3 12h1"/><path d="M12 3v1"/><path d="M5.6 5.6l.7 .7"/><path d="M3 21l18 -18"/>
-    </g>
-    <g data-mode="light" hidden>
-      <path d="M12 12m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0"/>
-      <path d="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7"/>
-    </g>
-    <g data-mode="dark" hidden>
-      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"/>
-    </g>
-  </svg>
+  <svg class="ic" aria-hidden="true"><use id="theme-use" href="/static/icons.svg#sun-moon"/></svg>
 </button>
 <div class="box">
   <div class="brand"><span class="mark">mx</span>mmxcode</div>
@@ -482,13 +473,15 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
 <script>
 // 主题：跟管理页上那个是同一件事，同一个记法（跟着系统、浅色、深色）。
 //
-// 图标是 Tabler 的官方路径（MIT），跟管理页那一套是同一份，所以两处摆出
+// 图标是管理页那一张雪碧里的（/static/icons.svg，Tabler，MIT）：两处摆出
 // 来的是同一个样子。
 (function () {
   var button = document.getElementById('theme-toggle');
   if (!button) return;
+  var use = document.getElementById('theme-use');
   var order = ['', 'light', 'dark'];
   var names = { '': '跟着系统', light: '浅色', dark: '深色' };
+  var marks = { '': 'sun-moon', light: 'sun', dark: 'moon' };
   var current = '';
   try {
     current = localStorage.getItem('mmxcode-theme') || '';
@@ -497,13 +490,13 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
   }
   if (order.indexOf(current) < 0) current = '';
   var paint = function () {
-    // 存着的那个值是 ''（跟着系统），图标的分组是 'auto'：对一下。
-    var mode = current === '' ? 'auto' : current;
-    for (var g of button.querySelectorAll('g[data-mode]')) {
-      g.hidden = g.dataset.mode !== mode;
-    }
-    button.title = '主题：' + names[current] + '（按一下换一个）';
-    button.setAttribute('aria-label', '主题：' + names[current]);
+    if (use) use.setAttribute('href', '/static/icons.svg#' + marks[current]);
+    // 现在是哪个模式，得说得出来：图标变了只是一张图，读屏器读不出来。
+    var text = '主题：' + names[current];
+    button.title = text + '（按一下换一个）';
+    button.setAttribute('aria-label', text);
+    if (current) document.documentElement.setAttribute('data-theme', current);
+    else document.documentElement.removeAttribute('data-theme');
   };
   paint();
   button.addEventListener('click', function () {
@@ -513,8 +506,6 @@ button:hover { background: var(--accent-hover); border-color: var(--accent-hover
     } catch (e) {
       /* 存不下也就算了 */
     }
-    if (current) document.documentElement.setAttribute('data-theme', current);
-    else document.documentElement.removeAttribute('data-theme');
     paint();
   });
 })();

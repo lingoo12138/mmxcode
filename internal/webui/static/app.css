@@ -536,7 +536,15 @@ body.side-min .side-collapse .ic {
 }
 
 /* 两栏。栏数是写死的：auto-fit 会多出一条空轨道，页面跟着内容变形状。 */
-.grid-2,
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  /* 两块并排，底下要对齐：矮的那块也拉到一样高。里面的东西还是从顶上
+   * 开始摆，不往上顶。 */
+  align-items: stretch;
+}
+
 .cols {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -10,11 +10,19 @@
      <a href="{{.Pending.URL}}" target="_blank" rel="noopener">这个页面</a>。</p>
 </div>
 {{else}}
-<div class="toolbar">
-  <button id="start-login" type="button" class="primary icon">
-    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>开始登录</span></button>
-  <span class="muted">浏览器会给你一个验证码，填到站点上就成了。</span>
-</div>
+<section class="panel">
+  <div class="panel-head">
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg>
+    <h2>登一个账号</h2>
+  </div>
+  <div class="panel-body">
+    <div class="toolbar">
+      <button id="start-login" type="button" class="primary icon">
+        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>开始登录</span></button>
+      <span class="muted">浏览器会给你一个验证码，填到站点上就成了。</span>
+    </div>
+  </div>
+</section>
 {{end}}
 {{/* 验证码和结果各有一个地方：页面一开始没有等待中的登录时，
      失败的话也得让人看见那句话。 */}}

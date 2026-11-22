@@ -3,7 +3,7 @@
   <p class="lead">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
   <div class="page-actions">
     <span class="muted" id="relogin-status" role="status"></span>
-    <button id="relogin-all" type="button" class="primary icon">
+    <button id="relogin-all" type="button" class="primary icon"{{if not .SignedOut}} disabled{{end}}>
       <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>全部重登</span></button>
   </div>
 </div>
@@ -20,7 +20,7 @@
       <td><div class="err">{{.Error}}</div></td>
     </tr>
     {{end}}
-    {{if not .SignedOut}}<tr><td class="empty" colspan="3">没有签出去的账号。</td></tr>{{end}}
+    {{if not .SignedOut}}<tr><td class="empty" colspan="3">没有签出去的账号。掉线还存着密码的账号会出现在这儿。</td></tr>{{end}}
   </tbody>
 </table>
 </div>

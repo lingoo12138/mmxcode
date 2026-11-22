@@ -869,6 +869,46 @@ func TestTheSignInPageIsReachableWithoutASession(t *testing.T) {
 	}
 }
 
+// TestTheIconSheetIsServedWithoutASession says the login page can have
+// its icon.
+//
+// 登录页上那个主题按钮用的是管理页那一张图标雪碧（/static/icons.svg）。
+// 登录页还没有会话，所以那张图得在两扇门的前面就能拿到：不然按下去
+// 回来的是登录页自己，那个按钮就成了空的。
+func TestTheIconSheetIsServedWithoutASession(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	h.gw.Cfg.Server.APIKeys = []string{"sk-1"}
+	h.gw.WebUI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/static/icons.svg" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Write([]byte(`<svg><symbol id="sun-moon"/></svg>`))
+	})
+
+	// 登录页指着这张图。
+	req := httptest.NewRequest(http.MethodGet, "/signin", nil)
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), `/static/icons.svg#`) {
+		t.Fatalf("the sign-in page does not use the icon sheet: %s", w.Body.String())
+	}
+
+	// 没有会话也要拿得到这张图。
+	req = httptest.NewRequest(http.MethodGet, "/static/icons.svg", nil)
+	w = httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<symbol") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
 // TestAWrongKeySetsNoCookie says a wrong key is refused and leaves no
 // cookie behind.
 func TestAWrongKeySetsNoCookie(t *testing.T) {

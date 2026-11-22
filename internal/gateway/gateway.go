@@ -476,6 +476,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.session(w, r)
 		return
 	}
+	// 静态的东西不进那两扇门。
+	//
+	// 登录页要摆一个主题按钮，那个图标是管理页那一张雪碧里的
+	// （/static/icons.svg）。登录页还没有会话，它要是也走那两扇门，
+	// 拿回来的不是这张图，是登录页自己。
+	//
+	// 那张雪碧里没有秘密：几根描边的路径而已。样式表和脚本也一样。
+	if s.WebUI != nil && strings.HasPrefix(r.URL.Path, "/static/") &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.WebUI.ServeHTTP(w, r)
+		return
+	}
 	// 两扇门：聊天那扇认两把 key（配置里的和后台申请的），管理页那扇只
 	// 认配置里的那把。
 	gate := s.auth
