@@ -1013,6 +1013,22 @@ tbody tr:last-child td {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* 从别处跳过来的那一行（概览页的「要处理的」点进来就是这种链接）。
+ *
+ * 两件事：跳的时候得露出来，不能藏在吸着的顶栏和表头底下；落了地也
+ * 得让人看见是这一行。 */
+.acc-table tbody tr[id] {
+  scroll-margin-top: calc(var(--top-h) + 44px);
+}
+
+.acc-table tbody tr:target td {
+  background: var(--accent-soft);
+}
+
+.acc-table tbody tr:target td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .keys-table tbody tr:hover td {
   background: var(--surface-2);
 }
