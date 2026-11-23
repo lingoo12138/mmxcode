@@ -232,6 +232,22 @@ func (s *Scheduler) pruneReadings(ctx context.Context) {
 	if err := s.Mgr.Store.PruneUsageSnapshots(ctx, time.Now().Add(-pruneOlderThan), pruneKeep); err != nil {
 		fmt.Printf("usage: the old readings could not be thrown away: %v\n", err)
 	}
+	s.pruneDaily(ctx)
+}
+
+// pruneDaily throws away the days that are too old to be looked at.
+//
+// 折线图看三十天，账本就留三十天：留得再久也没有人翻，留得再短图上就缺
+// 了一块。0 = 永远留着（跟签到那一档一个规矩）。
+func (s *Scheduler) pruneDaily(ctx context.Context) {
+	days := s.Cfg.Usage.HistoryDays
+	if days <= 0 {
+		return
+	}
+	cut := store.DayKey(time.Now().AddDate(0, 0, -days))
+	if _, err := s.Mgr.Store.PruneUsageDaily(ctx, cut); err != nil {
+		fmt.Printf("usage: the old days could not be thrown away: %v\n", err)
+	}
 }
 
 // round makes the reader of the credits.

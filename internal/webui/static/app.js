@@ -1568,6 +1568,154 @@ document.addEventListener('click', async (ev) => {
   if (status) status.textContent = text;
 })();
 
+// 用量页上那张图：跟着指针走的那根竖线，和浮着的那个数。
+//
+// 图是服务端画好的：没有脚本的时候它也在，线、点、格线、那几个数都在。
+// 这里添的是那层交互：
+//
+//   - 指针落在哪一块，那一块就是哪一天（不用瞄那个两像素的点）；
+//   - 键盘上左右键走日子，看到的是同一层东西；
+//   - 点一天就去问那一天是哪些号在用，问回来就地摆上，不重画这一页。
+(function () {
+  const fig = document.getElementById('usage-chart');
+  if (!fig) return;
+  const svg = fig.querySelector('.chart-svg');
+  const tip = document.getElementById('chart-tip');
+  const cross = fig.querySelector('.chart-cross');
+  const hoverDot = document.getElementById('chart-hover-dot');
+  if (!svg || !tip || !cross) return;
+  const days = Array.prototype.slice.call(fig.querySelectorAll('.chart-day'));
+  if (!days.length) return;
+
+  // 那个浮着的数摆在哪：那个点上面。摆不下就摆下面。
+  //
+  // 位置是百分比：那张皮是拉开的，字那层不是，所以字的大小不变，位置
+  // 跟着皮走。贴着边的点，浮着的数要往里让，不然它掉出图外。
+  function place(day) {
+    const left = Number(day.dataset.left);
+    const top = Number(day.dataset.top);
+    tip.hidden = false;
+    tip.classList.remove('is-start', 'is-middle', 'is-end', 'is-below');
+    if (left > 72) tip.classList.add('is-end');
+    else if (left < 16) tip.classList.add('is-start');
+    else tip.classList.add('is-middle');
+    if (top < 28) tip.classList.add('is-below');
+    tip.style.left = left + '%';
+    tip.style.top = top + '%';
+  }
+
+  // 摆那个数：值在前，名字在后（这里要的是数，名字是次要的）。
+  function show(day) {
+    days.forEach(function (d) { d.classList.remove('is-on'); });
+    day.classList.add('is-on');
+    const cx = Number(day.dataset.cx);
+    cross.setAttribute('x1', cx);
+    cross.setAttribute('x2', cx);
+    cross.classList.add('is-on');
+    if (hoverDot) {
+      hoverDot.style.left = day.dataset.left + '%';
+      hoverDot.style.top = day.dataset.top + '%';
+      hoverDot.hidden = false;
+    }
+    tip.textContent = '';
+    const value = document.createElement('strong');
+    value.textContent = Number(day.dataset.used).toLocaleString('zh-CN',
+      { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' 分';
+    const name = document.createElement('span');
+    name.textContent = day.dataset.short + ' · ' + day.dataset.accounts + ' 个号';
+    tip.appendChild(value);
+    tip.appendChild(name);
+    place(day);
+  }
+
+  function hide() {
+    days.forEach(function (d) { d.classList.remove('is-on'); });
+    cross.classList.remove('is-on');
+    if (hoverDot) hoverDot.hidden = true;
+    tip.hidden = true;
+  }
+
+  fig.addEventListener('pointermove', (ev) => {
+    const day = ev.target.closest ? ev.target.closest('.chart-day') : null;
+    if (day) show(day);
+  });
+
+  fig.addEventListener('pointerleave', hide);
+
+  // 键盘上也是同一层东西：左右键走日子。
+  fig.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    ev.preventDefault();
+    const at = days.indexOf(document.querySelector('.chart-day.is-on'));
+    let next = at < 0 ? 0 : at + (ev.key === 'ArrowRight' ? 1 : -1);
+    if (next < 0) next = days.length - 1;
+    if (next >= days.length) next = 0;
+    show(days[next]);
+  });
+
+  fig.addEventListener('focus', () => {
+    if (document.querySelector('.chart-day.is-on')) return;
+    show(days[days.length - 1]);
+  });
+
+  // 点一天：问那一天是哪些号在用，问回来就地摆上。
+  document.addEventListener('click', async (ev) => {
+    const link = ev.target.closest ? ev.target.closest('.chart-days a') : null;
+    if (!link) return;
+    const day = link.querySelector('.chart-day');
+    if (!day) return;
+    ev.preventDefault();
+    const href = link.getAttribute('href');
+    const panel = document.getElementById('usage-day');
+    const body = document.getElementById('usage-day-body');
+    const title = document.getElementById('usage-day-title');
+    if (!panel || !body) {
+      location.href = href;
+      return;
+    }
+    try {
+      const answer = await call('/api/usage/day?day=' + encodeURIComponent(day.dataset.day));
+      if (!answer.ok) throw new Error(messageOf(answer));
+      body.textContent = '';
+      const list = document.createElement('ul');
+      list.className = 'rows';
+      const accounts = Array.isArray(answer.json.accounts) ? answer.json.accounts : [];
+      accounts.forEach((a) => {
+        const li = document.createElement('li');
+        const who = document.createElement('span');
+        who.className = 'who';
+        const t = document.createElement('span');
+        t.className = 't';
+        t.textContent = a.name || a.id;
+        const s = document.createElement('span');
+        s.className = 's mono';
+        s.textContent = a.id;
+        who.appendChild(t);
+        who.appendChild(s);
+        const pill = document.createElement('span');
+        pill.className = 'pill';
+        pill.textContent = a.used + ' 分';
+        li.appendChild(who);
+        li.appendChild(pill);
+        list.appendChild(li);
+      });
+      if (!accounts.length) {
+        const li = document.createElement('li');
+        li.className = 'muted';
+        li.textContent = '那天没有账。';
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+      if (title) title.textContent = day.dataset.day + ' 是哪些号在用';
+      panel.hidden = false;
+      history.pushState(null, '', href);
+    } catch (e) {
+      // 问不到就照旧走那一遍：链接还在，页面自己会摆出来。
+      location.href = href;
+    }
+  });
+})();
+
 // 密钥：申请一把新的，撤销一把旧的。
 //
 // 申请出来的那一把 key 只在这一刻给得出：往后页面上只有它的开头。所以

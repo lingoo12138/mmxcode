@@ -615,7 +615,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 // schemaVersion is the version a file is at when the steps are done.
-const schemaVersion = 8
+const schemaVersion = 9
 
 // migrations are the steps, in order.
 //
@@ -629,6 +629,7 @@ var migrations = []func(ctx context.Context, conn *sql.Conn) error{
 	migrateCheckinIndex,
 	migrateIndexes,
 	migrateProxyGroups,
+	migrateUsageDaily,
 }
 
 // migrateMake makes the tables that are not there.
@@ -848,6 +849,34 @@ func migrateProxyGroups(ctx context.Context, conn *sql.Conn) error {
 			if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
 				return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
 			}
+		}
+		return nil
+	})
+}
+
+// migrateUsageDaily gives the file its table of daily consumption.
+//
+// 这一张表是后来才有的：一个文件在它之前做出来的时候没有它。表不在就造
+// 出来，在就不动它 —— 已经有了的账不该为了一个迁移被抄一遍。索引也是一
+// 样的：这一张表是照着「按日子问」建的。
+func migrateUsageDaily(ctx context.Context, conn *sql.Conn) error {
+	return runStep(ctx, conn, 9, func(tx *sql.Tx) error {
+		for _, t := range tables {
+			if t.name != "usage_daily" {
+				continue
+			}
+			got, err := storedSQL(ctx, tx, t.name)
+			if err != nil {
+				return err
+			}
+			if got == "" {
+				if _, err := tx.ExecContext(ctx, "CREATE TABLE "+t.name+t.body); err != nil {
+					return fmt.Errorf("migrate: make the table %s: %w", t.name, err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day)"); err != nil {
+			return fmt.Errorf("migrate: %w", err)
 		}
 		return nil
 	})

@@ -217,6 +217,33 @@ var tables = []table{
 		},
 	},
 	{
+		// 每天一行：一个账号一天用了多少积分。
+		//
+		// 读数表记的是「读到的时候账本上是多少」——那是账本的数，是累计
+		// 的，一天一天都在长。这一张表记的是长出来的那一截：一个账号一
+		// 天里用掉了多少。
+		//
+		// 它是给折线图用的：三十天的消耗，得有三十天的账可查。
+		name: "usage_daily",
+		body: `(
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  day        TEXT NOT NULL,
+  consumed   REAL,
+  used       REAL NOT NULL DEFAULT 0,
+  readings   INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, day)
+)`,
+		copy: []copyColumn{
+			notNull("account_id", "''"),
+			notNull("day", "''"),
+			nullable("consumed"),
+			notNull("used", "0"),
+			notNull("readings", "0"),
+			notNull("updated_at", "0"),
+		},
+	},
+	{
 		name: "egress_health",
 		body: `(
   url        TEXT PRIMARY KEY,
@@ -311,6 +338,7 @@ var indexStatements = []string{
 	"CREATE INDEX IF NOT EXISTS idx_checkins_day_account ON checkins(day, account_id, created_at, credit)",
 	"CREATE INDEX IF NOT EXISTS idx_checkins_account_created ON checkins(account_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_usage_account_created ON usage_snapshots(account_id, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day)",
 	"CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)",
 	"DROP INDEX IF EXISTS idx_checkins_day",
 	"DROP INDEX IF EXISTS idx_usage_account",
@@ -331,4 +359,5 @@ var childTables = []struct {
 	{"sessions", "account_id"},
 	{"checkins", "account_id"},
 	{"usage_snapshots", "account_id"},
+	{"usage_daily", "account_id"},
 }

@@ -732,6 +732,258 @@ body.side-min .side-collapse .ic {
   padding: 0;
 }
 
+/* ---------------------------------------------------------------- 那张图 */
+
+/* 范围切换：七天 / 三十天。
+ *
+ * 它是链接，不是按钮：换了范围就是另一个地址，地址栏里看得见，抄给别人
+ * 也是那个样子。 */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  margin-right: 14px;
+  padding: 2px;
+  border-radius: var(--radius-ctl);
+  background: var(--surface-2);
+}
+
+.seg a {
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.seg a:hover {
+  color: var(--text);
+}
+
+.seg a.is-on {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-card);
+}
+
+/* 那张图。
+ *
+ * 图是两块：一张皮（几何）和一层字。
+ *
+ * 皮按容器的大小拉满，所以线永远填满那么宽；字不在皮上 —— 皮上的字跟
+ * 着皮一起变形，标签会变成被拉长的字。字按百分比摆，一像素一像素算的，
+ * 容器多宽多窄，字都是那个大小。 */
+.chart {
+  position: relative;
+  height: 260px;
+  margin: 0;
+  padding: 0;
+}
+
+.chart:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.chart-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+/* 格线：实的、细的、退到后面去。 */
+.chart-grid line {
+  stroke: var(--line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 那层水：淡淡的，不是实心的一块。 */
+.chart-area {
+  fill: var(--accent);
+  fill-opacity: .1;
+  stroke: none;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 字那层。 */
+.chart-text {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 纵轴上的数：右对齐在轴线的左边。 */
+.chart-tick {
+  position: absolute;
+  transform: translate(-100%, -50%);
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 横轴上的日子。 */
+.chart-xlabel {
+  position: absolute;
+  transform: translateY(-50%);
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chart-xlabel.middle {
+  transform: translate(-50%, -50%);
+}
+
+.chart-xlabel.end {
+  transform: translate(-100%, -50%);
+}
+
+/* 那个点：一圈底色的边，压在线上的时候也看得清。 */
+.chart-dot {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.chart-hover-dot {
+  z-index: 2;
+}
+
+/* 数字穿的是字的那层颜色：数据色是那个点的事，字不穿。 */
+.chart-value {
+  position: absolute;
+  transform: translate(-50%, calc(-100% - 10px));
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chart-value.start {
+  transform: translate(0, calc(-100% - 10px));
+}
+
+.chart-value.end {
+  transform: translate(-100%, calc(-100% - 10px));
+}
+
+/* 那根跟着指针走的竖线。 */
+.chart-cross {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chart-cross.is-on {
+  opacity: 1;
+}
+
+/* 每一块是那一天的地方：指针落在它哪一块，就是哪一天。
+ *
+ * 它是透明的，看不见，但比那个点宽 —— 瞄那个两像素的点是不行的。 */
+.chart-days a {
+  cursor: pointer;
+}
+
+.chart-day {
+  fill: transparent;
+}
+
+.chart-day:hover,
+.chart-day.is-on {
+  fill: var(--accent);
+  fill-opacity: .07;
+}
+
+/* 浮着的那个数：值在前，名字在后。 */
+.chart-tip {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 9px;
+  border-radius: var(--radius-ctl);
+  background: var(--surface);
+  box-shadow: var(--shadow-pop);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translate(-50%, calc(-100% - 14px));
+}
+
+/* 贴着边的那个点，浮着的数要往里让，不然它掉出图外。 */
+.chart-tip.is-start {
+  transform: translate(0, calc(-100% - 14px));
+}
+
+.chart-tip.is-end {
+  transform: translate(-100%, calc(-100% - 14px));
+}
+
+/* 点在高处的时候，数摆下面：上面没有地方了。 */
+.chart-tip.is-below {
+  transform: translate(-50%, 16px);
+}
+
+.chart-tip.is-below.is-start {
+  transform: translate(0, 16px);
+}
+
+.chart-tip.is-below.is-end {
+  transform: translate(-100%, 16px);
+}
+
+.chart-tip strong {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-tip span {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+/* 表格：图上能看的东西，这里也能一个一个看。
+ *
+ * 浮着的那个数只是添头，不是唯一的门：这一栏是那道门。 */
+.table-view {
+  margin: 4px 0 12px;
+}
+
+.table-view summary {
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.table-view .table-wrap {
+  margin-top: 8px;
+  box-shadow: none;
+}
+
 /* ---------------------------------------------------------------- 数字 */
 
 /* 一排数字：不摆成六个一模一样的白盒子。
@@ -2435,6 +2687,11 @@ body.is-busy[data-busy]::before {
 
   .table-wrap {
     overflow-x: auto;
+  }
+
+  /* 窄屏上那张图矮一点：图是按百分比摆的，矮一点不影响它读得懂。 */
+  .chart {
+    height: 220px;
   }
 }
 

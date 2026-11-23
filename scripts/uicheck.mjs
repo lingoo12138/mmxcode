@@ -269,6 +269,48 @@ out.cardTitle = await evaluate('document.querySelector(".card h3") ? document.qu
 await key('Escape', 'Escape', 27)
 out.cardClosed = await evaluate('!document.querySelector(".card")')
 
+// ------------------------------------------------------------ 用量
+
+await goto(base + '/usage')
+out.chartDays = await evaluate('document.querySelectorAll(".chart-day").length')
+out.chartTicks = await evaluate('document.querySelectorAll(".chart-tick").length')
+out.chartXLabels = await evaluate('document.querySelectorAll(".chart-xlabel").length')
+out.chartValues = await evaluate('document.querySelectorAll(".chart-value").length')
+out.chartDots = await evaluate('document.querySelectorAll(".chart-dot").length')
+out.usedToday = await evaluate('(() => { const s = Array.prototype.slice.call(document.querySelectorAll(".stat")).find(x => /今天消耗/.test(x.textContent)); return s ? s.textContent.replace(/\\s+/g, " ").trim() : "" })()')
+
+// 指针落在图上：十字线出来了，浮着的那个数也出来了。
+await evaluate(`(() => {
+  const rect = document.querySelectorAll('.chart-day')[8]
+  const b = rect.getBoundingClientRect()
+  rect.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: b.left + b.width / 2, clientY: b.top + b.height / 2 }))
+  return true
+})()`)
+await sleep(200)
+out.tipShown = await evaluate('!document.getElementById("chart-tip").hidden')
+out.tipText = await evaluate('document.getElementById("chart-tip").textContent')
+out.crossOn = await evaluate('document.querySelector(".chart-cross").classList.contains("is-on")')
+out.hoverDot = await evaluate('!document.getElementById("chart-hover-dot").hidden')
+
+// 键盘上也是同一层东西：左右键走日子。
+await evaluate(`(() => { document.getElementById('usage-chart').focus(); return true })()`)
+await sleep(200)
+await key('ArrowLeft', 'ArrowLeft', 37)
+await sleep(200)
+out.tipAfterKey = await evaluate('document.getElementById("chart-tip").textContent')
+
+// 点一天：问那一天是哪些号在用，问回来就地摆上。
+await evaluate(`(() => {
+  const rect = document.querySelectorAll('.chart-day')[3]
+  rect.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return true
+})()`)
+await sleep(600)
+out.dayPanel = await evaluate('!document.getElementById("usage-day").hidden')
+out.dayRows = await evaluate('document.querySelectorAll("#usage-day-body li").length')
+out.dayTitle = await evaluate('document.getElementById("usage-day-title").textContent')
+out.dayInURL = await evaluate('location.search.indexOf("day=") >= 0')
+
 console.log(JSON.stringify(out, null, 2))
 ws.close()
 proc.kill()

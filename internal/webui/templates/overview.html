@@ -29,6 +29,15 @@
     </span>
   </a>
 
+  <a class="stat" href="/usage">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-line"/></svg><span>今天消耗</span></span>
+    <span class="value">{{printf "%.0f" .UsedToday}}<span class="unit">分</span></span>
+    <span class="foot">
+      {{if .TodayAccounts}}<span class="muted">{{.TodayAccounts}} 个号在用</span>
+      {{else}}<span class="muted">今天还没有账</span>{{end}}
+    </span>
+  </a>
+
   <a class="stat" href="/accounts">
     <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg><span>今日签到</span></span>
     <span class="value">{{.CheckedToday}}<span class="unit">/ {{.Active}}</span></span>

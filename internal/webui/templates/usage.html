@@ -8,7 +8,7 @@
   </div>
 </div>
 
-<div class="stats stats-3">
+<div class="stats">
   <div class="stat">
     <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#coin"/></svg><span>总发放</span></span>
     <span class="value">{{printf "%.2f" .Summary.TotalGranted}}<span class="unit">分</span></span>
@@ -17,7 +17,7 @@
   <div class="stat">
     <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#activity"/></svg><span>总消耗</span></span>
     <span class="value">{{printf "%.2f" .Summary.TotalConsumed}}<span class="unit">分</span></span>
-    <span class="foot"><span class="muted">已经用掉的</span></span>
+    <span class="foot"><span class="muted">账本上累计用掉的</span></span>
   </div>
   <div class="stat">
     <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-bar"/></svg><span>总剩余</span></span>
@@ -27,7 +27,117 @@
       {{else}}<span class="muted">没有会过期的批次</span>{{end}}
     </span>
   </div>
+  <div class="stat">
+    <span class="label"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-line"/></svg><span>今天消耗</span></span>
+    <span class="value">{{printf "%.2f" .UsedToday}}<span class="unit">分</span></span>
+    <span class="foot">
+      {{if .TodayAccounts}}<span class="muted">{{.TodayAccounts}} 个号在用</span>
+      {{else}}<span class="muted">今天还没有账</span>{{end}}
+    </span>
+  </div>
 </div>
+
+{{/* 三十天的账：一天一个点。
+     图是服务端画的 —— 没有脚本的时候它也在，脚本添的是那层交互。 */}}
+<section class="panel" data-panel="history">
+  <div class="panel-head is-toggle">
+    <h2 class="panel-title">
+      <button type="button" class="panel-toggle" aria-expanded="true" aria-controls="p-history">
+        <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#chart-line"/></svg>
+        <span>最近 {{.Days}} 天的消耗</span>
+        <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-down"/></svg>
+      </button>
+    </h2>
+    <div class="seg" role="group" aria-label="看多少天">
+      <a href="/usage?days=7" {{if eq .Days 7}}class="is-on" aria-current="true"{{end}}>7 天</a>
+      <a href="/usage?days=30" {{if eq .Days 30}}class="is-on" aria-current="true"{{end}}>30 天</a>
+    </div>
+  </div>
+  <div class="panel-body" id="p-history">
+    {{if .Chart.Empty}}
+    <div class="empty">
+      <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#chart-line"/></svg>
+      还没有这一段的账。读过的账号每一天都会留下一行。
+    </div>
+    {{else}}
+    <figure class="chart" id="usage-chart" tabindex="0" aria-label="最近 {{.Days}} 天每天用掉的积分">
+      <svg class="chart-svg" viewBox="0 0 {{.Chart.W}} {{.Chart.H}}" preserveAspectRatio="none" role="img"
+           aria-label="折线图：横轴是日子，纵轴是那一天的消耗">
+        <g class="chart-grid">
+          {{range .Chart.Ticks}}
+          <line x1="{{$.Chart.Left}}" x2="{{$.Chart.Right}}" y1="{{.Y}}" y2="{{.Y}}"/>
+          {{end}}
+        </g>
+        <path class="chart-area" d="{{.Chart.Area}}"/>
+        <path class="chart-line" d="{{.Chart.Line}}"/>
+        <line class="chart-cross" x1="0" x2="0" y1="{{.Chart.Top}}" y2="{{.Chart.Bottom}}"/>
+        <g class="chart-days">
+          {{range .Chart.Days}}
+          <a href="/usage?days={{$.Days}}&amp;day={{.Day}}"><rect class="chart-day" x="{{.X0}}" y="{{$.Chart.Top}}"
+             width="{{.W}}" height="{{$.Chart.Bottom}}-{{$.Chart.Top}}" data-day="{{.Day}}" data-short="{{.Short}}"
+             data-used="{{.Used}}" data-accounts="{{.Accounts}}" data-cx="{{.X}}" data-cy="{{.Y}}"
+             data-left="{{printf "%.4f" .Left}}" data-top="{{printf "%.4f" .Top}}"/></a>
+          {{end}}
+        </g>
+      </svg>
+      {{/* 字不在那张皮上：皮是拉开的，字跟着会被拉变形。
+           字是另外一层，一像素一像素摆上去的。 */}}
+      <div class="chart-text">
+        {{range .Chart.Ticks}}
+        <span class="chart-tick" style="left:{{printf "%.4f" .Left}}%; top:{{printf "%.4f" .Top}}%">{{.Label}}</span>
+        {{end}}
+        {{range .Chart.XLabels}}
+        <span class="chart-xlabel {{.Anchor}}" style="left:{{printf "%.4f" .Left}}%; top:{{printf "%.4f" .Top}}%">{{.Text}}</span>
+        {{end}}
+        {{range .Chart.Marks}}
+        <span class="chart-dot" style="left:{{printf "%.4f" .Left}}%; top:{{printf "%.4f" .Top}}%"></span>
+        <span class="chart-value {{.Anchor}}" style="left:{{printf "%.4f" .Left}}%; top:{{printf "%.4f" .Top}}%">{{.Label}}</span>
+        {{end}}
+      </div>
+      <span class="chart-dot chart-hover-dot" id="chart-hover-dot" hidden></span>
+      <div class="chart-tip" id="chart-tip" role="status" hidden></div>
+    </figure>
+    <details class="table-view">
+      <summary>表格</summary>
+      <div class="table-wrap">
+        <table>
+          <caption class="sr-only">每天用掉的积分</caption>
+          <thead><tr><th scope="col">日子</th><th scope="col" class="num">消耗</th><th scope="col" class="num">用掉的号</th></tr></thead>
+          <tbody>
+            {{range .Chart.Days}}{{if .Used}}
+            <tr><td>{{.Day}}</td><td class="num">{{printf "%.2f" .Used}}</td><td class="num">{{.Accounts}}</td></tr>
+            {{end}}{{end}}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {{end}}
+  </div>
+</section>
+
+{{/* 选中的一天：是哪些号在用。 */}}
+<section class="panel" id="usage-day" {{if not .Breakdown}}hidden{{end}}>
+  <div class="panel-head">
+    <h2 class="panel-title">
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#users"/></svg>
+      <span id="usage-day-title">{{if .Day}}{{.Day}} 是哪些号在用{{end}}</span>
+    </h2>
+    <a class="quiet" href="/usage?days={{.Days}}">看全部</a>
+  </div>
+  <div class="panel-body flush" id="usage-day-body">
+    {{range .Breakdown}}
+    <ul class="rows">
+      <li>
+        <span class="who">
+          <span class="t">{{if .Name}}{{.Name}}{{else}}{{.ID}}{{end}}</span>
+          <span class="s mono">{{.ID}}</span>
+        </span>
+        <span class="pill">{{printf "%.2f" .Used}} 分</span>
+      </li>
+    </ul>
+    {{end}}
+  </div>
+</section>
 
 <p class="note">{{if .Summary.Readings}}读数时间：{{.Summary.UpdatedAt.Format "2006-01-02 15:04"}}{{else}}还没有读过任何一个账号的积分。{{end}}</p>
 {{if .Summary.AccountsUnavailable}}<p class="note bad">有 {{.Summary.AccountsUnavailable}} 个账号的积分读不到。</p>{{end}}

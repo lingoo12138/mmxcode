@@ -280,6 +280,97 @@ func TestTheUsagePageSaysAnAccountThatWasNeverRead(t *testing.T) {
 	}
 }
 
+// TestTheUsagePageDrawsTheDailyConsumption says the usage page has the
+// chart of the daily consumption and says how much was used today.
+//
+// 图是这件事的正面：每天用掉多少，看得见；今天用掉多少，一眼就看见。
+func TestTheUsagePageDrawsTheDailyConsumption(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	// 三天的账。账本是累计的，所以从早到晚一天一天写：今天比昨天长出来
+	// 的那一截，就是今天用掉的。
+	start := time.Now().AddDate(0, 0, -2)
+	for i := 0; i < 3; i++ {
+		day := start.AddDate(0, 0, i)
+		s.Clock = func() time.Time { return day }
+		if err := s.SaveUsageDaily(ctx, "acc_01", float64(100*(i+1)), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Clock = time.Now
+
+	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "chart-line") {
+		t.Fatalf("the chart is not on the page: %s", body)
+	}
+	// 三十天：每一天都有一块可以按的地方。
+	if n := strings.Count(body, `class="chart-day"`); n != 30 {
+		t.Fatalf("chart-day = %d, want 30", n)
+	}
+	if !strings.Contains(body, "100.00") {
+		t.Fatalf("today's consumption is not on the page: %s", body)
+	}
+	if !strings.Contains(body, "1 个号在用") {
+		t.Fatalf("the count of the accounts is not on the page: %s", body)
+	}
+}
+
+// TestTheDayOnTheChartCanBeAsked says one day's consumption can be asked
+// for, account by account.
+//
+// 图上看得见那天用掉了多少，看不见是哪些号用的。这个门补上那一半。
+func TestTheDayOnTheChartCanBeAsked(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	s.Clock = func() time.Time { return now }
+	// 读两次：头一次是底数，第二次比底数长出来的那一截才是用掉的。
+	if err := s.SaveUsageDaily(ctx, "acc_01", 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveUsageDaily(ctx, "acc_01", 120, true); err != nil {
+		t.Fatal(err)
+	}
+	s.Clock = time.Now
+
+	req := httptest.NewRequest(http.MethodGet, "/api/usage/day?day="+store.DayKey(now), nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Day      string `json:"day"`
+		Used     float64
+		Accounts []struct {
+			ID   string  `json:"id"`
+			Name string  `json:"name"`
+			Used float64 `json:"used"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Day != store.DayKey(now) {
+		t.Fatalf("day = %q", out.Day)
+	}
+	if out.Used != 20 {
+		t.Fatalf("used = %v, want 20", out.Used)
+	}
+	if len(out.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(out.Accounts))
+	}
+	if out.Accounts[0].ID != "acc_01" {
+		t.Fatalf("account = %q", out.Accounts[0].ID)
+	}
+}
+
 // TestTheUsageCanBeRefreshedNow says a reading can be asked for now.
 //
 // 页面上那些数是上一次读数时的数。要看现在的数，就得能说一声「现在

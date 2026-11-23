@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -1206,6 +1207,13 @@ func (m *Manager) RefreshUsage(ctx context.Context, accountID string) (store.Usa
 
 	if err := m.Store.SaveUsageSnapshot(ctx, snap); err != nil {
 		return store.UsageSnapshot{}, err
+	}
+	// 这一天的账：账本上的数是累计的，长出来的那一截就是今天用掉的。
+	//
+	// 记账是 bookkeeping，不是读数：它坏了，那一次的读数还是好的，账本上
+	// 还是摆着这一次的数。所以这里只记一笔，不让它把读数也弄坏。
+	if err := m.Store.SaveUsageDaily(ctx, accountID, snap.Consumed, snap.HasAmounts); err != nil {
+		log.Printf("usage: the day of %s could not be written: %v", accountID, err)
 	}
 	return snap, nil
 }

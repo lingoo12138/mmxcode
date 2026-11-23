@@ -266,6 +266,11 @@ type Relogin struct {
 type Usage struct {
 	// Refresh holds how one round of reading the credits goes.
 	Refresh Refresh `yaml:"refresh" json:"refresh"`
+	// HistoryDays is how many days of daily consumption are kept.
+	//
+	// 三十天：折线图看三十天，账本也留三十天。留得再久也没有人翻，
+	// 留得再短图上就缺了一块。0 = 永远留着。
+	HistoryDays int `yaml:"history_days" json:"history_days"`
 }
 
 // Refresh holds the controls of one round of reading the credits.
@@ -457,16 +462,19 @@ func Default() Config {
 				MaxAccounts: 20,
 			},
 		},
-		Usage: Usage{Refresh: Refresh{
-			HotWindow:   Duration(5 * time.Minute),
-			ScanEvery:   OptionalDuration(30 * time.Second),
-			Concurrency: 4,
-			Timeout:     Duration(15 * time.Second),
-			Budget:      Duration(30 * time.Second),
-			Batch:       6,
-			Card:        2,
-			CardBudget:  Duration(5 * time.Second),
-		}},
+		Usage: Usage{
+			Refresh: Refresh{
+				HotWindow:   Duration(5 * time.Minute),
+				ScanEvery:   OptionalDuration(30 * time.Second),
+				Concurrency: 4,
+				Timeout:     Duration(15 * time.Second),
+				Budget:      Duration(30 * time.Second),
+				Batch:       6,
+				Card:        2,
+				CardBudget:  Duration(5 * time.Second),
+			},
+			HistoryDays: 30,
+		},
 		Concurrency: Concurrency{
 			PerAccount:   1,
 			TotalRatio:   5,
@@ -547,7 +555,29 @@ func Load(path string) (Config, error) {
 	if err := c.checkSQLite(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	if err := c.checkUsage(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	return c, nil
+}
+
+// checkUsage refuses the history that is not worth keeping.
+//
+// 负的保留天数按"永远留"办（清理那一档见到 <= 0 就不删），写 -1 的人以
+// 为自己说了什么，其实什么也没说 —— 宁可在这里报错。
+//
+// 1 到 6 天不许：折线图最少看一周，一周以下的那几行图上连一条线都拉不
+// 出来，留着只是占地方。
+func (c *Config) checkUsage() error {
+	if c.Usage.HistoryDays < 0 {
+		return fmt.Errorf("usage.history_days is %d: it is 0 (keep every day) or 7 or more",
+			c.Usage.HistoryDays)
+	}
+	if c.Usage.HistoryDays > 0 && c.Usage.HistoryDays < 7 {
+		return fmt.Errorf("usage.history_days is %d: it is 0 (keep every day) or 7 or more, because a week is the shortest worth keeping",
+			c.Usage.HistoryDays)
+	}
+	return nil
 }
 
 // checkUpstream refuses the settings that would mean something else.

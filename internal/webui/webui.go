@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -140,6 +141,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/api/usage/refresh":
 		w.apiUsageRefresh(rw, r)
 		return
+	case "/api/usage/day":
+		w.apiUsageDay(rw, r)
+		return
 	case "/api/egress":
 		w.apiEgress(rw, r)
 		return
@@ -185,7 +189,7 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case "/egress":
 		w.page(rw, r, "egress.html", w.egressData)
 	case "/usage":
-		w.page(rw, r, "usage.html", w.usageData)
+		w.page(rw, r, "usage.html", w.usagePage(r))
 	case "/login":
 		w.page(rw, r, "login.html", w.loginData)
 	case "/import":
@@ -431,6 +435,12 @@ func (w *WebUI) overviewData(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 
+	// 今天用掉多少积分：账本上的累计数跟昨天那次读数比出来的那一截。
+	usedToday, todayAccounts, err := w.usedToday(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// 出口：在用的那些，健康的和没测过的分开数。
 	outlets, err := w.egressRows(ctx)
 	if err != nil {
@@ -481,6 +491,7 @@ func (w *WebUI) overviewData(ctx context.Context) (map[string]any, error) {
 		"Readings": summary.Readings, "Unread": summary.AccountsUnread,
 		"UpdatedAt":    summary.UpdatedAt,
 		"CheckedToday": checkedToday, "Waiting": active - checkedToday,
+		"UsedToday": usedToday, "TodayAccounts": todayAccounts,
 		"Egress": outlets, "EgressOK": egressOK, "EgressUntested": egressUntested,
 		"KeysLive": keysLive, "KeysRevoked": keysRevoked,
 		"Runs": runRows,
@@ -688,8 +699,52 @@ func (w *WebUI) egressData(ctx context.Context) (map[string]any, error) {
 	return map[string]any{"Groups": groupRows, "Egress": out}, nil
 }
 
+// usagePage gives the usage page its data, with the range and the day
+// from the query.
+//
+// ?days=7 看七天，?day=2026-11-23 看那一天是哪些号在用。问的范围比留的
+// 多的那些天（账只留三十天），多出来的那些天是空的。
+func (w *WebUI) usagePage(r *http.Request) func(context.Context) (map[string]any, error) {
+	days := w.historyDays()
+	if v, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && v > 0 {
+		days = v
+	}
+	if keep := w.Cfg.Usage.HistoryDays; keep > 0 && days > keep {
+		days = keep
+	}
+	day := strings.TrimSpace(r.URL.Query().Get("day"))
+	return func(ctx context.Context) (map[string]any, error) {
+		return w.usageData(ctx, days, day)
+	}
+}
+
+// historyDays is how many days the chart shows by default.
+func (w *WebUI) historyDays() int {
+	days := w.Cfg.Usage.HistoryDays
+	if days <= 0 {
+		return 30
+	}
+	return days
+}
+
+// usedToday gives how much was used today, and how many accounts had a
+// row today.
+//
+// 今天的数是账本上的累计数跟昨天那次读数比出来的：夜里用掉的算今天。
+func (w *WebUI) usedToday(ctx context.Context) (float64, int, error) {
+	today := store.DayKey(time.Now())
+	totals, err := w.Store.UsageDailyTotals(ctx, today, today)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(totals) == 0 {
+		return 0, 0, nil
+	}
+	return totals[0].Used, totals[0].Accounts, nil
+}
+
 // usageData is the usage page's data.
-func (w *WebUI) usageData(ctx context.Context) (map[string]any, error) {
+func (w *WebUI) usageData(ctx context.Context, days int, day string) (map[string]any, error) {
 	snaps, err := w.Store.LatestUsageSnapshots(ctx)
 	if err != nil {
 		return nil, err
@@ -722,7 +777,53 @@ func (w *WebUI) usageData(ctx context.Context) (map[string]any, error) {
 			"ExpiresAt": a.ExpiresAt, "Pct": pct, "Bar": bar,
 		})
 	}
-	return map[string]any{"Summary": s, "Rows": rows}, nil
+
+	// 三十天的账：一天一个点，图上拉成一条线。
+	now := time.Now()
+	to := store.DayKey(now)
+	from := store.DayKey(now.AddDate(0, 0, -(days - 1)))
+	totals, err := w.Store.UsageDailyTotals(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
+	chart := buildChart(totals, from, to)
+
+	// 今天用掉多少。
+	usedToday, todayAccounts := 0.0, 0
+	for _, t := range totals {
+		if t.Day == to {
+			usedToday = t.Used
+			todayAccounts = t.Accounts
+		}
+	}
+
+	// 选中的那一天：是哪些号在用。
+	var breakdown []map[string]any
+	if day != "" {
+		rows, err := w.Store.UsageDailyAccounts(ctx, day)
+		if err != nil {
+			return nil, err
+		}
+		names := map[string]string{}
+		for _, a := range accounts {
+			names[a.ID] = a.Email
+			if names[a.ID] == "" {
+				names[a.ID] = a.Name
+			}
+		}
+		for _, r := range rows {
+			breakdown = append(breakdown, map[string]any{
+				"ID": r.AccountID, "Name": names[r.AccountID], "Used": r.Used,
+			})
+		}
+	}
+
+	return map[string]any{
+		"Summary": s, "Rows": rows,
+		"Chart": chart, "Days": days, "Day": day,
+		"UsedToday": usedToday, "TodayAccounts": todayAccounts,
+		"Breakdown": breakdown,
+	}, nil
 }
 
 // loginData is the login page's data.
@@ -964,6 +1065,45 @@ func (w *WebUI) apiUsage(rw http.ResponseWriter, r *http.Request) {
 	}
 	s := usage.Aggregate(snaps, accounts, time.Now())
 	writeJSON(rw, s)
+}
+
+// apiUsageDay gives one day's consumption, account by account.
+//
+// 它是折线图上点一天的那一下：图上看得见那天用掉了多少，看不见是哪些号
+// 用的。这个门就是补上那一半的。
+func (w *WebUI) apiUsageDay(rw http.ResponseWriter, r *http.Request) {
+	day := strings.TrimSpace(r.URL.Query().Get("day"))
+	if day == "" {
+		http.Error(rw, "the day is missing", http.StatusBadRequest)
+		return
+	}
+	rows, err := w.Store.UsageDailyAccounts(r.Context(), day)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	accounts, err := w.Store.ListAccounts(r.Context())
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	names := map[string]string{}
+	for _, a := range accounts {
+		name := a.Email
+		if name == "" {
+			name = a.Name
+		}
+		names[a.ID] = name
+	}
+	out := make([]map[string]any, 0, len(rows))
+	total := 0.0
+	for _, row := range rows {
+		total += row.Used
+		out = append(out, map[string]any{
+			"id": row.AccountID, "name": names[row.AccountID], "used": row.Used,
+		})
+	}
+	writeJSON(rw, map[string]any{"day": day, "used": total, "accounts": out})
 }
 
 // apiEgress gives the outlets and their health.
