@@ -250,11 +250,25 @@ function makeCard(titleText, leadText) {
 //
 // 框和抽屉是模态的：它们开着的时候，底下的表格不该还能按 —— Tab 跑出去
 // 按到看不见的按钮上，人会以为自己在框里。
+//
+// 按停的是**底下那一层**，不是最上面那一层：
+//
+// - 页面（.shell）：框或者抽屉开着的时候按停。
+// - 抽屉（.drawer）：只有它上面还飘着一个框的时候才按停。抽屉自己开着
+//   的时候按停它，它里面的按钮就全按不动了：点一下掉到罩子上，抽屉自
+//   己关上 —— 看着像按钮坏了。
+// - 框（.card）：它是最上面那一层，不按停。
 function refreshInert() {
-  const on = !!document.querySelector('.card') || !!drawerBox;
-  for (const el of document.querySelectorAll('.shell, .drawer')) {
-    if (on) el.setAttribute('inert', '');
-    else el.removeAttribute('inert');
+  const card = document.querySelector('.card');
+  const drawer = document.querySelector('.drawer');
+  const shell = document.querySelector('.shell');
+  if (shell) {
+    if (card || drawer) shell.setAttribute('inert', '');
+    else shell.removeAttribute('inert');
+  }
+  if (drawer) {
+    if (card) drawer.setAttribute('inert', '');
+    else drawer.removeAttribute('inert');
   }
 }
 
@@ -376,6 +390,21 @@ function outcomeWords(out) {
   }
 }
 
+// checkedWord says, in words, what a check-in did.
+//
+// 每一种结果都有话：签过的说签了几天，不能签的说不能签，不能用了的说
+// 不能用了。签到失败也是一种结果 —— 它不是「没有结果」。
+function checkedWord(out) {
+  const o = out && out.outcome;
+  if (o === 'claimed' || o === 'done') {
+    return { word: '已签 ' + (out.streak || 1) + ' 天', cls: 'good' };
+  }
+  if (o === 'ineligible') return { word: '不能签', cls: '' };
+  if (o === 'inactive') return { word: '不能用了', cls: 'bad' };
+  if (o === 'failed') return { word: '签到失败', cls: 'bad' };
+  return null;
+}
+
 // setChecked writes the result of a check-in into the cell that says
 // whether the account checked in today.
 //
@@ -383,27 +412,73 @@ function outcomeWords(out) {
 // 用了的写「不能用了」。只写签成了的那一种，别的结果就停在「未签」——
 // 人看着像没签成，那句话也不对。
 function setChecked(cell, out) {
-  const o = out && out.outcome;
-  let word = '';
-  let cls = '';
-  if (o === 'claimed' || o === 'done') {
-    word = '已签 ' + (out.streak || 1) + ' 天';
-    cls = 'good';
-  } else if (o === 'ineligible') {
-    word = '不能签';
-  } else if (o === 'inactive') {
-    word = '不能用了';
-    cls = 'bad';
-  } else if (o === 'failed') {
-    word = '签到失败';
-    cls = 'bad';
-  }
-  if (!word) return;
+  const w = checkedWord(out);
+  if (!w || !cell) return;
   cell.textContent = '';
   const pill = document.createElement('span');
-  pill.className = cls ? 'pill ' + cls : 'pill';
-  pill.textContent = word;
+  pill.className = w.cls ? 'pill ' + w.cls : 'pill';
+  pill.textContent = w.word;
   cell.appendChild(pill);
+}
+
+// windowWords says what the plan's windows look like, in one line.
+//
+// 跟服务器算的一样：「MiniMax-M2 61% · MiniMax-M2 12%」。
+function windowWords(raw) {
+  if (!raw) return '';
+  let list = null;
+  try {
+    list = JSON.parse(raw);
+  } catch (e) {
+    return '';
+  }
+  if (!Array.isArray(list) || !list.length) return '';
+  const parts = [];
+  for (const x of list) {
+    const name = String(x.ModelName || '');
+    if (x.Unlimited) {
+      parts.push(name + ' 不限');
+      continue;
+    }
+    parts.push(name + ' ' + Math.round(Number(x.Used) || 0) + '%');
+  }
+  return parts.join(' · ');
+}
+
+// setCredits writes a freshly read balance into the table's credits cell.
+//
+// 桌子上的数是上一次读到的。现读了一遍，抽屉里改了，桌子里也得跟着改 —
+// 不然两个数摆在一起，人得猜哪个是真的。
+function setCredits(cell, snap) {
+  if (!cell) return;
+  cell.textContent = '';
+  const granted = Number(snap.Granted) || 0;
+  const remaining = Number(snap.Remaining) || 0;
+  if (snap.HasAmounts !== true) {
+    const warn = document.createElement('span');
+    warn.className = 'warn';
+    warn.textContent = '读不到';
+    cell.appendChild(warn);
+    return;
+  }
+  const pct = granted > 0 ? (remaining / granted * 100) : 0;
+  const line = document.createElement('span');
+  line.className = 'nowrap';
+  line.textContent = remaining.toFixed(2) + ' / ' + granted.toFixed(0);
+  const meterLine = document.createElement('span');
+  meterLine.className = 'meter-line';
+  const meter = document.createElement('span');
+  meter.className = 'meter';
+  const bar = document.createElement('span');
+  bar.className = pct <= 0 ? 'bad' : (pct < 20 ? 'warn' : '');
+  bar.style.width = pct.toFixed(1) + '%';
+  meter.appendChild(bar);
+  meterLine.appendChild(meter);
+  const pctText = document.createElement('span');
+  pctText.className = 'pct';
+  pctText.textContent = pct.toFixed(0) + '%';
+  meterLine.appendChild(pctText);
+  cell.append(line, meterLine);
 }
 
 // ---------------------------------------------------------------- 主题
@@ -990,6 +1065,12 @@ function openDrawer(row) {
   const body = document.createElement('div');
   body.className = 'drawer-body';
 
+  // 抽屉底下那句话：出了错在这儿说。右下角那个飘字被抽屉盖住了，
+  // 出了错人在那儿根本看不见。
+  const footMsg = document.createElement('p');
+  footMsg.className = 'card-msg';
+  footMsg.setAttribute('role', 'status');
+
   const list = document.createElement('dl');
   list.className = 'kv';
   const statusText = d.state || statusNames[d.status] || d.status;
@@ -998,20 +1079,25 @@ function openDrawer(row) {
     : '读不到';
   const outlet = d.group ? ('组 ' + d.group) : (d.proxy || '跟随全局');
   const checked = d.checked === 'true' ? ('已签 ' + d.streak + ' 天') : '未签';
+  // kv 是抽屉里那一列「名字 → 值」。改一件事的时候要改其中一行，就得有
+  // 法子找到它：每一行给自己一个记号（data-kv）。
+  const kv = {};
   for (const pair of [
-    ['账号 ID', d.row],
-    ['邮箱', d.email || '没有'],
-    ['状态', statusText],
-    ['积分', left],
-    ['套餐', d.plan || '未知'],
-    ['额度窗口', d.window || '没有读到'],
-    ['出口', outlet],
-    ['今日签到', checked],
+    ['账号 ID', d.row, 'id'],
+    ['邮箱', d.email || '没有', 'email'],
+    ['状态', statusText, 'state'],
+    ['积分', left, 'credits'],
+    ['套餐', d.plan || '未知', 'plan'],
+    ['额度窗口', d.window || '没有读到', 'window'],
+    ['出口', outlet, 'outlet'],
+    ['今日签到', checked, 'checked'],
   ]) {
     const dt = document.createElement('dt');
     dt.textContent = pair[0];
     const dd = document.createElement('dd');
     dd.textContent = pair[1];
+    dd.dataset.kv = pair[2];
+    kv[pair[2]] = dd;
     list.append(dt, dd);
   }
   body.appendChild(list);
@@ -1043,11 +1129,18 @@ function openDrawer(row) {
       row.dataset.name = nameInput.value;
       const cell = row.querySelector('td[data-sort]');
       if (cell) cell.dataset.sort = nameInput.value;
-      sayAndReload('已保存');
+      // 表格里那个名字也改过来。抽屉开着的时候不重取整页：重取一次抽屉
+      // 就没了，人还得再点一遍 —— 看着像白按了。
+      const label = row.querySelector('.row-open');
+      if (label) label.textContent = nameInput.value.trim() || '未命名';
+      title.textContent = nameInput.value.trim() || d.email || d.row;
+      footMsg.textContent = '已保存';
+      say('已保存');
     } catch (e) {
+      footMsg.textContent = '保存失败：' + e.message;
       say('保存失败：' + e.message);
-      save.disabled = false;
     }
+    save.disabled = false;
   });
   const nameRow = document.createElement('div');
   nameRow.className = 'row';
@@ -1079,12 +1172,16 @@ function openDrawer(row) {
     groupSelect.appendChild(opt);
   }
   groupSelect.value = d.group || '';
+  // stored 是存着的样子：存不进去的时候要退回这儿来。屏幕上不能写着没
+  // 发生过的事。
+  groupSelect.dataset.stored = d.group || '';
   const urlInput = document.createElement('input');
   urlInput.id = 'drawer-url';
   urlInput.placeholder = '单独地址（空 = 跟随全局）';
   urlInput.setAttribute('aria-label', '单独地址');
   urlInput.dataset.account = d.row;
   urlInput.dataset.field = 'proxy_url';
+  urlInput.dataset.stored = d.proxy || '';
   urlInput.value = d.proxy || '';
   outletRow.append(groupSelect, urlInput);
   outletField.append(outletLabel, outletRow);
@@ -1092,11 +1189,37 @@ function openDrawer(row) {
 
   const foot = document.createElement('div');
   foot.className = 'drawer-foot';
-  // 抽屉里的话就在抽屉里说：右下角那个飘字被抽屉盖住了，出了错人根本
-  // 看不见。这句话就摆在按钮底下。
-  const footMsg = document.createElement('p');
-  footMsg.className = 'card-msg';
-  footMsg.setAttribute('role', 'status');
+  // 读一次额度：抽屉里的数是上一次读到的，旧的（积分只会往下走，旧的数
+  // 是高估）。这里现读一遍，抽屉里就地改过来。
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'icon';
+  refresh.append(icon('refresh'), document.createTextNode('读一次额度'));
+  refresh.addEventListener('click', async () => {
+    refresh.disabled = true;
+    footMsg.textContent = '正在读……';
+    try {
+      const answer = await call('/api/accounts/' + encodeURIComponent(d.row) + '/usage', undefined, '正在读额度');
+      if (!answer.ok) throw new Error(messageOf(answer));
+      const snap = answer.json || {};
+      const has = snap.HasAmounts === true;
+      kv.credits.textContent = has
+        ? (Number(snap.Remaining).toFixed(2) + ' / ' + Number(snap.Granted).toFixed(2))
+        : '读不到';
+      kv.plan.textContent = snap.Plan || '未知';
+      kv.window.textContent = windowWords(snap.WindowsJSON) || '没有读到';
+      // 表格里那两格也跟着变。
+      setCredits(row.querySelector('[data-credits]'), snap);
+      const planCell = row.querySelector('[data-plan]');
+      if (planCell && snap.Plan) planCell.textContent = snap.Plan;
+      footMsg.textContent = '读完了';
+      say('读完了');
+    } catch (e) {
+      footMsg.textContent = '读不到：' + e.message;
+      say('读不到：' + e.message);
+    }
+    refresh.disabled = false;
+  });
   const checkin = document.createElement('button');
   checkin.type = 'button';
   checkin.className = 'primary icon';
@@ -1107,11 +1230,18 @@ function openDrawer(row) {
     try {
       const out = await post('/api/accounts/' + encodeURIComponent(d.row) + '/checkin', undefined, '正在签到');
       footMsg.textContent = outcomeWords(out);
-      sayAndReload(outcomeWords(out));
+      // 「今日签到」那一行改过来，表格里那一格也改过来。整页重取会把
+      // 抽屉收掉。
+      const w = checkedWord(out);
+      if (w) kv.checked.textContent = w.word;
+      const cell = row.querySelector('[data-checked-cell]');
+      if (cell) setChecked(cell, out);
+      say(outcomeWords(out));
     } catch (e) {
       footMsg.textContent = '失败：' + e.message;
-      checkin.disabled = false;
+      say('失败：' + e.message);
     }
+    checkin.disabled = false;
   });
   const remove = document.createElement('button');
   remove.type = 'button';
@@ -1126,7 +1256,7 @@ function openDrawer(row) {
       sayAndReload('删掉了');
     });
   });
-  foot.append(checkin, remove, footMsg);
+  foot.append(refresh, checkin, remove, footMsg);
 
   box.append(head, body, foot);
   document.body.appendChild(scrim);
@@ -1319,27 +1449,27 @@ document.addEventListener('change', async (ev) => {
   if (!sel) return;
   const body = {};
   body[sel.dataset.field] = sel.value;
-  const row = sel.closest('tr');
-  const account = sel.dataset.account;
+  const account = sel.dataset.account || '';
+  // 抽屉里那对东西和表格里的是同一个号：找得到它们，就知道改完要把哪
+  // 几处摆成新的样子。
+  const pick = document.querySelector(`select[data-account="${account}"][data-field="proxy_group"]`);
+  const url = document.querySelector(`input[data-account="${account}"][data-field="proxy_url"]`);
+  const row = sel.closest('tr') || document.querySelector(`tr[data-row="${account}"]`);
   // 地址和组是二选一：选了组，地址框就清掉；填了地址，下拉框就回到空。
-  if (sel.dataset.field === 'proxy_group' && sel.value) {
-    const input = document.querySelector(`input[data-account="${account}"][data-field="proxy_url"]`);
-    if (input) input.value = '';
-  }
-  if (sel.dataset.field === 'proxy_url' && sel.value) {
-    const pick = document.querySelector(`select[data-account="${account}"][data-field="proxy_group"]`);
-    if (pick) pick.value = '';
-  }
+  if (sel.dataset.field === 'proxy_group' && sel.value && url) url.value = '';
+  if (sel.dataset.field === 'proxy_url' && sel.value && pick) pick.value = '';
   // 存不进去的时候，框里的话得退回去：屏幕上不能写着没发生过的事。
+  // 退回到存着的样子（stored），不是退回到空。
   const restore = () => {
-    const pick = document.querySelector(`select[data-account="${account}"][data-field="proxy_group"]`);
-    const url = document.querySelector(`input[data-account="${account}"][data-field="proxy_url"]`);
-    if (pick) pick.value = (row && row.dataset.group) || '';
-    if (url) url.value = (row && row.dataset.proxy) || '';
+    if (pick) pick.value = pick.dataset.stored || '';
+    if (url) url.value = url.dataset.stored || '';
   };
   sel.disabled = true;
   try {
-    await patch(`/api/accounts/${account}`, body, '正在保存');
+    await patch(`/api/accounts/${encodeURIComponent(account)}`, body, '正在保存');
+    // 存进去了：现在框里的话是真的了，把它记下来。
+    if (pick) pick.dataset.stored = pick.value;
+    if (url) url.dataset.stored = url.value;
     if (row) {
       if (sel.dataset.field === 'proxy_group') row.dataset.group = sel.value;
       else row.dataset.proxy = sel.value;
@@ -1358,6 +1488,13 @@ document.addEventListener('change', async (ev) => {
           cell.textContent = '跟随全局';
         }
       }
+    }
+    // 抽屉里那一行也改过来：抽屉开着的时候不重取整页。
+    const kvOutlet = document.querySelector('#acc-drawer [data-kv="outlet"]');
+    if (kvOutlet) {
+      const group = pick ? pick.value : '';
+      const address = url ? url.value : '';
+      kvOutlet.textContent = group ? ('组 ' + group) : (address || '跟随全局');
     }
     say('已保存');
   } catch (e) {

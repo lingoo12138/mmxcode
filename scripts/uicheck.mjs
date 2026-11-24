@@ -65,6 +65,27 @@ async function key(k, code, vk) {
   await sleep(250)
 }
 
+// clickButton 按一个按钮：真的鼠标按下去，不是 el.click()。
+//
+// el.click() 绕过了「点得到点不到」那一层（inert 干的事）：按钮在那儿
+// 摆着，人却按不到它，点下去掉到罩子上，浮层自己关了 —— 看着像按钮坏了。
+// 这种坏法只有真按才验得出来。
+async function clickButton(scope, text) {
+  const box = await evaluate(`(() => {
+    const list = Array.prototype.slice.call(document.querySelectorAll(${JSON.stringify(scope + ' button')}))
+    const b = list.find(x => x.textContent.trim() === ${JSON.stringify(text)})
+    if (!b) return ''
+    const r = b.getBoundingClientRect()
+    return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 })
+  })()`)
+  if (!box) return 'not found'
+  const { x, y } = JSON.parse(box)
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, buttons: 0 })
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
+  await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
+  return 'clicked'
+}
+
 await send('Page.enable')
 // 窗口得是宽的：窄屏那一套（侧栏变成横条）不是这里要验的东西。
 await send('Emulation.setDeviceMetricsOverride', {
@@ -212,6 +233,32 @@ await evaluate(`(() => {
 await sleep(300)
 out.drawerOpen = await evaluate('!!document.querySelector(".drawer")')
 out.drawerFields = await evaluate('document.querySelectorAll(".drawer .kv dt").length')
+// 抽屉自己不能是按停的：按停了，里面那些按钮就全按不动 —— 点一下掉到
+// 罩子上，抽屉自己关了，看着像按钮坏了。按停的是底下那一页。
+out.drawerInert = await evaluate('!!document.querySelector(".drawer[inert]")')
+out.shellInert = await evaluate('!!document.querySelector(".shell[inert]")')
+
+// 抽屉里的按钮：真的按。
+out.drawerSave = await clickButton('#acc-drawer', '存回去')
+await sleep(800)
+out.drawerMsg = await evaluate('document.querySelector("#acc-drawer .card-msg") ? document.querySelector("#acc-drawer .card-msg").textContent : ""')
+// 按完抽屉还在：整页重取一次抽屉就没了，人还得再点一遍。
+out.drawerOpenAfterSave = await evaluate('!!document.querySelector("#acc-drawer")')
+
+out.drawerCheckin = await clickButton('#acc-drawer', '立即签到')
+await sleep(1500)
+out.drawerCheckinMsg = await evaluate('document.querySelector("#acc-drawer .card-msg") ? document.querySelector("#acc-drawer .card-msg").textContent : ""')
+out.drawerChecked = await evaluate('document.querySelector(\'#acc-drawer [data-kv="checked"]\') ? document.querySelector(\'#acc-drawer [data-kv="checked"]\').textContent : ""')
+out.drawerOpenAfterCheckin = await evaluate('!!document.querySelector("#acc-drawer")')
+
+// 删掉：先弹一个框问一声。框在抽屉上面的时候，抽屉该按停。
+out.drawerDelete = await clickButton('#acc-drawer', '删掉')
+await sleep(500)
+out.drawerConfirm = await evaluate('!!document.querySelector(".card")')
+out.drawerInertUnderCard = await evaluate('!!document.querySelector(".drawer[inert]")')
+await key('Escape', 'Escape', 27)
+await sleep(200)
+out.drawerUsableAfterCard = await evaluate('!document.querySelector(".drawer[inert]")')
 
 // Esc 关掉它。
 await key('Escape', 'Escape', 27)
