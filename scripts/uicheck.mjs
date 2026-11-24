@@ -311,6 +311,27 @@ out.dayRows = await evaluate('document.querySelectorAll("#usage-day-body li").le
 out.dayTitle = await evaluate('document.getElementById("usage-day-title").textContent')
 out.dayInURL = await evaluate('location.search.indexOf("day=") >= 0')
 
+// ------------------------------------------------------------ 重登
+
+await goto(base + '/relogin')
+out.reloginRows = await evaluate('document.querySelectorAll("tr[data-relogin-row]").length')
+out.reloginWhys = await evaluate('document.querySelectorAll("tr[data-relogin-why]").length')
+out.reloginWhyText = await evaluate('document.querySelector(".err-band") ? document.querySelector(".err-band").textContent.trim() : ""')
+out.reloginPills = await evaluate('Array.prototype.map.call(document.querySelectorAll("td .pill"), x => x.textContent.trim()).join(",")')
+
+// 点一个「重登」：那一行和它下面那句理由都得从页面上走掉。
+if (out.reloginRows) {
+  await evaluate(`(() => {
+    const b = document.querySelector('[data-relogin]')
+    if (b) b.click()
+    return true
+  })()`)
+  await sleep(800)
+  out.reloginStatus = await evaluate('document.getElementById("relogin-status").textContent')
+  out.reloginRowsAfter = await evaluate('document.querySelectorAll("tr[data-relogin-row]").length')
+  out.reloginWhysAfter = await evaluate('document.querySelectorAll("tr[data-relogin-why]").length')
+}
+
 console.log(JSON.stringify(out, null, 2))
 ws.close()
 proc.kill()

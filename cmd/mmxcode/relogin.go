@@ -13,8 +13,10 @@ func newReloginCmd(e *env) *cobra.Command {
 	var accountID string
 	cmd := &cobra.Command{
 		Use:   "relogin",
-		Short: "把签出的账号登回去",
-		Long: "用存着的密码，把签出（signed_out）的账号重新登一遍。\n" +
+		Short: "把断了的账号登回去",
+		Long: "用存着的密码，把断了的账号重新登一遍。\n" +
+			"断了有两种：站点明说不认这个号（signed_out），和续签那条链断了\n" +
+			"（刷新令牌的答案丢了，站点可能已经用掉了它，那条链走不下去了）。\n" +
 			"没有存密码的账号登不回去——那个键没有就是没有。\n" +
 			"同一个账号不会同时登两遍，不过这只在一个进程里算数：这个命令跟\n" +
 			"一个正在跑着的 mmxcode serve 用同一个库的时候，两个进程可能同时登\n" +
@@ -23,7 +25,7 @@ func newReloginCmd(e *env) *cobra.Command {
 			return runRelogin(cmd.Context(), e, cmd.OutOrStdout(), accountID, all)
 		},
 	}
-	cmd.Flags().BoolVar(&all, "all", false, "重登所有签出且有密码的账号")
+	cmd.Flags().BoolVar(&all, "all", false, "重登所有断了且有密码的账号")
 	cmd.Flags().StringVar(&accountID, "account", "", "只重登这一个账号")
 	return cmd
 }

@@ -154,11 +154,11 @@
         <ul class="rows rows-link">
           {{range .Attention}}
           <li>
-            <a class="row-link" href="/accounts#acc-{{.ID}}">
-              <span class="pill {{if eq .Status "signed_out"}}warn{{else}}bad{{end}}">{{statusName .Status}}</span>
+            <a class="row-link" href="{{if .Login}}/relogin{{else}}/accounts#acc-{{.ID}}{{end}}">
+              <span class="pill {{if eq .Status "signed_out"}}warn{{else}}bad{{end}}">{{.State}}</span>
               <span class="who">
                 <span class="t">{{if .Name}}{{.Name}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}</span>
-                <span class="s">{{if .Error}}{{.Error}}{{else}}这个号掉线了，得重新登一次{{end}}</span>
+                <span class="s">{{if .Error}}{{.Error}}{{else if .Login}}这个号得登回去{{else}}这个号掉线了，得重新登一次{{end}}</span>
               </span>
               <svg class="ic ic-sm chev" aria-hidden="true"><use href="/static/icons.svg#chevron-right"/></svg>
             </a>

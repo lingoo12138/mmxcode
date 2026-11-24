@@ -62,7 +62,7 @@ mmxcode accounts proxy <id> --url http://127.0.0.1:7890
 mmxcode accounts proxy <id> --group clash
 mmxcode groups list                # 列出出口组
 mmxcode import --file accounts.txt  # 批量导入账号
-mmxcode relogin --all             # 把签出的账号登回去
+mmxcode relogin --all             # 把断了的账号登回去
 mmxcode checkin                  # 给所有账号签到
 mmxcode usage                    # 积分汇总
 mmxcode models                   # 模型列表
@@ -126,11 +126,13 @@ batch:
     enabled: true
 ```
 
-调度器会定期看那些签出（signed_out）而且还存着密码的账号，用存的密码重新
-登一遍。也可以手动来一次：
+调度器会定期看那些断了的账号，用存的密码重新登一遍。断了有两种：一是站点明说
+不认这个号了（签出，signed_out），二是续签那条链断了 —— 刷新令牌发出去了，
+答案丢了，站点可能已经用掉了它，所以网关不会再拿它去续（再发一次可能把一条
+还活着的链弄坏）。后一种只有人登回去才能接上。也可以手动来一次：
 
 ```bash
-mmxcode relogin --all              # 所有签出且有密码的账号
+mmxcode relogin --all              # 所有断了且有密码的账号
 mmxcode relogin --account acc_123  # 只登这一个
 ```
 
@@ -152,7 +154,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 - **贴一段清单**（手写那一份，页面上的长输入框，**最多 100 行**）
 
 两种交的是同一种清单：每行 `邮箱|密码`，`#` 开头是注释。旁边还有一页
-「重登」，列出签出的账号，一键登回去。
+「重登」，列出断了的账号，一个一个登回去，或者一次全登。
 
 上传这一页**一直开着**，配不配 `server.api_keys` 都一样：能不能传看的是有没有
 登录后台（那把 key 就是后台登录密钥）。明文密码走不走网络，是登录的人自己的
@@ -164,7 +166,7 @@ mmxcode relogin --account acc_123  # 只登这一个
 | 键 | 默认值 | 作用 |
 |---|---|---|
 | `batch.interval` | `3s` | 批量导入时两个账号之间的间隔 |
-| `batch.relogin.enabled` | `false` | 账号掉线了自动用存着的密码登回去 |
+| `batch.relogin.enabled` | `false` | 账号断了以后自动用存着的密码登回去 |
 | `batch.relogin.cooldown` | `1h` | 调度器两趟重登之间隔多久 |
 | `batch.relogin.max_accounts` | `20` | 一趟重登最多处理多少个账号 |
 
@@ -215,7 +217,8 @@ mmxcode relogin --account acc_123  # 只登这一个
 | `/api/session` | POST / DELETE | 登录换 cookie / 注销 |
 | `/api/import` | POST | 批量导入（上传文件，或贴一段清单；要先登录后台） |
 | `/api/import/{id}` | GET | 某一次批量导入走到哪儿了 |
-| `/api/relogin` | POST | 把签出的账号登回去 |
+| `/api/relogin` | POST | 把断了的账号都登回去 |
+| `/api/relogin/{id}` | POST | 只把这一个断了的账号登回去 |
 | `/api/keys` | GET / POST | 列出聊天用的 key / 申请一把新的 |
 | `/api/keys/{id}` | DELETE | 撤销一把 key |
 
@@ -229,7 +232,7 @@ WebUI 页面：
 | `/egress` | 出口 |
 | `/usage` | 用量 |
 | `/import` | 批量导入 |
-| `/relogin` | 重登 |
+| `/relogin` | 重登：断了的账号，一个一个登回去，或者一次全登 |
 | `/keys` | 密钥：申请聊天用的 api key |
 | `/signin` | 交 key 的登录页 |
 | `/static/app.css` | 页面的样式 |

@@ -125,6 +125,7 @@ func (e *env) wireImport(ui *webui.WebUI) {
 	ui.Relogin = func(ctx context.Context) (manager.ReloginResult, error) {
 		return e.mgr.ReloginAll(ctx, e.cfg.Batch.Relogin.MaxAccounts)
 	}
+	ui.ReloginOne = e.mgr.Relogin
 }
 
 // passwordNote says what happens to the passwords, when they are not

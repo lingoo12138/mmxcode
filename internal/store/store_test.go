@@ -579,7 +579,7 @@ func TestAMarkedSignedOutAccountIsNotMarkedAgain(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	written, err := s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	written, err := s.MarkFailedSignIn(ctx, "acc_1", StatusSignedOut, "the site refused the password", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +598,7 @@ func TestAMarkedSignedOutAccountIsNotMarkedAgain(t *testing.T) {
 	if err := s.UpdateAccountStatus(ctx, "acc_1", StatusActive, "", now); err != nil {
 		t.Fatal(err)
 	}
-	written, err = s.MarkSignedOut(ctx, "acc_1", "the site refused the password", now)
+	written, err = s.MarkFailedSignIn(ctx, "acc_1", StatusSignedOut, "the site refused the password", now)
 	if err != nil {
 		t.Fatal(err)
 	}

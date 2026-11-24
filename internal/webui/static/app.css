@@ -1523,6 +1523,12 @@ td.act {
   font-weight: 600;
 }
 
+/* 重登那页上，错的那一句是重点：它得整个儿写出来，不能只留一个尾巴。 */
+.err-band.err-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .empty {
   padding: 32px 16px;
   color: var(--text-3);
@@ -1785,6 +1791,11 @@ button.danger:hover {
 }
 
 button.small {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+a.btn.small {
   padding: 4px 8px;
   font-size: 12px;
 }
@@ -2687,6 +2698,31 @@ body.is-busy[data-busy]::before {
 
   .table-wrap {
     overflow-x: auto;
+  }
+
+  /* 窄屏上重登那张表有四列，全挤进一屏宽会把「重登」那个按钮顶到屏幕
+     外头去。把宽度定死，邮箱窄了就让它自己截断。 */
+  .relogin-table {
+    table-layout: fixed;
+  }
+
+  .relogin-table .c-name {
+    width: 26%;
+  }
+
+  .relogin-table .c-mail {
+    width: 34%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .relogin-table .c-why {
+    width: 22%;
+  }
+
+  .relogin-table .c-act {
+    width: 18%;
   }
 
   /* 窄屏上那张图矮一点：图是按百分比摆的，矮一点不影响它读得懂。 */

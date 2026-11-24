@@ -59,13 +59,19 @@ const defaultHotWindow = 5 * time.Minute
 
 // The reasons an account's last error says.
 //
-// They say which case it is, because the two are mended in different
-// ways: a broken chain needs a human, an unknown outcome does not.
+// They say which case it is, because the cases are mended in different
+// ways: a broken chain needs a human, and so does a chain whose answer
+// was lost — the difference is only in what is known.
 const (
 	// chainBrokenReason says the renewal chain cannot go on.
 	chainBrokenReason = "the refresh chain is broken: the refresh token was spent already and there is no newer one, so the account has to be signed in again"
-	// unknownOutcomeReason says a refresh was sent and its answer was lost.
-	unknownOutcomeReason = "the outcome of the last refresh is not known: the site may have spent the refresh token, so it was not sent again"
+	// UnknownOutcomeReason says a refresh was sent and its answer was
+	// lost.
+	//
+	// 这一句是给页面上的人看的：它说的是「这个号的链断了，只有重登能
+	// 救」。手里那份令牌也许还能用 —— 但它终归要到期，到期以后没有人
+	// 能续它。
+	UnknownOutcomeReason = "the outcome of the refresh is not known: the site may have spent the refresh token, so it is not sent again. Only a sign-in can mend this"
 	// tokenNotWrittenReason says a renewal worked and its token could
 	// not be written down.
 	tokenNotWrittenReason = "the token was renewed but it could not be written down, so the token in the database is older than the token in use"
@@ -404,10 +410,14 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		// all the same, so that the WebUI shows that this account is
 		// in trouble.
 		//
+		// 这一条链从此走不下去了：那个令牌不会再发出去，等到手里这份
+		// 到期，就没有人能续它了。所以这个号跟签出的号是一回事 ——
+		// 只有人能登回去，页面上得能把它推到重登那一页去。
+		//
 		// The cause goes with it: "the outcome is not known" says
 		// which case it is, but the transport's own words say what
 		// happened, and the sign-out branch keeps those too.
-		if mErr := m.markError(ctx, accountID, cur.Access, unknownOutcomeReason+": "+err.Error()); mErr != nil {
+		if mErr := m.markError(ctx, accountID, cur.Access, unknownOutcomeReason(err)); mErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("the error could not be saved: %w", mErr))
 		}
 		return nil, err
@@ -453,6 +463,46 @@ func (m *Manager) renewFailed(ctx context.Context, accountID string, cur *oauth.
 		return nil, errors.Join(err, fmt.Errorf("the sign-out could not be saved: %w", mErr))
 	}
 	return nil, err
+}
+
+// unknownOutcomeReason says what happened when a refresh's answer was
+// lost.
+//
+// 头一次失败带着那一次丢答案的原因（连接断了、读超时了）：那是唯一
+// 有用的那一句。后来那几次只有「不知道」了 —— 再写一遍只是把账号上
+// 已经写着的那句话说得更长。
+func unknownOutcomeReason(err error) string {
+	var uo *oauth.UnknownOutcomeError
+	if errors.As(err, &uo) && uo.Err != nil {
+		return UnknownOutcomeReason + ": " + err.Error()
+	}
+	return UnknownOutcomeReason
+}
+
+// NeedsLogin says the account has to be signed in again by a human.
+//
+// 两类账号都要人登回去：
+//
+//   - 站点明说不认这个号（签出）；
+//   - 续签那条链断了（刷新令牌的答案丢了，站点可能已经用掉了它，那个
+//     令牌不会再发出去）。
+//
+// 后一种手里那份令牌也许还能用 —— 但它终归要到期，到期以后没有人能
+// 续它。所以在它到期之前，人是可以把它登回去的：登回去换一条新链，这
+// 个号就回来了。
+//
+// 「出错」这个状态不总是这一种错：读不到额度那样的错也是它。可是那一
+// 种不用登回去 —— 它自己会好。所以认的是那句话，不是那个状态。
+func NeedsLogin(acc store.Account) bool {
+	return acc.Status == store.StatusSignedOut || ChainIsDead(acc.LastError)
+}
+
+// ChainIsDead says the account's refresh chain is dead.
+//
+// 认的是那句话。那句话写在账号的最后一条错上，后面可能还接着别的
+// （重登失败的原因），所以是「开头是它」，不是「就是它」。
+func ChainIsDead(reason string) bool {
+	return strings.HasPrefix(reason, UnknownOutcomeReason)
 }
 
 // newerToken gives the token to use when the token that was refused was
@@ -613,6 +663,10 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, access, reason s
 // that this account is in trouble instead of showing it as a normal
 // one.
 //
+// 后来那几次失败只有「不知道」了，第一次丢答案的原因才是有用的那一句。
+// 所以链断了的那句话已经在账号上的时候，就不再用后来的话盖掉它 ——
+// 盖掉了，页面上就只剩一句「不知道」。
+//
 // The write is conditional, for the same reason as in markSignedOut: the
 // error is about the chain in hand, and a chain that has moved on since
 // is somebody else's business.
@@ -621,7 +675,12 @@ func (m *Manager) markSignedOut(ctx context.Context, accountID, access, reason s
 // token whose outcome is not known, because that token must not be sent
 // again.
 func (m *Manager) markError(ctx context.Context, accountID, access, reason string) error {
-	_, err := m.Store.MarkErrorIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
+	a, err := m.Store.GetAccount(ctx, accountID)
+	if err == nil && ChainIsDead(a.LastError) {
+		// 链断了的那句话已经写着：别拿后来的话盖掉它。
+		return nil
+	}
+	_, err = m.Store.MarkErrorIfTheTokenIsStillThere(ctx, accountID, access, reason, time.Now())
 	return err
 }
 
@@ -650,6 +709,11 @@ func (m *Manager) note(ctx context.Context, accountID, reason string) {
 		// The sign-out has its own reason, and that is the one that
 		// matters: it says why the site does not take this account
 		// any more.
+		return
+	}
+	if ChainIsDead(a.LastError) {
+		// 链断了的那句话是这个号为什么要人登回去的理由：后来的记号
+		// 不能盖掉它 —— 盖掉了，重登那一页就看不出它为什么在那儿。
 		return
 	}
 	// The error is written on its own: the status is not written, and
@@ -720,11 +784,11 @@ func (m *Manager) ClearRetiredNotes(ctx context.Context) error {
 	return nil
 }
 
-// ErrNotSignedOut says the account is not signed out.
+// ErrNoLoginNeeded says the account does not have to be signed in again.
 //
-// 重登是给签出的账号准备的。状态不是签出的账号，替它登录没有意义：
-// 它手里那条链还能用，重登一次只会把还能用的令牌换掉。
-var ErrNotSignedOut = errors.New("这个账号不是签出状态，不用重登")
+// 重登是给断了链的账号准备的。链还好的账号替它登录没有意义：它手里那
+// 条链还能用，重登一次只会把还能用的令牌换掉。
+var ErrNoLoginNeeded = errors.New("这个账号不用重登")
 
 // ReloginFunc signs an account in again with the password it was
 // brought in with.
@@ -737,16 +801,17 @@ type ReloginFunc func(ctx context.Context, acc store.Account, password string) e
 // nothing to sign in with. That is an error, not a silent skip — the
 // person who asked wants to know.
 //
-// Only a signed-out account is signed in again. An account that is
-// still active has a token that works, and signing it in again would
-// replace that token with a new one for no reason.
+// Only an account that needs a sign-in is signed in again: one the site
+// has refused, and one whose refresh chain is dead. An account whose
+// chain still works has a token that works, and signing it in again
+// would replace that token with a new one for no reason.
 func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	acc, err := m.Store.GetAccount(ctx, accountID)
 	if err != nil {
 		return err
 	}
-	if acc.Status != store.StatusSignedOut {
-		return ErrNotSignedOut
+	if !NeedsLogin(acc) {
+		return ErrNoLoginNeeded
 	}
 	// 同一个账号的重登要一个一个来：调度器的一轮和命令行里的那一次
 	// 可能撞上，两个都登的话，站点那边就是两个设备码、两个会话。
@@ -758,8 +823,8 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	if err != nil {
 		return err
 	}
-	if acc.Status != store.StatusSignedOut {
-		return ErrNotSignedOut
+	if !NeedsLogin(acc) {
+		return ErrNoLoginNeeded
 	}
 	cipher, err := m.Store.Password(ctx, accountID)
 	if err != nil {
@@ -783,20 +848,27 @@ func (m *Manager) Relogin(ctx context.Context, accountID string) error {
 	if err := m.ReloginFn(ctx, acc, password); err != nil {
 		// 登不回去说的是这次登录失败，不是手里那条链的事。所以令牌
 		// 不动：清空它只能毁掉一个还能用的凭据，什么也救不回来。
-		// 这里写下的只是失败的原因，账号还是签出的。
+		// 这里写下的只是失败的原因，状态不动 —— 链断着的号还是断着
+		// 的，它跟签出的号一样留在重登那一页上，下一次接着试。
+		//
+		// 链断了的号，那句「链断了」得留在前面：它说的是这个号为什么
+		// 要人登回去。登不回去的原因接在后面 —— 两件事都要看得见。
+		reason := err.Error()
+		if acc.Status == store.StatusError {
+			reason = UnknownOutcomeReason + ": the sign-in failed: " + reason
+		}
 		//
 		// 写是**有条件**的：另一个进程可能刚把这个账号登回去了，那一
-		// 行现在是 active 了，这时候把它写回 signed_out，就是把别人刚
-		// 换好的令牌作废掉，还让这个账号显示成登出的状态——手里却握着
-		// 一份能用的凭据，轮转池不用它，下一轮又要登一次。
-		written, mErr := m.Store.MarkSignedOut(ctx, accountID, err.Error(), time.Now())
+		// 行现在是 active 了，这时候把失败的原因写上去，就是在一个好
+		// 好在用的账号上挂一条「它坏了」。
+		written, mErr := m.Store.MarkFailedSignIn(ctx, accountID, acc.Status, reason, time.Now())
 		if mErr != nil {
 			return errors.Join(err, fmt.Errorf("the failure could not be saved: %w", mErr))
 		}
 		if !written {
 			// 别人已经把它登回去了：原因照样要说给听着的人，但状态
 			// 是别人的，不能由这一边改回去。
-			return errors.Join(err, ErrNotSignedOut)
+			return errors.Join(err, ErrNoLoginNeeded)
 		}
 		return err
 	}
@@ -816,7 +888,7 @@ type ReloginResult struct {
 	Reasons []string
 }
 
-// ReloginAll signs in again every account that is signed out and has
+// ReloginAll signs in again every account that needs a sign-in and has
 // a password.
 //
 // It gives back how many it fixed, how many it did not, and why.
@@ -837,7 +909,7 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, err
 		return out, fmt.Errorf("the accounts could not be listed: %w", err)
 	}
 	for _, acc := range accounts {
-		if acc.Status != store.StatusSignedOut {
+		if !NeedsLogin(acc) {
 			continue
 		}
 		if limit > 0 && out.Fixed+out.Failed >= limit {
@@ -848,7 +920,7 @@ func (m *Manager) ReloginAll(ctx context.Context, limit int) (ReloginResult, err
 			continue
 		}
 		if err := m.Relogin(ctx, acc.ID); err != nil {
-			if errors.Is(err, ErrNotSignedOut) {
+			if errors.Is(err, ErrNoLoginNeeded) {
 				// 别人刚把它登回去了：这不算失败。
 				continue
 			}

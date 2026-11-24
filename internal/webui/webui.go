@@ -79,8 +79,13 @@ type WebUI struct {
 	// page and the command share one task, and so that a test can
 	// stand in for the network.
 	Import func(ctx context.Context, entries []provision.Entry) ([]provision.Result, error)
-	// Relogin signs the accounts that are signed out in again.
+	// Relogin signs the accounts that need a sign-in in again.
 	Relogin func(ctx context.Context) (manager.ReloginResult, error)
+	// ReloginOne signs one account in again.
+	//
+	// 一趟里登二十个，人要是只想登一个，就得能点那一个。所以它跟
+	// Relogin 分开：一个要的是「这些」，一个要的是「这个」。
+	ReloginOne func(ctx context.Context, accountID string) error
 	// PasswordNote says what happens to the passwords of the accounts
 	// that are brought in.
 	//
@@ -104,7 +109,7 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 	// and one set of templates for all of them would keep only the
 	// last page's content, so every page would render the last one.
 	tmpl := template.Must(template.New("mmxcode").Funcs(template.FuncMap{
-		"num": num, "statusName": statusName,
+		"num":      num,
 		"clipMail": clipMail, "host": hostOf,
 	}).ParseFS(templateFS, "templates/layout.html"))
 	return &WebUI{
@@ -181,6 +186,10 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		w.apiImportRun(rw, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/relogin/") {
+		w.apiReloginOne(rw, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/":
 		w.page(rw, r, "overview.html", w.overviewData)
@@ -220,20 +229,21 @@ func num(v *float64) float64 {
 	return *v
 }
 
-// statusName gives an account's status in words a person reads.
+// stateWord is the state of an account in words a person reads.
 //
-// 库里存的是机器认的字（active、signed_out、error），页面上摆的是人
-// 读的字。中间这一层是它。
-func statusName(s string) string {
-	switch s {
-	case store.StatusActive:
+// 「出错」是宽泛的状态：读不到额度那样的错也是它，那样的错自己会好。
+// 链断了不一样 —— 刷新令牌的答案丢了，那条链再也续不上，只有人登回去
+// 才能接上。摆出来的字得说出这个分别。
+func stateWord(a store.Account) string {
+	switch {
+	case a.Status == store.StatusActive:
 		return "正常"
-	case store.StatusSignedOut:
+	case a.Status == store.StatusSignedOut:
 		return "已登出"
-	case store.StatusError:
-		return "出错"
+	case manager.ChainIsDead(a.LastError):
+		return "链断了"
 	}
-	return s
+	return "出错"
 }
 
 // serveStatic gives a file from the static directory.
@@ -374,6 +384,13 @@ func (w *WebUI) accountsData(ctx context.Context) (map[string]any, error) {
 			"HasWindow":     hasWindow,
 			"CheckedIn":     checkedIn,
 			"Streak":        streak,
+			// State is the state in words a person reads. It is not
+			// always the status: a dead refresh chain is an error, but
+			// saying so hides that only a sign-in can mend it.
+			"State": stateWord(a),
+			// NeedsLogin says whether this account has to be signed in
+			// again: the action for it lives on the relogin page.
+			"NeedsLogin": manager.NeedsLogin(a),
 			// 账号在 error 或者 signed_out 的时候，光有状态是没用的：
 			// 上一次为什么失败，才是那个人要做的事。
 			"LastError": a.LastError,
@@ -426,6 +443,12 @@ func (w *WebUI) overviewData(ctx context.Context) (map[string]any, error) {
 		attention = append(attention, map[string]any{
 			"ID": a.ID, "Name": a.Name, "Email": a.Email,
 			"Status": a.Status, "Error": a.LastError,
+			// 要登回去的账号，指到重登那一页去：那儿有办法，人在
+			// 账号那一页只能看见一句错。
+			"Login": manager.NeedsLogin(a),
+			// State is the word for the state: 链断了 and 出错 are
+			// different things to do about.
+			"State": stateWord(a),
 		})
 	}
 
@@ -1711,6 +1734,27 @@ func (w *WebUI) apiRelogin(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiReloginOne signs one account in again.
+//
+// 登回去的是哪一个，页面上要说得出来：账号的名字和它为什么断了，都
+// 一起带回去。登不回去也是同一件事 —— 说的是哪一个、为什么。
+func (w *WebUI) apiReloginOne(rw http.ResponseWriter, r *http.Request) {
+	if w.ReloginOne == nil {
+		http.Error(rw, "这个网关没有重登", http.StatusNotImplemented)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/relogin/")
+	if id == "" {
+		http.Error(rw, "没有说清楚是哪一个账号", http.StatusBadRequest)
+		return
+	}
+	if err := w.ReloginOne(r.Context(), id); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{"id": id, "ok": true})
+}
+
 // apiImportRun says how one batch import is going.
 func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/import/")
@@ -1732,28 +1776,51 @@ func (w *WebUI) apiImportRun(rw http.ResponseWriter, r *http.Request) {
 
 // reloginData is the relogin page's data.
 //
-// Only the accounts that are signed out and still have a password are
-// listed: the others cannot be signed in again, and saying so is
-// better than a button that cannot work.
+// Every account that needs a sign-in is listed. The ones that still have
+// a password can be signed in again right here; the ones that have no
+// password cannot (there is nothing to sign in with), so they are shown
+// too, with the way out: a sign-in on the login page.
+//
+// 要人登回去的是两类：站点明说不认这个号的（签出），和续签那条链断了
+// 的（刷新令牌的答案丢了，站点可能已经用掉了它）。后一种手里那份令牌
+// 也许还能用，但它终归要到期 —— 到期以后没有人能续它。
 func (w *WebUI) reloginData(ctx context.Context) (map[string]any, error) {
 	accounts, err := w.Store.ListAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]map[string]any, 0)
+	can := 0
 	for _, a := range accounts {
-		if a.Status != store.StatusSignedOut {
+		if !manager.NeedsLogin(a) {
 			continue
 		}
 		cipher, err := w.Store.Password(ctx, a.ID)
-		if err != nil || cipher == "" {
-			continue
+		if err != nil {
+			return nil, err
 		}
 		// 存着的密码是加密的，可它也不该到页面上：这里只说这个账号
-		// 还能登回去。
+		// 还能不能自己登回去。
+		if cipher != "" {
+			can++
+		}
 		out = append(out, map[string]any{
-			"ID": a.ID, "Name": a.Name, "Email": a.Email, "Error": a.LastError,
+			"ID": a.ID, "Name": a.Name, "Email": a.Email,
+			"Why": loginWhy(a), "Error": a.LastError, "Can": cipher != "",
 		})
 	}
-	return map[string]any{"SignedOut": out}, nil
+	return map[string]any{"Accounts": out, "Can": can}, nil
+}
+
+// loginWhy says why the account has to be signed in again, in words a
+// person reads.
+//
+// 「签出」和「链断了」是两回事：前者是站点明说的，后者是我们猜的
+// （答案丢了，站点可能已经用掉了那个令牌）。两件事的治法一样，都是
+// 登回去，所以它们站在同一张表上 —— 但人得知道是哪一种。
+func loginWhy(a store.Account) string {
+	if a.Status == store.StatusSignedOut {
+		return "已登出"
+	}
+	return "链断了"
 }

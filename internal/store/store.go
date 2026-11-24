@@ -1349,21 +1349,23 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// MarkSignedOut writes the reason a sign-in failed, but only while the
-// account is still signed out.
+// MarkFailedSignIn writes the reason a sign-in failed, but only while the
+// account is still in the state the sign-in failed from.
 //
 // 它是有条件的：另一个进程可能刚把这个账号登回去了，那一行现在是
-// active 了，这时候把它写回 signed_out，就是把别人刚换好的令牌作废掉，
-// 还让这个账号显示成登出的状态——手里却握着一份能用的凭据。轮转池不
-// 会用它，下一轮又要登一次，白白多登一次。
+// active 了，这时候把失败的原因写上去，就是在一个好好在用的账号上挂
+// 一条「它坏了」。
 //
-// 它说有没有写下去：没有写，说明这一行的状态已经不是签出的了。
-func (s *Store) MarkSignedOut(ctx context.Context, id, lastError string, updatedAt time.Time) (bool, error) {
+// 状态不动：签出的号还是签出的，链断着的号还是链断着的 —— 它跟签出的
+// 号一样，要人登回去，页面上得留着它。
+//
+// 它说有没有写下去：没有写，说明这一行的状态已经不是那个了。
+func (s *Store) MarkFailedSignIn(ctx context.Context, id, status, lastError string, updatedAt time.Time) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE accounts SET status=?, last_error=?, updated_at=? WHERE id=? AND status=?`,
-		StatusSignedOut, lastError, ms(s.stamp(updatedAt)), id, StatusSignedOut)
+		UPDATE accounts SET last_error=?, updated_at=? WHERE id=? AND status=?`,
+		lastError, ms(s.stamp(updatedAt)), id, status)
 	if err != nil {
-		return false, fmt.Errorf("mark the account %s as signed out: %w", id, err)
+		return false, fmt.Errorf("mark the sign-in of %s as failed: %w", id, err)
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil

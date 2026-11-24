@@ -1,26 +1,33 @@
 {{define "content"}}
 <div class="page-head">
-  <p class="lead">签出（signed_out）而且还存着密码的账号，可以拿密码重新登一遍。</p>
+  <p class="lead">断了的账号。断了有两种：站点明说不认这个号，和续签那条链断了（刷新令牌的答案丢了，站点可能已经用掉了它）。存着密码的可以在这里登回去；没存密码的得自己登一次。</p>
   <div class="page-actions">
     <span class="muted" id="relogin-status" role="status"></span>
-    <button id="relogin-all" type="button" class="primary icon"{{if not .SignedOut}} disabled{{end}}>
+    <button id="relogin-all" type="button" class="primary icon"{{if not .Can}} disabled{{end}}>
       <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>全部重登</span></button>
   </div>
 </div>
 
 <div class="table-wrap">
-<table>
-  <caption class="sr-only">签出去的账号，和它们掉线的原因</caption>
-  <thead><tr><th scope="col">账号</th><th scope="col">邮箱</th><th scope="col">上次为什么掉的</th></tr></thead>
+<table class="relogin-table">
+  <colgroup>
+    <col class="c-name"><col class="c-mail"><col class="c-why"><col class="c-act">
+  </colgroup>
+  <caption class="sr-only">要登回去的账号，和它们断的原因</caption>
+  <thead><tr><th scope="col">账号</th><th scope="col">邮箱</th><th scope="col">断了</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
   <tbody>
-    {{range .SignedOut}}
-    <tr>
+    {{range .Accounts}}
+    <tr data-relogin-row="{{.ID}}">
       <td class="nowrap">{{.Name}}</td>
       <td>{{.Email}}</td>
-      <td><div class="err">{{.Error}}</div></td>
+      <td><span class="pill {{if eq .Why "已登出"}}warn{{else}}bad{{end}}">{{.Why}}</span></td>
+      <td class="act">{{if .Can}}<button type="button" class="small" data-relogin="{{.ID}}"
+        title="用存着的密码把这个账号登回去" aria-label="把 {{if .Name}}{{.Name}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}} 登回去">重登</button>
+        {{else}}<a class="btn small" href="/login" title="这个号没有存着的密码，得自己登一次">去登一次</a>{{end}}</td>
     </tr>
+    <tr class="err-row" data-relogin-why="{{.ID}}"><td colspan="4" class="err-band err-wrap"><span class="who">上次为什么</span>{{.Error}}</td></tr>
     {{end}}
-    {{if not .SignedOut}}<tr><td class="empty" colspan="3">没有签出去的账号。掉线还存着密码的账号会出现在这儿。</td></tr>{{end}}
+    {{if not .Accounts}}<tr><td class="empty" colspan="4">没有断了的账号。</td></tr>{{end}}
   </tbody>
 </table>
 </div>

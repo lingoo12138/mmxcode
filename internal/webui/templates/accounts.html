@@ -41,7 +41,7 @@
 </tr></thead>
 <tbody>
 {{range $acc := .Accounts}}
-<tr data-row="{{$acc.ID}}" id="acc-{{$acc.ID}}" data-status="{{$acc.Status}}"
+<tr data-row="{{$acc.ID}}" id="acc-{{$acc.ID}}" data-status="{{$acc.Status}}" data-state="{{$acc.State}}"
     data-name="{{$acc.Name}}" data-email="{{$acc.Email}}" data-plan="{{$acc.Plan}}"
     data-window="{{$acc.WindowSummary}}" data-error="{{$acc.LastError}}"
     data-has-amounts="{{$acc.HasAmounts}}" data-remaining="{{$acc.Remaining}}"
@@ -53,18 +53,21 @@
             aria-haspopup="dialog" aria-expanded="false" aria-controls="acc-drawer">{{if $acc.Name}}{{$acc.Name}}{{else}}未命名{{end}}</button>
     <span class="sub clip" title="{{$acc.Email}}">{{if $acc.Email}}{{clipMail $acc.Email}}{{else}}没有邮箱{{end}}</span>
   </td>
-  <td class="nowrap" data-sort="{{$acc.StatusRank}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">已登出</span>{{else}}<span class="pill bad">{{statusName $acc.Status}}</span>{{end}}</td>
+  <td class="nowrap" data-sort="{{$acc.StatusRank}}">{{if eq $acc.Status "active"}}<span class="pill good">正常</span>{{else if eq $acc.Status "signed_out"}}<span class="pill warn">{{$acc.State}}</span>{{else}}<span class="pill bad">{{$acc.State}}</span>{{end}}</td>
   <td class="num" data-sort="{{$acc.Remaining}}">{{if $acc.HasAmounts}}<span class="nowrap">{{printf "%.2f" $acc.Remaining}} / {{printf "%.0f" $acc.Granted}}</span><span class="meter-line"><span class="meter"><span class="{{$acc.Bar}}" style="width: {{printf "%.1f" $acc.Pct}}%"></span></span><span class="pct">{{printf "%.0f" $acc.Pct}}%</span></span>{{else}}<span class="warn">读不到</span>{{end}}</td>
   <td class="nowrap" data-sort="{{$acc.Plan}}">{{if $acc.Plan}}{{$acc.Plan}}{{else if $acc.WindowModel}}{{$acc.WindowModel}}{{else}}<span class="muted">未知</span>{{end}}{{if $acc.HasWindow}}<span class="sub clip" title="{{$acc.WindowModel}} 已用 {{printf "%.0f" $acc.WindowUsed}}%">已用 {{printf "%.0f" $acc.WindowUsed}}%</span>{{end}}</td>
   <td class="nowrap" data-outlet="1" data-sort="{{$acc.ProxyGroup}}">{{if $acc.ProxyGroup}}{{$acc.ProxyGroup}}{{else if $acc.ProxyURL}}<span class="mono clip" title="{{$acc.ProxyURL}}">{{host $acc.ProxyURL}}</span>{{else}}<span class="muted">跟随全局</span>{{end}}</td>
   <td class="nowrap" data-checked-cell="1">{{if $acc.CheckedIn}}<span class="pill good">已签 {{$acc.Streak}} 天</span>{{else}}<span class="pill">未签</span>{{end}}</td>
-  <td class="act">{{if not $acc.CheckedIn}}<button type="button" class="row-act" data-checkin="{{$acc.ID}}"
+  <td class="act">{{if $acc.NeedsLogin}}<a class="row-act" href="/relogin"
+    title="去重登页把这个号登回去" aria-label="去重登页把这个号登回去">
+    <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg>
+  </a>{{end}}{{if not $acc.CheckedIn}}<button type="button" class="row-act" data-checkin="{{$acc.ID}}"
     title="立即签到" aria-label="给 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}} 签到">
     <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg>
   </button>{{end}}</td>
 </tr>
 {{if $acc.LastError}}
-<tr class="err-row" data-owner="{{$acc.ID}}"><td colspan="8" class="err-band" title="{{$acc.LastError}}"><span class="who">{{statusName $acc.Status}}</span>{{$acc.LastError}}</td></tr>
+<tr class="err-row" data-owner="{{$acc.ID}}"><td colspan="8" class="err-band" title="{{$acc.LastError}}"><span class="who">{{$acc.State}}</span>{{$acc.LastError}}</td></tr>
 {{end}}
 {{end}}
 {{if not .Accounts}}<tr><td class="empty" colspan="8">还没有账号。<a href="/login">去登录</a>。</td></tr>{{end}}

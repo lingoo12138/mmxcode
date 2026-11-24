@@ -2316,6 +2316,169 @@ func TestReloginSignsTheAccountInAgain(t *testing.T) {
 	}
 }
 
+// TestTheDeadChainIsSignedInAgain says an account whose refresh chain
+// is dead can be signed in again.
+//
+// 刷新令牌的答案丢了：站点可能已经用掉了它，所以那条链走不下去了。
+// 手里那份令牌也许还能用，但它终归要到期 —— 到期以后没有人能续它。
+// 所以这个号跟签出的号是一回事：只有人能登回去。
+func TestTheDeadChainIsSignedInAgain(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusError, LastError: UnknownOutcomeReason,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: "acc_1", Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	if err := m.Relogin(ctx, "acc_1"); err != nil {
+		t.Fatal(err)
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusActive {
+		t.Fatalf("status = %q, want active", acc.Status)
+	}
+	if acc.LastError != "" {
+		t.Fatalf("last error = %q, want none", acc.LastError)
+	}
+}
+
+// TestTheDeadChainReasonIsNotBuried says a later note does not cover
+// the reason that says the chain is dead.
+//
+// 链断了的那句话是这个号为什么要人登回去的理由。签到没签上、额度没读到
+// 这样的记号跟它无关，可它一旦盖上去，重登那一页就看不出这个号为什么
+// 在那儿了。
+func TestTheDeadChainReasonIsNotBuried(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Email: "a@example.com",
+		Status: store.StatusError, LastError: UnknownOutcomeReason,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.note(ctx, "acc_1", "the check-in could not be written down")
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.LastError != UnknownOutcomeReason {
+		t.Fatalf("last error = %q, want %q", acc.LastError, UnknownOutcomeReason)
+	}
+}
+
+// TestTheDeadChainIsSignedInAgainWithAll says the round of re-logins
+// takes the accounts with a dead chain too.
+//
+// 链断了的号跟签出的号一样要人登回去：一趟只登签出的，那些链断了的
+// 号就永远在那儿等着。
+func TestTheDeadChainIsSignedInAgainWithAll(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	for _, id := range []string{"acc_out", "acc_dead"} {
+		status := store.StatusSignedOut
+		last := ""
+		if id == "acc_dead" {
+			status = store.StatusError
+			last = UnknownOutcomeReason
+		}
+		if err := m.Store.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Email: id + "@example.com",
+			Status: status, LastError: last, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Store.SetPassword(ctx, id, cipher, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return m.Store.SaveToken(ctx, store.Token{
+			AccountID: acc.ID, Access: "new-access", Refresh: "new-refresh",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		})
+	}
+	res, err := m.ReloginAll(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fixed != 2 || res.Failed != 0 {
+		t.Fatalf("result = %+v, want two fixed", res)
+	}
+}
+
+// TestAFailedReloginOfTheDeadChainKeepsItOnTheList says a sign-in that
+// fails does not take the account off the list.
+//
+// 登不回去不是「不用登了」：链还是断着的，下一次接着试。所以状态不动
+// （还是链断了），失败的原因写下来。
+func TestAFailedReloginOfTheDeadChainKeepsItOnTheList(t *testing.T) {
+	m := newTestManager(t, nil)
+	ctx := context.Background()
+	now := time.Now()
+	key := secret.Key(bytes.Repeat([]byte{7}, secret.KeySize))
+	cipher, err := key.Seal("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Key = key
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_1", Name: "a", Status: store.StatusError,
+		LastError: UnknownOutcomeReason, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPassword(ctx, "acc_1", cipher, now); err != nil {
+		t.Fatal(err)
+	}
+	m.ReloginFn = func(ctx context.Context, acc store.Account, password string) error {
+		return errors.New("the site refused the password")
+	}
+	if err := m.Relogin(ctx, "acc_1"); err == nil {
+		t.Fatal("no error for a failed sign-in")
+	}
+	acc, err := m.Store.GetAccount(ctx, "acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != store.StatusError {
+		t.Fatalf("status = %q, want the chain still broken", acc.Status)
+	}
+	if !strings.Contains(acc.LastError, "refused") {
+		t.Fatalf("last error = %q, want the reason of the failure", acc.LastError)
+	}
+}
+
 func TestReloginWithoutAPasswordSaysSo(t *testing.T) {
 	m := newTestManager(t, nil)
 	ctx := context.Background()
@@ -2649,10 +2812,10 @@ func TestAReloginOfAnActiveAccountIsRefused(t *testing.T) {
 	}
 	err = m.Relogin(ctx, "acc_1")
 	if err == nil {
-		t.Fatal("no error for an account that is not signed out")
+		t.Fatal("no error for an account that does not need a sign-in")
 	}
-	if !errors.Is(err, ErrNotSignedOut) {
-		t.Fatalf("error = %q, want it to say the account is not signed out", err)
+	if !errors.Is(err, ErrNoLoginNeeded) {
+		t.Fatalf("error = %q, want it to say the account does not need a sign-in", err)
 	}
 	if signedIn {
 		t.Fatal("an active account was signed in again")

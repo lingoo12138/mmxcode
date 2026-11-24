@@ -1401,11 +1401,97 @@ func TestTheReloginPageListsTheSignedOutAccounts(t *testing.T) {
 	}
 }
 
-// TestTheReloginPageHasNoAccountWithoutAPassword says an account that
-// has no password is not on the relogin page.
+// TestTheReloginPageListsTheDeadChainAccounts says the relogin page
+// says which accounts have a dead chain.
 //
-// 没有密码就没有能登回去的东西，把它摆在那儿只会让人白按一次。
-func TestTheReloginPageHasNoAccountWithoutAPassword(t *testing.T) {
+// 刷新令牌的答案丢了以后，那个号就再也没有人能续它了 —— 它跟签出的号
+// 一样要人登回去。不把它摆到重登那一页去，它就一直在那儿等着。
+func TestTheReloginPageListsTheDeadChainAccounts(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_11", Name: "链断了的", Email: "dead@example.com",
+		Status: store.StatusError, LastError: manager.UnknownOutcomeReason,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(context.Background(), "acc_11", "cipher", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "dead@example.com") {
+		t.Fatalf("the account with the dead chain is not on the page: %q", body)
+	}
+	if !strings.Contains(body, "链断了") {
+		t.Fatalf("the page does not say the chain is broken: %q", body)
+	}
+}
+
+// TestTheReloginPageHasNoAccountWithAnotherError says an account that
+// is in error for another reason is not on the relogin page.
+//
+// 「出错」是宽泛的状态：读不到额度那样的错也是它。那种错不用登回去
+// —— 它自己会好。摆到重登那一页去，人就白按一次。
+func TestTheReloginPageHasNoAccountWithAnotherError(t *testing.T) {
+	w, s := newTestWebUIWithConfig(t, config.Default())
+	now := time.Now()
+	if err := s.CreateAccount(context.Background(), store.Account{
+		ID: "acc_12", Name: "读不到额度的", Email: "other@example.com",
+		Status: store.StatusError, LastError: "the plan could not be read: the membership service said 502",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(context.Background(), "acc_12", "cipher", now); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/relogin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "other@example.com") {
+		t.Fatalf("an account with another error is on the page: %q", rec.Body.String())
+	}
+}
+
+// TestOneAccountCanBeSignedInAgain says one account can be signed in
+// again on its own.
+//
+// 一趟登二十个：人要是只想登一个，就得能点那一个。
+func TestOneAccountCanBeSignedInAgain(t *testing.T) {
+	w, _ := newTestWebUIWithConfig(t, config.Default())
+	var got string
+	w.ReloginOne = func(ctx context.Context, accountID string) error {
+		got = accountID
+		return nil
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/relogin/acc_09", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if got != "acc_09" {
+		t.Fatalf("account = %q, want acc_09", got)
+	}
+}
+
+// TestTheReloginPageHasNoPasswordAccountHasNoButton says an account
+// that has no password is on the page, but with no way to sign it in
+// from there.
+//
+// 没有密码就没有能登回去的东西：它还是得摆在这儿（它确实断了），
+// 但那个按钮不能有 —— 摆一个按不动的按钮，不如摆一句「去登一次」。
+func TestTheReloginPageHasNoPasswordAccountHasNoButton(t *testing.T) {
 	w, s := newTestWebUIWithConfig(t, config.Default())
 	now := time.Now()
 	if err := s.CreateAccount(context.Background(), store.Account{
@@ -1420,8 +1506,15 @@ func TestTheReloginPageHasNoAccountWithoutAPassword(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if strings.Contains(rec.Body.String(), "c@example.com") {
-		t.Fatalf("an account without a password is on the page: %q", rec.Body.String())
+	body := rec.Body.String()
+	if !strings.Contains(body, "c@example.com") {
+		t.Fatalf("an account without a password is not on the page: %q", body)
+	}
+	if strings.Contains(body, `data-relogin="acc_10"`) {
+		t.Fatalf("the page offers to sign in an account it has no password for: %q", body)
+	}
+	if !strings.Contains(body, "去登一次") {
+		t.Fatalf("the page does not say how to sign that account in: %q", body)
 	}
 }
 

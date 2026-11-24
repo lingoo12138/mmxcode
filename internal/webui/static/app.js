@@ -888,7 +888,7 @@ function openDrawer(row) {
 
   const list = document.createElement('dl');
   list.className = 'kv';
-  const statusText = statusNames[d.status] || d.status;
+  const statusText = d.state || statusNames[d.status] || d.status;
   const left = d.hasAmounts === 'true'
     ? (Number(d.remaining).toFixed(2) + ' / ' + Number(d.granted).toFixed(2))
     : '读不到';
@@ -1494,8 +1494,35 @@ function showImportResults(run) {
   }
 }
 
-// 重登：把签出的账号重新登一遍。
+// 重登：把断了的账号重新登一遍。
+//
+// 两个门：一个登全部，一个登一个。登一个是给人用的：一趟里登二十个，
+// 人要是只想登一个，就得能点那一个。
 document.addEventListener('click', async (ev) => {
+  const one = ev.target.closest('[data-relogin]');
+  if (one) {
+    const id = one.getAttribute('data-relogin');
+    const status = document.getElementById('relogin-status') || document.getElementById('status');
+    one.disabled = true;
+    if (status) status.textContent = '重登中……';
+    try {
+      const answer = await call('/api/relogin/' + encodeURIComponent(id), { method: 'POST' });
+      if (!answer.ok) throw new Error(messageOf(answer));
+      if (status) status.textContent = '登回去了：' + id;
+      // 这一行已经修好了：从页面上拿掉，剩下的行还在那儿等着。
+      // 理由那一行也是这个账号的，一块儿拿掉。
+      const row = one.closest('[data-relogin-row]');
+      if (row) {
+        const who = row.getAttribute('data-relogin-row');
+        row.remove();
+        document.querySelectorAll('[data-relogin-why="' + who + '"]').forEach(n => n.remove());
+      }
+    } catch (e) {
+      if (status) status.textContent = '失败：' + e.message;
+      one.disabled = false;
+    }
+    return;
+  }
   const button = ev.target.closest('#relogin-all');
   if (!button) return;
   const status = document.getElementById('relogin-status');
