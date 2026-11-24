@@ -86,6 +86,19 @@ type WebUI struct {
 	// 一趟里登二十个，人要是只想登一个，就得能点那一个。所以它跟
 	// Relogin 分开：一个要的是「这些」，一个要的是「这个」。
 	ReloginOne func(ctx context.Context, accountID string) error
+	// CheckinAll checks in the accounts that have not checked in today.
+	//
+	// 它是每天那趟签到的手动版本：服务器 00:00 没开着的那一天、那趟
+	// 跑到一半崩了、号是后来加的 —— 这些号今天还没签到，补上。
+	//
+	// 一趟要签的号可能有几百个，跑一分多钟，所以它是后台的活儿：页面
+	// 上看着它走到哪儿，不等着它。onStep 是每一个号的结果。
+	CheckinAll func(ctx context.Context, onStep func(CheckinStep))
+	// Context is the context the background work runs under.
+	//
+	// 补签那一趟是后台的活儿：请求的上下文在回答发出去的时候就死了，
+	// 那一趟得活到它签完。它跟着网关一起活到网关关掉。
+	Context context.Context
 	// PasswordNote says what happens to the passwords of the accounts
 	// that are brought in.
 	//
@@ -101,6 +114,97 @@ type WebUI struct {
 	// pendingTTL is how long a sign-in that has ended is kept. It is a
 	// field so that a test can make it short.
 	pendingTTL time.Duration
+	// checkin is the catch-up pass that is running, or ran.
+	checkin checkinRun
+}
+
+// CheckinStep is one account's check-in in a catch-up pass.
+//
+// 它说的是一个号签到了没有：签到了给多少积分，连着几天，签不上是
+// 为什么。人看着这一趟走到哪儿，靠的就是它。
+type CheckinStep struct {
+	// AccountID is the account.
+	AccountID string
+	// Outcome is what happened: claimed, done, ineligible, inactive,
+	// failed.
+	Outcome string
+	// Error is what went wrong, when something did.
+	Error string
+}
+
+// checkinRun is the state of the catch-up pass.
+//
+// 一趟补签是后台的活儿，跑一分多钟。页面上得看着它走到哪儿，所以这
+// 一份状态得有人看着 —— 一把锁，够了。
+type checkinRun struct {
+	mu sync.Mutex
+	// running says a pass is going on.
+	running bool
+	// total is how many accounts the pass has to do.
+	total int
+	// done is how many it has done.
+	done int
+	// failed is how many of those failed.
+	failed int
+	// fixed is how many it signed in.
+	fixed int
+	// message is what to say about it.
+	message string
+}
+
+// begin starts a pass, and says whether it started.
+//
+// 已经有一趟在跑的时候不再起一趟：两个号被签两次，站点拒一次是白花
+// 一次调用。
+func (r *checkinRun) begin(total int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running {
+		return false
+	}
+	r.running = true
+	r.total = total
+	r.done = 0
+	r.failed = 0
+	r.fixed = 0
+	r.message = ""
+	return true
+}
+
+// step records one account of the pass.
+func (r *checkinRun) step(s CheckinStep) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done++
+	if s.Error != "" {
+		r.failed++
+		return
+	}
+	if s.Outcome == "claimed" || s.Outcome == "done" {
+		r.fixed++
+	}
+}
+
+// end says the pass is over.
+func (r *checkinRun) end() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.running = false
+	if r.failed > 0 {
+		r.message = fmt.Sprintf("补签完了：签上 %d，失败 %d", r.fixed, r.failed)
+		return
+	}
+	r.message = fmt.Sprintf("补签完了：签上 %d", r.fixed)
+}
+
+// state is what the page asks about.
+func (r *checkinRun) state() map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return map[string]any{
+		"running": r.running, "total": r.total, "done": r.done,
+		"failed": r.failed, "fixed": r.fixed, "message": r.message,
+	}
 }
 
 // New makes the WebUI.
@@ -119,6 +223,9 @@ func New(mgr *manager.Manager, cfg config.Config, s *store.Store) *WebUI {
 		tmpl:       tmpl,
 		pending:    map[string]*pendingLogin{},
 		pendingTTL: defaultPendingTTL,
+		// 补签那一趟是后台的活儿：它得活到签完。默认是背景的，网关
+		// 起来以后会把它换成网关自己的那个。
+		Context: context.Background(),
 	}
 }
 
@@ -169,6 +276,9 @@ func (w *WebUI) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	case "/api/relogin":
 		w.apiRelogin(rw, r)
+		return
+	case "/api/checkin":
+		w.apiCheckinAll(rw, r)
 		return
 	case "/api/keys":
 		w.apiKeys(rw, r)
@@ -1423,6 +1533,44 @@ func (w *WebUI) apiCheckin(rw http.ResponseWriter, r *http.Request, id string) {
 		"outcome": out.Outcome, "credit": out.Credit,
 		"streak": out.Streak, "message": out.Message,
 	})
+}
+
+// apiCheckinAll starts a catch-up pass, or says how the one that is
+// going on is doing.
+//
+// POST 起一趟，GET 问一问现在到哪儿了。
+//
+// 一趟要签的号可能有几百个，跑一分多钟 —— 它是后台的活儿，回答不等它。
+// 已经有一趟在跑的时候不再起一趟：同一个号签两次，站点拒一次是白花一
+// 次调用。
+func (w *WebUI) apiCheckinAll(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(rw, w.checkin.state())
+		return
+	}
+	if w.CheckinAll == nil {
+		http.Error(rw, "这个网关没有补签", http.StatusNotImplemented)
+		return
+	}
+	// 一趟要签几个号：名单是现读的（今天还没签的那些）。它跟那一趟
+	// 读的是同一份，所以数字是对得上的。
+	total := 0
+	if accounts, err := w.Store.AccountsWithoutCheckin(r.Context(), w.Store.Today()); err == nil {
+		total = len(accounts)
+	}
+	if !w.checkin.begin(total) {
+		http.Error(rw, "已经有一趟补签在跑了", http.StatusConflict)
+		return
+	}
+	ctx := w.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		defer w.checkin.end()
+		w.CheckinAll(ctx, func(s CheckinStep) { w.checkin.step(s) })
+	}()
+	writeJSON(rw, w.checkin.state())
 }
 
 // apiAccountUsage gives one account's credits.

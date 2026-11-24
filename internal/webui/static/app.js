@@ -376,6 +376,36 @@ function outcomeWords(out) {
   }
 }
 
+// setChecked writes the result of a check-in into the cell that says
+// whether the account checked in today.
+//
+// 每一种结果都写：签过的写「已签 N 天」，不能签的写「不能签」，不能
+// 用了的写「不能用了」。只写签成了的那一种，别的结果就停在「未签」——
+// 人看着像没签成，那句话也不对。
+function setChecked(cell, out) {
+  const o = out && out.outcome;
+  let word = '';
+  let cls = '';
+  if (o === 'claimed' || o === 'done') {
+    word = '已签 ' + (out.streak || 1) + ' 天';
+    cls = 'good';
+  } else if (o === 'ineligible') {
+    word = '不能签';
+  } else if (o === 'inactive') {
+    word = '不能用了';
+    cls = 'bad';
+  } else if (o === 'failed') {
+    word = '签到失败';
+    cls = 'bad';
+  }
+  if (!word) return;
+  cell.textContent = '';
+  const pill = document.createElement('span');
+  pill.className = cls ? 'pill ' + cls : 'pill';
+  pill.textContent = word;
+  cell.appendChild(pill);
+}
+
 // ---------------------------------------------------------------- 主题
 
 // 主题：跟着系统、浅色、深色，三样轮着来。
@@ -501,6 +531,80 @@ function outcomeWords(out) {
     });
   }
   apply();
+})();
+
+// ---------------------------------------------------------------- 补签
+
+// 补签：给今天还没签到的号补签。
+//
+// 服务器 00:00 没开着的那一天、那趟跑到一半崩了、号是后来加进来的 ——
+// 这些号今天还没签到，补上。站点只给当天的签到：过去漏掉的那几天补不
+// 回来。
+//
+// 一趟要签的号可能有几百个，跑一分多钟，所以它是后台的活儿：这一页
+// 看着它走到哪儿，不等着它。
+(function () {
+  const button = document.getElementById('checkin-catchup');
+  if (!button) return;
+  const status = document.getElementById('checkin-status');
+
+  // watch 看着那一趟：它走到哪儿了、完了没有。
+  const watch = async () => {
+    for (;;) {
+      let state = null;
+      try {
+        const answer = await call('/api/checkin');
+        state = answer.json || {};
+      } catch (e) {
+        // 网关那边问不着了：这一趟的进度就看不见了，别把它当成「完了」。
+        if (status) status.textContent = '问不着这一趟到哪儿了：' + e.message;
+        return;
+      }
+      if (!state.running) {
+        if (status) status.textContent = state.message || '补签完了';
+        button.disabled = false;
+        // 表格上的「今日签到」和概览上「能签的都签了」都变了：重新取
+        // 一次页面。筛的条件在地址栏里，重取以后还在。
+        location.reload();
+        return;
+      }
+      if (status) {
+        status.textContent = '补签中 ' + state.done + ' / ' + state.total +
+          '（失败 ' + state.failed + '）';
+      }
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+  };
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    if (status) status.textContent = '补签中……';
+    try {
+      const answer = await call('/api/checkin', { method: 'POST' });
+      const state = answer.json || {};
+      if (state.running) {
+        await watch();
+        return;
+      }
+      if (status) status.textContent = state.message || '补签完了';
+      button.disabled = false;
+    } catch (e) {
+      if (status) status.textContent = '补签没起来：' + e.message;
+      button.disabled = false;
+    }
+  });
+
+  // 页面开着的时候那一趟可能已经在跑了（别人叫的，或者刚才这一趟还没
+  // 完）：看着它。
+  call('/api/checkin').then((answer) => {
+    const state = answer.json || {};
+    if (state.running) {
+      button.disabled = true;
+      watch();
+    } else if (state.message && status) {
+      status.textContent = state.message;
+    }
+  }).catch(() => { /* 问不着就算了 */ });
 })();
 
 // bandOf finds the error line that belongs to an account row.
@@ -1087,19 +1191,11 @@ document.addEventListener('click', async (ev) => {
     if (svg) svg.classList.add('is-spin');
     try {
       const out = await post('/api/accounts/' + encodeURIComponent(id) + '/checkin', undefined, '正在签到');
-      const word = outcomeWords(out);
-      // 签过了就把这一行的按钮收掉：跟服务端渲染出来的样子一样。
-      const td = checkin.closest('td');
-      if (td) td.textContent = '';
-      // 签到了就把那一格改过来：不然表格还在说「未签」。
-      if (cell && out.outcome === 'claimed') {
-        cell.textContent = '';
-        const pill = document.createElement('span');
-        pill.className = 'pill good';
-        pill.textContent = '已签 ' + (out.streak || 1) + ' 天';
-        cell.appendChild(pill);
-      }
-      say(word);
+      // 结果摆进「今日签到」那一格：每一种结果都写。签过的写「已签 N
+      // 天」，不能签的写「不能签」。只写签成了的那一种，表格就停在
+      // 「未签」—— 人看着像没签成。
+      if (cell) setChecked(cell, out);
+      say(outcomeWords(out));
     } catch (e) {
       // 失败要说清楚为什么，还得能再按一次。
       if (use) use.setAttribute('href', '/static/icons.svg#alert-triangle');
@@ -1108,7 +1204,13 @@ document.addEventListener('click', async (ev) => {
       checkin.title = String(e.message);
       checkin.setAttribute('aria-label', '签到失败：' + e.message);
       say('签到失败：' + e.message);
+      return;
     }
+    // 按钮还在那儿：还能再按一次（站点答「今天已经签过了」也是一句话）。
+    // 把它抹掉的话，签过的号就没有按钮了 —— 看着像坏了。
+    checkin.disabled = false;
+    if (use) use.setAttribute('href', '/static/icons.svg#check');
+    if (svg) svg.classList.remove('is-spin');
     return;
   }
 

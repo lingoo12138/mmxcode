@@ -1915,3 +1915,98 @@ func TestTheAccountPointsAtAGroup(t *testing.T) {
 		t.Errorf("the answer is %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestTheCheckinButtonIsThereForEveryAccount says every account has a
+// check-in button, even one that checked in today.
+//
+// 自动签到每天 00:00 把大家都签了，按钮于是都没了：人想手动签一个号，
+// 按键却不在那儿，看着像坏了。
+func TestTheCheckinButtonIsThereForEveryAccount(t *testing.T) {
+	w, s := newTestWebUI(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_01", Day: s.Today(), Outcome: "claimed", Credit: 25,
+		Streak: 3, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/accounts", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `data-checkin="acc_01"`) {
+		t.Fatalf("the account that checked in today has no check-in button: %q", rec.Body.String())
+	}
+}
+
+// TestTheCatchupPassRunsAndSaysHowItIsDoing says the catch-up pass
+// signs the accounts in and the page can watch it.
+//
+// 补签是后台的活儿：跑一分多钟。页面上得看着它走到哪儿，完了以后得
+// 说得清签上了几个、失败了几个。
+func TestTheCatchupPassRunsAndSaysHowItIsDoing(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	w.CheckinAll = func(ctx context.Context, onStep func(CheckinStep)) {
+		onStep(CheckinStep{AccountID: "acc_01", Outcome: "claimed"})
+		onStep(CheckinStep{AccountID: "acc_02", Outcome: "done"})
+		onStep(CheckinStep{AccountID: "acc_03", Error: "the site said no"})
+	}
+	rec := w.do(t, http.MethodPost, "/api/checkin", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	// 那一趟是后台跑的：等它跑完，再问它到哪儿了。
+	state := w.checkinState(t)
+	for state["running"] == true {
+		time.Sleep(10 * time.Millisecond)
+		state = w.checkinState(t)
+	}
+	if state["fixed"] != float64(2) {
+		t.Errorf("fixed = %v, want 2", state["fixed"])
+	}
+	if state["failed"] != float64(1) {
+		t.Errorf("failed = %v, want 1", state["failed"])
+	}
+	msg, _ := state["message"].(string)
+	if !strings.Contains(msg, "签上 2") || !strings.Contains(msg, "失败 1") {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+// TestTwoCatchupPassesDoNotRunAtOnce says a second catch-up is refused
+// while one is running.
+//
+// 同一个号签两次，站点拒一次是白花一次调用。
+func TestTwoCatchupPassesDoNotRunAtOnce(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	release := make(chan struct{})
+	w.CheckinAll = func(ctx context.Context, onStep func(CheckinStep)) {
+		<-release
+	}
+	rec := w.do(t, http.MethodPost, "/api/checkin", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = w.do(t, http.MethodPost, "/api/checkin", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("the second answer is %d: %s", rec.Code, rec.Body.String())
+	}
+	close(release)
+}
+
+// checkinState asks the page what the catch-up pass is doing.
+func (w *WebUI) checkinState(t *testing.T) map[string]any {
+	t.Helper()
+	rec := w.do(t, http.MethodGet, "/api/checkin", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}

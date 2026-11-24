@@ -2,6 +2,11 @@
 <div class="page-head">
   <p class="lead">网关后面站着的每一个账号。出口、签到、积分都在这一页上改。</p>
   <div class="page-actions">
+    <span class="muted" id="checkin-status" role="status" aria-live="polite"></span>
+    <button type="button" class="btn" id="checkin-catchup"
+      title="给今天还没签到的号补签（服务器 00:00 没开着、那趟跑了一半、号是后来加的，都是这种）">
+      <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg><span>补签</span>
+    </button>
     <a class="btn" href="/import"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#upload"/></svg><span>导入</span></a>
     <a class="btn primary" href="/login"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#login"/></svg><span>登录新账号</span></a>
   </div>
@@ -61,10 +66,10 @@
   <td class="act">{{if $acc.NeedsLogin}}<a class="row-act" href="/relogin"
     title="去重登页把这个号登回去" aria-label="去重登页把这个号登回去">
     <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#refresh"/></svg>
-  </a>{{end}}{{if not $acc.CheckedIn}}<button type="button" class="row-act" data-checkin="{{$acc.ID}}"
-    title="立即签到" aria-label="给 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}} 签到">
+  </a>{{end}}<button type="button" class="row-act" data-checkin="{{$acc.ID}}"
+    title="给这个号签到（签过了再点一次，站点会说今天已经签过了）" aria-label="给 {{if $acc.Name}}{{$acc.Name}}{{else if $acc.Email}}{{$acc.Email}}{{else}}{{$acc.ID}}{{end}} 签到">
     <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#check"/></svg>
-  </button>{{end}}</td>
+  </button></td>
 </tr>
 {{if $acc.LastError}}
 <tr class="err-row" data-owner="{{$acc.ID}}"><td colspan="8" class="err-band" title="{{$acc.LastError}}"><span class="who">{{$acc.State}}</span>{{$acc.LastError}}</td></tr>

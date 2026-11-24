@@ -1123,3 +1123,85 @@ func TestTheAddressesInTheGroupsAreChecked(t *testing.T) {
 		t.Errorf("the address in the group was not checked: %+v", rows)
 	}
 }
+
+// TestTheCatchupSignsInTheAccountsThatMissedToday says the catch-up
+// pass signs the accounts that have not checked in today, and says what
+// happened as it goes.
+//
+// 服务器 00:00 没开着的那一天、那趟跑到一半崩了、号是后来加的 —— 这些
+// 号今天还没签到，补上。页面上看着这一趟走到哪儿，靠的就是 onStep。
+func TestTheCatchupSignsInTheAccountsThatMissedToday(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.Write([]byte(`{"data":{"days":[
+				{"day_no":1,"status":3,"is_today":false,"points":25},
+				{"day_no":2,"status":3,"is_today":false,"points":25},
+				{"day_no":3,"status":3,"is_today":false,"points":25},
+				{"day_no":4,"status":2,"is_today":true,"points":25},
+				{"day_no":5,"status":1,"is_today":false,"points":25},
+				{"day_no":6,"status":1,"is_today":false,"points":25},
+				{"day_no":7,"status":1,"is_today":false,"points":25}]}}`))
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			w.Write([]byte(`{}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Migrate(ctx)
+	defer s.Close()
+	now := time.Now()
+	// 一个今天还没签的号，一个今天签过了的号。
+	for _, id := range []string{"acc_missed", "acc_done"} {
+		if err := s.CreateAccount(ctx, store.Account{
+			ID: id, Name: id, Status: store.StatusActive, UserID: "1",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveToken(ctx, store.Token{
+			AccountID: id, Access: "tok", Refresh: "ref",
+			ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveCheckin(ctx, store.Checkin{
+		AccountID: "acc_done", Day: s.Today(), Outcome: "claimed", Credit: 25,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	up := upstream.New(upstream.Options{Timeout: 5 * time.Second})
+	acc := account.New(up)
+	acc.SetBase(srv.URL, srv.URL)
+	mgr := manager.New(s, up, acc, egress.New(""), oauth.NewRenewer())
+
+	sc := New(mgr, config.Default())
+	steps := []CheckinResult{}
+	sc.Catchup(ctx, func(r CheckinResult) { steps = append(steps, r) })
+	if len(steps) != 1 {
+		t.Fatalf("steps = %+v, want only the account that missed today", steps)
+	}
+	if steps[0].AccountID != "acc_missed" {
+		t.Fatalf("the account = %q", steps[0].AccountID)
+	}
+	if steps[0].Outcome != "claimed" {
+		t.Fatalf("outcome = %q", steps[0].Outcome)
+	}
+	// 签到了，库里得有那一行：不然它今天的积分进不了池。
+	rows, err := s.CheckinTimes(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("the check-ins = %+v, want two", rows)
+	}
+}

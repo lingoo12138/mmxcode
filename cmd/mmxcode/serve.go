@@ -53,6 +53,17 @@ func newServeCmd(e *env) *cobra.Command {
 			//（规格 §6.3）。
 			gw.SeedPool(ctx)
 			sc := scheduler.New(e.mgr, e.cfg)
+			// 页面上那个「补签」：它跟每天 00:00 那趟是同一件事，只是
+			// 人手动叫的。补签那一趟是后台的活儿，所以它得活到签完 ——
+			// 用的是网关自己的那个上下文，不是那一次请求的。
+			ui.Context = ctx
+			ui.CheckinAll = func(ctx context.Context, onStep func(webui.CheckinStep)) {
+				sc.Catchup(ctx, func(r scheduler.CheckinResult) {
+					onStep(webui.CheckinStep{
+						AccountID: r.AccountID, Outcome: r.Outcome, Error: r.Error,
+					})
+				})
+			}
 
 			srv := &http.Server{
 				Addr:              listen,

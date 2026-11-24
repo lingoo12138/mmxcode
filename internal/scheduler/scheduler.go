@@ -127,6 +127,14 @@ const checkinBatch = 50
 // 「今天」是站点的那一天（大陆时间），跟管理器写进去的那一行是同一个
 // 日子。
 func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
+	return s.checkins(ctx, nil)
+}
+
+// checkins is the pass itself.
+//
+// onStep 是每一个号的结果（有人要看着这一趟走到哪儿：页面上那个补签
+// 就是这么看着的）。没有 onStep 的时候没人看。
+func (s *Scheduler) checkins(ctx context.Context, onStep func(CheckinResult)) []CheckinResult {
 	accounts, err := s.Mgr.Store.AccountsWithoutCheckin(ctx, s.Mgr.Store.Today())
 	if err != nil {
 		fmt.Printf("checkin: the accounts to check in could not be read: %v\n", err)
@@ -153,6 +161,9 @@ func (s *Scheduler) CheckinAll(ctx context.Context) []CheckinResult {
 			}
 		}
 		out = append(out, r)
+		if onStep != nil {
+			onStep(r)
+		}
 	}
 	// 最后不满一批的也写下去。
 	s.Mgr.RecordCheckins(ctx, records)
@@ -408,9 +419,26 @@ func (s *Scheduler) Run(ctx context.Context) {
 // 拒一次（白花一次调用，规格 §5.2）。后到的那趟等前一趟跑完，名单是
 // 现读的，前一趟签过的号不在里面。
 func (s *Scheduler) checkinAll(ctx context.Context) {
+	s.Catchup(ctx, nil)
+}
+
+// Catchup checks in the accounts that have not checked in today, and
+// says what happened as it goes.
+//
+// 人手动叫的那一趟补签。它跟 00:00 那趟是同一件事：签今天还没签的号。
+// 服务器 00:00 没开着的那一天、那趟跑到一半崩了、号是后来加进来的 ——
+// 这些号今天还没签到，补上。
+//
+// 站点只给当天的签到：过去漏掉的那几天补不回来，页面上要说明白。
+//
+// 它跟 00:00 那趟共用一把锁：两趟不叠着跑（同一个号被站点拒一次是
+// 白花一次调用，规格 §5.2）。
+//
+// onStep 是每一个号的结果：有人要看着这一趟走到哪儿。
+func (s *Scheduler) Catchup(ctx context.Context, onStep func(CheckinResult)) {
 	s.checkinMu.Lock()
 	defer s.checkinMu.Unlock()
-	for _, r := range s.CheckinAll(ctx) {
+	for _, r := range s.checkins(ctx, onStep) {
 		if r.Error != "" {
 			fmt.Printf("checkin %s: %s\n", r.AccountID, r.Error)
 			continue
