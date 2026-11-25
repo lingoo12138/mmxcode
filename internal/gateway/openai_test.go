@@ -331,6 +331,109 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 	}
 }
 
+// TestTheOpenAIAnswerCarriesTheCachedTokens says the cached tokens
+// reach the client of the OpenAI door.
+//
+// 上游只说「13 个新字进去，159 个字命中了缓存」。OpenAI 那边要的是一个
+// 总数（prompt_tokens）和一个命中数（cached_tokens），总数里含着命中的
+// 那部分。以前只把 13 报上去：客户端算出来的提示词小了一大截，命中是
+// 0 —— 缓存明明命中了，账上却看不出来。
+func TestTheOpenAIAnswerCarriesTheCachedTokens(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.ChatCompletionsPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","model":"m","stop_reason":"end_turn",` +
+			`"content":[{"type":"text","text":"hi"}],` +
+			`"usage":{"input_tokens":13,"output_tokens":149,"cache_creation_input_tokens":0,"cache_read_input_tokens":159}}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var answer struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+			Details          struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if answer.Usage.PromptTokens != 172 {
+		t.Fatalf("prompt_tokens = %d, want 172", answer.Usage.PromptTokens)
+	}
+	if answer.Usage.CompletionTokens != 149 {
+		t.Fatalf("completion_tokens = %d, want 149", answer.Usage.CompletionTokens)
+	}
+	if answer.Usage.TotalTokens != 321 {
+		t.Fatalf("total_tokens = %d, want 321", answer.Usage.TotalTokens)
+	}
+	if answer.Usage.Details.CachedTokens != 159 {
+		t.Fatalf("cached_tokens = %d, want 159", answer.Usage.Details.CachedTokens)
+	}
+}
+
+// TestTheCodexAnswerCarriesTheCachedTokens says the same for the Codex
+// door.
+//
+// 形状不一样：总数叫 input_tokens，命中数在 input_tokens_details 里。
+func TestTheCodexAnswerCarriesTheCachedTokens(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == site.ResponsesPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","model":"m","stop_reason":"end_turn",` +
+			`"content":[{"type":"text","text":"hi"}],` +
+			`"usage":{"input_tokens":13,"output_tokens":149,"cache_creation_input_tokens":0,"cache_read_input_tokens":159}}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"m","input":"hi"}`))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var answer struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+			Details      struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("the answer is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if answer.Usage.InputTokens != 172 {
+		t.Fatalf("input_tokens = %d, want 172", answer.Usage.InputTokens)
+	}
+	if answer.Usage.OutputTokens != 149 {
+		t.Fatalf("output_tokens = %d, want 149", answer.Usage.OutputTokens)
+	}
+	if answer.Usage.TotalTokens != 321 {
+		t.Fatalf("total_tokens = %d, want 321", answer.Usage.TotalTokens)
+	}
+	if answer.Usage.Details.CachedTokens != 159 {
+		t.Fatalf("cached_tokens = %d, want 159", answer.Usage.Details.CachedTokens)
+	}
+}
+
 // TestTheOpenAIRequestFallsBackWhenTheOpenPlatformIsNotConfigured says a
 // 503 from the open platform is "this account has no route there", not a
 // failure to hand to the client.

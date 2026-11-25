@@ -40,12 +40,6 @@ type anthropicContent struct {
 	Input json.RawMessage `json:"input"`
 }
 
-// anthropicUsage is what an answer says about its tokens.
-type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-}
-
 // ToResponses turns an Anthropic answer into a Responses answer.
 //
 // The items are the ones the streaming converter writes for the very
@@ -107,11 +101,9 @@ func ToResponses(body []byte, model string) ([]byte, error) {
 		out["reasoning_summary_text"] = reasoning.String()
 	}
 	if msg.Usage != nil {
-		out["usage"] = map[string]any{
-			"input_tokens":  msg.Usage.InputTokens,
-			"output_tokens": msg.Usage.OutputTokens,
-			"total_tokens":  msg.Usage.InputTokens + msg.Usage.OutputTokens,
-		}
+		// 用量照 Anthropic 那一路的数换算：总数是输入加命中缓存的那
+		// 部分，命中了多少另说。
+		out["usage"] = responsesUsage(msg.Usage.counts())
 	}
 	return json.Marshal(out)
 }

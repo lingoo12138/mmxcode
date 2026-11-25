@@ -333,11 +333,9 @@ func ToChatCompletion(body []byte, model string) ([]byte, error) {
 		}},
 	}
 	if msg.Usage != nil {
-		out["usage"] = map[string]any{
-			"prompt_tokens":     msg.Usage.InputTokens,
-			"completion_tokens": msg.Usage.OutputTokens,
-			"total_tokens":      msg.Usage.InputTokens + msg.Usage.OutputTokens,
-		}
+		// prompt_tokens 是输入的总字数：命中缓存的那些字在里头，
+		// prompt_tokens_details 说命中了多少。
+		out["usage"] = chatUsage(msg.Usage.counts())
 	}
 	return json.Marshal(out)
 }
@@ -381,11 +379,9 @@ type chatConverter struct {
 	// sawStop says the upstream's stream ended the way it should.
 	sawStop bool
 
-	// inputTokens and outputTokens are what the answer cost. The
-	// upstream says so at the start (the words that went in) and at
-	// the end (the words that came out).
-	inputTokens  int
-	outputTokens int
+	// counts is what the answer cost. The upstream says so at the start
+	// (the words that went in) and at the end (the words that came out).
+	counts tokenCounts
 }
 
 // StreamChatCompletions turns the upstream's Anthropic stream into an
@@ -463,7 +459,7 @@ func (c *chatConverter) event(ev *anthropicEvent) error {
 			if c.model == "" {
 				c.model = ev.Message.Model
 			}
-			c.inputTokens = ev.Message.Usage.InputTokens
+			c.counts.take(&ev.Message.Usage)
 		}
 	case "content_block_start":
 		return c.startBlock(ev)
@@ -475,14 +471,9 @@ func (c *chatConverter) event(ev *anthropicEvent) error {
 		if ev.Delta != nil && ev.Delta.StopReason != "" {
 			c.stopReason = ev.Delta.StopReason
 		}
-		if ev.Usage != nil {
-			// 有多少字进去了、有多少字出来了：上游在头一个事件和最后
-			// 一个事件里说的。
-			if ev.Usage.InputTokens > 0 {
-				c.inputTokens = ev.Usage.InputTokens
-			}
-			c.outputTokens = ev.Usage.OutputTokens
-		}
+		// 有多少字进去了、有多少字出来了、有多少命中了缓存：上游在
+		// 头一个事件和最后一个事件里说的，后说的算数。
+		c.counts.take(ev.Usage)
 	case "message_stop":
 		c.sawStop = true
 	}
@@ -594,11 +585,7 @@ func (c *chatConverter) usage() error {
 		"id": c.id, "object": "chat.completion.chunk",
 		"created": c.created, "model": c.model,
 		"choices": []any{},
-		"usage": map[string]any{
-			"prompt_tokens":     c.inputTokens,
-			"completion_tokens": c.outputTokens,
-			"total_tokens":      c.inputTokens + c.outputTokens,
-		},
+		"usage":   chatUsage(c.counts),
 	})
 	if err != nil {
 		return err

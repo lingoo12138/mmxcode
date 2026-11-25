@@ -18,13 +18,10 @@ type anthropicEvent struct {
 	Type    string `json:"type"`
 	Index   int    `json:"index"`
 	Message *struct {
-		ID         string `json:"id"`
-		Model      string `json:"model"`
-		StopReason string `json:"stop_reason"`
-		Usage      struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		ID         string         `json:"id"`
+		Model      string         `json:"model"`
+		StopReason string         `json:"stop_reason"`
+		Usage      anthropicUsage `json:"usage"`
 	} `json:"message"`
 	ContentBlock *struct {
 		Type     string          `json:"type"`
@@ -41,10 +38,7 @@ type anthropicEvent struct {
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
-	Usage *struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage *anthropicUsage `json:"usage"`
 	// Error is the error an error event carries.
 	Error json.RawMessage `json:"error"`
 	// StatusInfo and BaseResp are MiniMax's own ways of saying that
@@ -111,8 +105,9 @@ type converter struct {
 	text      strings.Builder
 	reasoning strings.Builder
 
-	inputTokens  int
-	outputTokens int
+	// counts is what the answer cost. The upstream says so at the start
+	// (the words that went in) and at the end (the words that came out).
+	counts tokenCounts
 
 	// sawStop says the upstream's stream ended the way it should.
 	sawStop bool
@@ -213,7 +208,7 @@ func (c *converter) event(ev *anthropicEvent) error {
 	switch ev.Type {
 	case "message_start":
 		if ev.Message != nil {
-			c.inputTokens = ev.Message.Usage.InputTokens
+			c.counts.take(&ev.Message.Usage)
 		}
 	case "content_block_start":
 		return c.startBlock(ev)
@@ -222,9 +217,9 @@ func (c *converter) event(ev *anthropicEvent) error {
 	case "content_block_stop":
 		return c.stopBlock(ev)
 	case "message_delta":
-		if ev.Usage != nil {
-			c.outputTokens = ev.Usage.OutputTokens
-		}
+		// 末尾这一块把话说全了：多少字进去了、多少字出来了、多少
+		// 命中了缓存。开头那块只说了个大概，后说的算数。
+		c.counts.take(ev.Usage)
 	case "message_stop":
 		c.sawStop = true
 	}
@@ -528,10 +523,7 @@ func (c *converter) complete() error {
 			"output":                 c.output(),
 			"output_text":            c.text.String(),
 			"reasoning_summary_text": c.reasoning.String(),
-			"usage": map[string]any{
-				"input_tokens": c.inputTokens, "output_tokens": c.outputTokens,
-				"total_tokens": c.inputTokens + c.outputTokens,
-			},
+			"usage":                  responsesUsage(c.counts),
 		},
 	})
 }
@@ -566,10 +558,7 @@ func (c *converter) fail(code, msg string) error {
 			"status": "failed",
 			"error":  map[string]any{"code": code, "message": msg},
 			"output": c.output(),
-			"usage": map[string]any{
-				"input_tokens": c.inputTokens, "output_tokens": c.outputTokens,
-				"total_tokens": c.inputTokens + c.outputTokens,
-			},
+			"usage":  responsesUsage(c.counts),
 		},
 	}); err != nil {
 		return err
