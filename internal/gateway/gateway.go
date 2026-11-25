@@ -1309,12 +1309,22 @@ func copyHeaders(w http.ResponseWriter, resp *http.Response) {
 // The event that says so has the shape of the protocol the client
 // speaks: an OpenAI client does not read Anthropic's error event, and a
 // Codex client reads the Responses one.
+//
+// 每写一段就冲一次：Go 的 HTTP 服务自己攒着 2048 字节才往 socket 上写，
+// 响应头也在那一份里。不冲的话，客户端连响应头都要等整个答案写完才收
+// 到 —— 流式对话等的是第一个字，攒着就等于没有流式（还有最后那个带
+// usage 的事件：它最后才到，攒着的时候客户端根本等不到）。
 func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto protocol, convertBack bool, model string) {
 	copyHeaders(w, resp)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	// 响应头先出去：客户端知道这一趟成了，在等上游的第一个字。
+	if flusher != nil {
+		flusher.Flush()
+	}
+	out := &flushingWriter{w: w, flusher: flusher}
 
 	var err error
 	if convertBack {
@@ -1322,12 +1332,12 @@ func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto p
 		// 网关再写一个就是第二次失败，形状还不一样。
 		switch proto {
 		case protocolCodex:
-			err = convert.StreamResponses(resp.Body, w, model)
+			err = convert.StreamResponses(resp.Body, out, model)
 		case protocolOpenAI:
-			err = convert.StreamChatCompletions(resp.Body, w, model)
+			err = convert.StreamChatCompletions(resp.Body, out, model)
 		}
 	} else {
-		sniffer := &idSniffer{w: w}
+		sniffer := &idSniffer{w: out}
 		_, err = io.Copy(sniffer, resp.Body)
 		if err != nil {
 			writeStreamError(sniffer, proto, err, model, sniffer.responseID())
@@ -1337,6 +1347,28 @@ func (s *Server) writeStream(w http.ResponseWriter, resp *http.Response, proto p
 		flusher.Flush()
 	}
 	resp.Body.Close()
+}
+
+// flushingWriter writes and then flushes.
+//
+// Go 的 HTTP 服务自己攒着 2048 字节才往 socket 上写（响应头也在里头）。
+// 一段流的头几百字节，谁都在攒着：客户端收不到响应头，也收不到第一个
+// 事件。写一段就冲一下，客户端才拿得到「来了一段」。
+type flushingWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+}
+
+// Write writes and flushes.
+//
+// 冲刷失败了也不当错：那一段已经写进去了（也许在服务自己的缓冲里），
+// 把它当错会让整段流断掉 —— 宁可让客户端晚一点看到，也不能把它腰斩。
+func (f *flushingWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if f.flusher != nil {
+		f.flusher.Flush()
+	}
+	return n, err
 }
 
 // writeStreamError writes the event that says the stream broke.

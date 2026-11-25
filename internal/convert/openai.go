@@ -380,6 +380,12 @@ type chatConverter struct {
 	stopReason string
 	// sawStop says the upstream's stream ended the way it should.
 	sawStop bool
+
+	// inputTokens and outputTokens are what the answer cost. The
+	// upstream says so at the start (the words that went in) and at
+	// the end (the words that came out).
+	inputTokens  int
+	outputTokens int
 }
 
 // StreamChatCompletions turns the upstream's Anthropic stream into an
@@ -453,8 +459,11 @@ func (c *chatConverter) run(r io.Reader) error {
 func (c *chatConverter) event(ev *anthropicEvent) error {
 	switch ev.Type {
 	case "message_start":
-		if ev.Message != nil && c.model == "" {
-			c.model = ev.Message.Model
+		if ev.Message != nil {
+			if c.model == "" {
+				c.model = ev.Message.Model
+			}
+			c.inputTokens = ev.Message.Usage.InputTokens
 		}
 	case "content_block_start":
 		return c.startBlock(ev)
@@ -465,6 +474,14 @@ func (c *chatConverter) event(ev *anthropicEvent) error {
 	case "message_delta":
 		if ev.Delta != nil && ev.Delta.StopReason != "" {
 			c.stopReason = ev.Delta.StopReason
+		}
+		if ev.Usage != nil {
+			// 有多少字进去了、有多少字出来了：上游在头一个事件和最后
+			// 一个事件里说的。
+			if ev.Usage.InputTokens > 0 {
+				c.inputTokens = ev.Usage.InputTokens
+			}
+			c.outputTokens = ev.Usage.OutputTokens
 		}
 	case "message_stop":
 		c.sawStop = true
@@ -558,7 +575,35 @@ func (c *chatConverter) finish() error {
 	}); err != nil {
 		return err
 	}
+	if err := c.usage(); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(c.bw, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return c.bw.Flush()
+}
+
+// usage writes the chunk that says what the answer cost.
+//
+// 它是最后一块，choices 是空的 —— 这是 OpenAI 自己那个样子（客户端问
+// 了 include_usage 的时候，它就是这么发的）。客户端从任何一块上读
+// usage，所以放在哪儿都行，放在最后一块最稳：那时候数已经齐了。
+func (c *chatConverter) usage() error {
+	b, err := json.Marshal(map[string]any{
+		"id": c.id, "object": "chat.completion.chunk",
+		"created": c.created, "model": c.model,
+		"choices": []any{},
+		"usage": map[string]any{
+			"prompt_tokens":     c.inputTokens,
+			"completion_tokens": c.outputTokens,
+			"total_tokens":      c.inputTokens + c.outputTokens,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.bw, "data: %s\n\n", b); err != nil {
 		return err
 	}
 	return c.bw.Flush()

@@ -255,6 +255,12 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 	var text strings.Builder
 	var finish string
 	chunks := 0
+	usage := struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	}{}
+	sawUsage := false
 	for _, line := range strings.Split(stream, "\n") {
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -272,6 +278,11 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			t.Fatalf("a chunk is not JSON: %v (%s)", err, payload)
@@ -282,6 +293,18 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 		if chunk.Model != "m" {
 			t.Fatalf("model = %q", chunk.Model)
 		}
+		if chunk.Usage != nil {
+			// 最后那块只有用量：choices 是空的（OpenAI 自己就那个
+			// 样子）。
+			sawUsage = true
+			usage.PromptTokens = chunk.Usage.PromptTokens
+			usage.CompletionTokens = chunk.Usage.CompletionTokens
+			usage.TotalTokens = chunk.Usage.TotalTokens
+			if len(chunk.Choices) != 0 {
+				t.Fatalf("the usage chunk has choices: %+v", chunk.Choices)
+			}
+			continue
+		}
 		chunks++
 		if len(chunk.Choices) != 1 {
 			t.Fatalf("choices = %+v", chunk.Choices)
@@ -290,6 +313,12 @@ func TestTheOpenAIStreamFallbackEndsWithDone(t *testing.T) {
 		if chunk.Choices[0].FinishReason != nil {
 			finish = *chunk.Choices[0].FinishReason
 		}
+	}
+	if !sawUsage {
+		t.Fatalf("the stream does not say what it used: %s", stream)
+	}
+	if usage.PromptTokens != 5 || usage.CompletionTokens != 3 || usage.TotalTokens != 8 {
+		t.Fatalf("usage = %+v", usage)
 	}
 	if chunks < 2 {
 		t.Fatalf("the stream has %d chunks: %s", chunks, stream)

@@ -455,6 +455,10 @@ func TestStreamChatCompletionsGivesTheChunks(t *testing.T) {
 			t.Fatalf("object = %q", chunk.Object)
 		}
 		chunks++
+		if len(chunk.Choices) == 0 {
+			// 最后那块只有用量，没有选择。
+			continue
+		}
 		text.WriteString(chunk.Choices[0].Delta.Content)
 		if chunk.Choices[0].FinishReason != nil {
 			finish = *chunk.Choices[0].FinishReason
@@ -526,6 +530,10 @@ func TestStreamChatCompletionsGivesTheToolCall(t *testing.T) {
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			t.Fatalf("a chunk is not JSON: %v (%s)", err, payload)
+		}
+		if len(chunk.Choices) == 0 {
+			// 最后那块只有用量，没有选择。
+			continue
 		}
 		for _, call := range chunk.Choices[0].Delta.ToolCalls {
 			if call.Function.Name != "" {
