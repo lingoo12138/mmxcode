@@ -29,6 +29,10 @@ type chatRequest struct {
 	Tools               []chatTool      `json:"tools"`
 	ToolChoice          json.RawMessage `json:"tool_choice"`
 	Stop                json.RawMessage `json:"stop"`
+	// Thinking says whether the model should think at all.
+	Thinking *thinking `json:"thinking"`
+	// ReasoningEffort says how deep it should think.
+	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 // chatMessage is one message of an OpenAI request.
@@ -152,6 +156,12 @@ func ToAnthropicOpenAI(body []byte) ([]byte, error) {
 	}
 	out.ToolChoice = openAIToolChoice(in.ToolChoice)
 	out.StopSequences = chatStop(in.Stop)
+	// 思考多深要搬过去：客户端要「浅一点」，模型就得真的浅一点。
+	thinkingType := ""
+	if in.Thinking != nil {
+		thinkingType = in.Thinking.Type
+	}
+	out.Thinking, out.OutputConfig = thinkingFor(thinkingType, in.ReasoningEffort)
 	return marshalTo(out, sizeOf(out))
 }
 
@@ -298,12 +308,16 @@ func ToChatCompletion(body []byte, model string) ([]byte, error) {
 	if id == "" {
 		id = randomID("chatcmpl")
 	}
-	var content strings.Builder
+	var content, reasoning strings.Builder
 	var toolCalls []any
 	for _, c := range msg.Content {
 		switch c.Type {
 		case "text":
 			content.WriteString(c.Text)
+		case "thinking":
+			// 思考另放一处：MiniMax 自己的 OpenAI 端点也是这么说的
+			// （默认分开，除非客户端说 reasoning_split=false）。
+			reasoning.WriteString(c.Thinking)
 		case "tool_use":
 			toolCalls = append(toolCalls, map[string]any{
 				"id": c.ID, "type": "function",
@@ -319,6 +333,9 @@ func ToChatCompletion(body []byte, model string) ([]byte, error) {
 	}
 	message := map[string]any{
 		"role": "assistant", "content": content.String(),
+	}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
@@ -342,7 +359,7 @@ func ToChatCompletion(body []byte, model string) ([]byte, error) {
 
 // chatBlock is what is known about one upstream content block.
 type chatBlock struct {
-	// kind is "text" or "tool".
+	// kind is "text", "reasoning", "tool" or "skipped".
 	kind string
 	// index is the tool call's index in the chunk's tool_calls.
 	index int
@@ -486,8 +503,12 @@ func (c *chatConverter) startBlock(ev *anthropicEvent) error {
 		return nil
 	}
 	switch ev.ContentBlock.Type {
-	case "text", "thinking":
+	case "text":
 		c.blocks[ev.Index] = &chatBlock{kind: "text"}
+		return nil
+	case "thinking":
+		// 思考另放一处：MiniMax 自己的 OpenAI 端点也是这么说的。
+		c.blocks[ev.Index] = &chatBlock{kind: "reasoning"}
 		return nil
 	case "tool_use":
 		st := &chatBlock{
@@ -522,6 +543,11 @@ func (c *chatConverter) blockDelta(ev *anthropicEvent) error {
 			return nil
 		}
 		return c.chunk(map[string]any{"content": ev.Delta.Text})
+	case "thinking_delta":
+		if st.kind != "reasoning" || ev.Delta.Thinking == "" {
+			return nil
+		}
+		return c.chunk(map[string]any{"reasoning_content": ev.Delta.Thinking})
 	case "input_json_delta":
 		if st.kind != "tool" {
 			return nil

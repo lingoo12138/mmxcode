@@ -434,6 +434,50 @@ func TestTheCodexAnswerCarriesTheCachedTokens(t *testing.T) {
 	}
 }
 
+// TestTheOpenAIThinkingDepthReachesTheUpstream says the depth the
+// client asks for reaches the model.
+//
+// 客户端说的是 OpenAI 的话（reasoning_effort），上游听的是 MiniMax 的
+// Anthropic 话（thinking.type + output_config.effort）。中间要翻一次。
+// 不翻的话，客户端要「浅一点」，模型还是按最深的来：更多的字、更慢、
+// 更贵，而客户端不知道。
+func TestTheOpenAIThinkingDepthReachesTheUpstream(t *testing.T) {
+	rec := &upstreamRecorder{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r)
+		if r.URL.Path == site.ChatCompletionsPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(`{"type":"message","id":"msg_1","content":[{"type":"text","text":"hi"}]}`))
+	})
+
+	body := `{"model":"m","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.gw.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	_, bodies := rec.seen()
+	if len(bodies) < 2 {
+		t.Fatalf("the upstream was asked %d times", len(bodies))
+	}
+	var up map[string]any
+	if err := json.Unmarshal(bodies[len(bodies)-1], &up); err != nil {
+		t.Fatalf("the upstream's request is not JSON: %v (%s)", err, bodies[len(bodies)-1])
+	}
+	thinking, _ := up["thinking"].(map[string]any)
+	if thinking == nil || thinking["type"] != "adaptive" {
+		t.Fatalf("thinking = %v, want adaptive", up["thinking"])
+	}
+	output, _ := up["output_config"].(map[string]any)
+	if output == nil || output["effort"] != "low" {
+		t.Fatalf("output_config = %v, want the effort low", up["output_config"])
+	}
+}
+
 // TestTheOpenAIRequestFallsBackWhenTheOpenPlatformIsNotConfigured says a
 // 503 from the open platform is "this account has no route there", not a
 // failure to hand to the client.

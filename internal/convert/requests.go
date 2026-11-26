@@ -59,6 +59,9 @@ type anthropicRequest struct {
 	Tools      []anthropicTool      `json:"tools,omitempty"`
 	ToolChoice *anthropicToolChoice `json:"tool_choice,omitempty"`
 	Thinking   *thinking            `json:"thinking,omitempty"`
+	// OutputConfig says how deep the model should think. MiniMax 的
+	// Anthropic 路用 output_config.effort 说这件事。
+	OutputConfig *outputConfig `json:"output_config,omitempty"`
 	// StopSequences are the sequences that end the answer. The
 	// Responses protocol has no such field, so it is only filled in
 	// when the request came from the OpenAI protocol.
@@ -172,8 +175,9 @@ func ToAnthropic(body []byte) ([]byte, error) {
 		})
 	}
 	out.ToolChoice = toolChoice(in.ToolChoice)
-	if in.Reasoning != nil && in.Reasoning.Effort != "" {
-		out.Thinking = &thinking{Type: "adaptive"}
+	if in.Reasoning != nil {
+		// 深度要搬过去：客户端要「浅一点」，模型就得真的浅一点。
+		out.Thinking, out.OutputConfig = thinkingFor("", in.Reasoning.Effort)
 	}
 	msgs, err := messages(in.Input)
 	if err != nil {

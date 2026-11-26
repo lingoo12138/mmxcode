@@ -777,6 +777,12 @@ node --test index.test.mjs
 
 Codex 那条路的请求上有个 `prompt_cache_key`（缓存路由的标识），上游的 Anthropic 那条路上没有这个字段，转不过去。M3 的缓存是自动的、靠前缀比对，这个标识只影响挑哪一个缓存条目，不影响有没有缓存。
 
+**思考多深也照客户的话。** Anthropic 那一门原样转发，深度本来就到得了模型：参考插件给的档位就是 `@ai-sdk/anthropic` 的选项（`thinking: {type: "adaptive"}` 加一个 `effort`），那个包把 `effort` 放进请求体的 `output_config.effort` —— 正是 MiniMax 那条 Anthropic 路的字段。OpenAI 和 Codex 那两门是本地转的，深度以前到不了模型：OpenAI 那一门连 `reasoning_effort` 都没读，Codex 那一门读了却把档位丢了。现在两边都翻成 `thinking` 加 `output_config.effort`。`minimal` 是 OpenAI 的说法、MiniMax 没有这一档（它比 low 还浅），落到 `low` 上；`none` 不是一档深度，是「不要思考」，翻成 `thinking: {type: "disabled"}`。
+
+两处已知不一样，都是有意留着不动：MiniMax 自己的 OpenAI 端点对 M3 是**默认思考**的，我们这一门默认不思考（Anthropic 路的默认）—— 客户端没说要思考就不说；OpenAI 端点的 `reasoning_split: false`（把思考包进 `content` 的 `<think>` 标签里）我们不支持，我们的 OpenAI 门总是分开放。
+
+**思考的内容也带回来了。** OpenAI 那一门以前把 thinking 块整个扔掉 —— 客户端只看见答案，思考的字不见了。现在思考放在 `reasoning_content` 里（流里是 `delta.reasoning_content`），跟 MiniMax 自己那个 OpenAI 端点一个样子。Codex 那一门本来就有（thinking 变成 reasoning item），Anthropic 那一门原样透传。
+
 **流是来一段发一段。** 上游发一段，客户端就收到一段，响应头也是先出去的。Go 的 HTTP 服务自己攒着 2048 字节才往 socket 上写（响应头也在里头），攒着的意思是客户端要等整个答案写完才看到第一个字，那就不叫流式了；最后那块带用量的更是等不到。网关每写一段就冲一次，客户端等的是第一个字，不是最后一个字。
 
 ## 计划
