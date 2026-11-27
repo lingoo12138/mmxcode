@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -3069,4 +3070,215 @@ func TestTheSameAccountIsNotReadTwiceAtTheSameTime(t *testing.T) {
 	}
 	m.EndReading("acc_1")
 	m.EndReading("acc_2")
+}
+
+// checkinPanel is the seven-day panel the site gives when the check-in
+// goes through.
+const checkinPanel = `{"data":{"days":[
+	{"day_no":1,"status":3,"is_today":false,"points":25},
+	{"day_no":2,"status":3,"is_today":false,"points":25},
+	{"day_no":3,"status":3,"is_today":false,"points":25},
+	{"day_no":4,"status":2,"is_today":true,"points":25},
+	{"day_no":5,"status":1,"is_today":false,"points":25},
+	{"day_no":6,"status":1,"is_today":false,"points":25},
+	{"day_no":7,"status":1,"is_today":false,"points":25}]}}`
+
+// checkinSite is a stand-in for MiniMax: the token endpoint, the sign-in
+// panel and the claim.
+//
+// 签到的测试不能碰真的站点：一次续期花掉一个 refresh token。
+//
+// refusals says how many times the panel turns the sign-in away before it
+// answers; failures says how many times it answers 500 (the site having a
+// bad moment) before it answers.
+func checkinSite(t *testing.T, refusals, failures int) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var refreshes, panels atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			refreshes.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600,
+			})
+		case "/minimax-cloud/api/v1/signin/status":
+			n := int(panels.Add(1))
+			switch {
+			case n <= refusals:
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"base_resp":{"status_code":1000048}}`))
+			case n <= refusals+failures:
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"the site is having a bad moment"}`))
+			default:
+				w.Write([]byte(checkinPanel))
+			}
+		case "/minimax-cloud/api/v1/signin/claim":
+			w.Write([]byte(`{"data":{"claim_result":1,"points":25}}`))
+		default:
+			t.Errorf("path = %s", r.URL.Path)
+			w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &refreshes
+}
+
+// seedCheckinAccount gives an account whose token is good for a while.
+func seedCheckinAccount(t *testing.T, m *Manager) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	if err := m.Store.CreateAccount(ctx, store.Account{
+		ID: "acc_01", Name: "a", UserID: "u1",
+		Status: store.StatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SaveToken(ctx, store.Token{
+		AccountID: "acc_01", Access: "old-access", Refresh: "old-refresh",
+		ExpiresAt: now.Add(time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestARefusedCheckinIsRenewedAndAskedAgain says a check-in the site
+// turns away is tried once more with a fresh token.
+//
+// 令牌可能只是过期了 —— 站点不认它，不等于这个号的签入没了。参考插件
+// 也是这么干的（minimax/index.mjs:1214-1229）：401 就续签，再问一次。
+// 问成了，这个号不该被推进重登页。
+func TestARefusedCheckinIsRenewedAndAskedAgain(t *testing.T) {
+	ctx := context.Background()
+	srv, refreshes := checkinSite(t, 1, 0)
+	m := newTestManager(t, srv)
+	seedCheckinAccount(t, m)
+
+	out, rec, err := m.CheckinRecord(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != "claimed" {
+		t.Fatalf("the outcome = %+v, want claimed", out)
+	}
+	if refreshes.Load() != 1 {
+		t.Errorf("the token was renewed %d times, want 1", refreshes.Load())
+	}
+	if rec.Outcome != "claimed" {
+		t.Errorf("the record says %q, want claimed", rec.Outcome)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if NeedsLogin(a) {
+		t.Fatalf("the account has to be signed in again: %q", a.LastError)
+	}
+}
+
+// TestARefusedCheckinThatStaysRefusedIsSignedOut says a check-in the
+// site turns away twice means the sign-in is gone.
+//
+// 站点连刚签出来的令牌都不认 —— 「站点明说不认这个号」就是重登那一页
+// 收的号。所以它要签出，要出现在重登页上。
+func TestARefusedCheckinThatStaysRefusedIsSignedOut(t *testing.T) {
+	ctx := context.Background()
+	srv, refreshes := checkinSite(t, 2, 0)
+	m := newTestManager(t, srv)
+	seedCheckinAccount(t, m)
+
+	out, _, err := m.CheckinRecord(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != checkin.OutcomeFailed {
+		t.Fatalf("the outcome = %+v, want failed", out)
+	}
+	if !out.Refused {
+		t.Fatalf("the outcome = %+v, want a refusal", out)
+	}
+	if refreshes.Load() != 1 {
+		t.Errorf("the token was renewed %d times, want 1", refreshes.Load())
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusSignedOut {
+		t.Fatalf("the status = %q, want %q", a.Status, store.StatusSignedOut)
+	}
+	if !NeedsLogin(a) {
+		t.Fatalf("the account is not on the relogin page: %q", a.LastError)
+	}
+}
+
+// TestARefusedCheckinWhoseRenewalFailsIsNotSignedOut says a renewal
+// that could not be done does not sign the account out.
+//
+// 站点不认这个号，可是续签没成（网络断了，站点抽风）—— 这时候还不知道
+// 这个号的签入有没有了。把好号签出去是冤枉人。
+func TestARefusedCheckinWhoseRenewalFailsIsNotSignedOut(t *testing.T) {
+	ctx := context.Background()
+	// 令牌那台不答了：续签过不去。
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/minimax-cloud/api/v1/signin/status":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"base_resp":{"status_code":1000048}}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"the site is having a bad moment"}`))
+		}
+	}))
+	defer broken.Close()
+	m := newTestManager(t, broken)
+	seedCheckinAccount(t, m)
+
+	out, _, err := m.CheckinRecord(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Outcome != checkin.OutcomeFailed {
+		t.Fatalf("the outcome = %+v, want failed", out)
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status == store.StatusSignedOut {
+		t.Fatalf("the account was signed out: %q", a.LastError)
+	}
+	if NeedsLogin(a) {
+		t.Fatalf("the account has to be signed in again: %q", a.LastError)
+	}
+}
+
+// TestACheckinThatFailedForAnotherReasonLeavesTheAccountAlone says a
+// site having a bad moment does not sign the account out.
+//
+// 站点自己出了毛病（500、网络断了），跟这个号的签入没关系。这样的号
+// 不能被推进重登页 —— 那儿收的是站点明说不认的号。
+func TestACheckinThatFailedForAnotherReasonLeavesTheAccountAlone(t *testing.T) {
+	ctx := context.Background()
+	srv, refreshes := checkinSite(t, 0, 1)
+	m := newTestManager(t, srv)
+	seedCheckinAccount(t, m)
+
+	if _, _, err := m.CheckinRecord(ctx, "acc_01"); err == nil {
+		t.Fatal("the check-in was reported as a success")
+	}
+	if refreshes.Load() != 0 {
+		t.Errorf("the token was renewed %d times, want 0", refreshes.Load())
+	}
+	a, err := m.Store.GetAccount(ctx, "acc_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != store.StatusActive {
+		t.Fatalf("the status = %q, want %q", a.Status, store.StatusActive)
+	}
+	if NeedsLogin(a) {
+		t.Fatalf("the account has to be signed in again: %q", a.LastError)
+	}
 }

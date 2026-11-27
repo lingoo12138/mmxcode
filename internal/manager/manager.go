@@ -1333,6 +1333,7 @@ func (m *Manager) CheckinRecord(ctx context.Context, accountID string) (checkin.
 	if err != nil {
 		return checkin.Outcome{}, store.Checkin{}, err
 	}
+	out = m.askAgainAfterARefusal(ctx, accountID, acc, a, out)
 	return out, store.Checkin{
 		AccountID: accountID,
 		Day:       m.Store.Today(),
@@ -1342,6 +1343,50 @@ func (m *Manager) CheckinRecord(ctx context.Context, accountID string) (checkin.
 		Message:   out.Message,
 		CreatedAt: time.Now(),
 	}, nil
+}
+
+// askAgainAfterARefusal deals with a check-in the site turned away.
+//
+// 站点不认这个号的时候，手里的令牌可能只是过期了：续签一次，用新令牌
+// 再问一次。参考插件也是这么干的（minimax/index.mjs:1214-1229）：401 就
+// 续签，再问一次。问成了，这个号照旧 —— 一个令牌过期了不是这个号的签入
+// 没了。
+//
+// 续签自己的错决定这个号的去向，那套机器已经做完了：
+//
+//   - 站点拒了刷新令牌（invalid_grant）→ 签出 → 进重登页；
+//   - 刷新那条链断了（答案丢了）→ 出错 → 也在重登页上（NeedsLogin 认链
+//     断了）；
+//   - 别的错（网络断了、站点抽风）→ 只记一笔，号照旧 —— 不知道签入还有
+//     没有，就不把它推出重登页。
+//
+// 续签成了，签到还是被拒：站点连刚签出来的令牌都不认。「站点明说不认
+// 这个号」就是重登那一页收的号，所以签出，进重登页。
+func (m *Manager) askAgainAfterARefusal(ctx context.Context, accountID string, acc *account.Client,
+	a store.Account, out checkin.Outcome) checkin.Outcome {
+	if !out.Refused {
+		return out
+	}
+	newTok, err := m.ForceRenew(ctx, accountID)
+	if err != nil {
+		// 续签的错已经落在账号上了（签出、链断了，或者只是记了一笔）。
+		// 这里只把签到这件事说清楚。
+		out.Message = "the site refused the sign-in and the renewal failed: " + err.Error()
+		return out
+	}
+	again, err := checkin.New(acc).Run(ctx, newTok.Access, a.UserID)
+	if err != nil {
+		out.Message = "the site refused the sign-in and the check-in could not be tried again: " + err.Error()
+		return out
+	}
+	if !again.Refused {
+		return again
+	}
+	// 站点连刚签出来的令牌都不认：这个号的签入在站点那里已经没了。
+	if err := m.markSignedOut(ctx, accountID, newTok.Access, again.Message); err != nil {
+		again.Message = again.Message + " (the sign-out could not be saved: " + err.Error() + ")"
+	}
+	return again
 }
 
 // RecordCheckins writes the records of a batch of check-ins down.

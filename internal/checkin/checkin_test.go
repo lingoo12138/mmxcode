@@ -270,3 +270,47 @@ func TestUnknownClaimResult(t *testing.T) {
 		t.Fatalf("error = %q", err.Error())
 	}
 }
+
+// TestARefusedSignInIsMarkedAsRefused says the refusal is kept apart
+// from the other failures.
+//
+// 「签到没成」有两种：站点不认这个号，和站点自己出了毛病（网络断了，
+// 面板坏了）。第一种要续签一次再问一次 —— 令牌可能只是过期了。第二种
+// 不用：把它推进重登是冤枉一个好号。所以这个区别得留在结果里。
+func TestARefusedSignInIsMarkedAsRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid access token"}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Refused {
+		t.Fatalf("the outcome = %+v, want a refusal", out)
+	}
+}
+
+// TestAFailureThatIsNotARefusalIsNotARefusal says the other kind of
+// failure is not mistaken for a refusal.
+//
+// 面板坏了不是站点不认这个号。把坏的当被拒，那个号就白被签出去了。
+func TestAFailureThatIsNotARefusalIsNotARefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"the site is having a bad moment"}`))
+	}))
+	defer srv.Close()
+
+	c := New(testAccountClient(t, srv))
+	out, err := c.Run(context.Background(), "tok", "1234567890")
+	if err == nil {
+		t.Fatalf("the outcome = %+v, want an error", out)
+	}
+	if out.Refused {
+		t.Fatalf("the outcome = %+v, want no refusal", out)
+	}
+}

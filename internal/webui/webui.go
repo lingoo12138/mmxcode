@@ -1529,9 +1529,17 @@ func (w *WebUI) apiCheckin(rw http.ResponseWriter, r *http.Request, id string) {
 	if _, err := round.Settle(r.Context(), id); err != nil {
 		fmt.Printf("checkin %s: the credits could not be read: %v\n", id, err)
 	}
+	// 站点不认这个号，签到就没成；这个号多半也已经签出去了（重登那一页
+	// 收的就是这种号）。页面得知道这两件事：表格里那一格的状态要改，
+	// 人也要知道要去重登页把这个号登回去。
+	signedOut := false
+	if a, err := w.Store.GetAccount(r.Context(), id); err == nil {
+		signedOut = a.Status == store.StatusSignedOut
+	}
 	writeJSON(rw, map[string]any{
 		"outcome": out.Outcome, "credit": out.Credit,
 		"streak": out.Streak, "message": out.Message,
+		"refused": out.Refused, "signed_out": signedOut,
 	})
 }
 

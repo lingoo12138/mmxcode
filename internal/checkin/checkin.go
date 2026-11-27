@@ -38,6 +38,15 @@ type Outcome struct {
 	Streak int
 	// Message is what to show.
 	Message string
+	// Refused says the site does not take this sign-in.
+	//
+	// 「签到没成」有两种：一种是站点不认这个号（401、403，或者 200 的
+	// 回答里带 MiniMax 的拒绝码），一种是站点自己出了毛病（网络断了，
+	// 面板坏了）。第一种要续签一次再问一次 —— 令牌可能只是过期了。第
+	// 二种不用：续签跟它没关系，把它推进重登是冤枉一个好号。
+	//
+	// 所以这个区别得留在结果里，不能压成同一句话。
+	Refused bool
 }
 
 // Client claims check-ins.
@@ -55,7 +64,9 @@ func New(acc *account.Client) *Client { return &Client{acc: acc} }
 // does with a refused sign-in — an HTTP 401 or 403, or MiniMax's own
 // refusal code in the body of a 200 — is to answer OutcomeFailed
 // instead of an error: a refused sign-in is one event, however it
-// arrives.
+// arrives. The refusal is said out loud in Refused, so that the
+// caller can tell it apart from a site that is merely having a bad
+// moment.
 func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error) {
 	if userID == "" {
 		id, err := c.acc.Identity(ctx, access, "")
@@ -70,7 +81,7 @@ func (c *Client) Run(ctx context.Context, access, userID string) (Outcome, error
 	}
 	var refused *account.RefusedError
 	if errors.As(err, &refused) || errors.Is(err, upstream.ErrSignInRefused) {
-		return Outcome{Outcome: OutcomeFailed, Message: err.Error()}, nil
+		return Outcome{Outcome: OutcomeFailed, Refused: true, Message: err.Error()}, nil
 	}
 	return Outcome{}, err
 }

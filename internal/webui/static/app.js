@@ -390,6 +390,10 @@ function outcomeWords(out) {
     case 'inactive':
       return '今天还不能签';
     case 'failed':
+      // 站点不认这个号跟「签到没成」不是一回事：前一个已经把这个号签出
+      // 去了，它在重登那一页上，人得去登回来；后一个（网络断了、站点抽
+      // 风）这个号照旧，不能冤枉它。
+      if (out.signed_out) return '站点不认这个号了，已经推到重登页';
       return (out.message || '签到没成');
     default:
       return String((out && out.outcome) || '');
@@ -1242,6 +1246,13 @@ function openDrawer(row) {
       if (w) kv.checked.textContent = w.word;
       const cell = row.querySelector('[data-checked-cell]');
       if (cell) setChecked(cell, out);
+      if (out.signed_out) {
+        // 这个号被签出去了：它在重登那一页上，表格里那一格的状态也该是
+        // 已登出。重取一页，说的才是真的。
+        kv.state.textContent = statusNames.signed_out;
+        sayAndReload('站点不认这个号了，已经推到重登页');
+        return;
+      }
       say(outcomeWords(out));
     } catch (e) {
       footMsg.textContent = '失败：' + e.message;
@@ -1331,6 +1342,12 @@ document.addEventListener('click', async (ev) => {
       // 天」，不能签的写「不能签」。只写签成了的那一种，表格就停在
       // 「未签」—— 人看着像没签成。
       if (cell) setChecked(cell, out);
+      if (out.signed_out) {
+        // 这个号被签出去了：重取一页，表格里那一格的状态才准，那个号也
+        // 才在重登那一页上。
+        sayAndReload('站点不认这个号了，已经推到重登页');
+        return;
+      }
       say(outcomeWords(out));
     } catch (e) {
       // 失败要说清楚为什么，还得能再按一次。

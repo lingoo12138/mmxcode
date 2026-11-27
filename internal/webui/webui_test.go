@@ -2010,3 +2010,48 @@ func (w *WebUI) checkinState(t *testing.T) map[string]any {
 	}
 	return out
 }
+
+// TestACheckinThatSignedTheAccountOutSaysSo says the answer says the
+// account was signed out.
+//
+// 签到把账号签出去了以后，页面得知道：表格里那一格的状态要改，那个号
+// 从此在重登那一页上。页面不知道，就只显示一句「签到失败」，人还是
+// 不知道这个号已经废了 —— 跟签到之前一模一样。
+func TestACheckinThatSignedTheAccountOutSaysSo(t *testing.T) {
+	w, _ := newTestWebUI(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600,
+			})
+		case "/v1/api/user/info":
+			w.Write([]byte(`{"data":{"userInfo":{"realUserID":"u1"}}}`))
+		case "/minimax-cloud/api/v1/signin/status":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"base_resp":{"status_code":1000048}}`))
+		default:
+			http.Error(w, "no upstream in the test", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	w.Mgr.Acc.SetBase(srv.URL, srv.URL)
+	w.Mgr.TokenURL = srv.URL + "/oauth2/token"
+
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/acc_01/checkin", nil)
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["signed_out"] != true {
+		t.Fatalf("the answer = %s, want the account to be signed out", rec.Body.String())
+	}
+	if out["refused"] != true {
+		t.Fatalf("the answer = %s, want a refusal", rec.Body.String())
+	}
+}
