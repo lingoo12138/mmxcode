@@ -373,6 +373,12 @@ const statusNames = {
 //
 // 网关给的是 claimed、done、ineligible 这些机器字，直接摆到页面上，人
 // 得自己猜。
+//
+// inactive 不是「这个号废了」：站点给的是七天的签到面板，今天那一行
+// 还没有（面板还在上一周，或者今天还没到点）。参考插件也是这么说的
+// （minimax/index.mjs:868）：inactive 是「今天还没开始，或者面板里没有
+// 今天」。这一趟签到是拿这个号的令牌签名发出去的，站点好好地回了面板
+// —— 号是好的，只是今天还签不了。
 function outcomeWords(out) {
   switch (out && out.outcome) {
     case 'claimed':
@@ -382,7 +388,7 @@ function outcomeWords(out) {
     case 'ineligible':
       return '这个号不能签';
     case 'inactive':
-      return '这个号已经不能用了';
+      return '今天还不能签';
     case 'failed':
       return (out.message || '签到没成');
     default:
@@ -392,15 +398,15 @@ function outcomeWords(out) {
 
 // checkedWord says, in words, what a check-in did.
 //
-// 每一种结果都有话：签过的说签了几天，不能签的说不能签，不能用了的说
-// 不能用了。签到失败也是一种结果 —— 它不是「没有结果」。
+// 每一种结果都有话：签过的说签了几天，不能签的说不能签，今天还不能签
+// 的说今天还不能签。签到失败也是一种结果 —— 它不是「没有结果」。
 function checkedWord(out) {
   const o = out && out.outcome;
   if (o === 'claimed' || o === 'done') {
     return { word: '已签 ' + (out.streak || 1) + ' 天', cls: 'good' };
   }
   if (o === 'ineligible') return { word: '不能签', cls: '' };
-  if (o === 'inactive') return { word: '不能用了', cls: 'bad' };
+  if (o === 'inactive') return { word: '今天还不能签', cls: '' };
   if (o === 'failed') return { word: '签到失败', cls: 'bad' };
   return null;
 }
